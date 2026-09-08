@@ -1,0 +1,14 @@
+{
+  "type": "hello",
+  "protocol": "node-link/v1",
+  "node_id": "00000000-0000-4000-8000-00000000000a",
+  "node_name": "Dev Node",
+  "daemon_version": "0.1.0",
+  "uptime_s": 4242,
+  "capability": {
+    "token": "fixture-capability-token-not-a-secret",
+    "expires_at": "2026-01-01T12:10:00Z",
+    "role": "submitter"
+  },
+  "proof": "fixture-ed25519-signature-not-a-secret"
+}

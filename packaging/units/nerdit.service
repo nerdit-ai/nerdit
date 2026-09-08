@@ -1,0 +1,51 @@
+# Nerdit daemon — systemd SYSTEM unit (P30 D-P30-8).
+#
+# Rendered by packaging/install.sh, never by Python: the installer substitutes
+# __NERDITD__ (absolute path to <ROOT>/current/nerditd), __USER__ (the unit's
+# user: $SUDO_USER when the installer ran under sudo, else root) and __HOME__
+# (that user's home) with sed, then writes the result to
+# /etc/systemd/system/nerdit.service.
+#
+# Restart=on-failure, not always: the daemon's own self-exec restart
+# (POST /daemon/restart) replaces the process image under the SAME pid via
+# execv, which systemd sees as a still-living main process — nothing to
+# restart, nothing to notice. Only a real crash or a non-zero exit brings
+# systemd in.
+#
+# AmbientCapabilities=CAP_NET_BIND_SERVICE is what makes the URL layer work at
+# all here. This unit runs as an UNPRIVILEGED user (D-P30-8: __USER__ is
+# $SUDO_USER, not root) while [proxy].https_port defaults to 443, so without
+# it the bundled Caddy the daemon forks dies with
+#   listening on :443: listen tcp :443: bind: permission denied
+# and the supervisor respawn-loops forever — every deployed app silently stuck
+# on loopback with no public_url. Ambient capabilities survive the fork+exec
+# into the Caddy child (measured: the child's CapAmb carries CAP_NET_BIND_SERVICE
+# and binds :443), which `setcap` on the binary would too — but setcap is lost
+# on every `nerdit update`, because D-P30-9 puts each release's Caddy at a NEW
+# path under /opt/nerdit/<version>/. The unit outlives the version dirs; the
+# file capability would not.
+#
+# Deliberately NO CapabilityBoundingSet= narrowing alongside it. The installer
+# renders User=root when it runs from a root shell with no SUDO_USER, and a
+# bounding set of only CAP_NET_BIND_SERVICE would strip that root daemon of
+# CAP_FOWNER/CAP_DAC_OVERRIDE/CAP_CHOWN — which it does use (e.g. the volume
+# permission pass in core/services.py chmods directories it may not own).
+# Ambient capabilities do not need the bounding set narrowed to work.
+[Unit]
+Description=Nerdit daemon (nerditd)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Environment=HOME=__HOME__
+Environment=NERDIT_BOOT_LOG=1
+WorkingDirectory=__HOME__
+ExecStart=__NERDITD__
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

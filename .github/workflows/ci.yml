@@ -1,0 +1,53 @@
+name: CI
+
+# Public-repo CI. Uses ZERO secrets — every step here runs identically on a
+# fork's pull_request event, where GitHub withholds repo secrets by design.
+# The full hardware suite (real Docker, real Caddy, GPU-gated tests) stays
+# private and runs on import into the private development repository (see
+# CONTRIBUTING.md); this workflow is the light, always-green contributor gate.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy src/nerdit
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      # A headless subset only: config/settings/schema + binding-resolution
+      # unit tests, none of which touch Docker, Caddy or a real filesystem
+      # daemon. The full suite (docker-mocked and real-hardware alike) runs
+      # on import into the private repo — see CONTRIBUTING.md.
+      - run: |
+          pytest tests/test_ai_binding_resolve.py \
+                 tests/test_ai_binding_schema.py \
+                 tests/test_bindings_registry.py \
+                 tests/test_config_legacy_sections.py \
+                 tests/test_config_store.py \
+                 tests/test_db_binding_resolution.py \
+                 tests/test_db_binding_schema.py \
+                 tests/test_project_config.py \
+                 tests/test_public_source_tree.py \
+                 tests/test_settings.py \
+                 -v --asyncio-mode=auto

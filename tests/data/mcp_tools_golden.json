@@ -1,0 +1,2093 @@
+{
+  "add_domain": {
+    "description": "Serve a deployed app at a domain YOU own, from this node's own proxy (P26).\n\n        Unlike ``share_service`` (Nerdit's domain, over the cloud tunnel), this\n        is the node's embedded Caddy answering ``https://<domain>/`` directly \u2014\n        in either proxy mode, at the ROOT, so a frontend needs no ``/<app>/``\n        base path. The one thing the daemon cannot do for you: point the\n        domain's DNS (A/AAAA/CNAME) at this machine. By default the domain is\n        served with the node's internal CA, so a client must run\n        ``nerdit trust`` once. ``acme=True`` requests a public ACME\n        certificate; it needs an ADMIN token (403 ``domain.acme_forbidden``,\n        ``reason: acme_admin_only`` \u2014 the node has one ACME account whose rate\n        limits every domain on it shares) and 409 ``domain.acme_disabled``\n        unless the daemon has ``[proxy.acme].enabled``. Leaving ``acme`` OUT\n        keeps whatever the domain already has (``false`` on a new one), so\n        re-running this tool to read the URL back never downgrades an issued\n        public certificate; pass ``acme=False`` to downgrade on purpose.\n\n        ``domain`` must be a bare, lowercase DNS name (case and a trailing dot\n        are folded server-side): no scheme, no path, no port, no wildcard, no IP\n        literal, no IDN/punycode, at least two labels, and never a name under\n        this node's own hostname / ``base_domain`` / extra hostnames. Refusals:\n        422 ``domain.invalid`` \u2014 the name broke exactly one grammar rule and the\n        message names it (``empty``, ``whitespace``, ``not_bare``,\n        ``has_port``, ``wildcard``, ``ip_literal``, ``idn``, ``single_label``,\n        ``grammar``, ``reserved``); 409 ``domain.taken`` (one domain, one\n        service \u2014 never silently re-pointed); 422 ``domain.kind_unsupported``\n        (models and databases are not routed).\n\n        Returns ``{domain, url, state, cert_state, created}``; ``state`` is\n        ``ready`` | ``withheld`` (``withheld`` = the proxy is off, the app is\n        not routed yet, or its ``[deploy].edge_auth`` secret does not resolve \u2014\n        the row is stored either way and answers once it is). ``cert_state`` is\n        the orthogonal certificate fact: ``internal`` (this node's CA) |\n        ``disabled`` (``acme`` asked for, ``[proxy.acme]`` off) | ``pending``\n        (issuing, or failing \u2014 check ``doctor``) | ``issued`` | ``expired``.\n        The URL then appears in ``get_service`` / ``list_routes`` under\n        ``public_urls`` (kind ``domain``). Idempotent; a key is auto-generated\n        if omitted.\n        ",
+    "inputSchema": {
+      "properties": {
+        "acme": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Acme"
+        },
+        "domain": {
+          "title": "Domain",
+          "type": "string"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "domain"
+      ],
+      "title": "add_domainArguments",
+      "type": "object"
+    }
+  },
+  "apply_config": {
+    "description": "Declaratively apply a multi-section daemon config document (all-or-nothing).\n\n        ``If-Match`` is required by the daemon on a real apply; when omitted\n        here it is auto-fetched (current ETag) so an agent can apply without\n        a manual read-then-write round trip \u2014 pass ``if_match`` explicitly to\n        disable the auto-fetch. ``dry_run=True`` validates and previews\n        without writing (exempt from ``If-Match``/idempotency key). An\n        idempotency key is auto-generated if omitted.\n        ",
+    "inputSchema": {
+      "properties": {
+        "dry_run": {
+          "default": false,
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "if_match": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "If Match"
+        },
+        "sections": {
+          "additionalProperties": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Sections",
+          "type": "object"
+        }
+      },
+      "required": [
+        "sections"
+      ],
+      "title": "apply_configArguments",
+      "type": "object"
+    }
+  },
+  "capabilities": {
+    "description": "Describe this daemon: version, caller role/quotas, URL grammar, backends.\n\n        Role-aware, pure in-memory read \u2014 call it first to learn what the\n        daemon can do (buildpacks, model backends, proxy mode and public-URL\n        shape, deploy limits, git allowlist, feature flags) instead of probing\n        endpoints. Admin callers additionally receive ``proxy.admin_addr`` and\n        the ``paths`` block.\n        ",
+    "inputSchema": {
+      "properties": {},
+      "title": "capabilitiesArguments",
+      "type": "object"
+    }
+  },
+  "cluster_stats": {
+    "description": "Get aggregate cluster metrics (GPUs in use/total, services up).",
+    "inputSchema": {
+      "properties": {},
+      "title": "cluster_statsArguments",
+      "type": "object"
+    }
+  },
+  "create_database": {
+    "description": "Provision a managed database (kind=database workload).\n\n        ``backend`` selects the data backend: ``postgres`` (default) or\n        ``redis``. Omit it to use the daemon's configured default. Provisioning\n        is asynchronous: the call returns immediately with the database row in\n        ``building`` while the daemon pulls the image off-tick and launches the\n        server; poll ``list_databases`` (or ``get_service``) until ``db_ready``\n        is true. Lifecycle (stop / restart / delete) goes through the existing\n        service tools. An idempotency key is auto-generated if omitted.\n\n        The daemon mints the password server-side and stores it write-only \u2014 it\n        is NEVER returned by this tool (key names only). An app connects to this\n        database by declaring a ``[db.<name>]`` binding (``provider=\"managed\"``,\n        ``database`` = this database's name \u2014 the ``database`` field is\n        required, there is no implicit default); at each launch it receives\n        ``NERDIT_DB_<NAME>_URL``, and the ``default`` binding also sets\n        ``DATABASE_URL`` (Postgres) or ``REDIS_URL`` (Redis) with the composed\n        DSN so an unmodified client library connects with no code change.\n        ",
+    "inputSchema": {
+      "properties": {
+        "backend": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Backend"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        }
+      },
+      "title": "create_databaseArguments",
+      "type": "object"
+    }
+  },
+  "deploy": {
+    "description": "Use when: the source is a local folder. Asynchronous \u2014 follow with wait_for_service.\n\nDeploys that folder (build + run + URL), or rolls back with\n``rollback=True``. The response carries ``next_step`` \u2014 a machine-shaped\n``{tool, args, why}`` naming the very call to make next \u2014 because a 201\nhere means \"the build was accepted\", never \"the app is up\".\n\nIf the app's ``nerdit.toml`` declares ``[ai.*]`` bindings, each is\ninjected at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\nOPENAI_MODEL`` \u2014 point the app's OpenAI SDK at these; no code change\nneeded. Idempotency key auto-generated if omitted. ``dry_run=True``\nreturns the build/config plan diff (env key names only, values never)\nwith zero writes \u2014 no idempotency key is minted or needed. An ``env``\nvalue of ``None`` deletes that key on redeploy.\n\n``nerdit.toml`` ``[deploy]`` keys \u2014 anything else is IGNORED and\nreported back in the response ``hints``: ``name``, ``port``, ``gpus``,\n``start``, ``health``, ``health_type`` (``http``|``tcp``),\n``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,\n``auto_deploy``, ``edge_auth``. There is **no** ``build`` key \u2014 run the\nbuild in your Dockerfile. On a successful non-dry-run deploy the\nresponse carries ``summary`` (app/status/version/public_url), ``hints``\n(ordered one-liners, never empty) and ``next_step`` (the structured\nfollow-up call); a ``dry_run`` plan and a ``rollback`` response carry\nnone of the three \u2014 read a plan's advisories from its ``warnings``. On a\nnode in ``path`` proxy mode the app is served at ``/<name>/``, so a\nfrontend must be built with that base\npath; in ``subdomain`` mode it is served at the root of its own\nhostname and needs none \u2014 read ``capabilities.proxy.mode``.\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
+    "inputSchema": {
+      "properties": {
+        "dry_run": {
+          "default": false,
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "env": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Env"
+        },
+        "gpus": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpus"
+        },
+        "health": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Health"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Port"
+        },
+        "rollback": {
+          "default": false,
+          "title": "Rollback",
+          "type": "boolean"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start"
+        },
+        "vendor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Vendor"
+        }
+      },
+      "title": "deployArguments",
+      "type": "object"
+    }
+  },
+  "deploy_app": {
+    "description": "Use when: you used write_app_files. Asynchronous \u2014 follow with wait_for_service.\n\nDistinct from ``deploy`` (which uploads a folder from the machine the MCP\nserver runs on) and from ``deploy_git`` (which clones a repository): this\none deploys the workspace of the same name, so it is the deploy verb for\nan app you wrote in this conversation. Call it again after each\n``write_app_files`` to ship an edit \u2014 ``redeploy_service`` refuses\nworkspace apps by design and points back here.\n\nIf the workspace's ``nerdit.toml`` declares ``[ai.*]`` bindings, each is\ninjected at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\nOPENAI_MODEL``. An ``env`` value of ``None`` deletes that key on\nredeploy. ``dry_run=True`` returns the build/config plan diff (env key\nnames only, values never) with zero writes \u2014 no idempotency key is minted\nor needed. Otherwise a key is auto-generated if omitted.\n\n``nerdit.toml`` ``[deploy]`` keys \u2014 anything else is IGNORED and\nreported back in the response ``hints``: ``name``, ``port``, ``gpus``,\n``start``, ``health``, ``health_type`` (``http``|``tcp``),\n``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,\n``auto_deploy``, ``edge_auth``. There is **no** ``build`` key \u2014 run the\nbuild in your Dockerfile. On a successful non-dry-run deploy the\nresponse carries ``summary`` (app/status/version/public_url), ``hints``\n(ordered one-liners, never empty) and ``next_step`` (the structured\nfollow-up call); a ``dry_run`` plan carries none of the three \u2014 read a\nplan's advisories from its ``warnings``. On a node in ``path``\nproxy mode the app is served at ``/<name>/``, so a frontend must be\nbuilt with that base path.\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
+    "inputSchema": {
+      "properties": {
+        "dry_run": {
+          "default": false,
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "env": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Env"
+        },
+        "gpus": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpus"
+        },
+        "health": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Health"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Port"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start"
+        },
+        "vendor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Vendor"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "deploy_appArguments",
+      "type": "object"
+    }
+  },
+  "deploy_git": {
+    "description": "Use when: the app lives in a Git repo. Asynchronous \u2014 follow with wait_for_service.\n\nClones ``repo_url`` server-side (public GitHub by default), then builds\nand runs it like ``deploy``. ``ref`` picks a branch/tag, ``subdir``\ndeploys a monorepo subtree. For a private repo, ``token_ref`` is a\nsecret *reference* (``${secrets.shared.GITHUB_TOKEN}``) resolved\nserver-side \u2014 never pass a raw token \u2014 or the literal\n``${github.installation}`` on a node linked to an account with the\nNerdit GitHub App installed on that repo. An existing ``name`` is a\nredeploy. An idempotency key is auto-generated if omitted.\n``dry_run=True`` returns the build/config plan diff (env key names only,\nvalues never) with zero writes \u2014 no idempotency key is minted or needed.\nAn ``env`` value of ``None`` deletes that key on redeploy.\n\nIf the repo's ``nerdit.toml`` declares ``[ai.*]`` bindings, each is\ninjected at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\nOPENAI_MODEL`` \u2014 point the app's OpenAI SDK at these; no code change\nneeded.\n\n``nerdit.toml`` ``[deploy]`` keys \u2014 anything else is IGNORED and\nreported back in the response ``hints``: ``name``, ``port``, ``gpus``,\n``start``, ``health``, ``health_type`` (``http``|``tcp``),\n``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,\n``auto_deploy``, ``edge_auth``. There is **no** ``build`` key \u2014 run the\nbuild in your Dockerfile. On a successful non-dry-run deploy the\nresponse carries ``summary`` (app/status/version/public_url), ``hints``\n(ordered one-liners, never empty) and ``next_step`` (the structured\nfollow-up call); a ``dry_run`` plan carries none of the three \u2014 read a\nplan's advisories from its ``warnings``. On a node in ``path``\nproxy mode the app is served at ``/<name>/``, so a frontend must be\nbuilt with that base path.\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
+    "inputSchema": {
+      "properties": {
+        "dry_run": {
+          "default": false,
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "env": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Env"
+        },
+        "gpus": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpus"
+        },
+        "health": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Health"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Port"
+        },
+        "ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ref"
+        },
+        "repo_url": {
+          "title": "Repo Url",
+          "type": "string"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start"
+        },
+        "subdir": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Subdir"
+        },
+        "token_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Token Ref"
+        },
+        "vendor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Vendor"
+        }
+      },
+      "required": [
+        "repo_url",
+        "name"
+      ],
+      "title": "deploy_gitArguments",
+      "type": "object"
+    }
+  },
+  "deploy_template": {
+    "description": "Use when: you want a starter app. Asynchronous \u2014 follow with wait_for_service.\n\nResolves ``template_id`` (see ``list_app_templates``), clones its\ncatalog repo server-side, and deploys it under ``name``. ``env`` and the\ndeploy overrides layer over the template's defaults. An ``env`` value of\n``None`` deletes that key on redeploy. An idempotency key is\nauto-generated if omitted. The response carries ``summary``, ``hints``\n(never empty) and ``next_step`` \u2014 the structured follow-up call \u2014 since\na 201 here means the build was accepted, not that the app is up.\n\nIf the template declares ``[ai.*]`` bindings, each is injected at launch\nas ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the ``default`` binding also\nsets ``OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL`` \u2014 point the app's\nOpenAI SDK at these; no code change needed. WARNING: the ``secrets`` values you pass\nhere transit this agent's transcript in plaintext; for high-value keys\nprefer ``nerdit secrets set`` from the CLI and deploy without ``secrets``.\n",
+    "inputSchema": {
+      "properties": {
+        "env": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Env"
+        },
+        "gpus": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpus"
+        },
+        "health": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Health"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Port"
+        },
+        "secrets": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Secrets"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start"
+        },
+        "template_id": {
+          "title": "Template Id",
+          "type": "string"
+        },
+        "vendor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Vendor"
+        }
+      },
+      "required": [
+        "template_id",
+        "name"
+      ],
+      "title": "deploy_templateArguments",
+      "type": "object"
+    }
+  },
+  "diagnose_service": {
+    "description": "Use when: a service is failing and you need the reason, not the logs.\n\nBundles the deploy phase, crash forensics (``last_exit_code``,\n``oom_killed``), a fresh health probe, AI-binding readiness, a bounded\nlog tail and a single ``remediation_code`` to branch on \u2014 call it after\n``wait_for_service`` returns ``failed`` instead of scraping logs.\n``name`` accepts the service name or the job id. Owner-or-admin read:\nthe bundle carries env/secret key *names* and app log lines, never\nsecret values. ``log_tail`` is clamped to [1, 200].\n",
+    "inputSchema": {
+      "properties": {
+        "log_tail": {
+          "default": 50,
+          "title": "Log Tail",
+          "type": "integer"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "diagnose_serviceArguments",
+      "type": "object"
+    }
+  },
+  "doctor": {
+    "description": "Run the daemon's bounded environment health checks (docker/gpu/proxy/db/...).\n\n        Returns per-check ``{status, detail}`` plus a worst-of top-level\n        status. Every check is timeout-bounded server-side; details carry key\n        *names* only, never paths or secret values \u2014 safe for every role.\n        ",
+    "inputSchema": {
+      "properties": {},
+      "title": "doctorArguments",
+      "type": "object"
+    }
+  },
+  "dump_database": {
+    "description": "Capture a logical, application-consistent dump of a managed database.\n\n        The daemon runs the engine's own dump tool \u2014 ``pg_dump --format=custom``\n        for Postgres, ``redis-cli --rdb`` for Redis \u2014 from a throwaway container\n        built from the database's OWN image, against the running server. This is\n        the dump to take before a migration or a destructive change: unlike the\n        volume backup (``nerdit backup --volume``, no tool), it is consistent by\n        the engine's rules rather than by the filesystem's.\n\n        CUSTODY: the artifact is a server-side tar under the daemon's backups\n        directory holding **every row** of ``name``; it is never served over\n        HTTP and nothing but metadata comes back here \u2014 basename, size, sha256,\n        engine, format, duration. Treat the basename as the handle: it is what\n        ``nerdit db restore`` takes.\n\n        RETENTION: the daemon keeps the last ``[retention].dump_keep_last``\n        dumps per database (default 5) and prunes older ones on its hourly\n        sweep, so a dump is not an archive. Copy one off the box if it must\n        outlive that window.\n\n        TIMEOUT: ``timeout_s`` (default 300) bounds the dump tool server-side\n        and is capped by ``[services].dump_timeout_max_s`` (``422\n        dump.timeout_too_large`` names the cap, never silently clamped). The\n        default matches the usual MCP client read budget, not the route's own\n        900: if your client gives up first, **a longer dump still completes\n        server-side and appears in ``list_database_dumps``**. So a read timeout\n        here is not a failure \u2014 call ``list_database_dumps`` and take the newest\n        entry. Do NOT blind-retry: this tool mints its own idempotency key per\n        call, so a retry is a second real dump (and the first one may still be\n        running, which answers ``409 dump.in_progress``).\n\n        Authorization is **owner-or-admin plus token scope**: a scoped submitter\n        can dump the databases it created, which is what makes this usable over\n        the (submitter-capped) cloud link. Refusals you should branch on: ``409\n        dump.database_not_ready`` (not running, or still doing initdb \u2014 poll\n        ``list_databases`` for ``db_ready``), ``409 dump.in_progress`` (this\n        database already has one running; distinct from the daemon-wide\n        ``backup.in_progress``), ``409 dump.too_many_in_flight``, ``409\n        dump.insufficient_disk`` (``detail`` carries ``required_bytes`` /\n        ``free_bytes``), ``422 dump.not_a_database``, and ``500 dump.failed``\n        whose ``hint`` is the tool's own last output line. There is deliberately\n        **no restore tool** \u2014 restoring replaces live data and stays on the CLI\n        (``nerdit db restore``) and REST.\n        ",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "timeout_s": {
+          "default": 300,
+          "title": "Timeout S",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "dump_databaseArguments",
+      "type": "object"
+    }
+  },
+  "get_app_config": {
+    "description": "Read a deployed app's daemon-persisted config (deploy fields + ai bindings).\n\n        Secret values are never returned \u2014 only ``${secrets.X}`` refs and env\n        key names. Each ``[ai.<name>]`` binding shown here is injected into the\n        app at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n        ``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\n        OPENAI_MODEL`` (drop-in OpenAI SDK).\n        ",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "get_app_configArguments",
+      "type": "object"
+    }
+  },
+  "get_audit": {
+    "description": "Read the audit log (admin-scoped), bounded to ``limit`` entries per page.\n\n        Returns an ``AuditLogPage`` dict; pass ``cursor`` from the previous page\n        to continue. Non-admin tokens get a structured ``forbidden`` (403) error.\n\n        Exact-match filters: ``action`` (e.g. ``deploy.create``), ``result``\n        (ok/error/denied/replay), ``target`` (a target id, e.g. a service name),\n        ``target_type`` (e.g. service, model) and ``principal_id`` (a token id \u2014\n        \"everything this caller did\").\n\n        ``action_prefix`` is the family form: ``deploy.`` returns every\n        ``deploy.*`` action without you enumerating them. It is a **literal**\n        prefix, not a pattern, and must match ``[a-z0-9._]`` (1-40 chars) or the\n        daemon answers ``bad_request``.\n\n        ``since``/``until`` are inclusive ISO-8601 UTC bounds\n        (``2026-08-07T10:00:00Z``). All filters compose with AND, and all are\n        applied in SQL \u2014 narrowing is cheap, so prefer a filter over paging.\n        ",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Action"
+        },
+        "action_prefix": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Action Prefix"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor"
+        },
+        "limit": {
+          "default": 50,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "principal_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Principal Id"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Result"
+        },
+        "since": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Since"
+        },
+        "target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target"
+        },
+        "target_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Type"
+        },
+        "until": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Until"
+        }
+      },
+      "title": "get_auditArguments",
+      "type": "object"
+    }
+  },
+  "get_config": {
+    "description": "Read daemon config: one section view, or all sections when omitted.\n\n        Secret-bearing values are redacted server-side.\n        ",
+    "inputSchema": {
+      "properties": {
+        "section": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Section"
+        }
+      },
+      "title": "get_configArguments",
+      "type": "object"
+    }
+  },
+  "get_events": {
+    "description": "Use when: you need the daemon's own account of what it just did.\n\nThe durable feed of autonomous transitions (``service.failed``,\n``service.degraded``, ``service.deploy_succeeded``, ``model.ready``,\n...), readable by any authenticated token. Two directions, and picking\nthe wrong one walks the wrong way through history: ``cursor`` browses\n**backwards** (id DESC, newest first) \u2014 use it to see what just\nhappened; ``since_id`` replays **forwards** (id ASC, oldest first) \u2014 use\nit to resume from an id you already processed. Passing both is a\n``400``. ``types`` is comma-separated (first 10 honoured); ``limit`` is\nclamped to [1, 200].\n",
+    "inputSchema": {
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor"
+        },
+        "limit": {
+          "default": 50,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "service": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Service"
+        },
+        "since_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Since Id"
+        },
+        "types": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Types"
+        }
+      },
+      "title": "get_eventsArguments",
+      "type": "object"
+    }
+  },
+  "get_service": {
+    "description": "Get one service. ``name`` accepts the service name or the job id.",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "get_serviceArguments",
+      "type": "object"
+    }
+  },
+  "list_app_files": {
+    "description": "List an app's workspace: paths, sizes, sha256 and totals.\n\n        What this lists is exactly what ``deploy_app`` would build \u2014 the exclude\n        rules are enforced at write time, not at deploy time. Bounded at 500\n        files by construction, so there is no paging.\n        ",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "list_app_filesArguments",
+      "type": "object"
+    }
+  },
+  "list_app_templates": {
+    "description": "List the app template store \u2014 deployable starter apps (id/name/coordinates).\n\n        Deploy one with ``deploy_template``. Distinct from ``list_jobs``-style\n        job presets: these are full app templates (web/API/AI starters).\n        ",
+    "inputSchema": {
+      "properties": {},
+      "title": "list_app_templatesArguments",
+      "type": "object"
+    }
+  },
+  "list_database_dumps": {
+    "description": "List the dump tars this daemon holds for one managed database.\n\n        Newest first, ``{dump, size_bytes, created_at}`` per row, where\n        ``created_at`` is the tar's mtime (the listing never opens an archive).\n        Metadata only, like ``dump_database``: the tars themselves stay under\n        the daemon's backups directory and are never served over HTTP, and each\n        one holds every row of ``name``.\n\n        Two things this read is for. It is the recovery path when a\n        ``dump_database`` call outran your client's read budget \u2014 **the dump\n        still completes server-side and shows up here**, so list before you\n        retry. And it is how you check retention: the daemon keeps the last\n        ``[retention].dump_keep_last`` per database (default 5) and prunes the\n        rest hourly, so on a default daemon what is listed here is all there is.\n        Retention can be turned off (``dump_keep_last = 0``), so the listing is\n        capped at the newest 500 instead: ``truncated`` is true when older tars\n        exist on the box that this page does not name.\n\n        Owner-or-admin plus token scope \u2014 the same gate as the dump that\n        produced them, because knowing which dumps a database has is knowing\n        something about the data.\n        ",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "list_database_dumpsArguments",
+      "type": "object"
+    }
+  },
+  "list_databases": {
+    "description": "List managed databases (kind=database workloads), bounded to ``limit`` per page.\n\n        Returns a cursor-paginated page; pass ``cursor`` from the previous page\n        to continue. A newly created database shows ``building`` until its\n        off-tick image pull and readiness probe complete (``db_ready`` true).\n        The ``endpoint`` is password-free by construction; lifecycle actions go\n        through the service tools.\n        ",
+    "inputSchema": {
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor"
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Limit"
+        }
+      },
+      "title": "list_databasesArguments",
+      "type": "object"
+    }
+  },
+  "list_gpus": {
+    "description": "List GPUs known to the daemon, with live utilization metrics.",
+    "inputSchema": {
+      "properties": {},
+      "title": "list_gpusArguments",
+      "type": "object"
+    }
+  },
+  "list_models": {
+    "description": "List served AI models (kind=model workloads), bounded to ``limit`` per page.\n\n        Returns a cursor-paginated page; pass ``cursor`` from the previous page\n        to continue. A newly served model shows ``building`` until its off-tick\n        pull completes; lifecycle actions go through the service tools.\n        ",
+    "inputSchema": {
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor"
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Limit"
+        }
+      },
+      "title": "list_modelsArguments",
+      "type": "object"
+    }
+  },
+  "list_routes": {
+    "description": "List the DB-authoritative route inventory, annotated with live Caddy state.\n\n        Cursor-paginated (``limit`` clamped to [1, 200]); pass ``cursor`` from\n        the previous page to continue. Models appear with ``route: null``\n        (loopback-only by design); each row carries its live-table annotation.\n        ",
+    "inputSchema": {
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor"
+        },
+        "limit": {
+          "default": 50,
+          "title": "Limit",
+          "type": "integer"
+        }
+      },
+      "title": "list_routesArguments",
+      "type": "object"
+    }
+  },
+  "list_secret_names": {
+    "description": "List a service's secret key names (values are never returned).\n\n        ``service=\"shared\"`` lists the global shared scope's key names;\n        readable by any authenticated principal (owners need the\n        referenceable list), unlike shared writes which are admin-only.\n        ",
+    "inputSchema": {
+      "properties": {
+        "service": {
+          "title": "Service",
+          "type": "string"
+        }
+      },
+      "required": [
+        "service"
+      ],
+      "title": "list_secret_namesArguments",
+      "type": "object"
+    }
+  },
+  "list_services": {
+    "description": "List services, optionally filtered by status, bounded to ``limit`` per page.",
+    "inputSchema": {
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor"
+        },
+        "limit": {
+          "default": 50,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        }
+      },
+      "title": "list_servicesArguments",
+      "type": "object"
+    }
+  },
+  "proxy_status": {
+    "description": "Get the embedded proxy's typed state (TLS, apex, respawn, live routes).\n\n        Authenticated read: proxy state, TLS subjects + CA fingerprint, apex\n        registration, respawn backoff, and a tri-state live route table read\n        from the Caddy admin API. Complements ``list_routes`` (the\n        DB-authoritative inventory).\n        ",
+    "inputSchema": {
+      "properties": {},
+      "title": "proxy_statusArguments",
+      "type": "object"
+    }
+  },
+  "read_app_file": {
+    "description": "Read one file back from an app's workspace as text.\n\n        Use it before patching a file you did not write in this conversation, so\n        the next ``write_app_files`` replaces content you have actually seen.\n        ",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "path"
+      ],
+      "title": "read_app_fileArguments",
+      "type": "object"
+    }
+  },
+  "redeploy_service": {
+    "description": "Use when: a git app needs a new commit. Asynchronous \u2014 follow with wait_for_service.\n\nRe-clones the repository and branch/tag the service was deployed from\nand rebuilds it, so picking up a new commit is one call with the service\nname alone. Use this instead of ``deploy_git`` when the service already\nexists \u2014 every coordinate (repo, ref, subdir, private-repo credential\nreference) is read back off the service. A service deployed from a\nfolder/zip has no recorded source and is refused. An idempotency key is\nauto-generated if omitted. ``dry_run=True`` returns the build/config plan\ndiff (env key names only, values never) with zero writes \u2014 no\nidempotency key is minted or needed. A non-dry-run response carries\n``summary``, ``hints`` (never empty) and ``next_step`` \u2014 the structured\nfollow-up call.\n",
+    "inputSchema": {
+      "properties": {
+        "dry_run": {
+          "default": false,
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "redeploy_serviceArguments",
+      "type": "object"
+    }
+  },
+  "remove_domain": {
+    "description": "Remove a custom domain; its route disappears on the next reconcile tick. Idempotent.",
+    "inputSchema": {
+      "properties": {
+        "domain": {
+          "title": "Domain",
+          "type": "string"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "domain"
+      ],
+      "title": "remove_domainArguments",
+      "type": "object"
+    }
+  },
+  "remove_secret": {
+    "description": "Delete one secret key, or all of a service's secrets when key is omitted.\n\n        An idempotency key is auto-generated if omitted, so a retried delete\n        collapses to a single apply. ``service=\"shared\"`` deletes from the\n        global shared scope (admin-only) \u2014 deleting a shared key can break\n        every app still referencing it via ``${secrets.shared.KEY}``.\n        ",
+    "inputSchema": {
+      "properties": {
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Key"
+        },
+        "service": {
+          "title": "Service",
+          "type": "string"
+        }
+      },
+      "required": [
+        "service"
+      ],
+      "title": "remove_secretArguments",
+      "type": "object"
+    }
+  },
+  "remove_service": {
+    "description": "Delete a service (teardown + remove).\n\n        ``name`` accepts the service name or the job id. ``purge`` is a CSV of\n        durable-state targets to destroy alongside the row\n        (``secrets``/``data``/``images``; default ``secrets``). ``force`` bypasses\n        the model reference guard (deleting a model still bound by other apps).\n        An idempotency key is auto-generated if omitted.\n        ",
+    "inputSchema": {
+      "properties": {
+        "force": {
+          "default": false,
+          "title": "Force",
+          "type": "boolean"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "purge": {
+          "default": "secrets",
+          "title": "Purge",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "remove_serviceArguments",
+      "type": "object"
+    }
+  },
+  "restart_daemon": {
+    "description": "Restart the daemon to apply restart-required config (admin-scoped, audited).\n\n        Returns 202 with drain counts. **Over the HTTP MCP transport this kills\n        the connection serving this call**: a dropped response after issuing it\n        means the restart most likely started. Confirm with ``capabilities``\n        (``uptime_s`` resets); retrying with the same idempotency key answers\n        ``409 daemon.restart_in_progress`` or a fresh 202, never a second\n        restart mid-drain.\n        ",
+    "inputSchema": {
+      "properties": {
+        "drain_timeout_s": {
+          "default": 60,
+          "title": "Drain Timeout S",
+          "type": "integer"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        }
+      },
+      "title": "restart_daemonArguments",
+      "type": "object"
+    }
+  },
+  "restart_service": {
+    "description": "Restart a service (clears backoff).\n\n        ``name`` accepts the service name or the job id. An idempotency key is\n        auto-generated if omitted.\n        ",
+    "inputSchema": {
+      "properties": {
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "restart_serviceArguments",
+      "type": "object"
+    }
+  },
+  "run_command": {
+    "description": "Run a one-off command in a deployed service's image (migrations, seeds).\n\n        The command runs in a throwaway container built from the service's\n        current image with the same env, secrets, AI/DB bindings and named\n        volumes as the live container \u2014 the service itself keeps serving.\n        ``name`` accepts the service name or the job id.\n\n        ``command`` is argv, run unshelled (no globbing, no pipes \u2014 wrap in\n        ``[\"sh\", \"-c\", \"...\"]`` if you need them). It REPLACES the image's\n        ``CMD`` and is APPENDED to its ``ENTRYPOINT`` when the image declares\n        one, so on an image whose entrypoint is e.g. ``python -m gunicorn``\n        your argv arrives as arguments to that, not as a fresh command line.\n\n        **Bounded-synchronous**: this call BLOCKS until the command exits or\n        ``timeout_s`` seconds elapse (default 300; the daemon rejects anything\n        above ``[services].run_timeout_max_s`` with ``run.timeout_too_large``),\n        then returns ``{exit_code, timed_out, oom_killed, duration_s, run_id,\n        log_tail, ...}``. Branch on ``exit_code``/``timed_out`` \u2014 a non-zero\n        exit is a normal 200 result, not an error. One run at a time per\n        service (409 ``service.run_in_progress``). ``log_tail`` is clamped to\n        [1, 200].\n\n        **Never put credentials in ``command`` argv**: argv is visible via\n        ``docker inspect`` on the host and is stored verbatim in the service's\n        ``last_run``. Pass them in ``env`` instead \u2014 those values are masked in\n        the audit trail. ``env`` overrides beat the app's config env and its\n        secrets, but never platform-computed keys (resolved AI/DB binding vars,\n        ``PORT``, ``NERDIT_RUN_ID``), which always win.\n\n        Because the call blocks for minutes, **supply your own\n        ``idempotency_key`` and REUSE it verbatim if you retry** \u2014 that is the\n        only thing standing between a client-side read timeout and a migration\n        running twice. Omitting it auto-generates one, which makes the single\n        call safe but leaves every retry a fresh execution. A retried key\n        REPLAYS an ``idempotent_replay`` envelope, NOT the command's output \u2014\n        the run's stdout is deliberately never cached at rest. Re-run under a\n        fresh key if you need the output again, or read it from\n        ``diagnose_service``'s ``last_run``.\n\n        **Key reuse protects a COMPLETED run only.** A failed call un-pins the\n        key, so a same-key retry really re-executes. In particular ``503\n        run.interrupted`` means the container started and was lost \u2014 the\n        command may have partially applied \u2014 and retrying it, with any key,\n        runs it again: stop and inspect instead. And if the daemon died\n        mid-run, the key stays claimed for 24 h and the retry returns ``409\n        idempotency_in_progress``; mint a fresh key once you have confirmed\n        the run is over.\n        ",
+    "inputSchema": {
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Command",
+          "type": "array"
+        },
+        "env": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Env"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "log_tail": {
+          "default": 200,
+          "title": "Log Tail",
+          "type": "integer"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "timeout_s": {
+          "default": 300,
+          "title": "Timeout S",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "command"
+      ],
+      "title": "run_commandArguments",
+      "type": "object"
+    }
+  },
+  "serve": {
+    "description": "Register a service from a prebuilt image. Idempotency key auto-generated if omitted.",
+    "inputSchema": {
+      "properties": {
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        },
+        "env": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Env"
+        },
+        "gpus": {
+          "default": 0,
+          "title": "Gpus",
+          "type": "integer"
+        },
+        "health_check": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Health Check"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "image": {
+          "title": "Image",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "port": {
+          "default": 8000,
+          "title": "Port",
+          "type": "integer"
+        },
+        "restart_policy": {
+          "default": "always",
+          "title": "Restart Policy",
+          "type": "string"
+        },
+        "script_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Script Path"
+        },
+        "vendor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Vendor"
+        }
+      },
+      "required": [
+        "name",
+        "image"
+      ],
+      "title": "serveArguments",
+      "type": "object"
+    }
+  },
+  "serve_model": {
+    "description": "Serve a local AI model as an OpenAI-compatible endpoint.\n\n        ``backend`` selects the serving backend: ``ollama`` (default; CPU or\n        GPU) or ``vllm`` (GPU-only, one model per server, weights from Hugging\n        Face \u2014 pass ``gpus>=1``). Omit it to use the daemon's configured\n        default. Serving is asynchronous: the call returns immediately with the\n        model row in ``building`` while the daemon pulls the image and weights\n        off-tick; poll ``list_models`` (or ``get_service``) until it is\n        ``running``. Lifecycle (stop / restart / delete) goes through the\n        existing service tools (``stop_service`` / ``restart_service`` /\n        ``remove_service``). An idempotency key is auto-generated if omitted.\n\n        ``max_model_len`` / ``gpu_memory_utilization`` are vLLM-only engine\n        bounds (context window cap [256, 262144]; VRAM fraction [0.1, 0.95]);\n        other backends reject them (``model.backend_param``).\n\n        An app connects to this model by declaring an ``[ai.<name>]`` binding\n        (provider ``ollama``, model = this model); at each launch it receives\n        ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the ``default`` binding also\n        sets ``OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL`` so an unmodified\n        OpenAI SDK reaches this endpoint with no code change.\n        ",
+    "inputSchema": {
+      "properties": {
+        "backend": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Backend"
+        },
+        "gpu_memory_utilization": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpu Memory Utilization"
+        },
+        "gpus": {
+          "default": 0,
+          "title": "Gpus",
+          "type": "integer"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "max_model_len": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Model Len"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "title": "serve_modelArguments",
+      "type": "object"
+    }
+  },
+  "service_logs": {
+    "description": "Use when: you need the raw output a service or its build printed.\n\n``name`` accepts the service name or the job id. Polling-only: pass\nthe last entry's id as ``since_id`` to fetch only newer lines.\n\n``source`` picks which output you get. ``'runtime'`` is the container's\nown stdout/stderr plus the crash tail; ``'build'`` is the image build's\noutput; ``'all'`` (the default) is both plus the daemon's own lifecycle\nlines. **Pass ``source='runtime'`` when you are debugging a running\napp** \u2014 the build and the app used to share one stream, so a bare\n``grep`` over a deployed app still matches BuildKit layer chatter\n(``404B``, ``CACHED``, ``sha256:\u2026``) from the build that produced it.\nLines written by an older daemon are stored as stdout and therefore read\nas ``'runtime'`` whichever program printed them.\n\n``grep`` keeps only lines CONTAINING that text. It is a plain\n**literal substring**, never a regex \u2014 ``grep='100%'`` finds a literal\n``100%``, ``.*`` finds a literal ``.*``, and there is no anchoring, no\ncharacter class and no escaping to do. ``since`` keeps only lines at or\nafter an ISO-8601 UTC timestamp (``2026-08-07T10:00:00Z``).\n\nAll three filter server-side inside the ``tail`` bound, so ``tail``\ncounts matching lines: ``grep='Traceback', source='runtime', tail=20``\ngives the last 20 app tracebacks out of a million-line log in one\nbounded query. Prefer that over pulling a large tail and searching it\nyourself.\n",
+    "inputSchema": {
+      "properties": {
+        "grep": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Grep"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "since": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Since"
+        },
+        "since_id": {
+          "default": 0,
+          "title": "Since Id",
+          "type": "integer"
+        },
+        "source": {
+          "default": "all",
+          "title": "Source",
+          "type": "string"
+        },
+        "tail": {
+          "default": 100,
+          "title": "Tail",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "service_logsArguments",
+      "type": "object"
+    }
+  },
+  "service_stats": {
+    "description": "Get live CPU, memory, network and PID usage for a running service.\n\n        ``name`` accepts the service name or the job id. Returns\n        ``{available, stats: {cpu_pct, mem_used_bytes, mem_limit_bytes,\n        mem_pct, net_rx_bytes, net_tx_bytes, pids}, gpus, cached}``.\n\n        **Branch on ``available``, never on zeroes.** ``available: false`` with\n        ``stats: null`` is the normal answer when the service has no running\n        container or the daemon cannot reach Docker; every individual counter\n        is likewise ``null`` when unknown, so a missing metric never\n        masquerades as an idle one. ``cpu_pct`` follows the docker convention \u2014\n        ``100.0`` is one fully-used core, so a multi-core host can exceed 100.\n\n        For *why* a service is unhealthy use ``diagnose_service``; this tool\n        answers *how much* a healthy one is consuming. The daemon caches the\n        sample for 2 seconds, so polling it in a loop is cheap.\n        ",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "service_statsArguments",
+      "type": "object"
+    }
+  },
+  "set_app_config": {
+    "description": "Write an app's ``deploy`` or ``ai`` config section (admin/owner-scoped).\n\n        ``if_match`` is auto-fetched (current app-config ETag) when omitted,\n        same convention as ``apply_config`` \u2014 pass it explicitly to disable\n        the auto-fetch. ``restart=True`` restarts the service after a\n        successful real write that needs it. ``dry_run=True`` previews\n        without writing. An idempotency key is auto-generated if omitted.\n\n        Writing the ``ai`` section re-wires the app's bindings: on the next\n        launch/restart each ``[ai.<name>]`` binding is injected as\n        ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the ``default`` binding also\n        sets ``OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL`` \u2014 pass\n        ``restart=True`` to apply it immediately.\n        ",
+    "inputSchema": {
+      "properties": {
+        "dry_run": {
+          "default": false,
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "if_match": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "If Match"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "restart": {
+          "default": false,
+          "title": "Restart",
+          "type": "boolean"
+        },
+        "section": {
+          "title": "Section",
+          "type": "string"
+        },
+        "values": {
+          "additionalProperties": true,
+          "title": "Values",
+          "type": "object"
+        }
+      },
+      "required": [
+        "name",
+        "section",
+        "values"
+      ],
+      "title": "set_app_configArguments",
+      "type": "object"
+    }
+  },
+  "set_config": {
+    "description": "Write a daemon config section (admin-scoped, validated, audited).\n\n        ``dry_run=True`` validates and returns the would-be section view\n        without writing; ``if_match`` enables optimistic concurrency against\n        the section's current version. An idempotency key is auto-generated if\n        omitted.\n        ",
+    "inputSchema": {
+      "properties": {
+        "dry_run": {
+          "default": false,
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "if_match": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "If Match"
+        },
+        "section": {
+          "title": "Section",
+          "type": "string"
+        },
+        "values": {
+          "additionalProperties": true,
+          "title": "Values",
+          "type": "object"
+        }
+      },
+      "required": [
+        "section",
+        "values"
+      ],
+      "title": "set_configArguments",
+      "type": "object"
+    }
+  },
+  "set_secret": {
+    "description": "Set/merge write-only secrets for a service; returns key names only.\n\n        An idempotency key is auto-generated if omitted, so a retried write\n        collapses to a single apply. ``service=\"shared\"`` targets the global\n        shared scope (admin-only; readable by every service via\n        ``${secrets.shared.KEY}``) \u2014 use it sparingly. WARNING: the values you\n        pass here transit this agent's transcript in plaintext; for\n        high-value shared keys (broadly-scoped API keys, credentials shared\n        across every app) prefer ``nerdit secrets set --shared`` from the CLI\n        instead of routing them through an agent.\n        ",
+    "inputSchema": {
+      "properties": {
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "service": {
+          "title": "Service",
+          "type": "string"
+        },
+        "values": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Values",
+          "type": "object"
+        }
+      },
+      "required": [
+        "service",
+        "values"
+      ],
+      "title": "set_secretArguments",
+      "type": "object"
+    }
+  },
+  "share_service": {
+    "description": "Use when: you need a URL you can open (public_url is LAN-only).\n\nExposes the app at ``https://<name>--<slug>.<domain>/`` via the cloud\nlink. ``access='private'`` (default) opens only for signed-in owners of this\nnode in the Nerdit console \u2014 works on every linked node, nothing to\nconfigure. ``access='public'`` makes the URL world-reachable: it needs a\nPro-entitled account (else 409 ``share.not_entitled``) AND either a\n``[deploy].edge_auth`` on the app or ``consent=true`` (else 409\n``share.unprotected``) \u2014 public means public. The node must be linked\n(409 ``share.link_required``). Returns ``{access, url, state}``; ``state``\nis ``ready`` | ``link_down`` | ``not_entitled``. The same URL then appears\nin ``get_service`` / ``list_routes`` under ``public_urls`` (kind\n``hosted``). Idempotent; a key is auto-generated if omitted.\n\n``state`` and ``origin`` answer two DIFFERENT questions and you need\nboth. ``state`` is about the LINK \u2014 is the hosted path provisioned.\n``origin`` is about the APP behind it: ``{status, answers, hint}``, where\n``answers`` is true only while the service is running. A share can be\n``state: ready`` with ``origin.answers: false``, and then the URL returns\n``share.not_shared`` (the hosted resolver refuses a service with no live\norigin) \u2014 which reads exactly like \"never shared\". When ``answers`` is\nfalse, ``origin.hint`` says what to do; call ``diagnose_service``.\n",
+    "inputSchema": {
+      "properties": {
+        "access": {
+          "default": "private",
+          "title": "Access",
+          "type": "string"
+        },
+        "consent": {
+          "default": false,
+          "title": "Consent",
+          "type": "boolean"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "share_serviceArguments",
+      "type": "object"
+    }
+  },
+  "stop_service": {
+    "description": "Stop a service (desired_state \u2192 stopped).\n\n        ``name`` accepts the service name or the job id. An idempotency key is\n        auto-generated if omitted.\n        ",
+    "inputSchema": {
+      "properties": {
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "stop_serviceArguments",
+      "type": "object"
+    }
+  },
+  "system_disk": {
+    "description": "Report disk usage: docker totals + named-volume/model/archive/backup trees.\n\n        Any authenticated read. Names and byte counts only (no absolute paths);\n        lists orphan images and orphan data dirs (reclaim them with\n        ``system_gc``). Concurrent ``du`` walks run under a soft budget \u2014 an\n        overrun returns a partial body with a ``scan_timeout`` warning.\n        ",
+    "inputSchema": {
+      "properties": {},
+      "title": "system_diskArguments",
+      "type": "object"
+    }
+  },
+  "system_gc": {
+    "description": "Garbage-collect orphan app images (admin-scoped, audited).\n\n        Reclaims ``nerdit-app/*`` image repos with no live workload row, verified\n        by re-listing so an in-use tag is reported skipped, never removed.\n        ``include_orphan_data=True`` also deletes service data dirs with no live\n        row (IRREVERSIBLE). ``dry_run=True`` enumerates candidates with zero\n        writes \u2014 no idempotency key is minted or needed; a real run auto-mints\n        one if omitted so a retry collapses to a single gc.\n        ",
+    "inputSchema": {
+      "properties": {
+        "dry_run": {
+          "default": false,
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "include_orphan_data": {
+          "default": false,
+          "title": "Include Orphan Data",
+          "type": "boolean"
+        }
+      },
+      "title": "system_gcArguments",
+      "type": "object"
+    }
+  },
+  "unshare_service": {
+    "description": "Use when: an app should stop being reachable at its hosted URL.\n\nThe URL stops answering on the next request (the tunnel re-reads the row\nper stream \u2014 there is no cache to wait out). Idempotent: removing a\nshare that does not exist is a success returning ``removed: false``,\nnever an error. The response is the removal receipt\n(``{service_name, removed}``), not a share view \u2014 read ``share_service``\nor ``get_service`` for the state of a share that still exists.\n",
+    "inputSchema": {
+      "properties": {
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "unshare_serviceArguments",
+      "type": "object"
+    }
+  },
+  "wait_for_service": {
+    "description": "Use when: a deploy is in flight and you need its real outcome.\n\nBlocks until the service converges (healthy) or fails, then returns\n``{outcome: converged|failed|timeout|superseded, ...}`` \u2014 always, never\nraising on a timeout. ``name`` accepts the service name or job id.\nAfter a ``deploy``/``deploy_git``/``deploy_app``/``deploy_template``\ncall, pass the 201's ``last_deploy.version`` as ``version`` so a\nconcurrent redeploy resolves ``superseded`` instead of being mistaken\nfor your deploy. ``timeout`` is clamped server-side to [1, 300] seconds.\n\nOn ``outcome: failed`` the response also carries ``diagnosis`` \u2014 the\nFULL ``diagnose_service`` bundle (``remediation.code`` + ``detail``,\ncrash forensics, health probe, binding readiness and a bounded log\ntail), folded in so a failure needs no second call. Branch on\n``diagnosis.remediation.code``. It is ``null`` on every non-failed\noutcome, and ``null`` on a failure your token is not owner-or-admin for\n(the bundle carries app log lines) \u2014 in that case call\n``diagnose_service`` yourself with a token that owns the app.\n",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 60,
+          "title": "Timeout",
+          "type": "integer"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "wait_for_serviceArguments",
+      "type": "object"
+    }
+  },
+  "write_app_files": {
+    "description": "Write files into an app's server-side workspace, then deploy it.\n\nThe two-step idiom for building an app from this conversation:\n``write_app_files`` (as many batches as you like) then ``deploy_app``.\nThe workspace survives the deploy and IS the working copy, so editing is\n\"write the one changed file \u2192 ``deploy_app`` again\".\n\n``files`` maps workspace-relative paths to **UTF-8 text**\n(``{\"main.py\": \"...\", \"requirements.txt\": \"fastapi\\n\"}``); ``delete``\nremoves paths. One batch is all-or-nothing: an invalid entry rejects the\nwhole request and nothing is written. Binary files are refused (deploy\nthose from a repo with ``deploy_git``); assets normally come from the\nbuild (npm/pip).\n\nLimits: 256 KiB per file, 10 MiB and 500 files per workspace. Paths must\nbe relative with no ``..``; ``.git``, ``node_modules``, ``__pycache__``,\n``.venv``, ``data/`` and ``*.pyc`` are refused because they never reach a\nbuild context. ``.env`` / ``.env.*`` are refused by name \u2014 use\n``set_secret``, which injects values at launch without them ever living\nin a file. WARNING: file contents you pass here transit this agent's\ntranscript in plaintext; never write secrets into app files \u2014 use\n``set_secret``. An idempotency key is auto-generated if omitted.\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
+    "inputSchema": {
+      "properties": {
+        "delete": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delete"
+        },
+        "files": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Files",
+          "type": "object"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "files"
+      ],
+      "title": "write_app_filesArguments",
+      "type": "object"
+    }
+  }
+}

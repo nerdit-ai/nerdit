@@ -1,0 +1,27 @@
+repos:
+  # Fast ruff checks on staged files (pre-commit stage)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.8
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Full test suite + type checking (pre-push stage)
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: python -m pytest -m "not hardware" -q
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: mypy
+        name: mypy
+        entry: python -m mypy src/nerdit
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]

@@ -1,0 +1,39 @@
+# Nerdit daemon — systemd USER unit (`systemctl --user`, P30 D-P30-8).
+#
+# Rendered by packaging/install.sh, never by Python: the installer substitutes
+# __NERDITD__ (absolute path to <ROOT>/current/nerditd) and __HOME__ with sed,
+# then writes the result to ~/.config/systemd/user/nerdit.service.
+#
+# No User= here — a user manager already runs everything as its own user, and
+# the directive is rejected in that scope. Otherwise identical to the system
+# unit, including the Restart=on-failure reasoning: the daemon's self-exec
+# restart (POST /daemon/restart) keeps the same pid, so systemd never sees it.
+#
+# And NO AmbientCapabilities= either, unlike the system unit — not an
+# oversight. An unprivileged user manager cannot raise a capability it does not
+# have, so the directive does not degrade, it KILLS the unit outright
+# (measured: `Failed to apply ambient capabilities (before UID change):
+# Operation not permitted` → status=218/CAPABILITIES, daemon never starts).
+# Consequence, stated in packaging/install.sh and docs/guide/install.md: in
+# this mode the bundled Caddy cannot bind the default [proxy].https_port = 443.
+# Either give it an unprivileged port (`nerdit config set proxy https_port=8443`)
+# or grant the binary the capability directly
+# (`sudo setcap cap_net_bind_service=+ep ~/.nerdit/current/caddy`) — the latter
+# needs re-running after every `nerdit update`, since D-P30-9 installs each
+# release's Caddy at a new versioned path.
+[Unit]
+Description=Nerdit daemon (nerditd)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=__HOME__
+Environment=NERDIT_BOOT_LOG=1
+WorkingDirectory=__HOME__
+ExecStart=__NERDITD__
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

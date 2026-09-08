@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest an idea or improvement for Nerdit.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What are you trying to do, and where does Nerdit fall short today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Nerdit to do instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds you're using today, or other approaches you thought about.
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Context, links, screenshots — anything that helps.

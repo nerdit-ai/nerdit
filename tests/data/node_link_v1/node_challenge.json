@@ -1,0 +1,6 @@
+{
+  "type": "node_challenge",
+  "protocol": "node-link/v1",
+  "challenge": "fixture-relay-nonce-not-a-secret",
+  "relay_id": "relay.example.test:443"
+}

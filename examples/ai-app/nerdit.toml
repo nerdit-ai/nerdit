@@ -1,0 +1,21 @@
+# Nerdit P5 north-star fixture — deploy config + the two-binding [ai.*] example.
+
+[deploy]
+name = "ai-app"
+port = 3000
+start = "node server.js"
+
+# Local model via Ollama: Nerdit injects OPENAI_BASE_URL / OPENAI_API_KEY /
+# OPENAI_MODEL (plus NERDIT_AI_DEFAULT_*). Serve it first:
+#   nerdit serve llama3.1:8b --gpus 1
+[ai.default]
+provider = "ollama"
+model = "llama3.1:8b"
+
+# External API via a write-only secret reference (never a literal key):
+#   nerdit secrets set ai-app OPENAI_KEY=sk-...
+[ai.cheap]
+provider = "api"
+model = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"
+api_key = "${secrets.OPENAI_KEY}"

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Nerdit daemon — launchd LaunchAgent (macOS, P30 D-P30-8).
+
+  Rendered by packaging/install.sh, never by Python: the installer substitutes
+  __NERDITD__ (absolute path to <ROOT>/current/nerditd) and __HOME__ with sed,
+  then writes the result to ~/Library/LaunchAgents/ai.nerdit.daemon.plist.
+
+  KeepAlive/SuccessfulExit=false is the launchd spelling of the systemd unit's
+  Restart=on-failure: a clean exit (`nerdit exit`) stays exited, a crash is
+  respawned. The daemon's own self-exec restart (POST /daemon/restart) keeps
+  the same pid, so launchd never sees it either.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.nerdit.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NERDITD__</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NERDIT_BOOT_LOG</key>
+    <string>1</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.nerdit/nerditd-launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.nerdit/nerditd-launchd.log</string>
+</dict>
+</plist>

@@ -1,0 +1,43 @@
+{
+  "description": "Console navigation to the node host: the daemon returns its fixture dashboard page in one body chunk.",
+  "request": {
+    "type": "open_stream",
+    "stream_id": "stream-dashboard",
+    "node_id": "00000000-0000-4000-8000-00000000000a",
+    "method": "GET",
+    "path": "/",
+    "query": "",
+    "headers": [
+      [
+        "accept",
+        "*/*"
+      ]
+    ],
+    "role": "submitter"
+  },
+  "response": [
+    {
+      "type": "stream_response_head",
+      "stream_id": "stream-dashboard",
+      "node_id": "00000000-0000-4000-8000-00000000000a",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "text/html; charset=utf-8"
+        ]
+      ]
+    },
+    {
+      "type": "stream_response_body",
+      "stream_id": "stream-dashboard",
+      "node_id": "00000000-0000-4000-8000-00000000000a",
+      "body_b64": "PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9InV0Zi04Ij4KPHRpdGxlPkRldiBOb2RlIOKAlCBOZXJkaXQgUmVtb3RlIExpbms8L3RpdGxlPgo8L2hlYWQ+Cjxib2R5Pgo8aDE+RGV2IE5vZGU8L2gxPgo8cD5TZXJ2ZWQgYnkgdGhlIGZha2UgZGFlbW9uIG92ZXIgbm9kZS1saW5rL3YxLjwvcD4KPHVsPgo8bGk+PGEgaHJlZj0iL2FwaS9zdGF0dXMiPi9hcGkvc3RhdHVzPC9hPjwvbGk+CjxsaT48YSBocmVmPSIvZXZlbnRzIj4vZXZlbnRzPC9hPjwvbGk+CjwvdWw+CjwvYm9keT4KPC9odG1sPgo="
+    },
+    {
+      "type": "stream_response_end",
+      "stream_id": "stream-dashboard",
+      "node_id": "00000000-0000-4000-8000-00000000000a"
+    }
+  ]
+}

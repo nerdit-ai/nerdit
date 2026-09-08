@@ -1,0 +1,44 @@
+{
+  "description": "MCP tools/list request and the single advertised tool.",
+  "request": {
+    "type": "open_stream",
+    "stream_id": "stream-mcp-tools-list",
+    "node_id": "00000000-0000-4000-8000-00000000000a",
+    "method": "POST",
+    "path": "/mcp",
+    "query": "",
+    "headers": [
+      [
+        "accept",
+        "*/*"
+      ]
+    ],
+    "body_b64": "eyJqc29ucnBjIjogIjIuMCIsICJpZCI6IDIsICJtZXRob2QiOiAidG9vbHMvbGlzdCIsICJwYXJhbXMiOiB7fX0=",
+    "role": "submitter"
+  },
+  "response": [
+    {
+      "type": "stream_response_head",
+      "stream_id": "stream-mcp-tools-list",
+      "node_id": "00000000-0000-4000-8000-00000000000a",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "application/json"
+        ]
+      ]
+    },
+    {
+      "type": "stream_response_body",
+      "stream_id": "stream-mcp-tools-list",
+      "node_id": "00000000-0000-4000-8000-00000000000a",
+      "body_b64": "eyJqc29ucnBjIjogIjIuMCIsICJpZCI6IDIsICJyZXN1bHQiOiB7InRvb2xzIjogW3sibmFtZSI6ICJzeXN0ZW1fZ2MiLCAiZGVzY3JpcHRpb24iOiAiUGxhbiBhIGdhcmJhZ2UgY29sbGVjdGlvbiBwYXNzIG92ZXIgdW51c2VkIG5vZGUgYXJ0aWZhY3RzLiIsICJpbnB1dFNjaGVtYSI6IHsidHlwZSI6ICJvYmplY3QiLCAicHJvcGVydGllcyI6IHsiZHJ5X3J1biI6IHsidHlwZSI6ICJib29sZWFuIiwgImRlc2NyaXB0aW9uIjogIlJlcG9ydCB3aGF0IHdvdWxkIGJlIHJlbW92ZWQgd2l0aG91dCByZW1vdmluZyBpdC4ifX0sICJyZXF1aXJlZCI6IFtdfX1dfX0="
+    },
+    {
+      "type": "stream_response_end",
+      "stream_id": "stream-mcp-tools-list",
+      "node_id": "00000000-0000-4000-8000-00000000000a"
+    }
+  ]
+}

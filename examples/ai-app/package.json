@@ -1,0 +1,9 @@
+{
+  "name": "ai-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Nerdit P5 north-star fixture: a dependency-free Node app wired to [ai.*] bindings.",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

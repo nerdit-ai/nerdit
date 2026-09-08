@@ -1,0 +1,69 @@
+# Nerdit — daemon configuration
+# Copy this file to ~/.nerdit/config.toml
+#
+# This is the DAEMON config: it controls how nerditd runs, binds, routes, and
+# sandboxes workloads on this machine.
+#
+# It is NOT the per-app deploy config. An application you deploy ships its own
+# nerdit.toml with [deploy] (build/run) and [ai.*] (model bindings) sections —
+# those live in the app repo, not here. See the docs for that surface.
+#
+# Sections marked "PLANNED" describe the Local AI PaaS pivot (phases P0–P6) and
+# are not yet implemented. They are documented here so the config surface is
+# stable as the features land.
+
+[nerdit]
+data_dir = "~/.nerdit"
+log_level = "info"              # debug | info | warning | error
+
+[daemon]
+# Bind address. Defaults to loopback (127.0.0.1) so a freshly copied config is
+# never exposed to the network.
+#
+# SECURITY: do NOT set host = "0.0.0.0" without first setting an auth token.
+# When no token is configured the daemon serves every API route WITHOUT
+# authentication, so binding to all interfaces would expose deploy, secrets,
+# and every other route to anyone on the LAN. To expose nerditd:
+#   1. set `auth_token` below (or let `nerdit init` generate one — see `nerdit token`),
+#   2. then change host to "0.0.0.0".
+host = "127.0.0.1"
+port = 9321
+pid_file = "~/.nerdit/nerditd.pid"
+# auth_token = "replace-with-a-strong-token"   # REQUIRED before binding to 0.0.0.0
+
+[containers]
+runtime = "docker"              # docker | podman (future)
+default_image = "nvidia/cuda:12.4.1-runtime-ubuntu22.04"
+cache_dir = "~/.nerdit/cache"
+
+[monitor]
+interval_seconds = 5
+gpu_temp_warning = 80           # °C
+gpu_temp_critical = 90          # °C
+zml_smi_path = "zml-smi"        # preferred vendor-neutral GPU discovery binary
+enable_amd = false              # true = allocate AMD GPUs to workloads (ROCm required)
+
+# --- PLANNED: Local AI PaaS surfaces (phases P0–P6, not yet implemented) ---
+
+[proxy]
+# URL layer (embedded Caddy). Path-based for the MVP; subdomain is a
+# fast-follow that flips with `mode` alone (no app changes on subdomain).
+mode = "path"                   # path | subdomain (subdomain = fast-follow)
+base_domain = "nerdit.local"    # used when mode = "subdomain"
+tls = "internal"                # Caddy internal CA (install the root CA on LAN clients)
+
+[services]
+# Host-port range for long-running services (stable across restarts).
+service_port_range = "9400-9499"
+
+[security]
+# Defense-in-depth defaults for non-admin tokens and deployed workloads.
+# Only these host-path prefixes may be mounted; sensitive paths (the Docker
+# socket, ~/.nerdit, /etc, /root) are refused unconditionally.
+mount_allowlist = ["/data", "/datasets", "/results"]
+default_cpu_limit = 4           # CPUs per workload (default cap)
+default_memory_limit = "8g"     # RAM per workload (default cap)
+
+[models]
+# Local model serving backend (one container per served model).
+default_backend = "ollama"      # ollama (vLLM later, same ModelBackend contract)

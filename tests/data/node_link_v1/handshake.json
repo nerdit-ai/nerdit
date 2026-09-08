@@ -1,0 +1,8 @@
+{
+  "protocol_version": "node-link/v1",
+  "node": {
+    "name": "fixture-node",
+    "uptime_seconds": 42,
+    "version": "0.1.0"
+  }
+}

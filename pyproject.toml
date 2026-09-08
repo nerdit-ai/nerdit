@@ -1,0 +1,300 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nerdit"
+version = "0.6.0"
+description = "The local AI PaaS — deploy and operate apps on your own hardware, with first-class local AI"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+keywords = [
+    "paas",
+    "self-hosted",
+    "local-ai",
+    "docker",
+    "ollama",
+    "deploy",
+    "gpu",
+    "mcp",
+]
+# Rendered on the PyPI project page (open-source plan §3 Q7 (d)) — the first
+# upload of the new line is what rebrands a project page still describing the
+# pre-pivot orchestrator. Deliberately NO "License :: ..." classifier: PEP 639
+# deprecates the license classifiers in favour of the `license` expression
+# above, and hatchling rejects carrying both.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    # Explicit, not transitive-via-starlette: the idempotency middleware relies
+    # on ``anyio.CancelScope(shield=True)`` for its cancel-safe cleanup (P22).
+    "anyio>=4",
+    "typer[all]>=0.12",
+    "rich>=13.0",
+    # Floor pinned by D-P22-7: the idempotency middleware reads the request body
+    # pre-``call_next`` and relies on Starlette's ``_CachedRequest`` replaying it
+    # to the router. Older resolutions do not guarantee that.
+    "fastapi>=0.139",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+    "pynvml>=11.5",
+    "docker>=7.0",
+    "aiosqlite>=0.20",
+    "pydantic>=2.7",
+    "sse-starlette>=2.0",
+    "python-multipart>=0.0.9",
+    "tomli-w>=1.0",
+    "cryptography>=42",
+    # P25 D-P25-6 (owner-countersigned): ``[deploy].edge_auth`` passwords are
+    # bcrypt-hashed at route-build time and only the hash rides the Caddy admin
+    # API. Caddy's ``http_basic`` verifies bcrypt natively; hashing in-process
+    # beats shelling out to ``caddy hash-password`` (which would hand the
+    # plaintext to a subprocess and couple validation to the proxy binary).
+    "bcrypt>=4",
+    # P27 WP-C1: the node-link tunnel client dials the relay with
+    # ``websockets.asyncio.client.connect``. Present transitively via
+    # ``uvicorn[standard]``, but imported directly here, so the floor is
+    # explicit — the ``anyio>=4`` precedent. ``>=14`` matches the cloud's own
+    # pin: its relay and reference client are built on the same
+    # ``websockets.asyncio`` API, and matching it keeps close-code and
+    # upgrade-rejection semantics identical on both ends of the frozen wire.
+    "websockets>=14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.27",
+]
+mcp = [
+    "mcp>=1.9,<2",
+]
+mdns = [
+    "zeroconf>=0.132",
+]
+
+[project.scripts]
+nerdit = "nerdit.cli.app:main"
+nerditd = "nerdit.daemon.server:main"
+
+# Every link points at the public repo (`nerdit-ai/nerdit`), which is where
+# the source is published and where a PyPI visitor can actually follow it.
+[project.urls]
+Homepage = "https://github.com/nerdit-ai/nerdit"
+Repository = "https://github.com/nerdit-ai/nerdit"
+Issues = "https://github.com/nerdit-ai/nerdit/issues"
+Changelog = "https://github.com/nerdit-ai/nerdit/blob/main/CHANGELOG.md"
+
+[tool.hatch.build]
+# The dashboard bundle is gitignored and built in CI before hatch/pyinstaller
+# run, and hatchling skips VCS-ignored paths — so without this the wheel ships
+# without the SPA and a non-editable install serves the 503 fallback. `artifacts`
+# (not force-include) is the right lever: it includes the path when it is there
+# and is silent when it is not, so a dist-less dev or CI install stays valid.
+artifacts = ["src/nerdit/daemon/web/dist"]
+
+# The sdist is an ALLOWLIST, never hatchling's default of "every tracked file":
+# this tree is the private development repo, and the default would ship the
+# planning layer, the private runbooks, the hosting layout and the CI files —
+# everything scripts/publish_public.sh deliberately keeps out of the public
+# mirror — inside a tarball PyPI never deletes. LICENSE and NOTICE are laid
+# down from packaging/public/ by the publish workflow before the build (a
+# missing entry here is silently skipped, so a dev build without them still
+# works). The publish workflow re-checks the built sdist against this set.
+[tool.hatch.build.targets.sdist]
+only-include = ["src/nerdit", "pyproject.toml", "README.md", "LICENSE", "NOTICE"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nerdit"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/nerdit/config/app_templates/builtin.json" = "nerdit/config/app_templates/builtin.json"
+# NOTE: daemon/web/dist is deliberately NOT force-included: it comes in through
+# the `artifacts` entry above. Force-including it as well makes the wheel build
+# fail with "A second file is being added at the same path".
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "N",
+    "W",
+    "B",       # flake8-bugbear
+    "C901",    # mccabe complexity
+    "PLR0912", # too many branches
+    "PLR0913", # too many arguments
+    "PLR0915", # too many statements
+    "SIM",     # flake8-simplify
+    "RET",     # flake8-return
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.ruff.lint.pylint]
+max-args = 6
+
+[tool.ruff.lint.flake8-bugbear]
+# Typer/FastAPI parameter factories are declarative metadata, not mutable
+# defaults. This is a permanent exemption, not debt: it keeps B008 live for
+# genuine mutable defaults in the same files (19 findings today are all of
+# this shape — typer.Option/typer.Argument, fastapi Body/File/Query).
+extend-immutable-calls = [
+    "typer.Option",
+    "typer.Argument",
+    "fastapi.Body",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Query",
+    "fastapi.Depends",
+]
+
+# ---------------------------------------------------------------------------
+# Ratchet ledger: every entry freezes exactly the rules a file trips TODAY, so
+# the rules are real gates for new and edited code while the backlog is worked
+# off. Rules NOT listed for a file are enforced there.
+#
+# Every entry is one of two kinds, named by its trailing comment:
+#   - a WP reference (e.g. "WP18 — split into views/purge/wait/diagnose") means
+#     a scheduled work package reshapes or deletes the offending code; delete
+#     the entry the moment that WP lands — a stale entry is a hole in the gate.
+#   - "idiom — <reason>" means the finding is a deliberate, load-bearing
+#     pattern (a suppressed race, a wide argument list mirroring an API/CLI
+#     surface, a linear wizard/dispatch ladder, …) with no WP scheduled to
+#     touch it; these are not silent permanent exemptions — re-open the
+#     backlog if one becomes fixable.
+# Both counts are re-derived against a real no-ledger `ruff check` run before
+# any entry is trusted — do not hand-copy an old count.
+# ---------------------------------------------------------------------------
+[tool.ruff.lint.per-file-ignores]
+
+# ── Track B: structural consolidation (WP-owned) ────────────────────────────
+"src/nerdit/core/services.py" = ["C901", "PLR0912", "PLR0913", "PLR0915", "SIM105"] # idiom — _launch's 8 co-dependent early-return resource-acquisition gates (env→minted-cred→GPU→port→sandbox→volumes) that retry-next-tick tests bind directly; _reconcile_live's 13 branches; __init__'s 11-collaborator constructor; 3 deliberate try/except-pass teardown/task-drain sites — re-open if a later change reduces any of these below threshold
+"src/nerdit/core/app_build.py" = ["PLR0913", "PLR0915"] # idiom — _settle_failed_generation's branch-dependent settle paths (revert-to-previous / stripped-markers / superseded / terminal), one contract the release hook reuses whole, plus its 7-arg parameterization of that contract — re-open per-code if a later change reduces either below threshold
+"src/nerdit/core/proxy/manager.py" = ["C901", "PLR0912", "PLR0913", "PLR0915"] # idiom — `ProxyManager`'s `__init__` (7-arg constructor), `start` (adopt/spawn/warn branch tree) and `reconcile` (upsert/prune/apex convergence) are inherent to the class this module owns whole — re-open per-code if a later change reduces any below threshold
+"src/nerdit/core/proxy/routing.py" = ["PLR0913"] # idiom — `public_url_for`'s 8-argument mode-aware signature (the one route+hostname+mode+scheme resolution point) — re-open if a later change reduces the arg count below threshold
+"src/nerdit/core/proxy/supervisor.py" = ["SIM115"] # idiom — `_spawn`'s log-file handle (`open(self._log_file, "a")`); the finally-closed pattern is deliberate, not a leak
+"src/nerdit/daemon/service_purge.py" = ["C901", "PLR0912", "PLR0915", "SIM105"] # idiom — delete_service's 124-statement/43-branch body plus 1 deliberate try/except-pass teardown-kill site — re-open if a later change reduces any of these below threshold
+"src/nerdit/daemon/routes/service_wait.py" = ["C901", "PLR0912", "PLR0913"] # idiom — _evaluate_wait's four-branch (model/database/version-aware/status-only) dispatch (20 complexity / 19 branches) and _build_wait_response's 7-argument response projector — re-open if a later change reduces either below threshold
+"src/nerdit/daemon/routes/service_diagnose.py" = ["C901", "PLR0912", "PLR0915", "SIM105", "SIM118"] # idiom — _classify_bindings/diagnose_service/_pending_env_key_names's inherent complexity — re-open per-code if a later change reduces any of these below threshold
+"src/nerdit/daemon/deploy_pipeline.py" = ["PLR0912", "PLR0913", "PLR0915"] # idiom — write_redeploy's branch count (kept as ONE function), several phase functions' explicit-arg signatures (incl. write_redeploy/_finalize_deploy), and _finalize_deploy's orchestrator statement count are inherent to this decomposition shape — re-open per-code if a later change reduces any below threshold
+"src/nerdit/daemon/routes/deploy.py" = ["PLR0913"] # idiom — `deploy()`'s 10 FastAPI Form(...) params — the ZIP-upload contract
+"src/nerdit/db/queries/_base.py" = ["SIM105"] # idiom — the ``@_serialized`` decorator's own poisoned-transaction rollback is a deliberate try/except-pass (BaseException, not a single-exception suppress: a rollback failure must never mask the original exception) — re-open if a later change reduces this below threshold
+"src/nerdit/db/queries/gpus.py" = ["SIM105"] # idiom — allocate_gpus/release_gpus each carry one deliberate BEGIN-IMMEDIATE rollback try/except-pass — re-open if a later change reduces this below threshold
+"src/nerdit/db/queries/audit.py" = ["PLR0913"] # idiom — insert_audit_log's wide keyword-only signature (10 fields, one per audit_log column) — re-open if a later change reduces this below threshold
+"src/nerdit/db/queries/events.py" = ["PLR0913"] # idiom — insert_event's wide keyword-only signature: one keyword per `events` column, the same shape as insert_audit_log above; the 7th is the writer-minted `ts`, which exists so one event's live frame and its own replay describe the same instant — re-open if a later change reduces this below threshold
+"src/nerdit/db/queries/idempotency.py" = ["SIM105"] # idiom — insert_idempotency_inprogress's BEGIN-IMMEDIATE rollback try/except-pass — re-open if a later change reduces this below threshold
+"src/nerdit/db/queries/workloads.py" = ["PLR0913", "SIM105"] # idiom — update_job_status's wide signature (8 fields, one per updatable column) and reserve_service_for_token's BEGIN-IMMEDIATE rollback try/except-pass — re-open if a later change reduces either below threshold
+"src/nerdit/db/queries/endpoints.py" = ["SIM105"] # idiom — acquire_service_port's two BEGIN-IMMEDIATE rollback try/except-pass sites (UNIQUE-backstop retry + generic) — re-open if a later change reduces this below threshold
+"src/nerdit/db/queries/service_config.py" = ["PLR0913", "SIM105"] # idiom — update_service_config/update_app_config's wide signatures (one keyword per updatable column/quota gate) and their QUOTA-2 BEGIN-IMMEDIATE rollback try/except-pass sites — re-open if a later change reduces either below threshold
+"src/nerdit/mcp/transport.py" = ["PLR0912"] # idiom — _TransportGuard.__call__'s 13-branch Host/Origin/body-cap/bearer-capture dispatch
+"src/nerdit/mcp/tools/config.py" = ["PLR0913"] # idiom — _set_app_config_impl's 8-argument signature (if_match/dry_run/restart auto-fetch convention) — re-open if a later change reduces it below threshold
+"src/nerdit/mcp/tools/deploy.py" = ["PLR0913"] # idiom — _deploy_impl/_deploy_git_impl/_deploy_template_impl's wide REST-payload-mirroring signatures — re-open if a later change reduces any below threshold
+"src/nerdit/mcp/tools/services.py" = ["PLR0913"] # idiom — _serve_impl's 12-argument signature (mirrors POST /services) — re-open if a later change reduces it below threshold
+"src/nerdit/mcp/tools/system.py" = ["PLR0913"] # idiom — _get_audit_impl's 7-argument filter signature — re-open if a later change reduces it below threshold
+"src/nerdit/mcp/tools/workspaces.py" = ["PLR0913"] # idiom — deploy_app/_deploy_app_impl mirror the shared deploy option set (port/gpus/start/health/env/vendor/dry_run/key) exactly as the sibling deploy tools do; narrowing it here would fork the ingress option surface
+"src/nerdit/daemon/server.py" = ["C901", "PLR0912", "PLR0915"] # idiom — lifespan()'s branch/statement count
+"src/nerdit/daemon/sweeps.py" = ["C901", "PLR0912", "PLR0915"] # idiom — _run_retention_sweep's 4-phase branching complexity (log prune / terminal-job prune / audit prune / workspace-orphan sweep), each phase reporting its own scan/audit/isolation — re-open per-code if a later change reduces any below threshold
+"src/nerdit/core/data/backend.py" = ["SIM105"] # idiom — the postgres/redis readiness-probe `finally` blocks (:281, :401) deliberately suppress OSError on writer.wait_closed(), a best-effort close after a raw TCP probe whose result is already decided
+"src/nerdit/core/data/binding.py" = ["PLR0913"] # idiom — resolve_db_binding/resolve_db_bindings/_resolve_managed's wide keyword signatures (queries/secrets/bridge_host/backend_for/load_scope/shared_env) mirror the launch-path contract, the same shape as the [ai.*] resolver in core/models/binding.py — not reducible without smuggling launch-path plumbing through a closure
+"src/nerdit/core/data/controller.py" = ["PLR0913"] # idiom — __init__'s wide keyword signature (databases_settings + models_settings alongside the shared ResourceController base params) mirrors the constructor contract shared with core/models/controller.py — re-open if a later change reduces it below threshold
+"src/nerdit/core/models/controller.py" = ["PLR0913"] # idiom — __init__'s wide keyword signature (models_settings alongside the shared ResourceController base params) mirrors the constructor contract shared with core/data/controller.py — re-open if a later change reduces it below threshold
+"src/nerdit/core/resources/controller.py" = ["PLR0913"] # idiom — ResourceController.__init__'s shared keyword signature (backend/runtime/queries + extra_backends/default_backend/data_dir/event_bus), inherited by both the model and database subclasses — re-open if a later change reduces it below threshold
+"src/nerdit/core/notify.py" = ["PLR0913"] # idiom — WebhookDispatcher.__init__'s 7 collaborators (queries/settings/secrets + a bus wake-up seam, the daemon version + instance_id stamped into every payload, and a transport test seam); collapsing any pair would hide one of them behind a bag — re-open if a later change reduces it below threshold
+
+# ── Idiom: src, no scheduled Track B WP ─────────────────────────────────────
+"src/nerdit/cli/client.py" = ["PLR0913"] # idiom — put_app_config/create_service/deploy*/deploy_git/deploy_template mirror the REST payload 1:1
+"src/nerdit/cli/commands/backup.py" = ["PLR0915"] # idiom — _run_restore/_run_volume_restore are linear confirm-then-execute CLI wizards
+"src/nerdit/cli/commands/check_deps.py" = ["PLR0912"] # idiom — _run_install_flow is a per-platform install-command dispatch ladder
+"src/nerdit/cli/commands/config.py" = ["SIM108"] # idiom — the if/else reads clearer than a nested ternary for the ai-vs-plain pair parse
+"src/nerdit/cli/commands/connect.py" = ["B904"] # idiom — the connect probe deliberately reports a user-facing message, not the low-level cause
+"src/nerdit/cli/commands/deploy.py" = ["C901", "PLR0912", "PLR0913", "PLR0915"] # idiom — deploy()/_deploy_async() surface every CLI deploy option directly
+"src/nerdit/cli/commands/init.py" = ["C901", "PLR0912", "PLR0915", "SIM105"] # idiom — _init_async is a linear interactive setup wizard
+"src/nerdit/cli/commands/logs.py" = ["B904"] # idiom — _logs_async re-raises with a user-facing message, dropping the low-level cause on purpose
+"src/nerdit/cli/commands/serve.py" = ["PLR0913"] # idiom — serve()/_serve_async()/_serve_model_async() surface every CLI serve option directly
+"src/nerdit/cli/commands/store.py" = ["PLR0913"] # idiom — store_deploy()/_deploy_async() mirror the template-deploy payload
+"src/nerdit/cli/commands/uninstall.py" = ["C901", "PLR0912", "PLR0915", "SIM102", "SIM105"] # idiom — uninstall() and its helpers are a linear confirm/teardown wizard
+"src/nerdit/cli/display.py" = ["PLR0912"] # idiom — render_client_error is a flat per-status-code dispatch ladder
+"src/nerdit/config/app_config.py" = ["PLR0913"] # idiom — validate_deploy_fields mirrors every [deploy] field as a parameter
+"src/nerdit/config/project.py" = ["PLR0912"] # idiom — validate_volume_specs is a flat multi-condition grammar validator
+"src/nerdit/config/settings.py" = ["C901", "PLR0912"] # idiom — load_settings is a flat per-section optional-key copy ladder over live config sections
+"src/nerdit/config/store.py" = ["PLR0913"] # idiom — _diff mirrors the config-apply payload shape
+"src/nerdit/core/backup.py" = ["PLR0915", "SIM105", "SIM115"] # idiom — long snapshot/pack routines plus a deliberately suppressed best-effort cleanup
+"src/nerdit/core/builder.py" = ["SIM108"] # idiom — the if/else reads clearer than a nested ternary for the npm-cache branch
+"src/nerdit/core/events.py" = ["SIM105"] # idiom — deliberate suppress on a full event queue (drop, don't block)
+"src/nerdit/core/gitsource.py" = ["PLR0912", "PLR0913", "PLR0915", "SIM105"] # idiom — clone_source is a guarded multi-check clone pipeline
+"src/nerdit/core/monitor.py" = ["SIM105"] # idiom — deliberate suppress on cancellation during stop()
+"src/nerdit/core/runtime/docker.py" = ["C901", "PLR0912", "RET505", "SIM105"] # idiom — _run_sync is a multi-vendor GPU error-classification ladder
+"src/nerdit/core/secrets.py" = ["SIM105"] # idiom — deliberate suppress on a best-effort directory creation
+"src/nerdit/core/workload.py" = ["SIM105"] # idiom — deliberate suppress on cancellation during stop()
+"src/nerdit/daemon/idempotency.py" = ["C901", "PLR0912"] # idiom — dispatch() is a per-method/per-header middleware ladder
+"src/nerdit/daemon/lifecycle.py" = ["SIM115"] # idiom — the boot log is deliberately long-lived
+"src/nerdit/daemon/remediation.py" = ["PLR0912", "SIM103"] # idiom — derive_remediation is a flat error-class-to-remediation-code lookup ladder
+"src/nerdit/daemon/routes/app_config.py" = ["C901", "PLR0912", "PLR0913", "PLR0915"] # idiom — put_app_config_section validates every [deploy]/[ai] field inline
+"src/nerdit/daemon/routes/audit.py" = ["PLR0913"] # idiom — list_audit surfaces every audit filter as a query parameter
+"src/nerdit/daemon/routes/system.py" = ["C901", "PLR0912", "PLR0915", "SIM105"] # idiom — get_doctor's check ladder + _run_gc's orchestration
+"src/nerdit/daemon/uploads.py" = ["B904", "SIM115"] # idiom — extract_upload re-raises with a user-facing message around a multi-step ZIP-safety extraction
+"src/nerdit/utils/logging.py" = ["SIM115"] # idiom — the rotating handler owns the fd
+
+# ── Idiom: tests, no scheduled Track B WP ───────────────────────────────────
+"tests/test_app_templates.py" = ["PLR0913"] # idiom — _fake_clone/_racing_clone mirror clone_source's parameter list
+"tests/test_cli_config.py" = ["B017"] # idiom — pins "parsing raises on any bad input", not one specific exception type
+"tests/test_deploy_route.py" = ["SIM222"] # idiom — the `or True` guard is a deliberate test-only override; WP20 pins this file unmodified
+"tests/test_migrations.py" = ["SIM300"] # idiom — Yoda `expected == actual` reads clearer in a migration-column assertion
+"tests/test_proxy.py" = ["C901", "PLR0912"] # idiom — the fake Caddy admin handler dispatches every admin-API verb inline
+"tests/test_proxy_smoke.py" = ["SIM105"] # idiom — deliberate suppress around a best-effort adoption cleanup
+"tests/test_restore.py" = ["SIM117"] # idiom — one context manager per line reads clearer in these symlink/traversal-attack tests
+"tests/test_retention.py" = ["PLR0913"] # idiom — _insert_job mirrors every job column as a parameter
+"tests/test_services_database_kind.py" = ["SIM300"] # idiom — Yoda `expected == actual` reads clearer in a kind-shape assertion
+"tests/test_services_reconcile.py" = ["PLR0913", "SIM105"] # idiom — _deploy_svc mirrors the deploy payload; deliberate suppress in a cancellation-race test
+"tests/test_uninstall.py" = ["PLR0913", "SIM114", "SIM211"] # idiom — _settings mirrors every settings field; the other two are deliberate readability choices in a fake
+
+[tool.ruff.format]
+# ruff 0.16 formats Python code blocks inside Markdown by default; the code
+# blocks in this repository's Markdown are illustrative specs with hand-aligned
+# comment columns — keep the formatter off Markdown entirely.
+exclude = ["*.md"]
+
+[tool.mypy]
+# The gate is `mypy src/nerdit` and it must exit 0, so a NEW type error fails
+# CI. Everything still broken today is suppressed *narrowly* below — per module,
+# per error code — and every entry names the WP that removes it. Do not add a
+# blanket `ignore_errors`, and do not widen an entry without a WP reference.
+#
+# `src/nerdit`, not `src/`: with namespace_packages off, pointing mypy at `src/`
+# risks crawling the un-`__init__`'d `src/nerdit/daemon/web` tree.
+python_version = "3.11" # declared floor; the dev venv is newer
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "hardware: requires real hardware (GPU, or a full daemon subprocess against real Docker)",
+    "integration: full-daemon subprocess integration test",
+]

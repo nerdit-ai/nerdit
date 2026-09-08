@@ -1,0 +1,41 @@
+# Caddy binary pin — P30 / D-P30-5.
+#
+# WHAT THIS PINS
+# Every Nerdit release tarball bundles ONE Caddy static binary, at the exact
+# version and with the exact bytes recorded here. The daemon's ProxyManager
+# spawns it (see [proxy].caddy_binary); bundling means one artifact, one
+# checksum, one tested combination — Caddy is never downloaded at install time
+# and never resolved from the customer's PATH unless they configure it.
+#
+# The hashes below are sha256 of the UPSTREAM release assets from
+# https://github.com/caddyserver/caddy/releases/download/v<VERSION>/, i.e.:
+#   caddy_<VERSION>_linux_amd64.tar.gz  -> CADDY_SHA256_LINUX_X86_64
+#   caddy_<VERSION>_linux_arm64.tar.gz  -> CADDY_SHA256_LINUX_ARM64
+#   caddy_<VERSION>_mac_arm64.tar.gz    -> CADDY_SHA256_MACOS_ARM64
+# .github/workflows/release.yml downloads the asset for its matrix cell and
+# verifies it against the matching line here BEFORE extracting; a mismatch
+# fails the build. Upstream publishes sha512 in caddy_<VERSION>_checksums.txt —
+# these sha256 values were cross-checked against that file at pin time.
+#
+# HOW TO BUMP
+#   1. Pick the new upstream release:
+#        curl -fsSL https://api.github.com/repos/caddyserver/caddy/releases/latest \
+#          | grep '"tag_name"'
+#   2. Download the three assets and recompute ALL THREE hashes (they change
+#      together — never bump the version without re-hashing every line):
+#        V=<x.y.z>
+#        for a in linux_amd64 linux_arm64 mac_arm64; do
+#          curl -fsSLO "https://github.com/caddyserver/caddy/releases/download/v$V/caddy_${V}_${a}.tar.gz"
+#        done
+#        sha256sum caddy_${V}_*.tar.gz     # macOS: shasum -a 256
+#   3. Cross-check against upstream caddy_${V}_checksums.txt (sha512), edit the
+#      four lines below, and re-run the WP-1 smoke (packaging/smoke.sh) — the
+#      bundled proxy is a tested combination, not a floating dependency.
+#
+# Format: strict KEY=VALUE, one per line, no quotes, no spaces. Parsed with
+# grep/cut by release.yml (never `source`d) and by any local build.
+
+CADDY_VERSION=2.11.4
+CADDY_SHA256_LINUX_X86_64=527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9
+CADDY_SHA256_LINUX_ARM64=52d42ae12b3462097e9868da6dfed3c9648ae12edd3b3638102312af84cb6904
+CADDY_SHA256_MACOS_ARM64=9efb0af2d6cf09cfb5053c0e51721b9b3d4956d346234f39368d943d25a3c9a7

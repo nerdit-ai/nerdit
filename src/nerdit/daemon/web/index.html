@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- The browser chrome's own colour. This is the one place a raw hex is
+         correct: a meta tag cannot read a CSS custom property, so the two
+         values below duplicate --color-background from styles/globals.css
+         (light) and its dark override. Keep them in step with that file. -->
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#09090b" />
+    <title>Nerdit Dashboard</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

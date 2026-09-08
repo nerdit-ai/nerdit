@@ -1,0 +1,44 @@
+{
+  "description": "MCP-shaped JSON-RPC 2.0 initialize request and result.",
+  "request": {
+    "type": "open_stream",
+    "stream_id": "stream-mcp",
+    "node_id": "00000000-0000-4000-8000-00000000000a",
+    "method": "POST",
+    "path": "/mcp",
+    "query": "",
+    "headers": [
+      [
+        "accept",
+        "*/*"
+      ]
+    ],
+    "body_b64": "eyJqc29ucnBjIjogIjIuMCIsICJpZCI6IDEsIm1ldGhvZCI6ImluaXRpYWxpemUiLCJwYXJhbXMiOnt9fQ==",
+    "role": "submitter"
+  },
+  "response": [
+    {
+      "type": "stream_response_head",
+      "stream_id": "stream-mcp",
+      "node_id": "00000000-0000-4000-8000-00000000000a",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "application/json"
+        ]
+      ]
+    },
+    {
+      "type": "stream_response_body",
+      "stream_id": "stream-mcp",
+      "node_id": "00000000-0000-4000-8000-00000000000a",
+      "body_b64": "eyJqc29ucnBjIjogIjIuMCIsICJpZCI6IDEsICJyZXN1bHQiOiB7InByb3RvY29sVmVyc2lvbiI6ICIyMDI1LTA2LTE4IiwgImNhcGFiaWxpdGllcyI6IHsidG9vbHMiOiB7fX0sICJzZXJ2ZXJJbmZvIjogeyJuYW1lIjogIm5lcmRpdC1mYWtlLWRhZW1vbiIsICJ2ZXJzaW9uIjogIjAuMS4wIn19fQ=="
+    },
+    {
+      "type": "stream_response_end",
+      "stream_id": "stream-mcp",
+      "node_id": "00000000-0000-4000-8000-00000000000a"
+    }
+  ]
+}

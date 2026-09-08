@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/nerdit-ai/nerdit/security/advisories/new
+    about: |
+      Do not open a public issue for security reports — use GitHub's
+      private security advisory feature instead. See SECURITY.md.

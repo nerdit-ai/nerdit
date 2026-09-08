@@ -1,0 +1,53 @@
+{
+  "description": "Server-sent events: every status event is its own stream_response_body frame so the gateway can stream incrementally. A live daemon keeps emitting until the peer closes the stream; this fixture pins two.",
+  "request": {
+    "type": "open_stream",
+    "stream_id": "stream-events",
+    "node_id": "00000000-0000-4000-8000-00000000000a",
+    "method": "GET",
+    "path": "/events",
+    "query": "",
+    "headers": [
+      [
+        "accept",
+        "*/*"
+      ]
+    ],
+    "role": "submitter"
+  },
+  "response": [
+    {
+      "type": "stream_response_head",
+      "stream_id": "stream-events",
+      "node_id": "00000000-0000-4000-8000-00000000000a",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "text/event-stream"
+        ],
+        [
+          "cache-control",
+          "no-cache"
+        ]
+      ]
+    },
+    {
+      "type": "stream_response_body",
+      "stream_id": "stream-events",
+      "node_id": "00000000-0000-4000-8000-00000000000a",
+      "body_b64": "ZXZlbnQ6IHN0YXR1cwpkYXRhOiB7Im5vZGVfbmFtZSI6ICJEZXYgTm9kZSIsICJ1cHRpbWVfcyI6IDQyNDIsICJ3b3JrbG9hZF9zdGF0ZSI6ICJpZGxlIn0KCg=="
+    },
+    {
+      "type": "stream_response_body",
+      "stream_id": "stream-events",
+      "node_id": "00000000-0000-4000-8000-00000000000a",
+      "body_b64": "ZXZlbnQ6IHN0YXR1cwpkYXRhOiB7Im5vZGVfbmFtZSI6ICJEZXYgTm9kZSIsICJ1cHRpbWVfcyI6IDQyNDIsICJ3b3JrbG9hZF9zdGF0ZSI6ICJpZGxlIn0KCg=="
+    },
+    {
+      "type": "stream_response_end",
+      "stream_id": "stream-events",
+      "node_id": "00000000-0000-4000-8000-00000000000a"
+    }
+  ]
+}

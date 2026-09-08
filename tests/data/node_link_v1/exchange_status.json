@@ -1,0 +1,43 @@
+{
+  "description": "Node REST call: name, version, uptime, and workload state as JSON.",
+  "request": {
+    "type": "open_stream",
+    "stream_id": "stream-status",
+    "node_id": "00000000-0000-4000-8000-00000000000a",
+    "method": "GET",
+    "path": "/api/status",
+    "query": "",
+    "headers": [
+      [
+        "accept",
+        "*/*"
+      ]
+    ],
+    "role": "submitter"
+  },
+  "response": [
+    {
+      "type": "stream_response_head",
+      "stream_id": "stream-status",
+      "node_id": "00000000-0000-4000-8000-00000000000a",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "application/json"
+        ]
+      ]
+    },
+    {
+      "type": "stream_response_body",
+      "stream_id": "stream-status",
+      "node_id": "00000000-0000-4000-8000-00000000000a",
+      "body_b64": "eyJub2RlX25hbWUiOiAiRGV2IE5vZGUiLCAiZGFlbW9uX3ZlcnNpb24iOiAiMC4xLjAiLCAicHJvdG9jb2wiOiAibm9kZS1saW5rL3YxIiwgInVwdGltZV9zIjogNDI0MiwgIndvcmtsb2FkX3N0YXRlIjogImlkbGUiLCAicmVxdWVzdHNfc2VydmVkIjogMCwgInR1bm5lbF9zZXNzaW9ucyI6IDB9"
+    },
+    {
+      "type": "stream_response_end",
+      "stream_id": "stream-status",
+      "node_id": "00000000-0000-4000-8000-00000000000a"
+    }
+  ]
+}

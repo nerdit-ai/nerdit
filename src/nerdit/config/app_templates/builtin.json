@@ -1,0 +1,64 @@
+[
+  {
+    "id": "fastapi-ai-chat",
+    "name": "FastAPI AI Chat",
+    "description": "A FastAPI chat app wired to a local model via [ai.default].",
+    "icon": "message-square",
+    "category": "ai",
+    "repo_url": "https://github.com/nerdit-ai/nerdit-templates",
+    "ref": "v1.1.0",
+    "subdir": "fastapi-ai-chat",
+    "deploy_defaults": {
+      "port": 8000,
+      "gpus": 0
+    },
+    "env_schema": [],
+    "ai_hint": "Expects a locally served model (e.g. `nerdit serve llama3.1:8b`); binds via [ai.default] provider=ollama."
+  },
+  {
+    "id": "node-starter",
+    "name": "Node Starter",
+    "description": "A minimal Node/Express web starter.",
+    "icon": "layout",
+    "category": "web",
+    "repo_url": "https://github.com/nerdit-ai/nerdit-templates",
+    "ref": "v1.1.0",
+    "subdir": "node-starter",
+    "deploy_defaults": {
+      "port": 3000,
+      "gpus": 0
+    },
+    "env_schema": []
+  },
+  {
+    "id": "fastapi-api-starter",
+    "name": "FastAPI API Starter",
+    "description": "A minimal FastAPI backend starter.",
+    "icon": "server",
+    "category": "api",
+    "repo_url": "https://github.com/nerdit-ai/nerdit-templates",
+    "ref": "v1.1.0",
+    "subdir": "fastapi-api-starter",
+    "deploy_defaults": {
+      "port": 8000,
+      "gpus": 0
+    },
+    "env_schema": []
+  },
+  {
+    "id": "static-site",
+    "name": "Static Site",
+    "description": "HTML/CSS/JS served by nginx-unprivileged \u2014 a non-root image that runs under the default sandbox.",
+    "icon": "file-text",
+    "category": "web",
+    "repo_url": "https://github.com/nerdit-ai/nerdit-templates",
+    "ref": "v1.1.0",
+    "subdir": "static-site",
+    "deploy_defaults": {
+      "port": 8080,
+      "gpus": 0
+    },
+    "env_schema": [],
+    "ai_hint": "Put the site under site/ (index.html is the entry point). Listens on 8080 as uid 101; do not switch to the stock nginx image \u2014 its root entrypoint fails under cap_drop=ALL."
+  }
+]
