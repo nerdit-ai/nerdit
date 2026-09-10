@@ -74,6 +74,7 @@ _DRY_RUN_ROUTES: list[tuple[str, re.Pattern[str]]] = [
     # Without this entry a `?dry_run=true` workspace deploy burns
     # the caller's Idempotency-Key and poisons the later real deploy.
     ("POST", re.compile(r"^/workspaces/[^/]+/deploy$")),
+    ("POST", re.compile(r"^/app-templates/[^/]+/deploy$")),
     ("POST", re.compile(r"^/config/daemon/apply$")),
     ("PUT", re.compile(r"^/config/daemon/[^/]+$")),
     ("PUT", re.compile(r"^/config/apps/[^/]+/[^/]+$")),

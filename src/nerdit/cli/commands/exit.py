@@ -19,7 +19,7 @@ from nerdit.cli.commands.uninstall import (
 )
 from nerdit.cli.display import _plain, console
 from nerdit.config.settings import NerditSettings, load_settings
-from nerdit.utils.install_layout import detect_service_unit
+from nerdit.utils.install_layout import detect_service_unit, service_unit_loaded
 
 
 def exit_daemon(
@@ -69,6 +69,11 @@ async def _exit_async(yes: bool) -> None:
         return
 
     unit = detect_service_unit()
+    try:
+        if unit is not None and not service_unit_loaded(unit):
+            unit = None
+    except RuntimeError as exc:
+        console.print(f"[yellow]{_plain(exc)}; trying the service stop.[/yellow]")
     if unit is not None:
         console.print(
             f"[dim]This daemon is managed by a {_plain(unit.kind)} service unit "
@@ -89,7 +94,7 @@ async def _exit_async(yes: bool) -> None:
     # 1. The service manager first when there is one: signalling a supervised
     #    daemon just gets it restarted.
     if unit is not None:
-        _stop_unit(unit)
+        _stop_unit(unit, data_dir=data_dir, pid_file=pid_file)
         liveness = probe_daemon(data_dir=data_dir, pid_file=pid_file)
         if not liveness.alive:
             pid_file.unlink(missing_ok=True)

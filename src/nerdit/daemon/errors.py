@@ -197,6 +197,7 @@ _SECRET_INPUT_FIELDS = frozenset(
     {
         "env",
         "environment",
+        "build_settings",  # Rejected build inputs may contain pasted credentials.
         "secret",
         "secrets",
         "token",

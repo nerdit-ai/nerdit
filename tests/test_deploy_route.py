@@ -399,7 +399,7 @@ def test_deploy_node_creates_building_service(tmp_path):
 
     generated = Path(cfg["build_context_dir"]) / "Dockerfile.nerdit"
     assert generated.is_file()
-    assert "node:20-slim" in generated.read_text()
+    assert "node:24.20.0-slim" in generated.read_text()
 
 
 def test_deploy_generates_dockerignore_for_buildpack(tmp_path):

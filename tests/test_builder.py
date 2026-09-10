@@ -14,6 +14,7 @@ from nerdit.core.builder import (
     DEFAULT_NODE_PORT,
     DEFAULT_PYTHON_PORT,
     GENERATED_DOCKERFILE_NAME,
+    NODE_BASE_IMAGE,
     PYTHON_BASE_IMAGE,
     BuildpackNotSupported,
     detect,
@@ -55,7 +56,7 @@ def _idx(text, needle):
 
 def test_dockerfile_wins_over_package_json(tmp_path):
     (tmp_path / "Dockerfile").write_text("FROM alpine\n")
-    _write_package_json(tmp_path, scripts={"start": "node index.js"})
+    _write_package_json(tmp_path, scripts={"build": "next build", "start": "next start"})
 
     plan = detect(tmp_path)
 
@@ -104,7 +105,7 @@ def test_node_generates_dockerfile(tmp_path):
     assert plan.language == "node"
     assert plan.dockerfile_name == GENERATED_DOCKERFILE_NAME
     assert plan.dockerfile_text
-    assert "node:20-slim" in plan.dockerfile_text
+    assert NODE_BASE_IMAGE in plan.dockerfile_text
     assert 'CMD ["npm", "start"]' in plan.dockerfile_text
     assert plan.start_command == "npm start"
     assert plan.port == DEFAULT_NODE_PORT
@@ -127,9 +128,38 @@ def test_node_layer_order_deps_copy_then_install_then_source(tmp_path):
     assert deps_copy < install < source_copy
 
 
+@pytest.mark.parametrize("workspaces", [None, ["packages/*"]])
+@pytest.mark.parametrize("locked", [False, True])
+def test_node_build_script_runs_after_source_and_install(tmp_path, workspaces, locked):
+    _write_package_json(
+        tmp_path, scripts={"build": "next build", "start": "next start"}, workspaces=workspaces
+    )
+    if locked:
+        (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}')
+
+    plan = detect(tmp_path)
+    text = plan.dockerfile_text
+
+    build = _idx(text, "RUN npm run build")
+    assert _idx(text, "COPY . .") < build
+    assert _idx(text, "RUN npm ci" if locked else "RUN npm install") < build
+    assert build < _idx(text, 'CMD ["npm", "start"]')
+    assert plan.start_command == "npm start"
+
+
+@pytest.mark.parametrize(
+    "scripts",
+    [None, {}, {"start": "node index.js"}, {"build": ""}, {"build": "  "}],
+)
+def test_node_without_valid_build_script_skips_build(tmp_path, scripts):
+    _write_package_json(tmp_path, scripts=scripts)
+
+    assert "RUN npm run build" not in detect(tmp_path).dockerfile_text
+
+
 def test_node_npm_ci_with_lockfile(tmp_path):
     _write_package_json(tmp_path, scripts={"start": "node index.js"})
-    (tmp_path / "package-lock.json").write_text("{}")
+    (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}')
 
     plan = detect(tmp_path)
 
@@ -393,3 +423,51 @@ def test_app_image_helpers():
     assert APP_IMAGE_REPO_PREFIX == "nerdit-app"
     assert app_image_repo("my-app") == "nerdit-app/my-app"
     assert app_image_tag("my-app", 3) == "nerdit-app/my-app:3"
+
+
+def test_preset_selects_node_in_mixed_root(tmp_path):
+    _write_package_json(tmp_path, scripts={"start": "node app.js"})
+    _write_requirements(tmp_path)
+    assert detect(str(tmp_path)).language == "python"
+    assert (
+        detect(str(tmp_path), _deploy_cfg(build_settings={"preset": "python"})).language == "python"
+    )
+    plan = detect(str(tmp_path), _deploy_cfg(build_settings={"preset": "node"}))
+    assert plan.language == "node"
+    assert plan.start_command == "npm start"
+
+
+@pytest.mark.parametrize("preset", ["node", "nextjs", "python", "dockerfile"])
+def test_preset_requires_its_project_files(tmp_path, preset):
+    with pytest.raises(BuildpackNotSupported, match="requires"):
+        detect(str(tmp_path), _deploy_cfg(build_settings={"preset": preset}))
+
+
+def test_next_preset_requires_dependency_and_cannot_bypass_next_validation(tmp_path):
+    _write_package_json(tmp_path, scripts={"start": "node server.js", "build": "echo build"})
+    with pytest.raises(BuildpackNotSupported, match="declared next dependency"):
+        detect(str(tmp_path), _deploy_cfg(build_settings={"preset": "nextjs"}))
+    (tmp_path / "package.json").write_text(json.dumps({"dependencies": {"next": "16.3.4"}}))
+    with pytest.raises(BuildpackNotSupported, match="require build and start"):
+        detect(str(tmp_path), _deploy_cfg(build_settings={"preset": "node"}))
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "dependencies": {"next": "16.3.4"},
+                "scripts": {"build": "next build", "start": "next start"},
+            }
+        )
+    )
+    assert (
+        detect(str(tmp_path), _deploy_cfg(build_settings={"preset": "nextjs"})).framework
+        == "nextjs"
+    )
+
+
+@pytest.mark.parametrize("preset", ["node", "nextjs", "python", "dockerfile"])
+def test_dockerfile_remains_authoritative_with_preset(tmp_path, preset):
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
+    (tmp_path / "package.json").write_text("malformed")
+    plan = detect(str(tmp_path), _deploy_cfg(build_settings={"preset": preset}))
+    assert plan.language == "dockerfile"
+    assert bool(plan.warnings) == (preset != "dockerfile")

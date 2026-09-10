@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -35,8 +36,8 @@ InstallMode = Literal["system", "user"]
 class ServiceUnit:
     """A service-manager unit and its canonical restart, stop and disable commands.
 
-    Keep commands aligned with install.sh. For launchd, bootout both stops and
-    unloads the job, preventing login respawn.
+    Keep commands aligned with install.sh. Launchd bootout unloads the job for
+    this login; removing its plist prevents registration at the next login.
     """
 
     kind: UnitKind
@@ -157,14 +158,13 @@ def _launchd_unit(path: Path) -> ServiceUnit:
         # it needs no plist path and does not race the reload.
         restart_argv=["launchctl", "kickstart", "-k", target],
         stop_argv=list(bootout),
-        # Booting a job out IS the disable: it unloads the agent, so it does not
-        # come back at the next login either.
+        # Uninstall also removes the plist to prevent registration next login.
         disable_argv=list(bootout),
     )
 
 
 def detect_service_unit() -> ServiceUnit | None:
-    """The service-manager unit managing this daemon, or `None`.
+    """Return installed service metadata, even when the job is not registered.
 
     Precedence is fixed and shared with `install.sh`: macOS has exactly one
     answer (the LaunchAgent), Linux prefers a `--user` unit over the system
@@ -180,6 +180,54 @@ def detect_service_unit() -> ServiceUnit | None:
     if system_unit.exists():
         return _systemd_unit("systemd-system", system_unit)
     return None
+
+
+def service_unit_loaded(unit: ServiceUnit) -> bool:
+    """Check launchd registration; installed systemd units can be stopped directly.
+
+    Raises:
+        RuntimeError: The launchd domain could not be queried reliably.
+    """
+    if unit.kind != "launchd":
+        return True
+    argv = ["launchctl", "print", unit.stop_argv[-1]]
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Could not query the daemon service: {exc}") from exc
+    if result.returncode == 0:
+        return True
+    if "Could not find service" in result.stderr:
+        return False
+    raise RuntimeError(f"Could not query the daemon service: {result.stderr.strip()}")
+
+
+def start_service_unit(unit: ServiceUnit) -> None:
+    """Start an installed unit, registering a missing LaunchAgent without enabling it.
+
+    Raises:
+        RuntimeError: Registration or startup failed; no unmanaged process is spawned.
+    """
+    if unit.kind == "launchd":
+        target = unit.stop_argv[-1]
+        commands = []
+        if not service_unit_loaded(unit):
+            commands.append(
+                ["launchctl", "bootstrap", target.rsplit("/", 1)[0], str(unit.unit_path)]
+            )
+        commands.append(["launchctl", "kickstart", target])
+    else:
+        argv = _systemctl(unit.kind == "systemd-user", "start", SYSTEMD_UNIT_NAME)
+        if unit.kind == "systemd-system" and os.geteuid() != 0:
+            argv = ["sudo", "-n", *argv]
+        commands = [argv]
+    for argv in commands:
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Could not start the daemon service: {exc}") from exc
+        if result.returncode:
+            raise RuntimeError(f"{' '.join(argv)} failed: {result.stderr.strip()}")
 
 
 # --------------------------------------------------------------------------- #

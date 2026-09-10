@@ -665,8 +665,8 @@ def _run_unit_command(argv: list[str], *, note: str = "") -> tuple[bool, str | N
     return True, None
 
 
-def _stop_unit(unit: ServiceUnit) -> tuple[bool, str]:
-    """Ask the service manager to stop the daemon; return success and detail.
+def _stop_unit(unit: ServiceUnit, *, data_dir: Path, pid_file: Path) -> tuple[bool, str]:
+    """Stop through the service manager and wait for the daemon to release its state.
 
     Do not disable or delete the unit. Signalling alone may trigger respawn, and
     a failed stop must be reported before any removal.
@@ -674,6 +674,14 @@ def _stop_unit(unit: ServiceUnit) -> tuple[bool, str]:
     label = " ".join(unit.stop_argv)
     ok, detail = _run_unit_command(unit.stop_argv)
     if ok:
+        # launchctl bootout can return before the daemon finishes draining.
+        deadline = time.monotonic() + _DAEMON_DRAIN_S
+        while probe_daemon(data_dir=data_dir, pid_file=pid_file).alive:
+            if time.monotonic() >= deadline:
+                detail = f"daemon did not stop within {_DAEMON_DRAIN_S:g}s"
+                console.print(f"[yellow]{detail} after '{escape(label)}'.[/yellow]")
+                return False, f"'{label}' succeeded, but {detail}"
+            time.sleep(0.2)
         console.print(f"[dim]Service unit stopped ('{escape(label)}').[/dim]")
         return True, f"'{label}' succeeded"
     return False, f"'{label}' failed ({detail})"
@@ -1131,7 +1139,11 @@ def uninstall(
     # Stop the unit first to prevent respawn. Record failures and retain the unit
     # until the data-dir lock proves the daemon is gone.
     if manifest.service_unit is not None:
-        _stopped_by_unit, service_result = _stop_unit(manifest.service_unit)
+        _stopped_by_unit, service_result = _stop_unit(
+            manifest.service_unit,
+            data_dir=manifest.data_dir,
+            pid_file=Path(settings.daemon.pid_file).expanduser(),
+        )
     else:
         service_result = "no service unit manages this install"
 

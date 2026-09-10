@@ -18,7 +18,9 @@ from pathlib import Path
 
 from fastapi import APIRouter, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
+from nerdit.config.build import BuildSettings
 from nerdit.config.project import SECRET_REF_RE
 from nerdit.core.bindings.secretref import walk_secret_ref
 from nerdit.core.gitsource import (
@@ -94,6 +96,7 @@ async def deploy(
     start: str | None = Form(None),
     health: str | None = Form(None),
     env: str | None = Form(None),
+    build_settings: str | None = Form(None),
     vendor: str | None = Form(None),
     dry_run: bool = Query(
         False, description="Validate + return a plan diff without writing anything."
@@ -136,6 +139,16 @@ async def deploy(
     # out-of-scope target.
     require_service_scope(request, name)
     parsed_env = _parse_env(env)
+    parsed_build = None
+    if build_settings is not None:
+        try:
+            parsed_build = BuildSettings.model_validate_json(build_settings).model_dump(
+                exclude_unset=True
+            )
+        except ValidationError:
+            raise NerditError(
+                422, "deploy.invalid_build_settings", "Invalid build_settings JSON object."
+            ) from None
 
     # Extract the folder into daemon-managed upload space (shared guards).
     context_dir = await extract_upload(
@@ -154,6 +167,7 @@ async def deploy(
         start=start,
         health=health,
         env=parsed_env,
+        build_settings=parsed_build,
         vendor=vendor,
         source_meta={"type": "zip"},
         dry_run=dry_run,
@@ -365,6 +379,9 @@ async def deploy_git(
         start=body.start,
         health=body.health,
         env=body.env,
+        build_settings=body.build_settings.model_dump(exclude_unset=True)
+        if body.build_settings
+        else None,
         vendor=body.vendor,
         source_meta=source_meta,
         context_root=dest_dir,

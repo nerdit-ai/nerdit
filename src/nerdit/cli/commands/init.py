@@ -13,9 +13,9 @@ from typing import TYPE_CHECKING
 import typer
 
 from nerdit.cli import checks
-from nerdit.cli.display import console
-from nerdit.config.defaults import DEFAULT_HOST, DEFAULT_PORT, NVIDIA_LIB_DIRS
-from nerdit.config.settings import generate_auth_token, get_client_config
+from nerdit.cli.display import _plain, console
+from nerdit.config.defaults import NVIDIA_LIB_DIRS
+from nerdit.config.settings import generate_auth_token, load_settings
 
 if TYPE_CHECKING:
     from nerdit.daemon.lifecycle import DaemonLifecycle
@@ -338,12 +338,8 @@ async def _init_async() -> None:
     except OSError:
         pass
 
-    # (P30) An installer-made install is already configured and already running
-    # under its service unit. Writing the source-checkout default config there
-    # would set `host = "0.0.0.0"` and a fresh auth_token — both restart-keyed,
-    # so the node would sit in `config_restart_pending` and, once restarted,
-    # bind every interface: the exact opposite of what `docs/guide/install.md`
-    # promises. `nerdit init` is the source-checkout bootstrap; installs skip it.
+    # Preserve installer defaults: source-checkout config would replace the
+    # loopback binding and auth token, both of which require a restart.
     from nerdit.utils.install_layout import detect_install_layout
 
     installed = detect_install_layout() is not None
@@ -402,20 +398,19 @@ async def _init_async() -> None:
                 )
 
     # Start daemon
-    lifecycle = DaemonLifecycle(host=DEFAULT_HOST, port=DEFAULT_PORT)
+    daemon = load_settings().daemon
+    host = "127.0.0.1" if daemon.host == "0.0.0.0" else daemon.host
+    lifecycle = DaemonLifecycle(host=host, port=daemon.port, pid_file=daemon.pid_file)
     if not lifecycle.is_running():
         console.print("Starting daemon...")
         try:
             started = lifecycle.start()
         except RuntimeError as exc:
-            # An incomplete frozen bundle makes _spawn_argv() raise. The
-            # surrounding code is built to explain a failed start; a traceback
-            # here would bypass all of it.
-            console.print(f"[red]Could not start the daemon:[/red] {exc}")
-            started = False
+            console.print(f"[red]Could not start the daemon:[/red] {_plain(exc)}")
+            raise typer.Exit(1) from exc
         if started and lifecycle.wait_for_ready(timeout=15.0):
             console.print("[green]Daemon started[/green]")
-        elif not _report_daemon_start_failure(DEFAULT_PORT, lifecycle):
+        elif not _report_daemon_start_failure(daemon.port, lifecycle):
             raise typer.Exit(1)
     else:
         console.print("[dim]Daemon already running[/dim]")
@@ -430,8 +425,7 @@ async def _init_async() -> None:
         console.print(f"  [cyan]nerdit connect <ip> --token {token}[/cyan]")
 
     # Display GPU info
-    host, port, cfg_token = get_client_config()
-    client = NerditClient(host=host, port=port, token=cfg_token)
+    client = NerditClient(host=host, port=daemon.port, token=daemon.auth_token)
     gpu_count = 0
     try:
         gpus = await client.list_gpus()
@@ -445,8 +439,8 @@ async def _init_async() -> None:
     # Health check recap
     console.print()
     console.print("[bold]Health check:[/bold]")
-    console.print(f"  [green]✓[/green] Daemon running on {DEFAULT_HOST}:{DEFAULT_PORT}")
-    console.print(f"  [green]✓[/green] Dashboard open on http://{DEFAULT_HOST}:{DEFAULT_PORT}/")
+    console.print(f"  [green]✓[/green] Daemon running on {host}:{daemon.port}")
+    console.print(f"  [green]✓[/green] Dashboard open on http://{host}:{daemon.port}/")
 
     if docker_ok:
         console.print("  [green]✓[/green] Docker available")

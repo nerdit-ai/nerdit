@@ -206,7 +206,7 @@ def test_exit_stops_through_the_service_unit(fake_home, tmp_path, monkeypatch, c
     monkeypatch.setattr(
         exit_mod,
         "_stop_unit",
-        lambda u: stopped.append(u) or (True, "ok"),
+        lambda u, **kw: stopped.append(u) or (True, "ok"),
     )
     monkeypatch.setattr(
         exit_mod, "_terminate", lambda *a, **k: pytest.fail("must not signal a stopped daemon")
@@ -239,7 +239,7 @@ def test_exit_falls_back_to_signalling_when_the_unit_stop_does_not_work(
         ]
     )
     monkeypatch.setattr(exit_mod, "probe_daemon", lambda **_k: next(verdicts))
-    monkeypatch.setattr(exit_mod, "_stop_unit", lambda u: (False, "failed"))
+    monkeypatch.setattr(exit_mod, "_stop_unit", lambda u, **kw: (False, "failed"))
     signalled: list[tuple[int, float]] = []
 
     def _term(pid, label, *, grace_s=5.0, expect_cmd=None):
@@ -291,3 +291,75 @@ def test_exit_survives_a_broken_config(fake_home, tmp_path, monkeypatch, capsys)
     out = " ".join(capsys.readouterr().out.split())
     assert "assuming defaults" in out
     assert "Daemon is not running" in out
+
+
+@pytest.mark.parametrize("loaded", [False, True])
+def test_exit_only_stops_registered_launchd_job(fake_home, tmp_path, monkeypatch, capsys, loaded):
+    from nerdit.utils.install_layout import _launchd_unit
+
+    data_dir = tmp_path / "data"
+    pid_file = tmp_path / "daemon.pid"
+    _wire(monkeypatch, _settings(data_dir, pid_file))
+    unit = _launchd_unit(tmp_path / "daemon.plist")
+    monkeypatch.setattr(exit_mod, "detect_service_unit", lambda: unit)
+    monkeypatch.setattr(exit_mod, "service_unit_loaded", lambda u: loaded)
+    verdicts = iter(
+        [
+            DaemonLiveness(True, 12345, "pidfile"),
+            DaemonLiveness(False, None, "none"),
+        ]
+    )
+    monkeypatch.setattr(exit_mod, "probe_daemon", lambda **kw: next(verdicts))
+    stopped = []
+    signalled = []
+    monkeypatch.setattr(exit_mod, "_stop_unit", lambda u, **kw: stopped.append(u))
+    monkeypatch.setattr(exit_mod, "_terminate", lambda pid, *a, **kw: signalled.append(pid) or True)
+    exit_daemon(yes=True)
+    assert stopped == ([unit] if loaded else [])
+    assert signalled == ([] if loaded else [12345])
+    out = " ".join(capsys.readouterr().out.split())
+    assert ("managed by a launchd" in out) == loaded
+    assert "falling back" not in out
+
+
+@posix_only
+@pytest.mark.parametrize("command", ["exit", "uninstall"])
+def test_service_stop_waits_for_daemon_without_pidfile_to_release_lock(
+    fake_home, tmp_path, monkeypatch, capsys, command
+):
+    import fcntl
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    held = os.open(str(data_dir / ".restore.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(held, fcntl.LOCK_SH)
+    pid_file = tmp_path / "custom.pid"
+    _wire(monkeypatch, _settings(data_dir, pid_file))
+    unit = _unit(tmp_path)
+    monkeypatch.setattr(exit_mod, "detect_service_unit", lambda: unit)
+    monkeypatch.setattr(uninstall_mod, "detect_service_unit", lambda: unit)
+    monkeypatch.setattr(uninstall_mod, "_run_unit_command", lambda *a, **kw: (True, None))
+    monkeypatch.setattr(exit_mod, "_terminate", lambda *a, **kw: pytest.fail("signal fallback"))
+    monkeypatch.setattr(
+        uninstall_mod, "_terminate", lambda *a, **kw: pytest.fail("signal fallback")
+    )
+    sleeps = []
+
+    def drain(interval):
+        sleeps.append(interval)
+        if len(sleeps) == 2:
+            fcntl.flock(held, fcntl.LOCK_UN)
+
+    monkeypatch.setattr(uninstall_mod.time, "sleep", drain)
+    try:
+        if command == "exit":
+            exit_daemon(yes=True)
+        else:
+            uninstall(yes=True, dry_run=False, purge_images=False, keep_data=False)
+        assert len(sleeps) == 2
+        out = " ".join(capsys.readouterr().out.split())
+        assert "falling back" not in out
+        assert "there is no pid to signal" not in out
+        assert not pid_file.exists()
+    finally:
+        os.close(held)

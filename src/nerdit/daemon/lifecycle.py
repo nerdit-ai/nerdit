@@ -14,6 +14,12 @@ from pathlib import Path
 import httpx
 
 from nerdit.config.defaults import DEFAULT_HOST, DEFAULT_PORT
+from nerdit.utils.install_layout import (
+    detect_install_layout,
+    detect_service_unit,
+    managed_daemon_port,
+    start_service_unit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +69,22 @@ class DaemonLifecycle:
         return [sys.executable, "-m", "nerdit.daemon.server"]
 
     def start(self) -> bool:
-        """Start the daemon as a detached subprocess. Returns True if started."""
+        """Start through the installed service, or detach a source-install daemon."""
         if self.is_running():
             logger.info("Daemon already running")
             return True
+
+        unit = detect_service_unit()
+        if unit is not None:
+            if managed_daemon_port(unit) != self._port:
+                raise RuntimeError(
+                    "Installed service configuration does not match this daemon's port. "
+                    "Check the service unit and ~/.nerdit/config.toml."
+                )
+            start_service_unit(unit)
+            return True
+        if detect_install_layout() is not None:
+            raise RuntimeError("The installed daemon service is missing. Re-run the installer.")
 
         argv = self._spawn_argv()
         self._pid_file.parent.mkdir(parents=True, exist_ok=True)

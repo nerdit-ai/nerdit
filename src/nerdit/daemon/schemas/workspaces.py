@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from nerdit.config.build import BuildSettings
 from nerdit.daemon.schemas._base import StrictRequestModel
 
 # --- requests ---------------------------------------------------------------
@@ -41,6 +42,7 @@ class WorkspaceDeployRequest(StrictRequestModel):
     port: int | None = Field(default=None, description="Container port to publish")
     gpus: int | None = Field(default=None, description="GPUs the service needs (0 = none)")
     start: str | None = Field(default=None, description="Start command override")
+    build_settings: BuildSettings | None = None
     health: str | None = Field(default=None, description="HTTP health-check path")
     env: dict[str, str | None] | None = Field(
         default=None, description="Environment variables (null value deletes on redeploy)"

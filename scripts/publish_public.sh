@@ -90,12 +90,6 @@ ALLOW_FILES=(
 # When in doubt a script stays out and is named in the manifest's tail.
 ALLOW_SCRIPTS=(
     "scripts/check-deps.sh"
-    "scripts/demo_p5.sh"
-    "scripts/demo_p6.sh"
-    "scripts/demo_p11.sh"
-    "scripts/demo_p13.sh"
-    "scripts/demo_p14c.sh"
-    "scripts/demo_p23.sh"
     "scripts/import_cycle_scan.py" # tests/test_import_cycle_scan.py drives it
     "scripts/license_tool.py"      # tests/test_license_tool.py drives it
     "scripts/publish_public.sh"    # this script — the allowlist is public too

@@ -1376,6 +1376,7 @@ def test_live_daemon_guard_leaves_the_unit_file_in_place(fake_home, tmp_path, mo
     """
     import fcntl
 
+    monkeypatch.setattr(uninstall_mod, "_DAEMON_DRAIN_S", 0)
     data_dir = tmp_path / "data"
     _populate_data_dir(data_dir)
     held = os.open(str(data_dir / ".restore.lock"), os.O_CREAT | os.O_RDWR, 0o600)
@@ -1654,3 +1655,21 @@ class TestAdoptedConfigCannotDirectRootDeletion:
         from nerdit.cli.commands.uninstall import _adopted_config_is_trustworthy
 
         assert _adopted_config_is_trustworthy(str(tmp_path)) is True
+
+
+def test_service_stop_drain_is_bounded(tmp_path, monkeypatch):
+    unit = _unit(tmp_path)
+    alive = uninstall_mod.DaemonLiveness(True, None, "data_dir_lock")
+    monkeypatch.setattr(uninstall_mod, "_run_unit_command", lambda *a, **kw: (True, None))
+    monkeypatch.setattr(uninstall_mod, "probe_daemon", lambda **kw: alive)
+    times = iter([0, 0, uninstall_mod._DAEMON_DRAIN_S])
+    monkeypatch.setattr(uninstall_mod.time, "monotonic", lambda: next(times))
+    sleeps = []
+    monkeypatch.setattr(uninstall_mod.time, "sleep", sleeps.append)
+
+    ok, detail = uninstall_mod._stop_unit(unit, data_dir=tmp_path, pid_file=tmp_path / "absent.pid")
+
+    assert not ok
+    assert "did not stop within" in detail
+    assert sleeps == [0.2]
+    assert unit.unit_path.exists()

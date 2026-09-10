@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import tomllib
 import zipfile
 from pathlib import Path
 
@@ -11,6 +12,39 @@ from nerdit.config.defaults import (
     UPLOAD_WARNING_BYTES,
     matches_exclude_pattern,
 )
+
+
+def repository_build_settings(directory: Path, requested: dict | None) -> dict:
+    """Inspect only build configuration that belongs to the uploaded context."""
+    from nerdit.config.build import BuildSettings
+
+    root = directory.resolve()
+
+    def read_settings(selected: Path) -> dict:
+        config = selected / "nerdit.toml"
+        if not config.resolve().is_relative_to(root):
+            raise ValueError("Build configuration must be inside the project.")
+        if not config.is_file():
+            return {}
+        with config.open("rb") as stream:
+            project = tomllib.load(stream)
+        deploy = project.get("deploy", {})
+        if not isinstance(deploy, dict):
+            raise ValueError("Deployment configuration must be a table.")
+        return BuildSettings.model_validate(deploy.get("build_settings") or {}).model_dump(
+            exclude_unset=True
+        )
+
+    repository = read_settings(root)
+    subdir = (requested or {}).get("subdir") or repository.get("subdir")
+    if subdir:
+        BuildSettings(subdir=subdir)
+        selected = (root / subdir).resolve()
+        if not selected.is_relative_to(root) or not selected.is_dir():
+            raise ValueError("Build root must be an existing directory inside the project.")
+        if selected != root:
+            repository.update(read_settings(selected))
+    return repository
 
 
 def should_exclude(rel_path: str) -> bool:

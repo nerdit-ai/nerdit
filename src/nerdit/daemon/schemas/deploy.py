@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from nerdit.config.build import BuildSettings
 from nerdit.daemon.schemas._base import StrictRequestModel
 
 # --- Deploy from a git repository (P11.5 / Part A) ---
@@ -38,6 +39,7 @@ class GitDeployRequest(StrictRequestModel):
     env: dict[str, str | None] | None = Field(
         default=None, description="Environment variables (null value deletes on redeploy)"
     )
+    build_settings: BuildSettings | None = None
     vendor: str | None = Field(default=None, description="Required GPU vendor")
     token_ref: str | None = Field(
         default=None,
@@ -98,4 +100,5 @@ class TemplateDeployRequest(StrictRequestModel):
     gpus: int | None = None
     start: str | None = None
     health: str | None = None
+    build_settings: BuildSettings | None = None
     vendor: str | None = None

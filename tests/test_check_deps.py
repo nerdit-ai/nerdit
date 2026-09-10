@@ -559,7 +559,7 @@ class TestCheckPortRealSockets:
 
         listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
         listener.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-        listener.bind(("0.0.0.0", 0))
+        listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         port = listener.getsockname()[1]
         monkeypatch.setattr("nerdit.cli.checks._nerditd_answers", lambda _p: False)

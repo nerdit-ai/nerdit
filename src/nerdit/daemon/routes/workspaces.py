@@ -393,6 +393,11 @@ async def deploy_workspace(
         port=opts.port,
         gpus=opts.gpus,
         start=opts.start,
+        build_settings=(
+            opts.build_settings.model_dump(exclude_unset=True)
+            if opts.build_settings is not None
+            else None
+        ),
         health=opts.health,
         env=opts.env,
         vendor=opts.vendor,

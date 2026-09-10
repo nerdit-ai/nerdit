@@ -11,19 +11,15 @@ exclusive device/key-stdin modes perform writes. Flag modes treat an existing
 link, including a race-safe 409, as success. After polling stops, later approval
 cannot complete this flow; timeout and interruption copy must say so.
 
-Restart the matching local service unit to apply changed link config. Remote
-daemons are never restarted locally; system units use noninteractive sudo when
-needed. With no usable unit, print instructions. Unlink drops the tunnel
-immediately. Status distinguishes stored config from live state.
+Restart the local target through its authenticated API to apply changed link
+config, waiting for a fresh boot. Remote targets retain manual restart guidance.
+Unlink drops the tunnel immediately. Status distinguishes stored config from live state.
 Escape all server-derived Rich text.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
-import shutil
-import subprocess
 import sys
 import time
 from datetime import UTC, datetime
@@ -36,13 +32,9 @@ from rich.live import Live
 from rich.markup import escape
 from rich.text import Text
 
+from nerdit.cli.commands.daemon import _restart_async as _restart_daemon
 from nerdit.cli.display import console, render_client_error
 from nerdit.cli.display import plain as _plain
-from nerdit.utils.install_layout import (
-    ServiceUnit,
-    detect_service_unit,
-    managed_daemon_port,
-)
 
 #: (P30 D-P30-10) Production endpoints, applied on the CLAIM path only and only
 #: when the corresponding flag is unset — an explicit ``--api-url`` /
@@ -149,12 +141,7 @@ _DEVICE_PENDING_APPROVAL_WARNING = (
 #: widening so a rate-limited poller still gives a verdict inside --timeout.
 _DEVICE_MAX_INTERVAL_S = 30.0
 
-#: How long the post-claim service restart may take before we fall back to
-#: printing the manual command. The claim itself already succeeded either way.
-_RESTART_TIMEOUT_S = 30
-
-#: Hosts that mean "the daemon on this machine". Only then may a local service
-#: unit be restarted — see `_restart_for_tunnel`.
+#: Hosts for which linking also restarts the configured daemon.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
@@ -468,10 +455,10 @@ async def _link_async(
         render_client_error(exc)
         raise typer.Exit(1) from exc
 
-    _render_claim_result(result)
+    await _render_claim_result(result)
 
 
-def _render_claim_result(result: dict) -> None:
+async def _render_claim_result(result: dict) -> None:
     """Render a successful code or pre-auth claim, then start the tunnel."""
     console.print(
         f"[green]Linked as [bold]{_plain(result.get('slug'))}[/bold] "
@@ -497,7 +484,7 @@ def _render_claim_result(result: dict) -> None:
         # Only worth bouncing the service when the restart can actually bring
         # the tunnel up. With [link].enabled still false it would stop and
         # start the daemon for nothing, then print "now flip it and restart".
-        _restart_for_tunnel()
+        await _restart_for_tunnel()
     else:
         # ``[link]`` is a real Rich markup tag, so the section name is escaped
         # rather than written raw (the P6 MarkupError lesson, from our own text
@@ -638,7 +625,7 @@ async def _key_stdin_async(
         render_client_error(exc)
         raise typer.Exit(1) from exc
 
-    _render_claim_result(result)
+    await _render_claim_result(result)
 
 
 async def _device_async(
@@ -682,7 +669,7 @@ async def _device_async(
     _render_device_prompt(start)
     result = await _poll_for_approval(client, start, timeout)
     if result is not None:
-        _render_device_linked(result)
+        await _render_device_linked(result)
 
 
 def _machine_line(start: dict) -> str:
@@ -723,7 +710,7 @@ def _restart_key_label(key: object) -> str:
     return escape(f"[{section}].{rest}" if dot else text)
 
 
-def _render_device_linked(result: dict) -> None:
+async def _render_device_linked(result: dict) -> None:
     """Render the approved link and restart only when link.enabled is true."""
     console.print()
     console.print(
@@ -745,7 +732,7 @@ def _render_device_linked(result: dict) -> None:
     if isinstance(keys, list) and keys:
         console.print("  restart required: " + ", ".join(_restart_key_label(k) for k in keys))
     if result.get("enabled"):
-        _restart_for_tunnel()
+        await _restart_for_tunnel()
     else:
         console.print(
             r"[yellow]\[link].enabled is still false — flip it and restart to bring "
@@ -953,7 +940,7 @@ async def _refresh_async(client: NerditClient, api_url: str) -> None:
     console.print(f"Hosted domain: {_plain(domain)}")
     if result.get("changed"):
         console.print("[green]Hosted domain updated.[/green]")
-        _restart_for_tunnel()
+        await _restart_for_tunnel()
     else:
         console.print("[dim]Already current — nothing to restart.[/dim]")
 
@@ -975,115 +962,36 @@ async def _configured_relay_url(client: NerditClient) -> str | None:
 
 
 def _targets_local_daemon() -> bool:
-    """Check the configured host before probing local service units.
-
-    A loopback host is necessary but insufficient; `_unit_manages_target` checks
-    the port so a second local daemon is not restarted accidentally.
-    """
+    """Keep automatic restart limited to a local target."""
     try:
         from nerdit.config.settings import get_client_config
 
-        host, port, _token = get_client_config()
+        host, _port, _token = get_client_config()
     except Exception:  # noqa: BLE001 — advisory; a broken config is not a reason to guess
         return False
     return str(host).strip().strip("[]").lower() in _LOOPBACK_HOSTS
 
 
-def _unit_manages_target(unit: ServiceUnit) -> bool:
-    """Check whether the unit serves the CLI's target port.
-
-    Decline known mismatches. An unknown unit port permits restart to preserve
-    auto-restart when unit configuration is unreadable.
-    """
-
-    managed_port = managed_daemon_port(unit)
-    if managed_port is None:
-        return True
-    try:
-        from nerdit.config.settings import get_client_config
-
-        _host, port, _token = get_client_config()
-    except Exception:  # noqa: BLE001 — advisory, as above
-        return True
-    return int(managed_port) == int(port)
-
-
-def _restart_command(unit: ServiceUnit) -> tuple[list[str] | None, str]:
-    """Return restart argv and a printable fallback command.
-
-    Non-root callers use `sudo -n` for system units when available; printable
-    fallbacks include sudo to avoid silent privilege failures or polkit prompts.
-    """
-    argv = list(unit.restart_argv)
-    if unit.kind != "systemd-system" or os.geteuid() == 0:
-        return argv, " ".join(argv)
-    printable = "sudo " + " ".join(argv)
-    sudo = shutil.which("sudo")
-    if sudo is None:
-        return None, printable
-    return [sudo, "-n", *argv], printable
-
-
-def _restart_for_tunnel() -> None:
-    """Restart the service unit noninteractively to apply committed link settings.
-
-    On failure, print the exact manual command and retain success: the claim
-    already committed. Never invoke the prompting daemon-restart CLI here.
-    """
+async def _restart_for_tunnel() -> None:
+    """Apply a saved link through the same noninteractive restart used by the CLI."""
     if not _targets_local_daemon():
         console.print(
-            "[yellow]This CLI is configured for a remote daemon, so no local service was "
-            "touched. Restart the daemon on that host to bring the tunnel up.[/yellow]"
+            "[yellow]This CLI is configured for a remote daemon. "
+            "Run nerdit daemon restart --yes --wait to bring its tunnel up.[/yellow]"
         )
         return
 
-    unit = detect_service_unit()
-    if unit is None:
+    code = await _restart_daemon(drain_timeout_s=60, yes=True, wait=True, wait_timeout=60)
+    if code:
         console.print(
-            "[dim]The tunnel starts on the next daemon restart — run: nerdit daemon restart[/dim]"
+            "[yellow]Link saved, but tunnel activation is pending. "
+            "Run: nerdit daemon restart --yes --wait[/yellow]"
         )
-        return
-
-    if not _unit_manages_target(unit):
-        console.print(
-            "[yellow]That service unit manages a different daemon on this machine, so no "
-            "service was touched. Restart the daemon you just linked to bring the tunnel "
-            "up.[/yellow]"
-        )
-        return
-
-    restart_argv, command = _restart_command(unit)
-    if restart_argv is None:
-        console.print(
-            f"[yellow]This daemon runs under a system service unit, which needs root. "
-            f"Restart it manually: {_plain(command)}[/yellow]"
-        )
-        return
-
-    try:
-        proc = subprocess.run(  # noqa: S603 — fixed argv from install_layout, no shell
-            restart_argv,
-            capture_output=True,
-            text=True,
-            timeout=_RESTART_TIMEOUT_S,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        detail: str = f"{type(exc).__name__}: {exc}"
     else:
-        if proc.returncode == 0:
-            console.print("[green]Daemon service restarted — the tunnel is starting.[/green]")
-            return
-        first_line = next(
-            (line.strip() for line in (proc.stderr or "").splitlines() if line.strip()),
-            f"exit {proc.returncode}",
+        console.print(
+            "[green]Daemon restarted — the tunnel is starting. "
+            "Check its connection with: nerdit link[/green]"
         )
-        detail = first_line
-
-    console.print(
-        f"[yellow]Could not restart the service automatically ({_plain(detail)}). "
-        f"Restart it manually: {_plain(command)}[/yellow]"
-    )
 
 
 async def _render_status(client: NerditClient) -> None:

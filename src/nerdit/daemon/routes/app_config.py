@@ -161,6 +161,8 @@ _BUILD_TIER_KEYS = frozenset(
         "build_context_root",
         "dockerfile_name",
         "buildpack",
+        "build_overrides",
+        "build_plan",
         "last_deploy",
     }
 )

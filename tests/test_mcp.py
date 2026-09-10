@@ -2016,7 +2016,10 @@ async def test_deploy_tool_descriptions_list_every_deploy_config_field():
         # Bound the scan to the key-list sentence itself, so surrounding prose
         # (``summary``/``hints``/``path``) cannot be mistaken for a schema key.
         assert "``[deploy]`` keys" in desc, name
-        section = desc.split("in the response ``hints``:")[1].split("There is")[0]
+        section = (
+            desc.split("in the response ``hints``:")[1].split("``build_settings``.")[0]
+            + "``build_settings``"
+        )
         listed = set(re.findall(r"``([a-z_]+)``", section))
         assert expected <= listed, f"{name} omits {sorted(expected - listed)}"
         # No key is claimed that DeployConfig does not declare (`build` is the
@@ -2026,12 +2029,11 @@ async def test_deploy_tool_descriptions_list_every_deploy_config_field():
 
 
 @pytest.mark.asyncio
-async def test_deploy_tool_descriptions_say_there_is_no_build_key():
-    """The field-test bug in one sentence: an agent guessed ``[deploy].build``
-    and it was silently dropped. Until a first-class key is countersigned, the
-    honest answer — 'there is no build key, use your Dockerfile' — ships here."""
+async def test_deploy_tool_descriptions_document_nested_build_settings():
+    """Build overrides live in the declared nested settings table."""
     for name, desc in (await _deploy_tool_descriptions()).items():
-        assert "no** ``build`` key" in desc, name
+        assert "``[deploy.build_settings]``" in desc, name
+        assert "``build: false``" in desc, name
         assert "Dockerfile" in desc, name
         assert "``hints``" in desc and "``summary``" in desc, name
 

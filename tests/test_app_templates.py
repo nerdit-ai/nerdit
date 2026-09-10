@@ -754,3 +754,25 @@ def test_template_deploy_response_carries_summary_and_hints(tmp_path, monkeypatc
     assert set(body["summary"]) == {"app", "status", "version", "public_url"}
     assert body["summary"]["app"] == body["name"] == "demo"
     assert isinstance(body["hints"], list)
+
+
+def test_template_build_preview_has_no_row_or_secret_writes(tmp_path, monkeypatch):
+    _patch_catalog(monkeypatch, _synthetic_template())
+    _patch_clone(monkeypatch, _node_context(tmp_path))
+    queries = _queries()
+    app = _make_app(queries, tmp_path)
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/app-templates/synth/deploy?dry_run=true",
+        headers=_auth(SUB_RAW),
+        json={
+            "name": "demo",
+            "env": {"API_URL": "u"},
+            "secrets": {"SERVICE_KEY": "template-preview-sentinel"},
+            "build_settings": {"build": False, "start": None},
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert "template-preview-sentinel" not in response.text
+    queries.reserve_service_for_token.assert_not_awaited()
+    queries.update_service_config.assert_not_awaited()
+    app.state.secret_manager.set.assert_not_called()

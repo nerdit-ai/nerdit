@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
+import tomllib
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -495,6 +498,76 @@ class NerditClient:
         """
         return await self._request_json("GET", f"{self._base_url}/api/capabilities", timeout=10.0)
 
+    async def require_build_settings_support(
+        self,
+        settings: dict | None = None,
+        *,
+        repository: dict | None = None,
+        directory: Path | None = None,
+    ) -> None:
+        """Reject old nodes before they can silently ignore build overrides."""
+        from nerdit.config.build import BuildSettings
+
+        try:
+            BuildSettings.model_validate(settings or {})
+            if directory is not None:
+                from nerdit.cli.upload import repository_build_settings
+
+                repository = repository_build_settings(directory, settings)
+            BuildSettings.model_validate(repository or {})
+        except (ValueError, OSError) as exc:
+            message = (
+                "Build settings must be valid and the build root/configuration inside the project."
+            )
+            if isinstance(exc, tomllib.TOMLDecodeError):
+                # Parser messages can quote user values; retain only numeric coordinates.
+                location = re.search(r"\(at line (\d+), column (\d+)\)$", str(exc))
+                message = "Invalid nerdit.toml syntax"
+                message += (
+                    f" at line {location[1]}, column {location[2]}."
+                    if location
+                    else ". Check the end of the file."
+                )
+            response = httpx.Response(
+                422,
+                request=httpx.Request("GET", f"{self._base_url}/api/capabilities"),
+                json={"code": "deploy.invalid_build_settings", "message": message},
+            )
+            response.raise_for_status()
+        if directory is not None and settings is None and not repository:
+            return
+        settings = {**(repository or {}), **(settings or {})}
+        # Null removes a saved override; a repository preset remains effective.
+        if settings.get("preset") is None and repository and "preset" in repository:
+            settings["preset"] = repository["preset"]
+        capabilities = await self.get_capabilities()
+        deploy = capabilities.get("deploy")
+        support = deploy.get("build_settings") if isinstance(deploy, dict) else None
+        if (
+            isinstance(support, dict)
+            and type(support.get("version")) is int
+            and support["version"] == 1
+            and (
+                "preset" not in settings
+                or (
+                    isinstance(support.get("fields"), list)
+                    and "preset" in support["fields"]
+                    and isinstance(support.get("presets"), list)
+                    and (settings["preset"] is None or settings["preset"] in support["presets"])
+                )
+            )
+        ):
+            return
+        response = httpx.Response(
+            409,
+            request=httpx.Request("GET", f"{self._base_url}/api/capabilities"),
+            json={
+                "code": "deploy.build_settings_unsupported",
+                "message": "Update the daemon on this node to use build settings, then retry.",
+            },
+        )
+        response.raise_for_status()
+
     async def restart_daemon(
         self, *, drain_timeout_s: int | None = None, idempotency_key: str | None = None
     ) -> dict:
@@ -981,11 +1054,13 @@ class NerditClient:
         port: int | None = None,
         gpus: int | None = None,
         start: str | None = None,
+        build_settings: dict | None = None,
         health: str | None = None,
         env: dict[str, str | None] | None = None,
         vendor: str | None = None,
         idempotency_key: str | None = None,
         dry_run: bool = False,
+        _build_settings_checked: bool = False,
     ) -> dict:
         """Upload an app ZIP and deploy it; an existing name triggers redeployment.
 
@@ -996,6 +1071,9 @@ class NerditClient:
         """
         import json
         from uuid import uuid4
+
+        if build_settings is not None and not _build_settings_checked:
+            await self.require_build_settings_support(build_settings)
 
         if not dry_run and not idempotency_key:
             idempotency_key = uuid4().hex
@@ -1014,6 +1092,9 @@ class NerditClient:
             data["env"] = json.dumps(env)
         if vendor:
             data["vendor"] = vendor
+
+        if build_settings is not None:
+            data["build_settings"] = json.dumps(build_settings)
 
         headers: dict[str, str] = {}
         if idempotency_key:
@@ -1066,7 +1147,7 @@ class NerditClient:
     # Git deployment uses API-only JSON routes and a longer timeout for cloning.
     # Fresh idempotency keys deduplicate retries; template reads use the embedded catalog.
 
-    async def deploy_git(
+    async def deploy_git(  # noqa: PLR0912 — omit unset fields for old-daemon compatibility
         self,
         *,
         repo_url: str,
@@ -1076,6 +1157,7 @@ class NerditClient:
         port: int | None = None,
         gpus: int | None = None,
         start: str | None = None,
+        build_settings: dict | None = None,
         health: str | None = None,
         env: dict[str, str | None] | None = None,
         vendor: str | None = None,
@@ -1092,6 +1174,9 @@ class NerditClient:
         """
         from uuid import uuid4
 
+        if build_settings is not None:
+            await self.require_build_settings_support(build_settings)
+
         if not dry_run and not idempotency_key:
             idempotency_key = uuid4().hex
 
@@ -1100,6 +1185,8 @@ class NerditClient:
             payload["ref"] = ref
         if subdir is not None:
             payload["subdir"] = subdir
+        if build_settings is not None:
+            payload["build_settings"] = build_settings
         if port is not None:
             payload["port"] = port
         if gpus is not None:
@@ -1148,9 +1235,11 @@ class NerditClient:
         port: int | None = None,
         gpus: int | None = None,
         start: str | None = None,
+        build_settings: dict | None = None,
         health: str | None = None,
         vendor: str | None = None,
-        idempotency_key: str,
+        idempotency_key: str | None = None,
+        dry_run: bool = False,
     ) -> dict:
         """Deploy an app template via `POST /api/app-templates/{template_id}/deploy`.
 
@@ -1159,11 +1248,20 @@ class NerditClient:
         template defaults / daemon defaults apply. The timeout matches
         `deploy_git` — the deploy clones the catalog repo server-side.
         """
+        from uuid import uuid4
+
+        if build_settings is not None:
+            await self.require_build_settings_support(build_settings)
+
+        if not dry_run and not idempotency_key:
+            idempotency_key = uuid4().hex
         payload: dict = {"name": name}
         if env:
             payload["env"] = env
         if secrets:
             payload["secrets"] = secrets
+        if build_settings is not None:
+            payload["build_settings"] = build_settings
         if port is not None:
             payload["port"] = port
         if gpus is not None:
@@ -1179,7 +1277,8 @@ class NerditClient:
             "POST",
             f"{self._base_url}/api/app-templates/{template_id}/deploy",
             json=payload,
-            headers={"Idempotency-Key": idempotency_key},
+            headers={"Idempotency-Key": idempotency_key} if idempotency_key else {},
+            params={"dry_run": "true"} if dry_run else None,
             timeout=180.0,
         )
 
@@ -1244,6 +1343,7 @@ class NerditClient:
         port: int | None = None,
         gpus: int | None = None,
         start: str | None = None,
+        build_settings: dict | None = None,
         health: str | None = None,
         env: dict[str, str | None] | None = None,
         vendor: str | None = None,
@@ -1257,10 +1357,15 @@ class NerditClient:
         """
         from uuid import uuid4
 
+        if build_settings is not None:
+            await self.require_build_settings_support(build_settings)
+
         if not dry_run and not idempotency_key:
             idempotency_key = uuid4().hex
 
         payload: dict = {}
+        if build_settings is not None:
+            payload["build_settings"] = build_settings
         if port is not None:
             payload["port"] = port
         if gpus is not None:

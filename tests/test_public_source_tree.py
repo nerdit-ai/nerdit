@@ -56,6 +56,7 @@ def test_public_source_keeps_tests_and_excludes_website_docs(tmp_path):
     for path in (source / "scripts").iterdir():
         if path.is_file():
             shutil.copy2(path, repo / "scripts" / path.name)
+    (repo / "scripts/demo_legacy.sh").write_text("#!/bin/sh\necho historical demo\n")
     git("init", "-q")
     git("config", "user.name", "Test")
     git("config", "user.email", "test@example.invalid")
@@ -74,6 +75,7 @@ def test_public_source_keeps_tests_and_excludes_website_docs(tmp_path):
     assert not (out / "docs").exists()
     assert not (out / "mkdocs.yml").exists()
     assert (out / "tests/test_example.py").is_file()
+    assert not list((out / "scripts").glob("demo*"))
     for name in ("README.md", "CONTRIBUTING.md", "SECURITY.md", "LICENSE", "NOTICE"):
         assert (out / name).is_file()
     assert "https://nerdit.ai/" in (out / "README.md").read_text()

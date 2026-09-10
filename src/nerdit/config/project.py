@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from nerdit.config.build import BuildSettings
+
 PROJECT_CONFIG_NAME = "nerdit.toml"
 
 # DNS-label rule for [deploy].name — same regex as ServiceCreateRequest.name
@@ -224,6 +226,7 @@ class DeployConfig(BaseModel):
     port: int | None = Field(default=None, ge=1, le=65535)
     gpus: int = Field(default=0, ge=0)
     start: str | None = None
+    build_settings: BuildSettings | None = None
     health: str | None = None
     # Health-probe kind: "tcp" supervises a non-HTTP server by a bare
     # connect to the published port; "http"/absent keeps the HTTP-GET probe. v1

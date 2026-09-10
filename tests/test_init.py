@@ -18,6 +18,12 @@ from nerdit.config.settings import get_client_config, load_settings
 from nerdit.daemon.lifecycle import DaemonLifecycle
 
 
+@pytest.fixture(autouse=True)
+def _no_real_service_start(monkeypatch):
+    monkeypatch.setattr("nerdit.daemon.lifecycle.detect_service_unit", lambda: None)
+    monkeypatch.setattr("nerdit.daemon.lifecycle.detect_install_layout", lambda: None)
+
+
 class TestDaemonLifecycle:
     """Test DaemonLifecycle with a real subprocess daemon."""
 
@@ -596,3 +602,66 @@ class TestInstallerAuthToken:
         cfg.chmod(0o644)
         assert _write_installer_auth_config(tmp_path) == "present"
         assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("start_error", [False, True])
+async def test_init_uses_local_settings_and_preserves_service_errors(
+    monkeypatch, tmp_path, start_error
+):
+    import typer
+
+    from nerdit.cli.commands import init as init_mod
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    data_dir = tmp_path / ".nerdit"
+    data_dir.mkdir()
+    pid_file = tmp_path / "custom.pid"
+    (data_dir / "config.toml").write_text(
+        f'[daemon]\nhost = "127.0.0.1"\nport = 9444\npid_file = "{pid_file}"\n'
+        '[client]\nremote_host = "remote.invalid"\nremote_port = 9999\n'
+    )
+    monkeypatch.setattr(init_mod, "_check_docker", lambda: False)
+    monkeypatch.setattr(init_mod, "_offer_start_docker", lambda: False)
+    monkeypatch.setattr("nerdit.utils.install_layout.detect_install_layout", lambda: object())
+    seen = {}
+
+    class Life:
+        def __init__(self, **kwargs):
+            seen["lifecycle"] = kwargs
+
+        def is_running(self):
+            return False
+
+        def start(self):
+            if start_error:
+                raise RuntimeError("launchctl bootstrap failed: disabled")
+            return True
+
+        def wait_for_ready(self, **kwargs):
+            return True
+
+    class Client:
+        def __init__(self, **kwargs):
+            seen["client"] = kwargs
+
+        async def list_gpus(self):
+            return []
+
+    console = _RecordingConsole()
+    monkeypatch.setattr(init_mod, "console", console)
+    monkeypatch.setattr("nerdit.daemon.lifecycle.DaemonLifecycle", Life)
+    monkeypatch.setattr("nerdit.cli.client.NerditClient", Client)
+    monkeypatch.setattr(
+        init_mod, "_report_daemon_start_failure", lambda *a: pytest.fail("masked error")
+    )
+    if start_error:
+        with pytest.raises(typer.Exit) as exc:
+            await init_mod._init_async()
+        assert exc.value.exit_code == 1
+        assert "bootstrap failed: disabled" in "\n".join(console.lines)
+        assert "client" not in seen
+    else:
+        await init_mod._init_async()
+        assert seen["client"] == {"host": "127.0.0.1", "port": 9444, "token": None}
+        assert "http://127.0.0.1:9444/" in "\n".join(console.lines)
+    assert seen["lifecycle"] == {"host": "127.0.0.1", "port": 9444, "pid_file": str(pid_file)}

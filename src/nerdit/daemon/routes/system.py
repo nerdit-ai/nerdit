@@ -57,6 +57,7 @@ from nerdit.core.license import (
 from nerdit.core.link.hosted import hosted_url
 from nerdit.core.link.identity import resolve_key_file
 from nerdit.core.link.manager import GITHUB_TOKEN_WARN_LEAD_S
+from nerdit.core.node_runtime import SUPPORTED_NODE_VERSIONS
 from nerdit.core.proxy import ProxyState, generate_route, public_url_for
 from nerdit.core.runtime.stub import StubRuntime
 from nerdit.core.secrets import SecretDecryptError, SecretRotationInProgress
@@ -446,6 +447,22 @@ async def get_capabilities(request: Request) -> dict[str, Any]:
             "git_allowed_hosts": list(settings.git.allowed_hosts),
             "max_upload_bytes": settings.daemon.max_upload_bytes,
             "dry_run": True,
+            "build_settings": {
+                "version": 1,
+                "node_versions": list(SUPPORTED_NODE_VERSIONS),
+                "presets": ["node", "nextjs", "python", "dockerfile"],
+                "fields": [
+                    "preset",
+                    "install",
+                    "build",
+                    "start",
+                    "node_version",
+                    "package_manager",
+                    "subdir",
+                ],
+                "public_env": False,
+                "secret_mounts": False,
+            },
             "max_concurrent_builds": settings.services.max_concurrent_builds,
         },
         "sandbox": sandbox_block,

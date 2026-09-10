@@ -560,6 +560,9 @@ async def test_system_shim_redeploys_without_a_request(tmp_path, fake_clone):
     the pipeline reads and runs as an admin ``system`` principal, so a row owned
     by someone else still redeploys unattended — in-process, no HTTP self-call."""
     job = _git_row(owner="tok-other")
+    config = json.loads(job.config)
+    config["build_overrides"] = {"build": False, "start": "python custom.py"}
+    job.config = json.dumps(config)
     q = _queries(job)
     app = _make_app(q, tmp_path)
 
@@ -577,6 +580,9 @@ async def test_system_shim_redeploys_without_a_request(tmp_path, fake_clone):
     assert fake_clone.calls, "the recorded source is re-cloned"
     cfg = json.loads(q.update_service_config.call_args.args[1])
     assert cfg["source"]["commit_sha"] == "1" * 40
+    assert cfg["build_overrides"] == config["build_overrides"]
+    assert result["build"]["build"] is False
+    assert result["build"]["start"] == "python custom.py"
     # No middleware runs on this path: the poller's own deploy.auto_redeploy row
     # is the audit record, not a route-middleware row.
     q.insert_audit_log.assert_not_awaited()

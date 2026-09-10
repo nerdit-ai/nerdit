@@ -6,7 +6,7 @@ job gets id-token: write and only downloads artifacts/runs the PyPA action;
 checkout, npm and pip stay in the unprivileged build job. Never add stored tokens.
 
 Require PUBLISH_SOURCE and an explicit tagged checkout. Build the dashboard before
-Python artifacts, inspect both for the bundle, overlay the public README before
+Python artifacts, inspect both for the bundle, prepare the public README before
 building, and reject private-repository references in wheel metadata.
 These static guards do not replace publishing a real tag.
 """
@@ -219,6 +219,7 @@ def test_checks_out_the_tag_not_the_default_branch() -> None:
     checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")]
     assert checkouts, "publish.yml never checks the repository out"
     for step in checkouts:
+        assert step["with"]["repository"] == "nerdit-ai/nerdit"
         ref = str(step.get("with", {}).get("ref", ""))
         assert ref == expected, (
             "the checkout must use the validated ref the resolve step emitted, "
@@ -274,7 +275,7 @@ def test_version_coherence_is_enforced() -> None:
 def test_build_order_dashboard_then_hatch_then_upload() -> None:
     code = _code()
     npm = code.index("npm run build")
-    readme = code.index("cp packaging/public/README.md README.md")
+    readme = code.index("Prepare the public README for PyPI")
     hatch = code.index("hatch build")
     upload = code.index("pypa/gh-action-pypi-publish")
     assert npm < hatch, (
@@ -282,7 +283,7 @@ def test_build_order_dashboard_then_hatch_then_upload() -> None:
         "`hatch build` or the wheel ships without the SPA"
     )
     assert readme < hatch, (
-        "the public README must be overlaid BEFORE `hatch build` — the long "
+        "the public README links must be prepared BEFORE `hatch build` — the long "
         "description is baked into the wheel's METADATA at build time"
     )
     assert hatch < upload, "the distribution must be built before it is uploaded"
@@ -306,14 +307,20 @@ def test_asserts_the_dashboard_bundle_in_both_artifacts() -> None:
     assert "twine check dist/*" in code
 
 
+def test_build_requires_a_published_public_release() -> None:
+    step = _resolve_step()
+    assert step["env"]["REPO"] == "nerdit-ai/nerdit"
+    run = step["run"]
+    assert "repos/$REPO/releases/tags/$RAW_TAG" in run
+    assert ".draft == false" in run
+    assert '"$PUBLISHED" != "true"' in run
+    assert "repos/$REPO/git/ref/tags/$RAW_TAG" in run
+
+
 def test_the_long_description_is_the_public_readme() -> None:
     code = _code()
-    assert "cp packaging/public/README.md README.md" in code, (
-        '`pyproject` sets readme = "README.md" and this tree\'s README is '
-        "written for maintainers; the public mirror's README is what a PyPI "
-        "visitor must see, so it is overlaid before the build (the same file "
-        "scripts/publish_public.sh overlays at the public seed's root)"
-    )
+    assert "cp packaging/public/README.md README.md" not in code
+    assert "Prepare the public README for PyPI" in code
 
 
 def test_the_long_description_has_no_relative_links() -> None:
@@ -321,7 +328,7 @@ def test_the_long_description_has_no_relative_links() -> None:
     links (docs/guide/install.md, LICENSE, CONTRIBUTING.md) 404 there. The
     overlay step rewrites them to the public repo and fails if any survive."""
     code = _code()
-    assert "https://github.com/nerdit-ai/nerdit/blob/main/" in code, (
+    assert "https://github.com/nerdit-ai/nerdit/blob/{os.environ['TAG']}/" in code, (
         "relative README links must be rewritten to the public repository"
     )
     assert "relative links survived the rewrite" in code, (
@@ -455,13 +462,11 @@ def test_the_sdist_is_an_allowlist() -> None:
     }, "[tool.hatch.build.targets.sdist] only-include must pin the package plus its four root files"
 
 
-def test_the_workflow_overlays_license_and_notice() -> None:
-    """The private tree has no root LICENSE/NOTICE (D-OS-2 keeps them under
-    packaging/public/); the sdist allowlist names both, so they are laid down
-    before the build the way the README is."""
+def test_the_workflow_requires_public_license_and_notice() -> None:
     code = _code()
-    assert "cp packaging/public/LICENSE LICENSE" in code
-    assert "cp packaging/public/NOTICE NOTICE" in code
+    assert "for f in README.md LICENSE NOTICE" in code
+    assert 'test -f "$f"' in code
+    assert "cp packaging/public/" not in code
 
 
 def test_the_sdist_contents_are_checked_against_the_allowlist() -> None:

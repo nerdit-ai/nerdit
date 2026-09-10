@@ -19,10 +19,6 @@ Bindings (see `nerdit.toml`):
 - `[ai.cheap]` — `provider = "api"` with `api_key = "${secrets.OPENAI_KEY}"` →
   requires `nerdit secrets set ai-app OPENAI_KEY=sk-...`.
 
-Run the whole demo with the reproducible runbook:
-
-```bash
-scripts/demo_p5.sh   # from the repo root
-```
+For deployment and model setup, follow the [AI services guide](https://docs.nerdit.ai/engine/ai).
 
 The automated CI counterpart of this fixture is `tests/test_p5_northstar.py`.

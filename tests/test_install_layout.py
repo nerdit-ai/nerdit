@@ -28,6 +28,13 @@ import pytest
 
 from nerdit.utils import install_layout as il
 
+
+@pytest.fixture(autouse=True)
+def _no_real_service_start(monkeypatch):
+    monkeypatch.setattr("nerdit.daemon.lifecycle.detect_service_unit", lambda: None)
+    monkeypatch.setattr("nerdit.daemon.lifecycle.detect_install_layout", lambda: None)
+
+
 # --------------------------------------------------------------------------- #
 # D-P30-5 — caddy resolution
 # --------------------------------------------------------------------------- #
@@ -137,7 +144,7 @@ def test_detect_launchd_plist_on_darwin(monkeypatch, tmp_path):
         "gui/501/ai.nerdit.daemon",
     ]
     assert unit.stop_argv == ["launchctl", "bootout", "gui/501/ai.nerdit.daemon"]
-    # bootout unloads AND prevents the login respawn — it is the disable.
+    # Uninstall removes the plist after bootout to prevent registration next login.
     assert unit.disable_argv == unit.stop_argv
 
 
@@ -556,3 +563,102 @@ def test_managed_daemon_port_declines_on_a_boolean_port(tmp_path):
     )
 
     assert il.managed_daemon_port(unit) is None
+
+
+@pytest.mark.parametrize("loaded", [True, False])
+def test_start_launchd_registers_only_missing_jobs(monkeypatch, tmp_path, loaded):
+    import subprocess
+
+    unit = il._launchd_unit(tmp_path / "ai.nerdit.daemon.plist")
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append(argv)
+        if argv[1] == "print" and not loaded:
+            return subprocess.CompletedProcess(argv, 113, stderr="Could not find service")
+        return subprocess.CompletedProcess(argv, 0, stderr="")
+
+    monkeypatch.setattr(il.subprocess, "run", run)
+    il.start_service_unit(unit)
+    target = unit.stop_argv[-1]
+    expected = [["launchctl", "print", target]]
+    if not loaded:
+        expected.append(["launchctl", "bootstrap", target.rsplit("/", 1)[0], str(unit.unit_path)])
+    expected.append(["launchctl", "kickstart", target])
+    assert seen == expected
+
+
+@pytest.mark.parametrize("failed_command", ["print", "bootstrap", "kickstart"])
+def test_launchd_start_reports_failures_without_enabling(monkeypatch, tmp_path, failed_command):
+    import subprocess
+
+    unit = il._launchd_unit(tmp_path / "ai.nerdit.daemon.plist")
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append(argv[1])
+        if argv[1] == failed_command:
+            return subprocess.CompletedProcess(argv, 5, stderr="service is disabled")
+        if argv[1] == "print":
+            return subprocess.CompletedProcess(argv, 113, stderr="Could not find service")
+        return subprocess.CompletedProcess(argv, 0, stderr="")
+
+    monkeypatch.setattr(il.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="service is disabled"):
+        il.start_service_unit(unit)
+    assert seen[-1] == failed_command
+    assert "enable" not in seen
+
+
+@pytest.mark.parametrize(
+    "kind,euid,prefix",
+    [
+        ("systemd-user", 501, ["systemctl", "--user"]),
+        ("systemd-system", 0, ["systemctl"]),
+        ("systemd-system", 501, ["sudo", "-n", "systemctl"]),
+    ],
+)
+def test_start_systemd_is_noninteractive(monkeypatch, tmp_path, kind, euid, prefix):
+    import subprocess
+
+    unit = il._systemd_unit(kind, tmp_path / "nerdit.service")
+    seen = []
+    monkeypatch.setattr(il.os, "geteuid", lambda: euid)
+    monkeypatch.setattr(
+        il.subprocess,
+        "run",
+        lambda argv, **kw: seen.append(argv) or subprocess.CompletedProcess(argv, 0, stderr=""),
+    )
+    il.start_service_unit(unit)
+    assert seen == [[*prefix, "start", "nerdit.service"]]
+
+
+@pytest.mark.parametrize("port", [9444, None, 9321])
+def test_lifecycle_starts_only_a_matching_installed_unit(monkeypatch, tmp_path, port):
+    from nerdit.daemon import lifecycle as lm
+
+    unit = il._launchd_unit(tmp_path / "daemon.plist")
+    monkeypatch.setattr(lm, "detect_service_unit", lambda: unit)
+    monkeypatch.setattr(lm, "managed_daemon_port", lambda u: port)
+    monkeypatch.setattr(lm.subprocess, "Popen", lambda *a, **kw: pytest.fail("unmanaged spawn"))
+    started = []
+    monkeypatch.setattr(lm, "start_service_unit", started.append)
+    lifecycle = lm.DaemonLifecycle(port=9444, pid_file=str(tmp_path / "daemon.pid"))
+    if port == 9444:
+        assert lifecycle.start()
+        assert started == [unit]
+        assert not lifecycle._pid_file.exists()  # service manager/daemon owns the PID
+    else:
+        with pytest.raises(RuntimeError, match="does not match"):
+            lifecycle.start()
+        assert not started
+
+
+def test_lifecycle_refuses_an_install_missing_its_unit(monkeypatch, tmp_path):
+    from nerdit.daemon import lifecycle as lm
+
+    monkeypatch.setattr(lm, "detect_service_unit", lambda: None)
+    monkeypatch.setattr(lm, "detect_install_layout", lambda: object())
+    monkeypatch.setattr(lm.subprocess, "Popen", lambda *a, **kw: pytest.fail("unmanaged spawn"))
+    with pytest.raises(RuntimeError, match="service is missing"):
+        lm.DaemonLifecycle(pid_file=str(tmp_path / "daemon.pid")).start()

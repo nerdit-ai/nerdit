@@ -117,11 +117,38 @@ def store_deploy(
     port: Optional[int] = typer.Option(None, "--port", "-p", help="Container port override"),
     gpus: Optional[int] = typer.Option(None, "--gpus", "-g", help="GPUs the app needs"),
     start: Optional[str] = typer.Option(None, "--start", help="Start command override"),
+    build_settings: Optional[str] = typer.Option(
+        None,
+        "--build-settings",
+        help=(
+            "JSON build overrides, including preset (node/nextjs/python/dockerfile); "
+            "null resets, build:false skips compilation"
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Preview without building or writing secrets"
+    ),
     health: Optional[str] = typer.Option(None, "--health", help="HTTP health path override"),
     vendor: Optional[str] = typer.Option(None, "--vendor", help="Force a GPU vendor"),
 ) -> None:
     """Deploy an app template: clone the catalog repo server-side, build, run."""
-    asyncio.run(_deploy_async(template_id, name, env, secret, port, gpus, start, health, vendor))
+    from nerdit.cli.commands.deploy import parse_build_settings
+
+    asyncio.run(
+        _deploy_async(
+            template_id,
+            name,
+            env,
+            secret,
+            port,
+            gpus,
+            start,
+            health,
+            vendor,
+            build_settings=parse_build_settings(build_settings),
+            dry_run=dry_run,
+        )
+    )
 
 
 async def _deploy_async(
@@ -134,6 +161,9 @@ async def _deploy_async(
     start: str | None,
     health: str | None,
     vendor: str | None,
+    *,
+    build_settings: dict | None = None,
+    dry_run: bool = False,
 ) -> None:
     from nerdit.cli.client import get_configured_client
 
@@ -155,6 +185,8 @@ async def _deploy_async(
             port=port,
             gpus=gpus,
             start=start,
+            build_settings=build_settings,
+            dry_run=dry_run,
             health=health,
             vendor=vendor,
             idempotency_key=uuid4().hex,
@@ -162,4 +194,9 @@ async def _deploy_async(
     except Exception as exc:  # noqa: BLE001 — rendered for the user
         render_client_error(exc)
         raise typer.Exit(1) from exc
-    display_deploy_result(service)
+    if dry_run:
+        from nerdit.cli.commands.deploy import _render_dry_run
+
+        _render_dry_run(service)
+    else:
+        display_deploy_result(service)

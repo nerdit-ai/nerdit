@@ -92,9 +92,9 @@ async function handleChat(url, res) {
         reply: body.choices?.[0]?.message?.content ?? null,
       })
     );
-  } catch (err) {
+  } catch {
     res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ binding: bindingName, error: String(err) }));
+    res.end(JSON.stringify({ binding: bindingName, error: 'Upstream request failed' }));
   }
 }
 

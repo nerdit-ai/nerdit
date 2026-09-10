@@ -78,12 +78,41 @@ async def _maybe_wait(client, name: str, service: dict, wait: bool, wait_timeout
         raise typer.Exit(code)
 
 
+def parse_build_settings(value: str | None) -> dict | None:
+    """Parse the explicit override object without exposing its contents on failure."""
+    import json
+
+    if value is None:
+        return None
+    try:
+        settings = json.loads(value)
+    except (ValueError, TypeError) as exc:
+        raise typer.BadParameter("must be a JSON object", param_hint="--build-settings") from exc
+    if not isinstance(settings, dict):
+        raise typer.BadParameter("must be a JSON object", param_hint="--build-settings")
+    return settings
+
+
 def _render_dry_run(plan: dict) -> None:
     """Render a `--dry-run` plan diff (1.10 body) — names only, never values."""
     action = plan.get("action", "?")
     name = plan.get("name", "?")
     console.print(f"[bold]Deploy plan[/bold] ({action}) for [cyan]{name}[/cyan] — dry run")
     console.print(f"  buildpack: {plan.get('buildpack')}")
+    build = plan.get("build") or {}
+    for key in (
+        "preset",
+        "framework",
+        "node_version",
+        "package_manager",
+        "install",
+        "build",
+        "start",
+        "subdir",
+        "commit_sha",
+    ):
+        if key in build:
+            console.print(f"  {key}: {_plain(str(build[key]))}")
     eff = plan.get("effective") or {}
     parts = ", ".join(f"{k}={eff.get(k)}" for k in ("port", "gpus", "start", "health"))
     console.print(f"  effective: {parts}")
@@ -139,6 +168,14 @@ def deploy(
     ),
     gpus: Optional[int] = typer.Option(None, "--gpus", "-g", help="GPUs the app needs"),
     start: Optional[str] = typer.Option(None, "--start", help="Start command override"),
+    build_settings: Optional[str] = typer.Option(
+        None,
+        "--build-settings",
+        help=(
+            "JSON build overrides, including preset (node/nextjs/python/dockerfile); "
+            "null resets, build:false skips compilation"
+        ),
+    ),
     health: Optional[str] = typer.Option(
         None, "--health", help="HTTP path to probe for health (e.g. /healthz)"
     ),
@@ -205,6 +242,7 @@ def deploy(
             wait_timeout=wait_timeout,
             unset_env=unset_env,
             dry_run=dry_run,
+            build_settings=parse_build_settings(build_settings),
         )
     )
 
@@ -228,6 +266,7 @@ async def _deploy_async(
     wait_timeout: int = 60,
     unset_env: list[str] | None = None,
     dry_run: bool = False,
+    build_settings: dict | None = None,
 ) -> None:
     """Merge effective deploy parameters over nerdit.toml [deploy], zip and POST."""
     from nerdit.cli.client import get_configured_client
@@ -273,6 +312,7 @@ async def _deploy_async(
                 port=port,
                 gpus=gpus,
                 start=start,
+                build_settings=build_settings,
                 health=health,
                 env=env_values,
                 vendor=vendor,
@@ -319,7 +359,6 @@ async def _deploy_async(
 
     effective_port = port if port is not None else (deploy_cfg.port if deploy_cfg else None)
     effective_gpus = gpus if gpus is not None else (deploy_cfg.gpus if deploy_cfg else None)
-    effective_start = start or (deploy_cfg.start if deploy_cfg else None)
     effective_health = health or (deploy_cfg.health if deploy_cfg else None)
 
     try:
@@ -327,6 +366,16 @@ async def _deploy_async(
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
+
+    if build_settings is not None or (deploy_cfg and deploy_cfg.build_settings is not None):
+        try:
+            await client.require_build_settings_support(
+                build_settings,
+                directory=directory,
+            )
+        except Exception as exc:  # noqa: BLE001 — rendered for the user
+            render_client_error(exc)
+            raise typer.Exit(1) from exc
 
     from nerdit.cli.upload import check_upload_size, create_dir_zip, warn_large_upload
 
@@ -349,10 +398,12 @@ async def _deploy_async(
     try:
         service = await client.deploy(
             zip_bytes=zip_bytes,
+            _build_settings_checked=True,
             name=effective_name,
             port=effective_port,
             gpus=effective_gpus,
-            start=effective_start,
+            start=start,
+            build_settings=build_settings,
             health=effective_health,
             env=env_values,
             vendor=vendor,

@@ -18,10 +18,14 @@ Release engineering — the release procedure, CI secrets, signing key custody,
 and the `get.nerdit.ai` hosting setup — lives in the private development
 repository and is not part of this public tree.
 
-Release builds happen in CI: a `v*` tag push runs
-`.github/workflows/release.yml`, which builds the matrix, calls `assemble.sh`,
-signs `SHA256SUMS` and publishes to the releases repo. The local build below is
-for development and for reproducing a CI failure, not for shipping.
+Release builds happen in CI: a `v*` tag push assembles and validates the public
+source tree once. Each platform builds from that same archive, then CI calls
+`assemble.sh`, signs `SHA256SUMS` and publishes the matching source and binaries.
+Release notes link the exact public commit; reruns refuse to replace binaries
+when the public tag contains a different tree. Source publication is required.
+
+The installer downloads these signed binaries; users do not need Python or a
+compiler. The local build below is for development and build verification.
 
 ---
 
@@ -62,22 +66,23 @@ Change the layout in `assemble.sh` and nowhere else.
 
 ## Building locally
 
-Prerequisites: a working dev venv, Docker (for the smoke), and the **committed
-dashboard bundle**. The spec asserts `src/nerdit/daemon/web/dist/index.html`
+Start from the public release tag you want to build. Prerequisites: Python,
+Node.js/npm, and Docker for the smoke. Build the dashboard from its lockfile;
+the bundle is not committed. The spec asserts `src/nerdit/daemon/web/dist/index.html`
 exists and fails the build by name if it does not:
 
 ```bash
-cd src/nerdit/daemon/web && npm install && npm run build && cd -
+(cd src/nerdit/daemon/web && npm ci && npm run build)
 ```
 
 PyInstaller is deliberately **not** a project dependency — it is a build tool,
-not a runtime one, and pinning it in `pyproject.toml` would push it onto every
-contributor. The exact version CI uses is pinned in
-`.github/workflows/release.yml`; install the same one ad hoc:
+not a runtime one. CI uses Python 3.12, Node.js 20 and PyInstaller 6.16.0.
+Use a clean build environment with the same runtime extra:
 
 ```bash
-venv/bin/pip install pyinstaller==6.16.0     # match release.yml
-venv/bin/pyinstaller --noconfirm packaging/nerdit.spec
+python3.12 -m venv /tmp/nerdit-build-venv
+/tmp/nerdit-build-venv/bin/pip install '.[mcp]' pyinstaller==6.16.0
+/tmp/nerdit-build-venv/bin/pyinstaller --noconfirm --clean packaging/nerdit.spec
 # -> dist/nerdit/{nerdit,nerditd,_internal}
 ```
 
@@ -86,8 +91,8 @@ venv/bin/pyinstaller --noconfirm packaging/nerdit.spec
 > a *dev* venv leaks its extras into a customer tarball. Building this repo's
 > `venv/` (which has `[dev]`, `[mcp]` and `[mdns]`) produced a bundle carrying
 > `mcp`, `zeroconf` and — via pydantic's own mypy plugin module — the whole of
-> mypy. **Release builds must use a clean venv with `pip install .` and nothing
-> else** (`.github/workflows/release.yml` owns that); the spec additionally
+> mypy. **Release builds use a clean environment with `pip install '.[mcp]'` and
+> the pinned PyInstaller build tool**; the spec additionally
 > excludes `pydantic.mypy` / `pydantic.v1.mypy` so the mypy chain cannot come
 > back through the side door. Expect a locally built bundle to be larger than a
 > CI one, and never treat a local build as representative of what ships.
@@ -188,6 +193,7 @@ service-account `HOME` (the D-P30-8 units included) has the same problem.
   does not set the quarantine xattr, so Gatekeeper does not intercept. A
   browser-downloaded tarball would — the docs state the curl path as the only
   supported install.
-- **The bundle is obfuscation, not secrecy** (D-P30-1, accepted honestly): the
-  bytecode is extractable. The protection model is the relay-side entitlement
-  check, not the freeze.
+- **The bundle packages the public engine source**, its Python runtime and
+  dependencies for convenient installation. Matching source does not imply
+  byte-for-byte reproducible archives: Python dependencies and host build
+  environments can still differ.

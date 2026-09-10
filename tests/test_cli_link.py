@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import re
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -33,42 +32,19 @@ from nerdit.cli.commands.link import (
     _link_async,
     _unlink_async,
 )
-from nerdit.utils.install_layout import ServiceUnit
 
 CODE = "ZZTOPSECRET42"
 
-_UNIT = ServiceUnit(
-    kind="systemd-system",
-    unit_path=Path("/etc/systemd/system/nerdit.service"),
-    restart_argv=["systemctl", "restart", "nerdit.service"],
-    stop_argv=["systemctl", "stop", "nerdit.service"],
-    disable_argv=["systemctl", "disable", "nerdit.service"],
-)
-
-#: The scopes a non-root caller may restart directly. A systemd SYSTEM unit is
-#: the one that needs escalation — see the sudo tests below.
-_USER_UNIT = ServiceUnit(
-    kind="systemd-user",
-    unit_path=Path("/home/alice/.config/systemd/user/nerdit.service"),
-    restart_argv=["systemctl", "--user", "restart", "nerdit.service"],
-    stop_argv=["systemctl", "--user", "stop", "nerdit.service"],
-    disable_argv=["systemctl", "--user", "disable", "nerdit.service"],
-)
-
-
-class _Completed:
-    def __init__(self, returncode: int = 0, stderr: str = "") -> None:
-        self.returncode = returncode
-        self.stderr = stderr
-
 
 @pytest.fixture(autouse=True)
-def _no_service_unit(monkeypatch):
-    """(P30 D-P30-10) Default every test to "no unit present" — the pre-P30
-    hint path — so a real systemd/launchd unit on the dev box can never make
-    these tests shell out. Tests that exercise the restart opt in explicitly.
-    """
-    monkeypatch.setattr(link_mod, "detect_service_unit", lambda: None)
+def _no_daemon_restart(monkeypatch):
+    """Never restart a real daemon from a CLI rendering test."""
+    restart = AsyncMock(return_value=0)
+    monkeypatch.setattr(link_mod, "_restart_daemon", restart)
+    monkeypatch.setattr(
+        "nerdit.config.settings.get_client_config", lambda: ("127.0.0.1", 9321, None)
+    )
+    return restart
 
 
 _CLAIM_OK = {
@@ -422,8 +398,8 @@ async def test_claim_reports_remote_mcp_enabled(fake_client, capsys):
     assert "Remote MCP: enabled" in capsys.readouterr().out
 
 
-async def test_claim_no_unit_prints_restart_hint(fake_client, capsys):
-    """No service unit → the pre-P30 hint, byte-identical (D-P30-10)."""
+async def test_claim_restarts_without_a_service_unit(fake_client, capsys, _no_daemon_restart):
+    """A detached daemon can apply its saved link without launchd registration."""
     await _link_async(CODE, "https://app.localhost", None, True)
 
     fake_client.claim_link.assert_awaited_once()
@@ -436,7 +412,10 @@ async def test_claim_no_unit_prints_restart_hint(fake_client, capsys):
     out = capsys.readouterr().out
     assert "brave-otter" in out
     assert _CLAIM_OK["node_id"] in out
-    assert "nerdit daemon restart" in out
+    assert "Daemon restarted" in out
+    _no_daemon_restart.assert_awaited_once_with(
+        drain_timeout_s=60, yes=True, wait=True, wait_timeout=60
+    )
     assert CODE not in out
 
 
@@ -490,134 +469,30 @@ async def test_explicit_relay_flag_skips_the_config_read(monkeypatch, capsys):
     assert client.claim_link.await_args.kwargs["relay_url"] == "wss://relay.localhost/link"
 
 
-async def test_claim_with_unit_restarts_service(fake_client, monkeypatch, capsys):
-    """(P30 D-P30-10) A managed daemon is restarted through the service manager
-    — never the prompting ``nerdit daemon restart``."""
-    monkeypatch.setattr(link_mod, "detect_service_unit", lambda: _USER_UNIT)
-    seen: list[dict] = []
-
-    def _run(argv, **kwargs):
-        seen.append({"argv": list(argv), "kwargs": kwargs})
-        return _Completed(0)
-
-    monkeypatch.setattr(link_mod.subprocess, "run", _run)
-
-    await _link_async(CODE, "https://app.localhost", None, True)
-
-    assert len(seen) == 1
-    assert seen[0]["argv"] == _USER_UNIT.restart_argv
-    assert seen[0]["kwargs"]["capture_output"] is True
-    assert seen[0]["kwargs"]["timeout"] == 30
-    out = capsys.readouterr().out
-    assert "Daemon service restarted" in out
-    assert "nerdit daemon restart" not in out
-    assert CODE not in out
-
-
-async def test_system_unit_as_non_root_escalates_through_sudo(fake_client, monkeypatch, capsys):
-    """The flagship install (`curl | sudo sh`) runs the unit as $SUDO_USER, so
-    the customer's `nerdit link` is a NON-root caller facing a SYSTEM unit: a
-    bare `systemctl restart` there fails (or blocks on polkit)."""
-    monkeypatch.setattr(link_mod, "detect_service_unit", lambda: _UNIT)
-    monkeypatch.setattr(link_mod.os, "geteuid", lambda: 1000)
-    monkeypatch.setattr(link_mod.shutil, "which", lambda name: "/usr/bin/sudo")
-    seen: list[list[str]] = []
-    monkeypatch.setattr(
-        link_mod.subprocess, "run", lambda argv, **kw: (seen.append(list(argv)), _Completed(0))[1]
-    )
-
-    await _link_async(CODE, "https://app.localhost", None, True)
-
-    assert seen == [["/usr/bin/sudo", "-n", "systemctl", "restart", "nerdit.service"]]
-    assert "Daemon service restarted" in capsys.readouterr().out
-
-
-async def test_system_unit_without_sudo_prints_a_runnable_command(fake_client, monkeypatch, capsys):
-    """No sudo on the box: never run the unprivileged form (it would hang on a
-    polkit prompt) — print the command that actually works, sudo included."""
-    monkeypatch.setattr(link_mod, "detect_service_unit", lambda: _UNIT)
-    monkeypatch.setattr(link_mod.os, "geteuid", lambda: 1000)
-    monkeypatch.setattr(link_mod.shutil, "which", lambda name: None)
-
-    def _never(*args, **kwargs):  # pragma: no cover — must not be reached
-        raise AssertionError("no subprocess may run without sudo available")
-
-    monkeypatch.setattr(link_mod.subprocess, "run", _never)
-
-    await _link_async(CODE, "https://app.localhost", None, True)
-
-    out = " ".join(capsys.readouterr().out.split())
-    assert "sudo systemctl restart nerdit.service" in out
-
-
-async def test_root_caller_restarts_a_system_unit_directly(fake_client, monkeypatch, capsys):
-    monkeypatch.setattr(link_mod, "detect_service_unit", lambda: _UNIT)
-    monkeypatch.setattr(link_mod.os, "geteuid", lambda: 0)
-    seen: list[list[str]] = []
-    monkeypatch.setattr(
-        link_mod.subprocess, "run", lambda argv, **kw: (seen.append(list(argv)), _Completed(0))[1]
-    )
-
-    await _link_async(CODE, "https://app.localhost", None, True)
-
-    assert seen == [_UNIT.restart_argv]
-
-
-async def test_remote_target_never_touches_the_local_unit(fake_client, monkeypatch, capsys):
-    """`nerdit connect gpu-box` makes the claim land on gpu-box; restarting a
-    unit found HERE would bounce the wrong daemon."""
+async def test_remote_target_does_not_restart_automatically(
+    fake_client, monkeypatch, capsys, _no_daemon_restart
+):
     monkeypatch.setattr(
         "nerdit.config.settings.get_client_config", lambda: ("gpu-box", 9321, "tok")
     )
-
-    def _never_detect():  # pragma: no cover — must not be reached
-        raise AssertionError("a remote target must not probe for a local unit")
-
-    monkeypatch.setattr(link_mod, "detect_service_unit", _never_detect)
-
     await _link_async(CODE, "https://app.localhost", None, True)
-
+    _no_daemon_restart.assert_not_awaited()
     out = capsys.readouterr().out
     assert "configured for a remote daemon" in out
+    assert "nerdit daemon restart --yes --wait" in " ".join(out.split())
     assert CODE not in out
 
 
-async def test_claim_unit_restart_failure_prints_manual_command(fake_client, monkeypatch, capsys):
-    """A failed restart is cosmetic — the claim is already committed, so it
-    prints the exact command and still exits 0."""
-    monkeypatch.setattr(link_mod, "detect_service_unit", lambda: _UNIT)
-    monkeypatch.setattr(
-        link_mod.subprocess,
-        "run",
-        lambda argv, **kw: _Completed(1, "Failed to restart nerdit.service: access denied\n"),
-    )
-
-    await _link_async(CODE, "https://app.localhost", None, True)  # no raise
-
+async def test_claim_restart_failure_reports_activation_pending(
+    fake_client, capsys, _no_daemon_restart
+):
+    _no_daemon_restart.return_value = 1
+    await _link_async(CODE, "https://app.localhost", None, True)
     out = " ".join(capsys.readouterr().out.split())
-    assert "Could not restart the service automatically" in out
-    assert "access denied" in out
-    # A system unit under a non-root caller: the printed command must be the
-    # one that actually works when typed, sudo included.
-    assert "sudo systemctl restart nerdit.service" in out
+    assert "Link saved, but tunnel activation is pending" in out
+    assert "nerdit daemon restart --yes --wait" in " ".join(out.split())
+    assert "tunnel is starting" not in out
     assert CODE not in out
-
-
-async def test_claim_unit_restart_timeout_is_survivable(fake_client, monkeypatch, capsys):
-    import subprocess as _subprocess
-
-    monkeypatch.setattr(link_mod, "detect_service_unit", lambda: _UNIT)
-
-    def _boom(argv, **kwargs):
-        raise _subprocess.TimeoutExpired(argv, 30)
-
-    monkeypatch.setattr(link_mod.subprocess, "run", _boom)
-
-    await _link_async(CODE, "https://app.localhost", None, True)  # no raise
-
-    out = " ".join(capsys.readouterr().out.split())
-    assert "Could not restart the service automatically" in out
-    assert "systemctl restart nerdit.service" in out
 
 
 async def test_claim_no_enable_warns_the_flag_is_still_false(monkeypatch, capsys):
@@ -1208,7 +1083,9 @@ async def test_refresh_changed_restarts_the_service(fake_client, monkeypatch, ca
     """(S2) ``[link]`` is restart-required as a whole section, so a refresh that
     actually moved the domain must bounce the daemon exactly as a claim does."""
     restarts: list[int] = []
-    monkeypatch.setattr(link_mod, "_restart_for_tunnel", lambda: restarts.append(1))
+    monkeypatch.setattr(
+        link_mod, "_restart_for_tunnel", AsyncMock(side_effect=lambda: restarts.append(1))
+    )
 
     await _link_async("refresh", None, None, True)
 
@@ -1238,7 +1115,7 @@ async def test_refresh_unchanged_does_not_restart(monkeypatch, capsys):
 
 
 async def test_refresh_is_case_insensitive_and_honours_api_url(fake_client, monkeypatch, capsys):
-    monkeypatch.setattr(link_mod, "_restart_for_tunnel", lambda: None)
+    monkeypatch.setattr(link_mod, "_restart_for_tunnel", AsyncMock())
 
     await _link_async("  REFRESH  ", "https://app.localhost", None, True)
 
@@ -1249,7 +1126,7 @@ async def test_refresh_is_case_insensitive_and_honours_api_url(fake_client, monk
 async def test_refresh_never_prompts_for_a_code(fake_client, monkeypatch, capsys):
     """The refresh check precedes the claim-intent gate, so ``link refresh
     --api-url …`` can never fall through to the hidden code prompt."""
-    monkeypatch.setattr(link_mod, "_restart_for_tunnel", lambda: None)
+    monkeypatch.setattr(link_mod, "_restart_for_tunnel", AsyncMock())
     monkeypatch.setattr(
         typer, "prompt", lambda *a, **kw: pytest.fail("refresh mode must not prompt")
     )
@@ -1312,7 +1189,7 @@ def test_cli_link_refresh_argv(monkeypatch):
 
     client = _fake_client()
     monkeypatch.setattr("nerdit.cli.client.get_configured_client", lambda: client)
-    monkeypatch.setattr(link_mod, "_restart_for_tunnel", lambda: None)
+    monkeypatch.setattr(link_mod, "_restart_for_tunnel", AsyncMock())
 
     result = _runner.invoke(app, ["link", "refresh", "--api-url", "http://app.localhost"])
     assert result.exit_code == 0, result.output
@@ -1386,7 +1263,9 @@ def device_client(monkeypatch):
     client = _fake_client()
     monkeypatch.setattr("nerdit.cli.client.get_configured_client", lambda: client)
     restarts: list[int] = []
-    monkeypatch.setattr(link_mod, "_restart_for_tunnel", lambda: restarts.append(1))
+    monkeypatch.setattr(
+        link_mod, "_restart_for_tunnel", AsyncMock(side_effect=lambda: restarts.append(1))
+    )
     client.restarts = restarts
     return client
 
@@ -1827,7 +1706,7 @@ def test_cli_link_key_stdin_reads_one_line_and_the_key_never_appears_in_argv_or_
 
     client = _fake_client()
     monkeypatch.setattr("nerdit.cli.client.get_configured_client", lambda: client)
-    monkeypatch.setattr(link_mod, "_restart_for_tunnel", lambda: None)
+    monkeypatch.setattr(link_mod, "_restart_for_tunnel", AsyncMock())
 
     # There is no ``--key``: the key can never be an option value.
     rejected = _runner.invoke(app, ["link", "--key", PREAUTH_KEY])
@@ -1866,7 +1745,7 @@ def test_cli_link_hidden_prompt_dispatches_an_nk_key_into_the_key_field(monkeypa
 
     client = _fake_client()
     monkeypatch.setattr("nerdit.cli.client.get_configured_client", lambda: client)
-    monkeypatch.setattr(link_mod, "_restart_for_tunnel", lambda: None)
+    monkeypatch.setattr(link_mod, "_restart_for_tunnel", AsyncMock())
 
     result = _runner.invoke(
         app, ["link", "--api-url", "https://app.localhost"], input=f"{PREAUTH_KEY}\n"
@@ -1978,56 +1857,35 @@ async def test_claim_prints_the_mcp_section_name_instead_of_eating_it(fake_clien
     assert "(.http_enabled" not in out
 
 
-def test_restart_for_tunnel_leaves_a_second_daemon_on_another_port_alone(monkeypatch, capsys):
-    """The unit is restarted only when it manages the daemon we just linked.
+async def test_restart_for_tunnel_uses_target_api_port_and_waits_for_fresh_boot(monkeypatch):
+    """Restart the selected daemon, independent of another installed service."""
+    from nerdit.cli.commands.daemon import _restart_async
 
-    Found live (P34): a sandbox daemon on ``127.0.0.1:9333`` was linked, the
-    host-only gate passed, and the CLI restarted the system unit serving a
-    DIFFERENT daemon on ``:9321`` — bouncing an unrelated service while
-    reporting "the tunnel is starting" about a daemon that never restarted and
-    so never picked up ``[link].enabled``. Two daemons on one machine is
-    ordinary: it is what this repository's live-run procedure asks every run to
-    set up.
-    """
-    monkeypatch.setattr(link_mod, "detect_service_unit", lambda: _UNIT)
-    monkeypatch.setattr(
-        "nerdit.config.settings.get_client_config", lambda *a, **k: ("127.0.0.1", 9333, None)
+    requests = []
+    polls = 0
+
+    def handler(request):
+        nonlocal polls
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(202, json={"in_flight_builds": 0, "in_flight_runs": 0})
+        polls += 1
+        return httpx.Response(200, json={"version": "test", "uptime_s": 100 if polls == 1 else 0})
+
+    client = NerditClient(
+        "127.0.0.1", 9333, token="test-only", transport=httpx.MockTransport(handler)
     )
-    monkeypatch.setattr(link_mod, "managed_daemon_port", lambda _u: 9321)
-    ran: list[list[str]] = []
-    monkeypatch.setattr(
-        link_mod.subprocess, "run", lambda argv, **kw: (ran.append(list(argv)), _Completed(0))[1]
-    )
+    monkeypatch.setattr("nerdit.cli.client.get_configured_client", lambda: client)
+    monkeypatch.setattr(link_mod, "_restart_daemon", _restart_async)
+    monkeypatch.setattr(typer, "confirm", lambda *a, **k: pytest.fail("restart must not prompt"))
+    await link_mod._restart_for_tunnel()
 
-    link_mod._restart_for_tunnel()
-
-    assert ran == [], "restarted a unit managing a different daemon"
-    assert "manages a different daemon" in capsys.readouterr().out
-
-
-def test_restart_for_tunnel_still_restarts_when_the_unit_port_is_unknowable(monkeypatch, capsys):
-    """An unreadable unit falls back to the old host-only behaviour, not to a refusal.
-
-    The guard exists to stop a KNOWN mismatch. Treating "cannot tell" as "not
-    ours" would replace a working auto-restart with a printed command on every
-    install whose unit file this process cannot read — trading a rare wrong
-    restart for a common broken one.
-    """
-    monkeypatch.setattr(link_mod, "detect_service_unit", lambda: _UNIT)
-    monkeypatch.setattr(link_mod.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(
-        "nerdit.config.settings.get_client_config", lambda *a, **k: ("127.0.0.1", 9321, None)
-    )
-    monkeypatch.setattr(link_mod, "managed_daemon_port", lambda _u: None)
-    ran: list[list[str]] = []
-    monkeypatch.setattr(
-        link_mod.subprocess, "run", lambda argv, **kw: (ran.append(list(argv)), _Completed(0))[1]
-    )
-
-    link_mod._restart_for_tunnel()
-
-    assert ran == [_UNIT.restart_argv]
-    assert "Daemon service restarted" in capsys.readouterr().out
+    assert polls >= 2
+    assert all(request.url.port == 9333 for request in requests)
+    restart = next(request for request in requests if request.method == "POST")
+    assert restart.url.path == "/api/daemon/restart"
+    assert restart.headers["authorization"] == "Bearer test-only"
+    assert restart.headers["idempotency-key"]
 
 
 async def test_a_slow_poll_cannot_overrun_the_advertised_device_timeout(capsys):

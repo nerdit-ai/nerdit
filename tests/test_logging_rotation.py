@@ -12,7 +12,15 @@ import stat
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 
+import pytest
+
 from nerdit.utils.logging import setup_logging
+
+
+@pytest.fixture(autouse=True)
+def _no_real_service_start(monkeypatch):
+    monkeypatch.setattr("nerdit.daemon.lifecycle.detect_service_unit", lambda: None)
+    monkeypatch.setattr("nerdit.daemon.lifecycle.detect_install_layout", lambda: None)
 
 
 @contextmanager

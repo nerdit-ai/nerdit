@@ -22,6 +22,7 @@ async def _deploy_impl(
     port: int | None = None,
     gpus: int | None = None,
     start: str | None = None,
+    build_settings: dict[str, Any] | None = None,
     health: str | None = None,
     env: dict[str, str | None] | None = None,
     vendor: str | None = None,
@@ -67,8 +68,17 @@ async def _deploy_impl(
     eff_name = name or (dcfg.name if dcfg else None) or directory.name
     eff_port = port if port is not None else (dcfg.port if dcfg else None)
     eff_gpus = gpus if gpus is not None else (dcfg.gpus if dcfg else None)
-    eff_start = start or (dcfg.start if dcfg else None)
     eff_health = health or (dcfg.health if dcfg else None)
+
+    if build_settings is not None or (dcfg and dcfg.build_settings is not None):
+        support_error = await _call(
+            client.require_build_settings_support(
+                build_settings,
+                directory=directory,
+            )
+        )
+        if support_error is not None:
+            return support_error
 
     from nerdit.cli.upload import create_dir_zip
 
@@ -76,10 +86,12 @@ async def _deploy_impl(
     return await _call(
         client.deploy(
             zip_bytes=zip_bytes,
+            _build_settings_checked=True,
             name=eff_name,
             port=eff_port,
             gpus=eff_gpus,
-            start=eff_start,
+            start=start,
+            build_settings=build_settings,
             health=eff_health,
             env=env,
             vendor=vendor,
@@ -99,6 +111,7 @@ async def _deploy_git_impl(
     port: int | None = None,
     gpus: int | None = None,
     start: str | None = None,
+    build_settings: dict[str, Any] | None = None,
     health: str | None = None,
     env: dict[str, str | None] | None = None,
     vendor: str | None = None,
@@ -126,6 +139,7 @@ async def _deploy_git_impl(
             port=port,
             gpus=gpus,
             start=start,
+            build_settings=build_settings,
             health=health,
             env=env,
             vendor=vendor,
@@ -171,8 +185,10 @@ async def _deploy_template_impl(
     port: int | None = None,
     gpus: int | None = None,
     start: str | None = None,
+    build_settings: dict[str, Any] | None = None,
     health: str | None = None,
     vendor: str | None = None,
+    dry_run: bool = False,
     idempotency_key: str | None = None,
 ) -> Any:
     """Deploy an app template (clone catalog repo + build + run), auto-minting a key.
@@ -182,7 +198,7 @@ async def _deploy_template_impl(
     collapses to one build. An ``env`` value of ``None`` deletes that key on
     redeploy.
     """
-    if not idempotency_key:
+    if not dry_run and not idempotency_key:
         idempotency_key = str(uuid.uuid4())
     return await _call(
         client.deploy_template(
@@ -193,6 +209,8 @@ async def _deploy_template_impl(
             port=port,
             gpus=gpus,
             start=start,
+            build_settings=build_settings,
+            dry_run=dry_run,
             health=health,
             vendor=vendor,
             idempotency_key=idempotency_key,
@@ -215,6 +233,7 @@ async def deploy(
         port: int | None = None,
         gpus: int | None = None,
         start: str | None = None,
+        build_settings: dict[str, Any] | None = None,
         health: str | None = None,
         env: dict[str, str | None] | None = None,
         vendor: str | None = None,
@@ -242,8 +261,10 @@ async def deploy(
         reported back in the response ``hints``: ``name``, ``port``, ``gpus``,
         ``start``, ``health``, ``health_type`` (``http``|``tcp``),
         ``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,
-        ``auto_deploy``, ``edge_auth``. There is **no** ``build`` key — run the
-        build in your Dockerfile. On a successful non-dry-run deploy the
+        ``auto_deploy``, ``edge_auth``, ``build_settings``. Generated Node builds run
+        ``scripts.build`` automatically;
+        override it through ``[deploy.build_settings]`` or use a Dockerfile.
+        On a successful non-dry-run deploy the
         response carries ``summary`` (app/status/version/public_url), ``hints``
         (ordered one-liners, never empty) and ``next_step`` (the structured
         follow-up call); a ``dry_run`` plan and a ``rollback`` response carry
@@ -252,6 +273,14 @@ async def deploy(
         frontend must be built with that base
         path; in ``subdomain`` mode it is served at the root of its own
         hostname and needs none — read ``capabilities.proxy.mode``.
+
+        ``build_settings`` overrides preset/install/build/start/node_version/package_manager/subdir.
+        ``preset`` selects node/nextjs/python/dockerfile; null resets to
+        repository/default detection.
+        An existing Dockerfile retains precedence.
+        Omit it to preserve saved overrides; a null field resets to repository/default,
+        and ``build: false`` skips compilation. Commands run inside the build container.
+        Build-time environment and secret mounts are unsupported; runtime env is unchanged.
 
         {SANDBOX_NOTE}
         """
@@ -262,6 +291,7 @@ async def deploy(
             port=port,
             gpus=gpus,
             start=start,
+            build_settings=build_settings,
             health=health,
             env=env,
             vendor=vendor,
@@ -278,6 +308,7 @@ async def deploy_git(
         port: int | None = None,
         gpus: int | None = None,
         start: str | None = None,
+        build_settings: dict[str, Any] | None = None,
         health: str | None = None,
         env: dict[str, str | None] | None = None,
         vendor: str | None = None,
@@ -309,14 +340,24 @@ async def deploy_git(
         reported back in the response ``hints``: ``name``, ``port``, ``gpus``,
         ``start``, ``health``, ``health_type`` (``http``|``tcp``),
         ``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,
-        ``auto_deploy``, ``edge_auth``. There is **no** ``build`` key — run the
-        build in your Dockerfile. On a successful non-dry-run deploy the
+        ``auto_deploy``, ``edge_auth``, ``build_settings``. Generated Node builds run
+        ``scripts.build`` automatically;
+        override it through ``[deploy.build_settings]`` or use a Dockerfile.
+        On a successful non-dry-run deploy the
         response carries ``summary`` (app/status/version/public_url), ``hints``
         (ordered one-liners, never empty) and ``next_step`` (the structured
         follow-up call); a ``dry_run`` plan carries none of the three — read a
         plan's advisories from its ``warnings``. On a node in ``path``
         proxy mode the app is served at ``/<name>/``, so a frontend must be
         built with that base path.
+
+        ``build_settings`` overrides preset/install/build/start/node_version/package_manager/subdir.
+        ``preset`` selects node/nextjs/python/dockerfile; null resets to
+        repository/default detection.
+        An existing Dockerfile retains precedence.
+        Omit it to preserve saved overrides; a null field resets to repository/default,
+        and ``build: false`` skips compilation. Commands run inside the build container.
+        Build-time environment and secret mounts are unsupported; runtime env is unchanged.
 
         {SANDBOX_NOTE}
         """
@@ -329,6 +370,7 @@ async def deploy_git(
             port=port,
             gpus=gpus,
             start=start,
+            build_settings=build_settings,
             health=health,
             env=env,
             vendor=vendor,
@@ -379,8 +421,10 @@ async def deploy_template(
         port: int | None = None,
         gpus: int | None = None,
         start: str | None = None,
+        build_settings: dict[str, Any] | None = None,
         health: str | None = None,
         vendor: str | None = None,
+        dry_run: bool = False,
         idempotency_key: str | None = None,
     ) -> Any:
         """Use when: you want a starter app. Asynchronous — follow with wait_for_service.
@@ -392,6 +436,14 @@ async def deploy_template(
         auto-generated if omitted. The response carries ``summary``, ``hints``
         (never empty) and ``next_step`` — the structured follow-up call — since
         a 201 here means the build was accepted, not that the app is up.
+
+        ``build_settings`` overrides preset/install/build/start/node_version/package_manager/subdir.
+        ``preset`` selects node/nextjs/python/dockerfile; null resets to
+        repository/default detection.
+        An existing Dockerfile retains precedence.
+        Omission preserves overrides; a null field resets to repository/default;
+        ``build: false`` skips compilation. ``dry_run=True`` previews without writes,
+        building or storing secrets. Build-time env and secret mounts are unsupported.
 
         If the template declares ``[ai.*]`` bindings, each is injected at launch
         as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the ``default`` binding also
@@ -409,6 +461,8 @@ async def deploy_template(
             port=port,
             gpus=gpus,
             start=start,
+            build_settings=build_settings,
+            dry_run=dry_run,
             health=health,
             vendor=vendor,
             idempotency_key=idempotency_key,

@@ -507,9 +507,7 @@ say "installing nerdit $VERSION ($OS/$ARCH, $MODE install) into $ROOT"
 # 5. Download
 # --------------------------------------------------------------------------
 
-# Service-manager verbs live in exactly one place each: the installer, the
-# rollback handler below and `nerdit link` must never drift into two dialects
-# of "restart the daemon" (they are mirrored in utils/install_layout.py).
+# Share service-manager commands between installation and rollback.
 stop_unit() {
 	if [ "$OS" = macos ]; then
 		launchctl bootout "gui/$EUID_NOW/ai.nerdit.daemon" >/dev/null 2>&1 || true
@@ -532,8 +530,20 @@ unit_active() {
 
 start_unit() {
 	if [ "$OS" = macos ]; then
-		launchctl bootstrap "gui/$EUID_NOW" "$PLIST_DST" >/dev/null 2>&1 || true
-		launchctl kickstart -k "gui/$EUID_NOW/ai.nerdit.daemon" >/dev/null 2>&1 || true
+		if ! unit_active; then
+			if ! launchctl bootstrap "gui/$EUID_NOW" "$PLIST_DST"; then
+				warn "could not register $PLIST_DST with launchd; check the error above and rerun the installer"
+				return 1
+			fi
+		fi
+		if ! launchctl kickstart -k "gui/$EUID_NOW/ai.nerdit.daemon"; then
+			warn "could not start gui/$EUID_NOW/ai.nerdit.daemon; check the launchd error above"
+			return 1
+		fi
+		if ! unit_active; then
+			warn "launchd did not register gui/$EUID_NOW/ai.nerdit.daemon"
+			return 1
+		fi
 	elif [ "$MODE" = system ]; then
 		# `enable` + `restart`, not `enable --now`: --now is a no-op on a unit
 		# systemd still counts as active, which is exactly the state that
@@ -885,7 +895,9 @@ fi
 wait_healthy() {
 	_wh_i=0
 	while [ "$_wh_i" -lt 30 ]; do
-		if curl -fs "http://127.0.0.1:$PROBE_PORT/health" >/dev/null 2>&1; then
+		# A directly started daemon must not hide an unloaded launchd job.
+		if { [ "$OS" != macos ] || unit_active; } &&
+			curl -fs "http://127.0.0.1:$PROBE_PORT/health" >/dev/null 2>&1; then
 			return 0
 		fi
 		_wh_i=$((_wh_i + 1))
@@ -1014,29 +1026,9 @@ if [ "$IS_UPDATE" = 0 ] && [ "$SKIP_LINK" = 0 ] && [ "$HEALTHY" -eq 1 ]; then
 	fi
 fi
 
-# What a successful link owes the closing doctor, in two parts.
-#
-# (1) The system-mode restart. `nerdit link` finishes with _restart_for_tunnel,
-#     which on a systemd SYSTEM unit escalates through `sudo -n systemctl
-#     restart` — something the de-escalated $UNIT_USER the step above ran as
-#     cannot do non-interactively. So on exactly the headless fleet path the
-#     pre-auth key exists for, the CLI prints its "restart it by hand" hint and
-#     returns, leaving the node linked with the tunnel down. This script is
-#     still root, so it performs that restart itself, through `start_unit` —
-#     the one place the service-manager verbs live (see the note above it). The
-#     CLI's yellow hint on that path is cosmetic, not a failure.
-# (2) The health re-probe. Where the CLI's own restart DOES succeed (user-mode
-#     systemd, launchd) it fires and returns WITHOUT waiting for health, so the
-#     daemon is mid-drain (uvicorn's 30 s graceful shutdown) at the exact
-#     moment the closing doctor would run — printing a red
-#     "daemon | fail | unreachable" table on a perfectly good install. Re-probe
-#     first; if it times out, say so once and SKIP the doctor rather than end a
-#     good install on a false red.
+# Linking restarts through the daemon API; recheck health before doctor.
 RUN_DOCTOR=1
 if [ "$LINKED_NOW" -eq 1 ]; then
-	if [ "$MODE" = system ]; then
-		start_unit || warn "could not restart the nerdit service after linking; restart it by hand to bring the tunnel up"
-	fi
 	if wait_healthy; then
 		:
 	else

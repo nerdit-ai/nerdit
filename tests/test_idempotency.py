@@ -735,6 +735,7 @@ def test_honors_dry_run_registry_matches_both_mounts():
     positives = [
         ("POST", "/deploy"),
         ("POST", "/deploy/git"),
+        ("POST", "/app-templates/synth/deploy"),
         ("POST", "/config/daemon/apply"),
         ("PUT", "/config/daemon/proxy"),
         ("PUT", "/config/apps/demo/ai"),
@@ -747,7 +748,7 @@ def test_honors_dry_run_registry_matches_both_mounts():
     negatives = [
         ("POST", "/models"),  # no dry_run handler arg — FastAPI ignores the param
         ("POST", "/services"),
-        ("POST", "/app-templates/synth/deploy"),
+        ("POST", "/app-templates/synth/deploy/extra"),
         ("GET", "/deploy"),  # wrong method never bypasses
         ("POST", "/deploy/git/extra"),  # anchored patterns: no prefix match
         ("PUT", "/config/apps/demo"),  # whole-app PUT does not exist / no dry_run

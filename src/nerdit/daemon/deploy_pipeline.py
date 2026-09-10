@@ -32,6 +32,7 @@ from nerdit.config.app_config import (
     validate_db_section,
     validate_deploy_fields,
 )
+from nerdit.config.build import BuildSettings
 from nerdit.config.defaults import ZIP_EXCLUDE_PATTERNS, app_image_repo, app_image_tag
 from nerdit.config.project import (
     _DISPLAY_UNSAFE_RE,
@@ -276,6 +277,7 @@ _DEPLOY_SHAPE_HINT = (
     "<=4096 chars), cutover (false disarms the zero-downtime swap), "
     "auto_deploy (true opts into push-triggered redeploy) and edge_auth "
     "({user, password = '${secrets.KEY}'}); "
+    "build_settings (install/build/start/node_version/package_manager/subdir); "
     "explicit deploy fields override these values."
 )
 
@@ -1135,6 +1137,93 @@ def _failure_detail(job: Job) -> str | None:
     return None
 
 
+def _request_build_settings(requested: dict | None, start: str | None) -> dict | None:
+    if start is None:
+        return requested
+    return {"start": start, **(requested or {})}
+
+
+def _merge_build_settings(
+    repository: dict | None, saved: dict | None, requested: dict | None
+) -> tuple[BuildSettings, dict, dict]:
+    """Keep only explicit request overrides; null resets a key to repository defaults."""
+    try:
+        repo = BuildSettings.model_validate(repository or {}).model_dump(exclude_none=True)
+        patch = BuildSettings.model_validate(requested or {}).model_dump(exclude_unset=True)
+        # Reset/replacement may remove a previously accepted unsafe command, but
+        # malformed saved shapes and unknown fields must still be rejected.
+        if saved is not None and not isinstance(saved, dict):
+            BuildSettings.model_validate(saved)
+        overrides = dict(saved or {})
+        for key, value in patch.items():
+            if value is None:
+                overrides.pop(key, None)
+            else:
+                overrides[key] = value
+        overrides = BuildSettings.model_validate(overrides).model_dump(exclude_none=True)
+    except ValidationError:
+        raise NerditError(
+            422,
+            "deploy.invalid_build_settings",
+            "Invalid build_settings. Use supported commands, runtime, manager and relative subdir; "
+            "build environment and secret inputs are not supported.",
+        ) from None
+    origins = {key: "config" for key in repo}
+    origins.update({key: "request" if key in patch else "saved" for key in overrides})
+    return BuildSettings.model_validate({**repo, **overrides}), overrides, origins
+
+
+def _build_context(context: Path, subdir: str | None) -> Path:
+    """Select a directory inside the ingress-owned tree, never a host path."""
+    if not subdir:
+        return context
+    selected = (context / subdir).resolve()
+    if not selected.is_relative_to(context.resolve()) or not selected.is_dir():
+        raise NerditError(
+            422,
+            "deploy.invalid_build_settings",
+            "build_settings.subdir must select an existing directory inside the project.",
+        )
+    return selected
+
+
+def _build_preview(
+    plan: BuildPlan,
+    settings: BuildSettings,
+    origins: dict,
+    source: dict,
+    *,
+    legacy_start: str | None = None,
+    request_start: str | None = None,
+) -> dict:
+    if settings.start is None and legacy_start:
+        origins = {**origins, "start": "request" if request_start is not None else "config"}
+    if plan.language == "dockerfile":
+        origins = {
+            **origins,
+            **{
+                key: "dockerfile"
+                for key in ("preset", "install", "build", "node_version", "package_manager")
+            },
+        }
+    root = "/".join(part for part in (source.get("subdir"), settings.subdir) if part) or "."
+    return {
+        "preset": settings.preset,
+        "framework": plan.framework or plan.language,
+        "node_version": plan.node_version,
+        "package_manager": plan.package_manager,
+        "install": plan.install_command,
+        "build": False
+        if settings.build is False and plan.language != "dockerfile"
+        else plan.build_command,
+        "start": plan.effective_start_command or plan.start_command,
+        "subdir": root,
+        "commit_sha": source.get("commit_sha"),
+        "sources": {key: origins.get(key, "detected") for key in BuildSettings.model_fields},
+        "warnings": list(plan.warnings),
+    }
+
+
 async def _finalize_deploy(
     request: Request,
     context_dir: Path,
@@ -1149,6 +1238,7 @@ async def _finalize_deploy(
     source_meta: dict,
     context_root: Path | None = None,
     owner_token_id: str | None = None,
+    build_settings: dict | None = None,
     dry_run: bool = False,
 ) -> dict:
     """Validate a prepared build context and create or update its service row.
@@ -1166,6 +1256,8 @@ async def _finalize_deploy(
     """
     principal = current_principal(request)
     queries = request.app.state.queries
+
+    context_root = context_root or context_dir
 
     # Everything past extraction must clean up the context dir on failure —
     # including the row re-read below (a DB error must not leak the tree).
@@ -1192,6 +1284,30 @@ async def _finalize_deploy(
 
         project, project_error = _read_project_toml(context_dir)
         zip_deploy, unknown_deploy_keys = _parse_deploy_defaults(project, name)
+        # Legacy explicit start is also a request override; nested membership wins,
+        # including null reset. Clients must not promote repository defaults here.
+        build_settings = _request_build_settings(build_settings, start)
+        start = None if build_settings and "start" in build_settings else start
+        settings, overrides, origins = _merge_build_settings(
+            zip_deploy.get("build_settings"), prev_cfg.get("build_overrides"), build_settings
+        )
+        selected = _build_context(context_dir, settings.subdir)
+        if selected != context_dir:
+            root_settings = zip_deploy.get("build_settings") or {}
+            context_dir = selected
+            nested, nested_error = _read_project_toml(context_dir)
+            project_error = project_error or nested_error
+            # Preserve root auth, bindings and deployment defaults. The selected
+            # app may explicitly replace sections or override deploy keys.
+            nested_deploy, _ = _parse_deploy_defaults(nested, name)
+            project = {**project, **nested, "deploy": {**zip_deploy, **nested_deploy}}
+            zip_deploy, unknown_deploy_keys = _parse_deploy_defaults(project, name)
+            # Root selection happens once; nested config cannot recursively escape it.
+            repository = {**root_settings, **(zip_deploy.get("build_settings") or {})}
+            repository["subdir"] = settings.subdir
+            settings, overrides, origins = _merge_build_settings(
+                repository, prev_cfg.get("build_overrides"), build_settings
+            )
         effective = resolve_effective_fields(
             name=name,
             port=port,
@@ -1203,6 +1319,7 @@ async def _finalize_deploy(
             prev_cfg=prev_cfg,
         )
         deploy_cfg = effective.deploy_cfg
+        deploy_cfg.build_settings = settings
 
         # Detect a buildpack and materialize the generated Dockerfile (if any).
         try:
@@ -1213,7 +1330,11 @@ async def _finalize_deploy(
                 "deploy.no_buildpack",
                 str(exc),
                 hint=(
-                    "Add a Dockerfile, a package.json (Node), or a "
+                    "Choose a compatible preset or update the repository configuration. "
+                    'To clear a saved preset override, send build_settings={"preset": null}; '
+                    "this restores repository/default detection."
+                    if settings.preset is not None
+                    else "Add a Dockerfile, a package.json (Node), or a "
                     "requirements.txt / pyproject.toml (Python)."
                 ),
             ) from exc
@@ -1276,6 +1397,14 @@ async def _finalize_deploy(
             deploy_cfg=deploy_cfg,
         )
 
+        preview = _build_preview(
+            plan, settings, origins, source_meta, legacy_start=deploy_cfg.start, request_start=start
+        )
+        build_fields["build_overrides"] = overrides
+        build_fields["build_plan"] = preview
+
+        effective.eff_start = plan.start_command
+
         # classify the [ai.*] preserve action + the NARROWED
         # overwrote_api_config flag once, up front — the write branches below
         # and the dry_run preview both consume it (prev_cfg={} for a fresh
@@ -1302,7 +1431,7 @@ async def _finalize_deploy(
             prior_config_api=prior_config_api,
             zip_deploy=zip_deploy,
             gpus=gpus,
-            start=start,
+            start=settings.start or ("" if build_settings and "start" in build_settings else start),
             health=health,
             effective=effective,
             existing=existing,
@@ -1327,6 +1456,8 @@ async def _finalize_deploy(
                 overwrote_api_config=overwrote_api_config,
                 unknown_deploy_keys=unknown_deploy_keys,
             )
+            body["build"] = preview
+            body["warnings"].extend(preview["warnings"])
             cleanup_root = context_root or context_dir
             await asyncio.to_thread(shutil.rmtree, cleanup_root, ignore_errors=True)
             return body
@@ -1406,6 +1537,7 @@ async def _finalize_deploy(
         body = resp.model_dump(mode="json")
         return {
             **body,
+            "build": preview,
             # Additive P7 field: agents detect an API-config clobber on redeploy.
             "overwrote_api_config": overwrote_api_config,
             # (Agent-DX) The at-a-glance block + the ordered advisory channel,

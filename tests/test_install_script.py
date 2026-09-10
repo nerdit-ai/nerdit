@@ -426,30 +426,13 @@ class TestStatic:
             if not line.strip().startswith("#")
         )
 
-    def test_system_mode_link_step_is_followed_by_a_root_side_unit_restart(self):
-        """On a systemd SYSTEM unit the CLI's own ``_restart_for_tunnel``
-        escalates through ``sudo -n systemctl restart``, which the de-escalated
-        unit user the link step runs as cannot execute — so on exactly the
-        headless fleet path the pre-auth key exists for, the install would end
-        linked with the tunnel down. The installer is still root here: it
-        performs that restart itself, through ``start_unit``, the ONE place the
-        service-manager verbs live."""
-        text = _script_text()
-        tail = text[text.index('if [ "$LINKED_NOW" -eq 1 ]; then') :]
-        assert 'if [ "$MODE" = system ]; then\n\t\tstart_unit ||' in tail
-        # No second dialect of "restart the daemon" (the section 5 rule).
-        assert "systemctl restart nerdit.service" not in tail
-
     def test_link_step_reprobes_health_before_the_closing_doctor(self):
-        """``_restart_for_tunnel`` returns WITHOUT waiting for health, so the
-        closing doctor would otherwise run against a daemon mid-drain (uvicorn's
-        graceful shutdown is 30 s) and print a red ``daemon | fail |
-        unreachable`` row on a perfectly good install. Re-probe first; on
-        timeout warn once and SKIP the doctor rather than show a false red."""
+        """Avoid a second restart after the CLI has already restarted the daemon."""
         text = _script_text()
         assert "wait_healthy() {" in text
         tail = text[text.index('if [ "$LINKED_NOW" -eq 1 ]; then') :]
         assert "if wait_healthy; then" in tail
+        assert "start_unit" not in tail
         assert "RUN_DOCTOR=0" in tail
         assert 'if [ "$RUN_DOCTOR" -eq 1 ]; then' in text
 
@@ -673,8 +656,30 @@ def _rig(tmp_path: Path, *, keyed: bool = True, curl_fails: bool = False) -> Sim
         )
 
     _write_exe(binn / "docker", '#!/bin/sh\necho "docker $*" >> "$SENTINEL"\nexit 0\n')
-    for name in ("systemctl", "launchctl"):
-        _write_exe(binn / name, f'#!/bin/sh\necho "{name} $*" >> "$SENTINEL"\nexit 0\n')
+    _write_exe(binn / "systemctl", '#!/bin/sh\necho "systemctl $*" >> "$SENTINEL"\nexit 0\n')
+    _write_exe(
+        binn / "launchctl",
+        "#!/bin/sh\n"
+        'echo "launchctl $*" >> "$SENTINEL"\n'
+        'case "$1" in\n'
+        '  print) test -f "$SENTINEL.launchd" ;;\n'
+        '  bootout) rm -f "$SENTINEL.launchd" ;;\n'
+        "  bootstrap)\n"
+        '    if [ "${LAUNCHCTL_FAIL:-}" = bootstrap ]; then\n'
+        '      echo "Bootstrap failed: 5: Input/output error" >&2; exit 5\n'
+        "    fi\n"
+        '    touch "$SENTINEL.launchd" ;;\n'
+        "  kickstart)\n"
+        '    if [ "${LAUNCHCTL_FAIL:-}" = kickstart ]; then\n'
+        '      echo "Could not kickstart service: 5: Input/output error" >&2; exit 5\n'
+        "    fi\n"
+        '    test -f "$SENTINEL.launchd" || exit 3\n'
+        '    if [ "${LAUNCHCTL_FAIL:-}" = unregistered ]; then\n'
+        '      rm "$SENTINEL.launchd"\n'
+        "    fi ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n",
+    )
 
     # NO openssl stub: the real system `openssl` (LibreSSL on macOS, OpenSSL
     # on Linux) must verify these P-256 signatures — that is the property
@@ -852,6 +857,34 @@ class TestRehearsal:
         else:
             assert "systemctl --user enable nerdit.service" in calls
             assert "systemctl --user restart nerdit.service" in calls
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="launchd is macOS only")
+    @pytest.mark.parametrize(
+        ("failure", "diagnostic"),
+        [
+            ("bootstrap", "Bootstrap failed: 5: Input/output error"),
+            ("kickstart", "Could not kickstart service: 5: Input/output error"),
+            ("unregistered", "launchd did not register gui/"),
+        ],
+    )
+    def test_launchd_failure_cannot_be_hidden_by_a_healthy_daemon(
+        self, tmp_path, failure, diagnostic
+    ):
+        rig = _rig(tmp_path)
+        _publish(rig, "0.5.0")
+        # /health already answers, as when init has started an unmanaged daemon.
+        probe = subprocess.run(
+            ["curl", "-fs", "http://127.0.0.1:9000/health"],
+            env=_base_env(rig),
+            capture_output=True,
+        )
+        assert probe.returncode == 0
+        proc = _run(rig, LAUNCHCTL_FAIL=failure)
+        assert proc.returncode != 0
+        assert diagnostic in proc.stderr
+        assert "nerdit 0.5.0 is installed." not in proc.stdout
+        assert "nerdit doctor" not in _calls(rig)
+        assert "launchctl enable" not in _calls(rig)
 
     def test_pinned_version_skips_the_latest_lookup(self, tmp_path):
         rig = _rig(tmp_path)

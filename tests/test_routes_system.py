@@ -192,6 +192,22 @@ def test_capabilities_admin_has_paths_and_admin_addr():
     }
     assert body["buildpacks"] == ["dockerfile", "python", "node"]
     assert body["deploy"]["git_allowed_hosts"] == ["github.com"]
+    assert body["deploy"]["build_settings"] == {
+        "version": 1,
+        "node_versions": ["22.23.2", "24.20.0"],
+        "presets": ["node", "nextjs", "python", "dockerfile"],
+        "fields": [
+            "preset",
+            "install",
+            "build",
+            "start",
+            "node_version",
+            "package_manager",
+            "subdir",
+        ],
+        "public_env": False,
+        "secret_mounts": False,
+    }
     assert body["limits"]["wait_concurrency_max"] == 64
     # (P24a) The stream budgets an agent needs BEFORE it opens the N+1st
     # follower and gets a ``*.saturated`` frame instead of a stream.

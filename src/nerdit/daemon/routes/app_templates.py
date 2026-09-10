@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
+from fastapi.responses import JSONResponse
 
 from nerdit.config.app_templates import app_templates_by_id, load_app_templates
 from nerdit.core.gitsource import GitSourceError, clone_source, git_source_meta
@@ -98,7 +99,12 @@ async def get_app_template(template_id: str) -> AppTemplate:
     status_code=201,
     operation_id="deploy_app_template",
 )
-async def deploy_app_template(request: Request, template_id: str, body: TemplateDeployRequest):
+async def deploy_app_template(
+    request: Request,
+    template_id: str,
+    body: TemplateDeployRequest,
+    dry_run: bool = Query(False, description="Preview without building or writing secrets"),
+):
     """Deploy a public-repository template through the shared git pipeline.
 
     Precedence is request, template defaults, repo TOML, then buildpack defaults.
@@ -108,6 +114,8 @@ async def deploy_app_template(request: Request, template_id: str, body: Template
     """
     require_role(request, TokenRole.submitter, TokenRole.admin)
     _git_disabled_if_off(request)
+    if dry_run:
+        request.state.audit_action = "deploy.template_plan"
 
     template = app_templates_by_id().get(template_id)
     if template is None:
@@ -216,13 +224,19 @@ async def deploy_app_template(request: Request, template_id: str, body: Template
         port=eff_port,
         gpus=eff_gpus,
         start=eff_start,
+        build_settings=(
+            body.build_settings.model_dump(exclude_unset=True)
+            if body.build_settings is not None
+            else None
+        ),
         health=eff_health,
         env=body.env,
         vendor=body.vendor,
         source_meta=source_meta,
         context_root=dest_dir,
+        dry_run=dry_run,
     )
-    if secrets:
+    if secrets and not dry_run:
         mgr = request.app.state.secret_manager
         try:
             _secret_call(mgr.set, body.name, secrets)
@@ -234,4 +248,6 @@ async def deploy_app_template(request: Request, template_id: str, body: Template
                     f"set them with `nerdit secrets set {body.name} ...` and restart it."
                 )
             raise
+    if dry_run:
+        return JSONResponse(status_code=200, content=resp)
     return resp

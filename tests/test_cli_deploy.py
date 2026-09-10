@@ -356,7 +356,8 @@ async def test_deploy_zips_and_merges_nerdit_toml(tmp_path, fake_client):
     assert call["name"] == "demo"
     assert call["port"] == 3000
     assert call["gpus"] == 1
-    assert call["start"] == "npm start"
+    # The daemon reads repository defaults; only actual overrides go on the wire.
+    assert call["start"] is None
     # A fresh Idempotency-Key was minted.
     assert call["idempotency_key"]
     # The folder was zipped (a real zip containing the app file).

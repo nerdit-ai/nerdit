@@ -1,4 +1,4 @@
-"""P6 surface gate: the automated counterpart to ``scripts/demo_p6.sh``.
+"""Verify service status, audit access, and MCP tools against real route handlers.
 
 Pure-async at the route+DB level (mirrors ``tests/test_p5_northstar.py`` —
 never the Starlette ``TestClient``): the real cluster/services/audit routers

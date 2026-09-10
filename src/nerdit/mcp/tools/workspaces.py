@@ -58,6 +58,7 @@ async def _deploy_app_impl(
     port: int | None = None,
     gpus: int | None = None,
     start: str | None = None,
+    build_settings: dict[str, Any] | None = None,
     health: str | None = None,
     env: dict[str, str | None] | None = None,
     vendor: str | None = None,
@@ -73,6 +74,7 @@ async def _deploy_app_impl(
             port=port,
             gpus=gpus,
             start=start,
+            build_settings=build_settings,
             health=health,
             env=env,
             vendor=vendor,
@@ -144,6 +146,7 @@ async def deploy_app(
         port: int | None = None,
         gpus: int | None = None,
         start: str | None = None,
+        build_settings: dict[str, Any] | None = None,
         health: str | None = None,
         env: dict[str, str | None] | None = None,
         vendor: str | None = None,
@@ -171,14 +174,23 @@ async def deploy_app(
         reported back in the response ``hints``: ``name``, ``port``, ``gpus``,
         ``start``, ``health``, ``health_type`` (``http``|``tcp``),
         ``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,
-        ``auto_deploy``, ``edge_auth``. There is **no** ``build`` key — run the
-        build in your Dockerfile. On a successful non-dry-run deploy the
+        ``auto_deploy``, ``edge_auth``, ``build_settings``. Use ``[deploy.build_settings]``
+        for build overrides, or a Dockerfile for custom builds.
+        On a successful non-dry-run deploy the
         response carries ``summary`` (app/status/version/public_url), ``hints``
         (ordered one-liners, never empty) and ``next_step`` (the structured
         follow-up call); a ``dry_run`` plan carries none of the three — read a
         plan's advisories from its ``warnings``. On a node in ``path``
         proxy mode the app is served at ``/<name>/``, so a frontend must be
         built with that base path.
+
+        ``build_settings`` overrides preset/install/build/start/node_version/package_manager/subdir.
+        ``preset`` selects node/nextjs/python/dockerfile; null resets to
+        repository/default detection.
+        An existing Dockerfile retains precedence.
+        Omit it to preserve saved overrides; a null field resets to repository/default,
+        and ``build: false`` skips compilation. Commands run inside the build container.
+        Build-time environment and secret mounts are unsupported; runtime env is unchanged.
 
         {SANDBOX_NOTE}
         """
@@ -188,6 +200,7 @@ async def deploy_app(
             port=port,
             gpus=gpus,
             start=start,
+            build_settings=build_settings,
             health=health,
             env=env,
             vendor=vendor,
