@@ -482,3 +482,49 @@ async def test_local_deploy_checks_capabilities_once_before_archive(tmp_path, mo
             dry_run=True,
         )
     assert order == ["GET", "ZIP", "POST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("support", [{"version": 1}, {"version": 1, "public_env": False}])
+async def test_old_node_refuses_public_env_before_mutation(support):
+    """A node without the flag would build and silently drop the variables."""
+    seen = []
+
+    def handler(request):
+        seen.append(request.method)
+        return httpx.Response(200, json={"deploy": {"build_settings": support}})
+
+    client = NerditClient(host="localhost", transport=httpx.MockTransport(handler))
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.deploy_git(
+            repo_url="https://github.com/acme/demo",
+            name="demo",
+            build_settings={"public_env": {"VITE_API": "https://api.example.com"}},
+        )
+    assert seen == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_public_env_passes_a_supporting_node_and_a_null_still_needs_it():
+    def handler(request):
+        return httpx.Response(
+            200, json={"deploy": {"build_settings": {"version": 1, "public_env": True}}}
+        )
+
+    client = NerditClient(host="localhost", transport=httpx.MockTransport(handler))
+    await client.require_build_settings_support({"public_env": {"VITE_API": "x"}})
+
+    def old_node(request):
+        return httpx.Response(200, json={"deploy": {"build_settings": {"version": 1}}})
+
+    old = NerditClient(host="localhost", transport=httpx.MockTransport(old_node))
+    # The key is on the wire either way: a null reaches a pre-P38 `extra="forbid"`
+    # model as a 422, and it resets to a repository map the old node would drop.
+    with pytest.raises(httpx.HTTPStatusError) as reset:
+        await old.require_build_settings_support({"public_env": None})
+    assert reset.value.response.status_code == 409
+    with pytest.raises(httpx.HTTPStatusError) as repo:
+        await old.require_build_settings_support(
+            {"public_env": None}, repository={"public_env": {"VITE_A": "1"}}
+        )
+    assert repo.value.response.status_code == 409

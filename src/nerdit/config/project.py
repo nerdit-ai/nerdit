@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from nerdit.config.build import BuildSettings
 
@@ -98,38 +98,40 @@ def validate_volume_specs(specs: list) -> list[str]:
         raise ValueError(f"at most {MAX_VOLUMES} volumes allowed, got {len(specs)}")
     seen_names: set[str] = set()
     seen_paths: set[str] = set()
-    for spec in specs:
+    # Messages name the spec by position, never by content: they reach 422
+    # bodies, CLI output and agent transcripts, and a pasted credential must
+    # not ride along.
+    for index, spec in enumerate(specs, start=1):
         if not isinstance(spec, str):
-            raise ValueError(f"volume spec must be a string: {spec!r}")
+            raise ValueError(f"volume spec #{index} must be a string")
         volname, sep, container_path = spec.partition(":")
         if not sep:
-            raise ValueError(f"volume spec must be '<name>:<path>': {spec!r}")
+            raise ValueError(f"volume spec #{index} must be '<name>:<path>'")
         if ":" in container_path:
-            raise ValueError(f"volume spec has an extra ':': {spec!r}")
+            raise ValueError(f"volume spec #{index} has an extra ':'")
         if not _VOLUME_NAME_RE.fullmatch(volname):
             raise ValueError(
-                f"invalid volume name {volname!r}: 1-32 lowercase letters, digits or '-'"
+                f"volume spec #{index}: invalid volume name, expected 1-32 lowercase "
+                "letters, digits or '-'"
             )
         if not container_path.startswith("/"):
-            raise ValueError(f"volume container path must be absolute: {container_path!r}")
+            raise ValueError(f"volume spec #{index}: container path must be absolute")
         # POSIX normpath preserves an exactly-two-slash prefix (``//x`` stays
         # ``//x``), which would slip past the forbidden-path checks below while
         # the kernel collapses it to ``/x``. Reject a doubled leading slash.
         if container_path.startswith("//"):
-            raise ValueError(
-                f"volume container path has a doubled leading slash: {container_path!r}"
-            )
+            raise ValueError(f"volume spec #{index}: container path has a doubled leading slash")
         if os.path.normpath(container_path) != container_path:
-            raise ValueError(f"volume container path must be normalized: {container_path!r}")
+            raise ValueError(f"volume spec #{index}: container path must be normalized")
         if container_path in _FORBIDDEN_VOLUME_PATHS:
-            raise ValueError(f"volume container path not allowed: {container_path!r}")
+            raise ValueError(f"volume spec #{index}: container path not allowed")
         for prefix in _FORBIDDEN_VOLUME_PREFIXES:
             if container_path == prefix or container_path.startswith(prefix + "/"):
-                raise ValueError(f"volume container path not allowed: {container_path!r}")
+                raise ValueError(f"volume spec #{index}: container path not allowed")
         if volname in seen_names:
-            raise ValueError(f"duplicate volume name: {volname!r}")
+            raise ValueError(f"volume spec #{index}: duplicate volume name")
         if container_path in seen_paths:
-            raise ValueError(f"duplicate volume container path: {container_path!r}")
+            raise ValueError(f"volume spec #{index}: duplicate container path")
         seen_names.add(volname)
         seen_paths.add(container_path)
     return specs
@@ -267,8 +269,10 @@ class DeployConfig(BaseModel):
     @classmethod
     def _check_name_is_dns_label(cls, value: str) -> str:
         if not _DNS_LABEL_RE.match(value):
+            # Value-free on purpose: this text reaches 422 bodies, CLI output and
+            # agent transcripts, and a pasted credential must not ride along.
             raise ValueError(
-                f"Invalid [deploy] name '{value}': must be a DNS label "
+                "Invalid [deploy] name: must be a DNS label "
                 "(lowercase letters, digits and '-', 1-63 chars, "
                 "starting and ending with a letter or digit)."
             )
@@ -279,7 +283,7 @@ class DeployConfig(BaseModel):
     def _check_memory_limit_format(cls, value: str | None) -> str | None:
         if value is not None and not _MEMORY_LIMIT_RE.match(value):
             raise ValueError(
-                f"Invalid [deploy] memory_limit '{value}': expected a byte count "
+                "Invalid [deploy] memory_limit: expected a byte count "
                 "with an optional b/k/m/g suffix (e.g. '512m', '2g', '1073741824')."
             )
         return value
@@ -577,8 +581,30 @@ def load_project_config(path: Path | None = None) -> ProjectConfig | None:
         return None
     with open(path, "rb") as f:
         data = tomllib.load(f)
+    if "deploy" in data and not isinstance(data["deploy"], dict):
+        # ``DeployConfig(**"text")`` would be a TypeError, which no caller
+        # treats as a config error; make it the same ValueError shape as the
+        # [ai]/[db] table checks (and the daemon's 422 for the same file).
+        raise ValueError(f"[deploy] in {PROJECT_CONFIG_NAME} must be a table.")
     return ProjectConfig(
         deploy=DeployConfig(**data["deploy"]) if "deploy" in data else None,
         ai=parse_ai_bindings(data["ai"]) if "ai" in data else None,
         db=parse_db_bindings(data["db"]) if "db" in data else None,
     )
+
+
+def describe_project_config_error(exc: ValueError) -> str:
+    """One value-free line for a ``load_project_config`` failure.
+
+    Callers that surface the error to a terminal or an agent use this instead of
+    ``str(exc)``: a pydantic ``ValidationError`` string is many lines and, for
+    models without ``hide_input_in_errors``, echoes the rejected input. Only the
+    first error's location and validator message are kept — the same shape the
+    daemon's ``422 deploy.invalid`` envelope uses.
+    """
+    if isinstance(exc, ValidationError):
+        first = exc.errors(include_url=False, include_input=False)[0]
+        loc = ".".join(str(part) for part in first.get("loc", ()))
+        where = f"{exc.title}.{loc}" if loc else exc.title
+        return f"Invalid {PROJECT_CONFIG_NAME} ({where}): {first.get('msg', 'validation error')}"
+    return f"Invalid {PROJECT_CONFIG_NAME}: {exc}"

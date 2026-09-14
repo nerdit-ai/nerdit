@@ -15,7 +15,7 @@ from uuid import uuid4
 
 import typer
 
-from nerdit.cli.display import console, display_service_submitted, render_client_error
+from nerdit.cli.display import _plain, console, display_service_submitted, render_client_error
 
 # Strict model-reference shape (S7): 'llama3.1:8b', 'phi3.5', 'library/llama:tag'.
 # Deliberately narrow — anything else falls through to the explicit error below.
@@ -114,7 +114,11 @@ async def _serve_async(
 ) -> None:
     """Merge effective service parameters over nerdit.toml [deploy] and register."""
     from nerdit.cli.client import get_configured_client
-    from nerdit.config.project import find_project_config, load_project_config
+    from nerdit.config.project import (
+        describe_project_config_error,
+        find_project_config,
+        load_project_config,
+    )
 
     # S7 (P5): classify the positional BEFORE the nerdit.toml walk-up — for a
     # nonexistent path, find_project_config would silently pick up an ancestor
@@ -152,7 +156,11 @@ async def _serve_async(
     # Locate nerdit.toml from the given directory (or cwd), then read [deploy].
     start = Path(path).resolve() if path else None
     config_path = find_project_config(start)
-    project = load_project_config(config_path)
+    try:
+        project = load_project_config(config_path)
+    except ValueError as exc:  # pydantic ValidationError is a ValueError
+        console.print(f"[red]{_plain(describe_project_config_error(exc))}[/red]")
+        raise typer.Exit(1) from exc
     if config_path:
         console.print(f"[dim]nerdit.toml found at {config_path}[/dim]")
     deploy = project.deploy if project and project.deploy else None

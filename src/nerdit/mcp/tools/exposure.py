@@ -22,11 +22,29 @@ schema never drifts from the route's.
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from nerdit.cli.client import NerditClient
 from nerdit.mcp.errors import _call
+from nerdit.mcp.tools._shared import IdempotencyKey
 from nerdit.mcp.transport import _request_client
+
+# Local alias: the exposure tools address an APP, never the wider
+# "app, model or database" that the daemon-wide service lookup accepts — so an alias is
+# not stretched. The kind gate lives on the WRITE routes only; the delete routes
+# resolve and delete with no kind check, so the description attributes the
+# refusal to the two writes rather than to all four tools.
+ExposedApp = Annotated[
+    str,
+    Field(
+        description="Name (or row id) of an existing deployed app — only kind "
+        "'service' can be exposed: ``share_service``/``add_domain`` refuse a model "
+        "or database with 422 ``*.kind_unsupported``, while the remove tools just "
+        "find nothing to undo."
+    ),
+]
 
 
 async def _share_service_impl(
@@ -86,10 +104,25 @@ async def _remove_domain_impl(
 
 # fmt: off
 async def share_service(
-        name: str,
-        access: str = "private",
-        consent: bool = False,
-        idempotency_key: str | None = None,
+        name: ExposedApp,
+        access: Annotated[
+            str,
+            Field(
+                description="Exposure mode: ``private`` (the default — signed-in owners "
+                "of this node only) or ``public`` (world-reachable). Any other value is "
+                "refused by the daemon with a 422."
+            ),
+        ] = "private",
+        consent: Annotated[
+            bool,
+            Field(
+                description="Acknowledges that a public share serves the app to anyone "
+                "with the URL. Read only when ``access='public'``, where ``false`` (the "
+                "default) is refused unless the app carries a ``[deploy].edge_auth`` "
+                "block; ignored for a private share."
+            ),
+        ] = False,
+        idempotency_key: IdempotencyKey = None,
     ) -> Any:
         """Use when: you need a URL you can open (public_url is LAN-only).
 
@@ -103,7 +136,7 @@ async def share_service(
         (409 ``share.link_required``). Returns ``{access, url, state}``; ``state``
         is ``ready`` | ``link_down`` | ``not_entitled``. The same URL then appears
         in ``get_service`` / ``list_routes`` under ``public_urls`` (kind
-        ``hosted``). Idempotent; a key is auto-generated if omitted.
+        ``hosted``).
 
         ``state`` and ``origin`` answer two DIFFERENT questions and you need
         both. ``state`` is about the LINK — is the hosted path provisioned.
@@ -123,8 +156,8 @@ async def share_service(
         )
 
 async def unshare_service(
-        name: str,
-        idempotency_key: str | None = None,
+        name: ExposedApp,
+        idempotency_key: IdempotencyKey = None,
     ) -> Any:
         """Use when: an app should stop being reachable at its hosted URL.
 
@@ -142,10 +175,27 @@ async def unshare_service(
         )
 
 async def add_domain(
-        name: str,
-        domain: str,
-        acme: bool | None = None,
-        idempotency_key: str | None = None,
+        name: ExposedApp,
+        domain: Annotated[
+            str,
+            Field(
+                description="Bare lowercase DNS name of at least two labels: no scheme, "
+                "path, port, wildcard, IP literal or IDN/punycode. Case and one trailing "
+                "dot are folded server-side, so ``App.Example.COM.`` and "
+                "``app.example.com`` are one resource. A name at or under this node's own "
+                "hostname, ``base_domain`` or ``extra_hostnames`` is reserved."
+            ),
+        ],
+        acme: Annotated[
+            bool | None,
+            Field(
+                description="Tri-state certificate policy. ``true`` = request a public "
+                "ACME certificate; ``false`` = serve with this node's internal CA; omit "
+                "(the default ``null``) = keep the row's stored value, ``false`` on a new "
+                "domain — so a re-run never downgrades an issued certificate."
+            ),
+        ] = None,
+        idempotency_key: IdempotencyKey = None,
     ) -> Any:
         """Serve a deployed app at a domain YOU own, from this node's own proxy (P26).
 
@@ -159,15 +209,9 @@ async def add_domain(
         certificate; it needs an ADMIN token (403 ``domain.acme_forbidden``,
         ``reason: acme_admin_only`` — the node has one ACME account whose rate
         limits every domain on it shares) and 409 ``domain.acme_disabled``
-        unless the daemon has ``[proxy.acme].enabled``. Leaving ``acme`` OUT
-        keeps whatever the domain already has (``false`` on a new one), so
-        re-running this tool to read the URL back never downgrades an issued
-        public certificate; pass ``acme=False`` to downgrade on purpose.
+        unless the daemon has ``[proxy.acme].enabled``.
 
-        ``domain`` must be a bare, lowercase DNS name (case and a trailing dot
-        are folded server-side): no scheme, no path, no port, no wildcard, no IP
-        literal, no IDN/punycode, at least two labels, and never a name under
-        this node's own hostname / ``base_domain`` / extra hostnames. Refusals:
+        Refusals:
         422 ``domain.invalid`` — the name broke exactly one grammar rule and the
         message names it (``empty``, ``whitespace``, ``not_bare``,
         ``has_port``, ``wildcard``, ``ip_literal``, ``idn``, ``single_label``,
@@ -183,8 +227,7 @@ async def add_domain(
         ``disabled`` (``acme`` asked for, ``[proxy.acme]`` off) | ``pending``
         (issuing, or failing — check ``doctor``) | ``issued`` | ``expired``.
         The URL then appears in ``get_service`` / ``list_routes`` under
-        ``public_urls`` (kind ``domain``). Idempotent; a key is auto-generated
-        if omitted.
+        ``public_urls`` (kind ``domain``).
         """
         return await _add_domain_impl(
             _request_client(),
@@ -195,9 +238,16 @@ async def add_domain(
         )
 
 async def remove_domain(
-        name: str,
-        domain: str,
-        idempotency_key: str | None = None,
+        name: ExposedApp,
+        domain: Annotated[
+            str,
+            Field(
+                description="The bound domain to unbind, case and one trailing dot folded "
+                "as on add. Grammar is not ENFORCED on delete (a legacy or now-reserved "
+                "binding stays removable): a name that is not bound simply removes nothing."
+            ),
+        ],
+        idempotency_key: IdempotencyKey = None,
     ) -> Any:
         """Remove a custom domain; its route disappears on the next reconcile tick. Idempotent."""
         return await _remove_domain_impl(

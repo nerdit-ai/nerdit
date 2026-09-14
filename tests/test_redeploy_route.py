@@ -903,8 +903,10 @@ def test_the_redeploy_hint_stays_generic_on_a_stale_mirror(tmp_path, fake_clone)
     app = _make_app(q, tmp_path, secret_manager=_secret_manager({}))
     app.state.link_manager = _link_manager({}, link_state="connected", pro_mirror="stale")
 
+    # The legacy admin: the generic wording is the admin's (a submitter's is
+    # pinned in test_recorded_github_ref_without_a_token_is_422_before_the_clone).
     resp = TestClient(app, raise_server_exceptions=False).post(
-        "/deploy/demo/redeploy", headers=_auth(SUB_RAW)
+        "/deploy/demo/redeploy", headers=_auth(LEGACY)
     )
 
     assert resp.status_code == 422
@@ -945,8 +947,10 @@ def test_recorded_github_ref_without_a_token_is_422_before_the_clone(tmp_path, f
     assert resp.status_code == 422
     body = resp.json()
     assert body["code"] == "deploy.github_token_absent"
-    assert "Nerdit GitHub App" in body["hint"]
-    assert "${secrets.*}" in body["hint"]
+    # The redeploy was posted by the submitter that owns the row (audit A22):
+    # it is told who can supply the token, not to do what its role cannot.
+    assert body["hint"].startswith("this token cannot install the Nerdit GitHub App")
+    assert "${secrets.shared.GITHUB_TOKEN}" in body["hint"]
     assert not fake_clone.calls
     q.update_service_config.assert_not_awaited()
 
@@ -962,3 +966,27 @@ def test_recorded_github_ref_for_a_repo_outside_every_installation_is_422(tmp_pa
     assert resp.status_code == 422
     assert resp.json()["code"] == "deploy.github_token_absent"
     assert not fake_clone.calls
+
+
+async def test_saved_public_env_survives_a_redeploy_from_source(tmp_path, fake_clone):
+    """P38: the saved map is re-persisted, not carried forward by omission."""
+    job = _git_row()
+    config = json.loads(job.config)
+    config["build_overrides"] = {"public_env": {"VITE_API": "https://api.example.com"}}
+    job.config = json.dumps(config)
+    q = _queries(job)
+    app = _make_app(q, tmp_path)
+
+    result = await deploy_pipeline.redeploy_from_source(
+        request_or_none=None,
+        app=app,
+        queries=q,
+        settings=app.state.settings,
+        secrets=None,
+        job=job,
+        principal="system",
+    )
+
+    cfg = json.loads(q.update_service_config.call_args.args[1])
+    assert cfg["public_env"] == {"VITE_API": "https://api.example.com"}
+    assert result["build"]["public_env"] == {"VITE_API": "https://api.example.com"}

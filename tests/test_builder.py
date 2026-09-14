@@ -94,6 +94,53 @@ def test_python_wins_over_node_markers(tmp_path):
     assert plan.dockerfile_name == GENERATED_DOCKERFILE_NAME
 
 
+@pytest.mark.parametrize("framework", ["node", "nextjs"])
+@pytest.mark.parametrize(
+    "pyproject",
+    ["", "[tool.ruff]\nline-length = 100\n", "[tool.black]\nline-length = 88\n"],
+)
+def test_tooling_pyproject_does_not_override_node(tmp_path, framework, pyproject):
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "dependencies": {"next": "16.3.4"} if framework == "nextjs" else {},
+                "scripts": {"build": "next build", "start": "next start"},
+            }
+        )
+    )
+    (tmp_path / "pyproject.toml").write_text(pyproject)
+
+    plan = detect(tmp_path)
+
+    assert plan.language == "node"
+    assert plan.framework == framework
+    assert plan.build_command == "npm run build"
+    assert plan.effective_start_command == "npm start"
+    assert "RUN npm run build" in plan.dockerfile_text
+    assert detect(tmp_path, _deploy_cfg(build_settings={"preset": "python"})).language == "python"
+
+
+@pytest.mark.parametrize(
+    "pyproject, legacy_marker",
+    [
+        ("[project]\nname = 'app'\n", None),
+        ("[build-system]\nrequires = ['setuptools']\n", None),
+        ("[tool.poetry]\nname = 'app'\n", None),
+        ("[tool.ruff]\nline-length = 100\n", "setup.py"),
+        ("[tool.ruff]\nline-length = 100\n", "setup.cfg"),
+        ("[tool.ruff]\nline-length = 100\n", "requirements.txt"),
+        ("[invalid TOML", None),
+    ],
+)
+def test_python_project_keeps_precedence_over_node(tmp_path, pyproject, legacy_marker):
+    _write_package_json(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(pyproject)
+    if legacy_marker:
+        (tmp_path / legacy_marker).write_text("")
+
+    assert detect(tmp_path).language == "python"
+
+
 # --- Node buildpack ---
 
 
@@ -471,3 +518,97 @@ def test_dockerfile_remains_authoritative_with_preset(tmp_path, preset):
     plan = detect(str(tmp_path), _deploy_cfg(build_settings={"preset": preset}))
     assert plan.language == "dockerfile"
     assert bool(plan.warnings) == (preset != "dockerfile")
+
+
+# --- public_env ARG declarations (P38) ---
+
+
+def test_node_public_env_args_sit_between_install_and_build(tmp_path):
+    _write_package_json(tmp_path, scripts={"build": "vite build", "start": "node index.js"})
+
+    text = detect(
+        tmp_path,
+        deploy_cfg=_deploy_cfg(build_settings={"public_env": {"VITE_B": "2", "VITE_A": "1"}}),
+    ).dockerfile_text
+
+    install = _idx(text, "RUN npm install")
+    first_arg = _idx(text, "ARG VITE_A")
+    assert install < first_arg < _idx(text, "ARG VITE_B")  # sorted by key
+    assert first_arg < _idx(text, "COPY . .") < _idx(text, "RUN npm run build")
+
+
+def test_node_public_env_args_follow_an_install_override(tmp_path):
+    _write_package_json(tmp_path, scripts={"build": "vite build", "start": "node index.js"})
+
+    text = detect(
+        tmp_path,
+        deploy_cfg=_deploy_cfg(
+            build_settings={"install": "npm ci --omit=optional", "public_env": {"VITE_A": "1"}}
+        ),
+    ).dockerfile_text
+
+    assert _idx(text, "npm ci --omit=optional") < _idx(text, "ARG VITE_A")
+    assert _idx(text, "ARG VITE_A") < _idx(text, "RUN npm run build")
+
+
+def test_python_public_env_args_sit_between_install_and_source_copy(tmp_path):
+    _write_requirements(tmp_path)
+
+    text = detect(
+        tmp_path,
+        deploy_cfg=_deploy_cfg(build_settings={"public_env": {"PUBLIC_API": "https://x.test"}}),
+    ).dockerfile_text
+
+    install = _idx(text, "RUN pip install --no-cache-dir -r requirements.txt")
+    assert install < _idx(text, "ARG PUBLIC_API") < _idx(text, "COPY . .")
+
+
+@pytest.mark.parametrize("marker", ["requirements", "pyproject", "package"])
+def test_no_public_env_emits_no_arg_lines(tmp_path, marker):
+    if marker == "requirements":
+        _write_requirements(tmp_path)
+    elif marker == "pyproject":
+        _write_pyproject(tmp_path)
+    else:
+        _write_package_json(tmp_path, scripts={"start": "node index.js"})
+
+    assert "\nARG " not in detect(tmp_path, deploy_cfg=_deploy_cfg()).dockerfile_text
+
+
+def test_passthrough_warns_only_for_undeclared_public_env(tmp_path):
+    (tmp_path / "Dockerfile").write_text("FROM alpine\narg VITE_DECLARED=fallback\n")
+
+    warnings = detect(
+        tmp_path,
+        deploy_cfg=_deploy_cfg(
+            build_settings={"public_env": {"VITE_DECLARED": "1", "VITE_MISSING": "2"}}
+        ),
+    ).warnings
+
+    assert warnings == [
+        "public_env VITE_MISSING is not declared as ARG in Dockerfile; the value will be unused."
+    ]
+
+
+def test_passthrough_warns_for_a_global_arg_above_the_first_from(tmp_path):
+    """A pre-FROM `ARG` is a global arg: unset inside every build stage."""
+    (tmp_path / "Dockerfile").write_text("ARG VITE_DECLARED\nFROM alpine\n")
+
+    warnings = detect(
+        tmp_path,
+        deploy_cfg=_deploy_cfg(build_settings={"public_env": {"VITE_DECLARED": "1"}}),
+    ).warnings
+
+    assert warnings == [
+        "public_env VITE_DECLARED is not declared as ARG in Dockerfile; the value will be unused."
+    ]
+
+
+def test_passthrough_without_public_env_keeps_existing_warnings(tmp_path):
+    (tmp_path / "Dockerfile").write_text("FROM alpine\n")
+
+    plan = detect(tmp_path, deploy_cfg=_deploy_cfg(build_settings={"install": "make deps"}))
+
+    assert plan.warnings == [
+        "Dockerfile is authoritative; preset/install/build/runtime/manager overrides are ignored."
+    ]

@@ -1,7 +1,7 @@
 """Inspect an app directory and return a Docker build plan without invoking Docker.
 
-An existing Dockerfile takes precedence. Otherwise, Python markers
-(`requirements.txt` or `pyproject.toml`) precede Node's `package.json`.
+An existing Dockerfile takes precedence. Otherwise, Python project markers
+precede Node's `package.json`; tooling-only `pyproject.toml` files do not.
 `[deploy]` hints supply command and port values but do not select a language.
 Unsupported trees raise `BuildpackNotSupported`; callers write generated
 Dockerfiles and invoke the runtime.
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -72,6 +73,48 @@ class BuildpackNotSupported(Exception):  # noqa: N818 — P4 public API name
     """Raised when no supported buildpack matches the app folder."""
 
 
+def _public_env_args(settings: BuildSettings) -> str:
+    """Bare ``ARG KEY`` declarations for the plan's public build variables.
+
+    Returned with a leading blank line so callers can append it straight after
+    the install step: values arrive via ``--build-arg``, never as ``ARG K=V``
+    defaults (Dockerfile expansion would mangle them), and declaring them after
+    the install keeps the dependency layer cached when only a value changes.
+    Empty string when no ``public_env`` is set.
+    """
+    keys = sorted(settings.public_env or {})
+    return "\n\n" + "\n".join(f"ARG {key}" for key in keys) if keys else ""
+
+
+def _undeclared_public_env(context: Path, settings: BuildSettings) -> list[str]:
+    """Warn per public_env key the passthrough Dockerfile never declares as ARG.
+
+    Build args are passed to a user Dockerfile but only reach the build when it
+    declares them; an undeclared key is the silent failure this feature exists
+    to make loud. The instruction keyword is case-insensitive (Dockerfile
+    grammar); the ARG *name* is not (docker compares it byte for byte). Only the
+    text from the first `FROM` is searched, since an `ARG` above it is a global
+    arg and is unset inside every stage.
+    """
+    keys = sorted(settings.public_env or {})
+    if not keys:
+        return []
+    try:
+        text = (context / "Dockerfile").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    # ponytail: token search from the first stage, so a declaration in ANOTHER
+    # stage of a multi-stage build reads as declared. Parse the stage graph if
+    # that ever warns falsely.
+    stages = re.search(r"^[ \t]*(?i:FROM)\b", text, re.MULTILINE)
+    body = text[stages.start() :] if stages else text
+    return [
+        f"public_env {key} is not declared as ARG in Dockerfile; the value will be unused."
+        for key in keys
+        if not re.search(rf"^[ \t]*(?i:ARG)\s+{re.escape(key)}(\b|=)", body, re.MULTILINE)
+    ]
+
+
 @dataclass
 class BuildPlan:
     """What the caller needs to build an image from a context directory.
@@ -109,14 +152,10 @@ def detect(context_dir: str | Path, deploy_cfg: DeployConfig | None = None) -> B
 
     # 1. Existing Dockerfile → passthrough, the user owns the build.
     if (context / "Dockerfile").is_file():
-        return BuildPlan(
-            language="dockerfile",
-            dockerfile_name="Dockerfile",
-            dockerfile_text=None,
-            port=deploy_cfg.port if deploy_cfg else None,
-            start_command=explicit_start,
-            effective_start_command=explicit_start,
-            warnings=[
+        # public_env is deliberately absent from the "ignored overrides" list:
+        # build args DO reach a user Dockerfile — provided it declares them.
+        warnings = (
+            [
                 "Dockerfile is authoritative; preset/install/build/runtime/manager "
                 "overrides are ignored."
             ]
@@ -125,7 +164,16 @@ def detect(context_dir: str | Path, deploy_cfg: DeployConfig | None = None) -> B
                 getattr(settings, key) is not None
                 for key in ("install", "build", "node_version", "package_manager")
             )
-            else [],
+            else []
+        )
+        return BuildPlan(
+            language="dockerfile",
+            dockerfile_name="Dockerfile",
+            dockerfile_text=None,
+            port=deploy_cfg.port if deploy_cfg else None,
+            start_command=explicit_start,
+            effective_start_command=explicit_start,
+            warnings=warnings + _undeclared_public_env(context, settings),
         )
 
     if settings.preset == "dockerfile":
@@ -149,14 +197,17 @@ def detect(context_dir: str | Path, deploy_cfg: DeployConfig | None = None) -> B
             )
         return _plan_python(context, deploy_cfg)
 
-    # 3. Python markers → generate a Python Dockerfile (pip install).
-    #    (Checked before Node so a mixed repo with requirements.txt builds as
-    #    Python — honest about what we would actually be building.)
-    if (context / "requirements.txt").is_file() or (context / "pyproject.toml").is_file():
+    # Python projects retain precedence, but Ruff/Black configuration alone
+    # must not turn a Node app into a Python build.
+    package_json = context / "package.json"
+    pyproject = context / "pyproject.toml"
+    if (context / "requirements.txt").is_file() or (
+        pyproject.is_file()
+        and (not package_json.is_file() or _pyproject_defines_project(pyproject))
+    ):
         return _plan_python(context, deploy_cfg)
 
     # 4. Node buildpack.
-    package_json = context / "package.json"
     if package_json.is_file():
         return _plan_node(context, package_json, deploy_cfg)
 
@@ -165,6 +216,25 @@ def detect(context_dir: str | Path, deploy_cfg: DeployConfig | None = None) -> B
     raise BuildpackNotSupported(
         "no Dockerfile, package.json, or supported project files found in "
         "the uploaded project — add a Dockerfile or a package.json to deploy this app."
+    )
+
+
+def _pyproject_defines_project(pyproject: Path) -> bool:
+    """Distinguish Python project metadata from standalone tool configuration."""
+    if pyproject.is_symlink() or any(
+        (pyproject.parent / marker).is_file() for marker in ("setup.py", "setup.cfg")
+    ):
+        return True
+    try:
+        metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        # Only change precedence when we can establish the file is tooling-only.
+        return True
+    tool = metadata.get("tool", {})
+    return (
+        "project" in metadata
+        or "build-system" in metadata
+        or (isinstance(tool, dict) and "poetry" in tool)
     )
 
 
@@ -239,15 +309,16 @@ def _plan_node(context: Path, package_json: Path, deploy_cfg: DeployConfig | Non
         if settings.install
         else f"RUN {packages.install}"
     )
+    args = _public_env_args(settings)
     if settings.install or node_install_needs_source(context, pkg):
-        copy_and_install = f"COPY . .\n\n{install}"
+        copy_and_install = f"COPY . .\n\n{install}{args}"
     else:
         # Configuration, lifecycle scripts and local dependencies take the full
         # source path above. Simple projects keep a cached dependency layer.
         manifests = "package*.json" if packages.name == "npm" else "package.json"
         if packages.lockfile and packages.lockfile != "package-lock.json":
             manifests += f" {packages.lockfile}"
-        copy_and_install = f"COPY {manifests} ./\n\n{install}\n\nCOPY . ."
+        copy_and_install = f"COPY {manifests} ./\n\n{install}{args}\n\nCOPY . ."
     build_command = (
         None
         if settings.build is False
@@ -322,33 +393,34 @@ def _plan_python(context: Path, deploy_cfg: DeployConfig | None) -> BuildPlan:
         if requirements.is_file()
         else "pip install --no-cache-dir ."
     )
+    args = _public_env_args(settings)
     if settings.install:
-        copy_and_install = "COPY . .\n\nRUN " + json.dumps(["sh", "-c", settings.install])
+        copy_and_install = "COPY . .\n\nRUN " + json.dumps(["sh", "-c", settings.install]) + args
     elif requirements.is_file() and _requirements_reference_tree(requirements):
         # A requirements.txt entry references the source tree (`-e .`, `.`,
         # a nested `-r`/`-c` include, a `file:` URL). pip needs the whole
         # tree present, so copy first then install (layer-cache win skipped).
-        copy_and_install = """\
+        copy_and_install = f"""\
 # requirements.txt references the source tree, so deps install AFTER the full
 # copy (the pin-file-first layer-cache win is skipped for correctness).
 COPY . .
 
-RUN pip install --no-cache-dir -r requirements.txt"""
+RUN pip install --no-cache-dir -r requirements.txt{args}"""
     elif requirements.is_file():
-        copy_and_install = """\
+        copy_and_install = f"""\
 # Copy the pin file first so the install layer is cached across source edits.
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt{args}
 
 # Copy the rest of the app context (uploads are already filtered server-side).
 COPY . ."""
     else:
-        copy_and_install = """\
+        copy_and_install = f"""\
 # Copy the app context (uploads are already filtered server-side).
 COPY . .
 
 # PEP 517 build needs the whole source tree present, so install comes last.
-RUN pip install --no-cache-dir ."""
+RUN pip install --no-cache-dir .{args}"""
 
     # Start command resolution: [deploy].start > uvicorn fallback. The uvicorn
     # fallback assumes `uvicorn` is installed and the ASGI app is named

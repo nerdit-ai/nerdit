@@ -280,3 +280,49 @@ def test_unsafe_saved_command_can_be_reset_or_replaced(tmp_path, monkeypatch, re
 def test_saved_settings_shape_remains_validated(saved):
     with pytest.raises(NerditError):
         _merge_build_settings({}, saved, {"install": None})
+
+
+def test_public_env_values_are_previewed_and_persisted(tmp_path):
+    """Public build variables land in the plan IN CLEAR and in the row.
+
+    They are compiled into browser bundles, so masking them would hide the one
+    thing an operator can check; `BuildSettings` refuses secret references.
+    """
+    q = _queries()
+    settings = json.dumps({"public_env": {"VITE_API": "https://api.example.com"}})
+    preview = _dry_post(_client(q, tmp_path), _node_zip(), build_settings=settings)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["build"]["public_env"] == {"VITE_API": "https://api.example.com"}
+    assert preview.json()["build"]["sources"]["public_env"] == "request"
+    result = _post(_client(q, tmp_path), _node_zip(), build_settings=settings)
+    assert result.status_code == 201, result.text
+    cfg = json.loads(q.reserve_service_for_token.call_args.args[0].config)
+    assert cfg["public_env"] == {"VITE_API": "https://api.example.com"}
+    assert cfg["build_plan"]["public_env"] == {"VITE_API": "https://api.example.com"}
+
+
+def test_public_env_defaults_to_an_empty_map(tmp_path):
+    """Written on every deploy so a carried-forward map can never resurrect."""
+    q = _queries()
+    assert _post(_client(q, tmp_path), _node_zip()).status_code == 201
+    cfg = json.loads(q.reserve_service_for_token.call_args.args[0].config)
+    assert cfg["public_env"] == {}
+
+
+def test_git_saved_public_env_survives_and_null_resets(tmp_path, monkeypatch):
+    previous = _existing({"build_overrides": {"public_env": {"VITE_API": "saved"}}})
+    q = git_queries(previous)
+    response = git_post(git_client(q, tmp_path), monkeypatch, _fake_clone())
+    assert response.status_code == 201, response.text
+    cfg = json.loads(q.update_service_config.call_args.args[1])
+    assert cfg["build_overrides"] == {"public_env": {"VITE_API": "saved"}}
+    assert cfg["public_env"] == {"VITE_API": "saved"}
+    assert response.json()["build"]["public_env"] == {"VITE_API": "saved"}
+    response = git_post(
+        git_client(q, tmp_path), monkeypatch, _fake_clone(), build_settings={"public_env": None}
+    )
+    assert response.status_code == 201, response.text
+    cfg = json.loads(q.update_service_config.call_args.args[1])
+    assert "public_env" not in cfg["build_overrides"]
+    assert cfg["public_env"] == {}
+    assert response.json()["build"]["public_env"] == {}

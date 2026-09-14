@@ -15,7 +15,9 @@ and REST, where a human types the word ``restore`` at a confirm prompt.
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from nerdit.cli.client import NerditClient
 from nerdit.mcp.errors import _call, _clamp
@@ -23,6 +25,8 @@ from nerdit.mcp.tools._shared import (
     DEFAULT_DATABASE_LIMIT,
     DEFAULT_DUMP_TIMEOUT_S,
     MAX_DATABASE_LIMIT,
+    Cursor,
+    IdempotencyKey,
 )
 from nerdit.mcp.transport import _request_client
 
@@ -107,21 +111,59 @@ async def _list_database_dumps_impl(client: NerditClient, *, name: str) -> Any:
     return await _call(client.list_database_dumps(name))
 
 
+DatabaseBackend = Annotated[
+    str | None,
+    Field(
+        description="Data backend to provision: ``postgres`` or ``redis``. Omit to "
+        "use the daemon's ``[databases].default_backend`` (``postgres`` out of the "
+        "box); an unknown value is refused, never silently defaulted."
+    ),
+]
+DatabaseName = Annotated[
+    str | None,
+    Field(
+        description="Service name for the new database (lowercase DNS label, ≤ 63 "
+        "chars). Omit to use the backend's own name prefix. An existing name is a "
+        "conflict, not a redeploy."
+    ),
+]
+DatabaseLimit = Annotated[
+    int | None,
+    Field(
+        description="Databases per page; omit for 50. Clamped to 200, the daemon's own page cap."
+    ),
+]
+DatabaseTarget = Annotated[
+    str,
+    Field(
+        description="Name of an existing managed database (``kind=database``); an "
+        "app or model row is refused."
+    ),
+]
+DumpTimeout = Annotated[
+    int,
+    Field(
+        description="Seconds the dump tool may run server-side; omit for 300. "
+        "Floored at 1 and otherwise passed straight through, so a value above the "
+        "daemon's ``[services].dump_timeout_max_s`` gets the authoritative 422 "
+        "``dump.timeout_too_large`` instead of being silently clamped."
+    ),
+]
+
+
 # fmt: off
 async def create_database(
-        backend: str | None = None,
-        name: str | None = None,
-        idempotency_key: str | None = None,
+        backend: DatabaseBackend = None,
+        name: DatabaseName = None,
+        idempotency_key: IdempotencyKey = None,
     ) -> Any:
         """Provision a managed database (kind=database workload).
 
-        ``backend`` selects the data backend: ``postgres`` (default) or
-        ``redis``. Omit it to use the daemon's configured default. Provisioning
-        is asynchronous: the call returns immediately with the database row in
-        ``building`` while the daemon pulls the image off-tick and launches the
-        server; poll ``list_databases`` (or ``get_service``) until ``db_ready``
-        is true. Lifecycle (stop / restart / delete) goes through the existing
-        service tools. An idempotency key is auto-generated if omitted.
+        Provisioning is asynchronous: the call returns immediately with the
+        database row in ``building`` while the daemon pulls the image off-tick
+        and launches the server; poll ``list_databases`` (or ``get_service``)
+        until ``db_ready`` is true. Lifecycle (stop / restart / delete) goes
+        through the existing service tools.
 
         The daemon mints the password server-side and stores it write-only — it
         is NEVER returned by this tool (key names only). An app connects to this
@@ -139,18 +181,21 @@ async def create_database(
             idempotency_key=idempotency_key,
         )
 
-async def list_databases(limit: int | None = None, cursor: str | None = None) -> Any:
+async def list_databases(limit: DatabaseLimit = None, cursor: Cursor = None) -> Any:
         """List managed databases (kind=database workloads), bounded to ``limit`` per page.
 
-        Returns a cursor-paginated page; pass ``cursor`` from the previous page
-        to continue. A newly created database shows ``building`` until its
-        off-tick image pull and readiness probe complete (``db_ready`` true).
+        Returns a cursor-paginated page. A newly created database shows
+        ``building`` until its off-tick image pull and readiness probe complete
+        (``db_ready`` true).
         The ``endpoint`` is password-free by construction; lifecycle actions go
         through the service tools.
         """
         return await _list_databases_impl(_request_client(), limit=limit, cursor=cursor)
 
-async def dump_database(name: str, timeout_s: int = DEFAULT_DUMP_TIMEOUT_S) -> Any:
+async def dump_database(
+        name: DatabaseTarget,
+        timeout_s: DumpTimeout = DEFAULT_DUMP_TIMEOUT_S,
+    ) -> Any:
         """Capture a logical, application-consistent dump of a managed database.
 
         The daemon runs the engine's own dump tool — ``pg_dump --format=custom``
@@ -171,11 +216,8 @@ async def dump_database(name: str, timeout_s: int = DEFAULT_DUMP_TIMEOUT_S) -> A
         sweep, so a dump is not an archive. Copy one off the box if it must
         outlive that window.
 
-        TIMEOUT: ``timeout_s`` (default 300) bounds the dump tool server-side
-        and is capped by ``[services].dump_timeout_max_s`` (``422
-        dump.timeout_too_large`` names the cap, never silently clamped). The
-        default matches the usual MCP client read budget, not the route's own
-        900: if your client gives up first, **a longer dump still completes
+        TIMEOUT: the default matches the usual MCP client read budget, not
+        the route's own 900: if your client gives up first, **a longer dump still completes
         server-side and appears in ``list_database_dumps``**. So a read timeout
         here is not a failure — call ``list_database_dumps`` and take the newest
         entry. Do NOT blind-retry: this tool mints its own idempotency key per
@@ -197,7 +239,7 @@ async def dump_database(name: str, timeout_s: int = DEFAULT_DUMP_TIMEOUT_S) -> A
         """
         return await _dump_database_impl(_request_client(), name=name, timeout_s=timeout_s)
 
-async def list_database_dumps(name: str) -> Any:
+async def list_database_dumps(name: DatabaseTarget) -> Any:
         """List the dump tars this daemon holds for one managed database.
 
         Newest first, ``{dump, size_bytes, created_at}`` per row, where

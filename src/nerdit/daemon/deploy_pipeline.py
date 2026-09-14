@@ -277,7 +277,8 @@ _DEPLOY_SHAPE_HINT = (
     "<=4096 chars), cutover (false disarms the zero-downtime swap), "
     "auto_deploy (true opts into push-triggered redeploy) and edge_auth "
     "({user, password = '${secrets.KEY}'}); "
-    "build_settings (install/build/start/node_version/package_manager/subdir); "
+    "build_settings (install/build/start/node_version/package_manager/subdir/"
+    "public_env); "
     "explicit deploy fields override these values."
 )
 
@@ -1165,8 +1166,8 @@ def _merge_build_settings(
         raise NerditError(
             422,
             "deploy.invalid_build_settings",
-            "Invalid build_settings. Use supported commands, runtime, manager and relative subdir; "
-            "build environment and secret inputs are not supported.",
+            "Invalid build_settings. Use supported commands, runtime, manager, relative subdir "
+            "and public_env values; secret inputs and secret references are not supported.",
         ) from None
     origins = {key: "config" for key in repo}
     origins.update({key: "request" if key in patch else "saved" for key in overrides})
@@ -1219,6 +1220,11 @@ def _build_preview(
         "start": plan.effective_start_command or plan.start_command,
         "subdir": root,
         "commit_sha": source.get("commit_sha"),
+        # Deliberately in clear: these values are compiled into public build
+        # output (a browser bundle), and secret references are refused by
+        # `BuildSettings`, so masking them would hide the only thing an
+        # operator can check before the deploy.
+        "public_env": dict(settings.public_env or {}),
         "sources": {key: origins.get(key, "detected") for key in BuildSettings.model_fields},
         "warnings": list(plan.warnings),
     }
@@ -1402,6 +1408,10 @@ async def _finalize_deploy(
         )
         build_fields["build_overrides"] = overrides
         build_fields["build_plan"] = preview
+        # Written on EVERY deploy, empty map included: `write_redeploy` carries
+        # unlisted build keys forward, so an omitted key would resurrect a map
+        # the caller just removed.
+        build_fields["public_env"] = dict(settings.public_env or {})
 
         effective.eff_start = plan.start_command
 
@@ -1585,28 +1595,69 @@ def _source_credential_error(name: str, detail: str) -> NerditError:
     )
 
 
-def github_token_absent_error(*, tier_gated: bool = False) -> NerditError:
+#: What a submitter can do about a private repository: nothing alone. Its
+#: role can neither install the GitHub App nor write the shared scope, so the
+#: hint names the person who can and the exact reference to pass afterwards
+#: (audit A22). Admin wording is untouched: the poller and CLI key off status
+#: and code, and the tier sentence (D-X16-37) still wins when it applies.
+_SUBMITTER_PRIVATE_REPO_HINT = (
+    "this token cannot install the Nerdit GitHub App or write a shared secret — "
+    "ask the node owner to install the app on this repository, or to run "
+    "`nerdit secrets set --shared --prompt GITHUB_TOKEN`, then pass "
+    "token_ref '${secrets.shared.GITHUB_TOKEN}'"
+)
+
+#: The clone-failure twin keeps the stock "check the URL" action (a typo and a
+#: private repository fail identically) and names no host and no key: the
+#: repository may live on any `[git].allowed_hosts` entry, so a GitHub-named
+#: secret must not be steered at a GitLab or Gitea server.
+_SUBMITTER_CLONE_HINT = (
+    "repository not found or private — verify the URL is correct and the repo is "
+    "public; for a private repository this token cannot write a shared secret, so "
+    "ask the node owner to run `nerdit secrets set --shared --prompt KEY`, then pass "
+    "token_ref '${secrets.shared.KEY}'"
+)
+
+
+def github_token_absent_error(
+    *, tier_gated: bool = False, role: TokenRole | None = None
+) -> NerditError:
     """Build the explicit-action GitHub-token absence error.
 
-    GitWatch treats this exact 422/code pair as quiet backoff. Tier gating changes
-    only the hint after positive evidence; status, code and detail remain stable.
-    Hints contain no URL, account identifier or slug.
+    GitWatch treats this exact 422/code pair as quiet backoff. Tier gating and
+    the caller's role change only the hint; status, code and detail remain
+    stable. Hints contain no URL, account identifier or slug.
     """
+    if tier_gated:
+        # Soft on purpose, and never "upgrade to Pro": an account that pays
+        # mid-poll keeps a stale-false mirror until the cloud's next push
+        # (~5 min), so this line has to stay true for the customer who has
+        # just paid and is looking at it.
+        hint = "this account's plan does not include GitHub deploys — see the Nerdit console"
+    elif role is TokenRole.submitter:
+        hint = _SUBMITTER_PRIVATE_REPO_HINT
+    else:
+        hint = (
+            "link this node and install the Nerdit GitHub App, or pass a `${secrets.*}` token_ref"
+        )
     return NerditError(
         422,
         "deploy.github_token_absent",
         "token_ref '${github.installation}' resolves to no installation token for this repository.",
-        hint=(
-            # Soft on purpose, and never "upgrade to Pro": an account that pays
-            # mid-poll keeps a stale-false mirror until the cloud's next push
-            # (~5 min), so this line has to stay true for the customer who has
-            # just paid and is looking at it.
-            "this account's plan does not include GitHub deploys — see the Nerdit console"
-            if tier_gated
-            else "link this node and install the Nerdit GitHub App, "
-            "or pass a `${secrets.*}` token_ref"
-        ),
+        hint=hint,
     )
+
+
+def private_repo_hint(exc: GitSourceError, *, role: TokenRole, had_token: bool) -> str | None:
+    """The clone-failure hint a caller can act on, by role.
+
+    An unauthenticated clone that hit an auth challenge is a private (or
+    missing) repository. The stock hint tells the caller to store a token;
+    a submitter cannot, so it gets the owner-facing, host-neutral sentence.
+    """
+    if role is TokenRole.submitter and not had_token and _is_auth_failure(exc):
+        return _SUBMITTER_CLONE_HINT
+    return exc.hint
 
 
 def github_absent_is_tier_gated(app: Any) -> bool:
@@ -1664,7 +1715,10 @@ async def _resolve_source_token(
     if token_ref == GITHUB_INSTALLATION_REF:
         token = resolve_github_installation_token(request.app, repo_url)
         if token is None:
-            raise github_token_absent_error(tier_gated=github_absent_is_tier_gated(request.app))
+            raise github_token_absent_error(
+                tier_gated=github_absent_is_tier_gated(request.app),
+                role=current_principal(request).role,
+            )
         return token
     if secrets is None:  # pragma: no cover - always wired in the daemon
         raise NerditError(500, "internal", "Secret manager is not configured.")

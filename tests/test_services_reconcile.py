@@ -1753,6 +1753,20 @@ class _CompletingBuildRuntime(FakeRuntime):
         yield f"Built {image}"
 
 
+class _BuildArgsRuntime(FakeRuntime):
+    """A successful build that records whatever ``build_args`` it was handed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.build_args: list[dict | None] = []
+
+    async def build_image(self, context_dir, image, dockerfile=None, build_args=None):
+        self.calls.append("build_image")
+        self.build_args.append(dict(build_args) if build_args is not None else None)
+        self.missing_images.discard(image)
+        yield f"Built {image}"
+
+
 class _FailingBuildRuntime(FakeRuntime):
     """build_image always raises — a deterministic build failure."""
 
@@ -1802,6 +1816,32 @@ async def _drain_builds(controller) -> None:
 
 def _phase(job) -> str:
     return json.loads(job.config)["last_deploy"]["phase"]
+
+
+async def _build_once(queries, tmp_path, **cfg_extra) -> _BuildArgsRuntime:
+    """Run one deploy through AppBuilder.build and return the recording runtime."""
+    runtime = _BuildArgsRuntime()
+    runtime.missing_images.add("nerdit-app/app:1")
+    controller = _controller(queries, runtime)
+    controller._prune_old_images = _anoop  # type: ignore[assignment]
+    ctx = tmp_path / "ctx"
+    ctx.mkdir()
+    await queries.create_job(_deploy_svc("app", ctx=ctx, **cfg_extra))
+    await controller.reconcile()
+    await _drain_builds(controller)
+    return runtime
+
+
+async def test_public_env_is_forwarded_as_build_args(queries, tmp_path):
+    runtime = await _build_once(queries, tmp_path, public_env={"VITE_API": "https://x"})
+    assert runtime.build_args == [{"VITE_API": "https://x"}]
+
+
+@pytest.mark.parametrize("cfg_extra", [{}, {"public_env": {}}])
+async def test_build_args_is_not_passed_when_public_env_is_empty(queries, tmp_path, cfg_extra):
+    """The kwarg is omitted entirely, so 3-argument runtimes keep working."""
+    runtime = await _build_once(queries, tmp_path, **cfg_extra)
+    assert runtime.build_args == [None]
 
 
 async def test_deploy_phase_machine_full_happy_path(queries, tmp_path):

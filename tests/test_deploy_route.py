@@ -3434,3 +3434,21 @@ def test_the_failure_hint_never_carries_app_authored_text(tmp_path):
     hints = resp.json()["hints"]
     assert "crash_loop" in hints[0]
     assert "hunter2" not in " ".join(hints)
+
+
+def test_dry_run_plan_shows_public_env_in_clear(tmp_path):
+    """P38: the one plan field printed with its values.
+
+    They compile into public build output, and `BuildSettings` refuses secret
+    references, so the contrast with the names-only `env_diff` is deliberate.
+    """
+    q = _queries()
+    resp = _dry_post(
+        _client(q, tmp_path),
+        _node_zip(),
+        build_settings=json.dumps({"public_env": {"VITE_API": "https://api.example.com"}}),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["build"]["public_env"] == {"VITE_API": "https://api.example.com"}
+    resp = _dry_post(_client(q, tmp_path), _node_zip())
+    assert resp.json()["build"]["public_env"] == {}

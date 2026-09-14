@@ -48,6 +48,7 @@ from nerdit.daemon.deploy_pipeline import (
     _validate_request_name,
     github_absent_is_tier_gated,
     github_token_absent_error,
+    private_repo_hint,
     redeploy_from_source,
     reject_non_service_row,
     resolve_github_installation_token,
@@ -201,7 +202,10 @@ async def _resolve_token_ref(
     if token_ref == GITHUB_INSTALLATION_REF:
         token = resolve_github_installation_token(request.app, repo_url)
         if token is None:
-            raise github_token_absent_error(tier_gated=github_absent_is_tier_gated(request.app))
+            raise github_token_absent_error(
+                tier_gated=github_absent_is_tier_gated(request.app),
+                role=current_principal(request).role,
+            )
         return token
     match = SECRET_REF_RE.match(token_ref)
     assert match is not None  # caller pre-validated against SECRET_REF_RE
@@ -357,7 +361,14 @@ async def deploy_git(
             allowed_hosts=settings.git.allowed_hosts,
         )
     except GitSourceError as exc:
-        raise NerditError(exc.status_code, exc.code, exc.message, hint=exc.hint) from exc
+        raise NerditError(
+            exc.status_code,
+            exc.code,
+            exc.message,
+            hint=private_repo_hint(
+                exc, role=current_principal(request).role, had_token=token is not None
+            ),
+        ) from exc
 
     # `token_ref` persists the `${…}` reference NAME — never
     # the token — so an unattended redeploy of a private repo can re-resolve the

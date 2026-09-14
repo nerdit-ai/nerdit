@@ -6,11 +6,34 @@ Split out of ``mcp/server.py`` (Track B WP24, pure motion).
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from nerdit.cli.client import NerditClient
 from nerdit.mcp.errors import _call
+from nerdit.mcp.tools._shared import IdempotencyKey
 from nerdit.mcp.transport import _request_client
+
+_SecretsScopeWrite = Annotated[
+    str,
+    Field(
+        description="Existing service (app, model or database) whose secrets this call "
+        "modifies, or ``shared`` for the global scope — writing that one is admin-only, "
+        "and a service reads a shared key only where a ``${secrets.shared.KEY}`` "
+        "reference is honoured (``[ai.*].api_key``, ``[db.*].password``, "
+        "``[deploy].edge_auth.password``, a git ``token_ref``), never through ``env``, "
+        "whose values stay literal."
+    ),
+]
+_SecretsScopeRead = Annotated[
+    str,
+    Field(
+        description="Existing service (app, model or database) whose secret key names to "
+        "read, or ``shared`` for the global scope, whose names any authenticated principal "
+        "may read."
+    ),
+]
 
 
 async def _set_secret_impl(
@@ -56,41 +79,53 @@ async def _rm_secret_impl(
 
 # fmt: off
 async def set_secret(
-        service: str, values: dict[str, str], idempotency_key: str | None = None
+        service: _SecretsScopeWrite,
+        values: Annotated[
+            dict[str, str],
+            Field(
+                description="KEY → value pairs merged into the stored set: a listed key is "
+                "overwritten, an unlisted one kept. Key names are env-var identifiers "
+                "(``[A-Za-z_][A-Za-z0-9_]*``); a value may be multi-line but may contain no "
+                "NUL and no control character other than tab/newline/CR. An empty map is "
+                "refused."
+            ),
+        ],
+        idempotency_key: IdempotencyKey = None,
     ) -> Any:
         """Set/merge write-only secrets for a service; returns key names only.
 
-        An idempotency key is auto-generated if omitted, so a retried write
-        collapses to a single apply. ``service="shared"`` targets the global
-        shared scope (admin-only; readable by every service via
-        ``${secrets.shared.KEY}``) — use it sparingly. WARNING: the values you
-        pass here transit this agent's transcript in plaintext; for
-        high-value shared keys (broadly-scoped API keys, credentials shared
-        across every app) prefer ``nerdit secrets set --shared`` from the CLI
-        instead of routing them through an agent.
+        WARNING: the values you pass here transit this agent's transcript in
+        plaintext; for high-value shared keys (broadly-scoped API keys,
+        credentials shared across every app) prefer ``nerdit secrets set --shared`` from the CLI
+        instead of routing them through an agent. The leak-free path for any
+        value: a human runs ``nerdit secrets set <service> --prompt KEY``
+        (hidden input) and you only ever name ``KEY``; it is injected at
+        launch, overriding an ``env`` key of the same name.
         """
         return await _set_secret_impl(
             _request_client(), service, values, idempotency_key=idempotency_key
         )
 
-async def list_secret_names(service: str) -> Any:
-        """List a service's secret key names (values are never returned).
-
-        ``service="shared"`` lists the global shared scope's key names;
-        readable by any authenticated principal (owners need the
-        referenceable list), unlike shared writes which are admin-only.
-        """
+async def list_secret_names(service: _SecretsScopeRead) -> Any:
+        """List a service's secret key names (values are never returned)."""
         return await _list_secret_names_impl(_request_client(), service)
 
 async def remove_secret(
-        service: str, key: str | None = None, idempotency_key: str | None = None
+        service: _SecretsScopeWrite,
+        key: Annotated[
+            str | None,
+            Field(
+                description="The one secret key to delete; omit it — null or an empty "
+                "string — to delete ALL of the scope's secrets at once. Deleting a key "
+                "that does not exist is a 404."
+            ),
+        ] = None,
+        idempotency_key: IdempotencyKey = None,
     ) -> Any:
         """Delete one secret key, or all of a service's secrets when key is omitted.
 
-        An idempotency key is auto-generated if omitted, so a retried delete
-        collapses to a single apply. ``service="shared"`` deletes from the
-        global shared scope (admin-only) — deleting a shared key can break
-        every app still referencing it via ``${secrets.shared.KEY}``.
+        Deleting a shared key can break every app still referencing it via
+        ``${secrets.shared.KEY}``.
         """
         return await _rm_secret_impl(
             _request_client(), service, key=key, idempotency_key=idempotency_key

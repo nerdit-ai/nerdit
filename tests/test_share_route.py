@@ -137,11 +137,13 @@ def _queries(job: Job | None = None, shares: dict[str, ServiceShare] | None = No
     )
     q.list_service_shares = AsyncMock(side_effect=lambda: dict(table))
 
-    async def _set(name: str, access: str, *, job_id: str) -> ServiceShare:
+    async def _set(
+        name: str, access: str, *, job_id: str, preserve_existing: bool = False
+    ) -> ServiceShare:
         existing = table.get(name)
         row = ServiceShare(
             service_name=name,
-            access=access,
+            access=existing.access if existing and preserve_existing else access,
             # The upsert preserves ``created_at`` — "shared since" is a fact
             # about the share, not about the last access flip.
             created_at=existing.created_at if existing else datetime.now(UTC),
@@ -301,7 +303,9 @@ def test_an_admin_may_share_someone_elses_app() -> None:
     response = _put(_client(q), ADMIN_RAW)
 
     assert response.status_code == 200, response.text
-    q.set_service_share.assert_awaited_once_with("demo", "private", job_id="svc-1")
+    q.set_service_share.assert_awaited_once_with(
+        "demo", "private", job_id="svc-1", preserve_existing=False
+    )
 
 
 def test_a_scoped_token_may_not_share_a_service_outside_its_scope() -> None:
@@ -346,7 +350,9 @@ def test_sharing_privately_writes_the_row_and_computes_the_url(recorder: AsyncMo
     assert body["url"] == HOSTED_URL
     assert body["state"] == "ready"
     assert body["created_at"]
-    q.set_service_share.assert_awaited_once_with("demo", "private", job_id="svc-1")
+    q.set_service_share.assert_awaited_once_with(
+        "demo", "private", job_id="svc-1", preserve_existing=False
+    )
 
     row = q.insert_audit_log.await_args_list[-1].kwargs
     assert row["action"] == "share.set"
@@ -379,6 +385,22 @@ def test_resharing_keeps_created_at_and_repoints_access(recorder: AsyncMock) -> 
     assert response.status_code == 200, response.text
     assert response.json()["access"] == "public"
     assert response.json()["created_at"] == first["created_at"]
+
+
+@pytest.mark.parametrize("existing", [None, "private", "public"])
+def test_private_preview_preserves_existing_access(existing, recorder: AsyncMock) -> None:
+    shares = {"demo": ServiceShare(service_name="demo", access=existing)} if existing else {}
+    q = _queries(_svc(), shares=shares)
+    response = _put(_client(q, with_audit=True), access="private", preserve_existing=True)
+    assert response.status_code == 200
+    assert response.json()["access"] == (existing or "private")
+    q.set_service_share.assert_awaited_once_with(
+        "demo", "private", job_id="svc-1", preserve_existing=True
+    )
+    audit = json.loads(q.insert_audit_log.await_args.kwargs["params_redacted"])
+    assert audit["access"] == (existing or "private")
+    if existing == "public":
+        assert "url" not in recorder.record.await_args.kwargs["data"]
 
 
 def test_a_public_share_never_carries_the_url_into_the_event(recorder: AsyncMock) -> None:

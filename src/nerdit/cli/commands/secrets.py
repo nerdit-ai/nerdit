@@ -8,13 +8,14 @@ admin access; rotation confirms before replacing the old key.
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from typing import Annotated, Optional
 from uuid import uuid4
 
 import typer
 
 from nerdit.cli.commands.deploy import parse_env_pairs
-from nerdit.cli.display import console, render_client_error
+from nerdit.cli.display import _plain, console, render_client_error
+from nerdit.core.secrets import validate_secret_items
 
 SHARED_SERVICE = "shared"
 
@@ -59,6 +60,12 @@ def secrets_set(
     shared: bool = typer.Option(
         False, "--shared", help="Target the global shared scope instead of a service."
     ),
+    prompt_keys: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--prompt", metavar="KEY", help="Read a secret value without echo (repeatable)."
+        ),
+    ] = None,
 ) -> None:
     """Set/merge secrets for a service (values are write-only)."""
     pairs = list(pairs or [])
@@ -69,13 +76,16 @@ def secrets_set(
         pairs = [service, *pairs]
         service = None
     target = _resolve_service(service, shared)
-    if not pairs:
-        console.print("[red]Missing argument: KEY=VAL pairs.[/red]")
+    if not pairs and not prompt_keys:
+        console.print("[red]Provide KEY=VAL pairs or --prompt KEY.[/red]")
         raise typer.Exit(1)
     try:
         values = parse_env_pairs(pairs)
+        validate_secret_items(dict.fromkeys(prompt_keys or [], ""))
+        for key in prompt_keys or []:
+            values[key] = typer.prompt(f"Value for {key}", hide_input=True)
     except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{_plain(exc)}[/red]")
         raise typer.Exit(1) from exc
     asyncio.run(_set_async(target, values))
 

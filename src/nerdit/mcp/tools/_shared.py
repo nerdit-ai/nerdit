@@ -12,7 +12,9 @@ tool description carries — for the same leaf-module reason.
 from __future__ import annotations
 
 from textwrap import wrap
-from typing import TypeVar
+from typing import Annotated, Any, TypeVar
+
+from pydantic import Field
 
 # Bounds for the read tools. Agents must not be able to page the daemon to death
 # or pull unbounded logs through a single tool call.
@@ -107,6 +109,100 @@ SANDBOX_NOTE = (
 )
 
 SANDBOX_NOTE_PLACEHOLDER = "{SANDBOX_NOTE}"
+
+# --- Shared parameter vocabulary (audit A24) --------------------------------
+#
+# FastMCP renders an ``Annotated[..., Field(description=...)]`` parameter as a
+# ``description`` on that property of the tool's ``inputSchema``, so an agent
+# that reads only the schema still gets the rule. Parameters that recur across
+# tools are defined ONCE here so the same word means the same thing in every
+# tool (the SANDBOX_NOTE argument, applied to arguments). A tool whose
+# parameter genuinely differs annotates it inline instead of stretching an
+# alias. Every property must carry a description — pinned by
+# ``tests/test_mcp.py::test_every_tool_property_has_a_description``.
+AppName = Annotated[
+    str,
+    Field(
+        description="App name (lowercase DNS label). A new name creates the app; an "
+        "existing one redeploys it in place."
+    ),
+]
+IdempotencyKey = Annotated[
+    str | None,
+    Field(
+        description="Caller-chosen key: a retry with the same key replays the first "
+        "result instead of acting twice. Omit and a fresh key is minted per call, "
+        "so each call acts."
+    ),
+]
+DryRun = Annotated[
+    bool,
+    Field(
+        description="true = validate and return the plan (what would change) with "
+        "zero writes; nothing is built, deployed or audited as a change."
+    ),
+]
+Cursor = Annotated[
+    str | None,
+    Field(description="Opaque paging cursor from the previous page's response; omit for page 1."),
+]
+DeployEnv = Annotated[
+    dict[str, str | None] | None,
+    Field(
+        description="Runtime env for the container: values are literal strings, never "
+        "resolved (a ``${secrets.*}`` reference is passed through as text); a null "
+        "value deletes that key on redeploy. Secrets go through ``set_secret``, "
+        "which overrides an ``env`` key of the same name at launch."
+    ),
+]
+DeployPort = Annotated[
+    int | None,
+    Field(
+        description="Port the container listens on: the only port published and "
+        "health-checked. Omit to use ``nerdit.toml`` ``[deploy].port``, else the port "
+        "already recorded on a redeploy, else 8000."
+    ),
+]
+DeployGpus = Annotated[
+    int | None,
+    Field(
+        description="GPUs to reserve for the container (0 = none). Omit to use "
+        "``[deploy].gpus``, else the count already recorded on a redeploy, else 0."
+    ),
+]
+DeployStart = Annotated[
+    str | None,
+    Field(
+        description="Start command run inside the built image (shell syntax). Omit to "
+        "use ``[deploy].start`` or the buildpack default."
+    ),
+]
+DeployHealth = Annotated[
+    str | None,
+    Field(
+        description="HTTP health path probed on ``port`` (e.g. ``/health``); the app is "
+        "``healthy`` once it answers 2xx. Omit to keep ``[deploy].health`` (or the "
+        "existing app's probe on redeploy)."
+    ),
+]
+DeployVendor = Annotated[
+    str | None,
+    Field(
+        description="GPU vendor to reserve when ``gpus`` > 0 (``nvidia`` or ``amd``); "
+        "omit to let the daemon choose on a fresh deploy — a redeploy keeps the vendor "
+        "already recorded."
+    ),
+]
+BuildSettings = Annotated[
+    dict[str, Any] | None,
+    Field(
+        description="Build overrides, same keys as ``[deploy.build_settings]`` in "
+        "``nerdit.toml``: ``preset`` (node/nextjs/python/dockerfile), ``install``, "
+        "``build`` (``false`` skips compilation), ``start``, ``node_version``, "
+        "``package_manager``, ``subdir``, ``public_env`` (build-time variables baked "
+        "into the bundle, never secrets). Commands run inside the build container."
+    ),
+]
 
 _F = TypeVar("_F")
 

@@ -5,8 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from nerdit.config.project import find_project_config, load_project_config
+from nerdit.config.project import (
+    DeployConfig,
+    describe_project_config_error,
+    find_project_config,
+    load_project_config,
+)
 
 # --- find_project_config ---
 
@@ -398,3 +404,28 @@ def test_load_project_config_rejects_multiline_release(tmp_path):
     toml_file.write_text('[deploy]\nname = "my-app"\nrelease = """\nmigrate\nseed\n"""\n')
     with pytest.raises(ValidationError, match="control characters"):
         load_project_config(path=toml_file)
+
+
+def test_load_project_config_rejects_non_table_deploy(tmp_path):
+    """A scalar/array [deploy] is a config error, not a TypeError from ``**``."""
+    path = tmp_path / "nerdit.toml"
+    path.write_text('deploy = "never-print-this"\n')
+    with pytest.raises(ValueError, match=r"\[deploy\] in nerdit.toml must be a table"):
+        load_project_config(path)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"name": "never-print-this=x"},
+        {"name": "a", "memory_limit": "never-print-this"},
+        {"name": "a", "volumes": ["never-print-this"]},
+        {"name": "a", "volumes": ["ok:/never-print-this/../x"]},
+        {"name": "a", "volumes": ["v:/a", "v:/never-print-this"]},
+    ],
+)
+def test_deploy_validator_messages_are_value_free(kwargs):
+    """These messages reach 422 bodies, CLI output and agent transcripts."""
+    with pytest.raises(ValidationError) as excinfo:
+        DeployConfig(**kwargs)
+    assert "never-print-this" not in describe_project_config_error(excinfo.value)

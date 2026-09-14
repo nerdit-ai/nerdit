@@ -86,7 +86,7 @@ class Job(BaseModel):
         default=None, description="Dashboard-friendly failure category"
     )
     error_message: str | None = Field(default=None, description="Raw technical failure message")
-    submitted_via: str = Field(default="cli", description="'cli' or 'dashboard'")
+    submitted_via: str = Field(default="cli", description="Always 'cli' today; see the API schema")
     submitted_by_token: str | None = Field(
         default=None,
         description="ID of the API token that submitted this job (None = legacy/local). "

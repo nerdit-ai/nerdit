@@ -1,6 +1,6 @@
 {
   "add_domain": {
-    "description": "Serve a deployed app at a domain YOU own, from this node's own proxy (P26).\n\n        Unlike ``share_service`` (Nerdit's domain, over the cloud tunnel), this\n        is the node's embedded Caddy answering ``https://<domain>/`` directly \u2014\n        in either proxy mode, at the ROOT, so a frontend needs no ``/<app>/``\n        base path. The one thing the daemon cannot do for you: point the\n        domain's DNS (A/AAAA/CNAME) at this machine. By default the domain is\n        served with the node's internal CA, so a client must run\n        ``nerdit trust`` once. ``acme=True`` requests a public ACME\n        certificate; it needs an ADMIN token (403 ``domain.acme_forbidden``,\n        ``reason: acme_admin_only`` \u2014 the node has one ACME account whose rate\n        limits every domain on it shares) and 409 ``domain.acme_disabled``\n        unless the daemon has ``[proxy.acme].enabled``. Leaving ``acme`` OUT\n        keeps whatever the domain already has (``false`` on a new one), so\n        re-running this tool to read the URL back never downgrades an issued\n        public certificate; pass ``acme=False`` to downgrade on purpose.\n\n        ``domain`` must be a bare, lowercase DNS name (case and a trailing dot\n        are folded server-side): no scheme, no path, no port, no wildcard, no IP\n        literal, no IDN/punycode, at least two labels, and never a name under\n        this node's own hostname / ``base_domain`` / extra hostnames. Refusals:\n        422 ``domain.invalid`` \u2014 the name broke exactly one grammar rule and the\n        message names it (``empty``, ``whitespace``, ``not_bare``,\n        ``has_port``, ``wildcard``, ``ip_literal``, ``idn``, ``single_label``,\n        ``grammar``, ``reserved``); 409 ``domain.taken`` (one domain, one\n        service \u2014 never silently re-pointed); 422 ``domain.kind_unsupported``\n        (models and databases are not routed).\n\n        Returns ``{domain, url, state, cert_state, created}``; ``state`` is\n        ``ready`` | ``withheld`` (``withheld`` = the proxy is off, the app is\n        not routed yet, or its ``[deploy].edge_auth`` secret does not resolve \u2014\n        the row is stored either way and answers once it is). ``cert_state`` is\n        the orthogonal certificate fact: ``internal`` (this node's CA) |\n        ``disabled`` (``acme`` asked for, ``[proxy.acme]`` off) | ``pending``\n        (issuing, or failing \u2014 check ``doctor``) | ``issued`` | ``expired``.\n        The URL then appears in ``get_service`` / ``list_routes`` under\n        ``public_urls`` (kind ``domain``). Idempotent; a key is auto-generated\n        if omitted.\n        ",
+    "description": "Serve a deployed app at a domain YOU own, from this node's own proxy (P26).\n\nUnlike ``share_service`` (Nerdit's domain, over the cloud tunnel), this\nis the node's embedded Caddy answering ``https://<domain>/`` directly \u2014\nin either proxy mode, at the ROOT, so a frontend needs no ``/<app>/``\nbase path. The one thing the daemon cannot do for you: point the\ndomain's DNS (A/AAAA/CNAME) at this machine. By default the domain is\nserved with the node's internal CA, so a client must run\n``nerdit trust`` once. ``acme=True`` requests a public ACME\ncertificate; it needs an ADMIN token (403 ``domain.acme_forbidden``,\n``reason: acme_admin_only`` \u2014 the node has one ACME account whose rate\nlimits every domain on it shares) and 409 ``domain.acme_disabled``\nunless the daemon has ``[proxy.acme].enabled``.\n\nRefusals:\n422 ``domain.invalid`` \u2014 the name broke exactly one grammar rule and the\nmessage names it (``empty``, ``whitespace``, ``not_bare``,\n``has_port``, ``wildcard``, ``ip_literal``, ``idn``, ``single_label``,\n``grammar``, ``reserved``); 409 ``domain.taken`` (one domain, one\nservice \u2014 never silently re-pointed); 422 ``domain.kind_unsupported``\n(models and databases are not routed).\n\nReturns ``{domain, url, state, cert_state, created}``; ``state`` is\n``ready`` | ``withheld`` (``withheld`` = the proxy is off, the app is\nnot routed yet, or its ``[deploy].edge_auth`` secret does not resolve \u2014\nthe row is stored either way and answers once it is). ``cert_state`` is\nthe orthogonal certificate fact: ``internal`` (this node's CA) |\n``disabled`` (``acme`` asked for, ``[proxy.acme]`` off) | ``pending``\n(issuing, or failing \u2014 check ``doctor``) | ``issued`` | ``expired``.\nThe URL then appears in ``get_service`` / ``list_routes`` under\n``public_urls`` (kind ``domain``).\n",
     "inputSchema": {
       "properties": {
         "acme": {
@@ -13,9 +13,11 @@
             }
           ],
           "default": null,
+          "description": "Tri-state certificate policy. ``true`` = request a public ACME certificate; ``false`` = serve with this node's internal CA; omit (the default ``null``) = keep the row's stored value, ``false`` on a new domain \u2014 so a re-run never downgrades an issued certificate.",
           "title": "Acme"
         },
         "domain": {
+          "description": "Bare lowercase DNS name of at least two labels: no scheme, path, port, wildcard, IP literal or IDN/punycode. Case and one trailing dot are folded server-side, so ``App.Example.COM.`` and ``app.example.com`` are one resource. A name at or under this node's own hostname, ``base_domain`` or ``extra_hostnames`` is reserved.",
           "title": "Domain",
           "type": "string"
         },
@@ -29,9 +31,11 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
+          "description": "Name (or row id) of an existing deployed app \u2014 only kind 'service' can be exposed: ``share_service``/``add_domain`` refuse a model or database with 422 ``*.kind_unsupported``, while the remove tools just find nothing to undo.",
           "title": "Name",
           "type": "string"
         }
@@ -45,11 +49,12 @@
     }
   },
   "apply_config": {
-    "description": "Declaratively apply a multi-section daemon config document (all-or-nothing).\n\n        ``If-Match`` is required by the daemon on a real apply; when omitted\n        here it is auto-fetched (current ETag) so an agent can apply without\n        a manual read-then-write round trip \u2014 pass ``if_match`` explicitly to\n        disable the auto-fetch. ``dry_run=True`` validates and previews\n        without writing (exempt from ``If-Match``/idempotency key). An\n        idempotency key is auto-generated if omitted.\n        ",
+    "description": "Declaratively apply a multi-section daemon config document (all-or-nothing).\n\nA dry run needs neither an ``If-Match`` nor an idempotency key.\n",
     "inputSchema": {
       "properties": {
         "dry_run": {
           "default": false,
+          "description": "true = validate and return the plan (what would change) with zero writes; nothing is built, deployed or audited as a change.",
           "title": "Dry Run",
           "type": "boolean"
         },
@@ -63,6 +68,7 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "if_match": {
@@ -75,6 +81,7 @@
             }
           ],
           "default": null,
+          "description": "ETag of the whole config, sent as ``If-Match`` (the daemon requires it on a real apply; 409 ``config.stale`` when it no longer matches). Omit and the current ETag is read and used for you; ``*`` matches unconditionally. Not needed when ``dry_run`` is true.",
           "title": "If Match"
         },
         "sections": {
@@ -82,6 +89,7 @@
             "additionalProperties": true,
             "type": "object"
           },
+          "description": "Desired state as ``{section: {key: value}}``. Only the sections named are touched; each is merged and validated like ``set_config``'s ``values`` (an omitted key keeps its value, null deletes a NULLABLE key \u2014 a null on a non-nullable one is a 422 \u2014 and an unknown key is a 422). One invalid key rejects the whole document.",
           "title": "Sections",
           "type": "object"
         }
@@ -94,7 +102,7 @@
     }
   },
   "capabilities": {
-    "description": "Describe this daemon: version, caller role/quotas, URL grammar, backends.\n\n        Role-aware, pure in-memory read \u2014 call it first to learn what the\n        daemon can do (buildpacks, model backends, proxy mode and public-URL\n        shape, deploy limits, git allowlist, feature flags) instead of probing\n        endpoints. Admin callers additionally receive ``proxy.admin_addr`` and\n        the ``paths`` block.\n        ",
+    "description": "Describe this daemon: version, caller role/quotas, URL grammar, backends.\n\nRole-aware, pure in-memory read \u2014 call it first to learn what the\ndaemon can do (buildpacks, model backends, proxy mode and public-URL\nshape, deploy limits, git allowlist, feature flags) instead of probing\nendpoints. Admin callers additionally receive ``proxy.admin_addr`` and\nthe ``paths`` block.\n",
     "inputSchema": {
       "properties": {},
       "title": "capabilitiesArguments",
@@ -110,7 +118,7 @@
     }
   },
   "create_database": {
-    "description": "Provision a managed database (kind=database workload).\n\n        ``backend`` selects the data backend: ``postgres`` (default) or\n        ``redis``. Omit it to use the daemon's configured default. Provisioning\n        is asynchronous: the call returns immediately with the database row in\n        ``building`` while the daemon pulls the image off-tick and launches the\n        server; poll ``list_databases`` (or ``get_service``) until ``db_ready``\n        is true. Lifecycle (stop / restart / delete) goes through the existing\n        service tools. An idempotency key is auto-generated if omitted.\n\n        The daemon mints the password server-side and stores it write-only \u2014 it\n        is NEVER returned by this tool (key names only). An app connects to this\n        database by declaring a ``[db.<name>]`` binding (``provider=\"managed\"``,\n        ``database`` = this database's name \u2014 the ``database`` field is\n        required, there is no implicit default); at each launch it receives\n        ``NERDIT_DB_<NAME>_URL``, and the ``default`` binding also sets\n        ``DATABASE_URL`` (Postgres) or ``REDIS_URL`` (Redis) with the composed\n        DSN so an unmodified client library connects with no code change.\n        ",
+    "description": "Provision a managed database (kind=database workload).\n\nProvisioning is asynchronous: the call returns immediately with the\ndatabase row in ``building`` while the daemon pulls the image off-tick\nand launches the server; poll ``list_databases`` (or ``get_service``)\nuntil ``db_ready`` is true. Lifecycle (stop / restart / delete) goes\nthrough the existing service tools.\n\nThe daemon mints the password server-side and stores it write-only \u2014 it\nis NEVER returned by this tool (key names only). An app connects to this\ndatabase by declaring a ``[db.<name>]`` binding (``provider=\"managed\"``,\n``database`` = this database's name \u2014 the ``database`` field is\nrequired, there is no implicit default); at each launch it receives\n``NERDIT_DB_<NAME>_URL``, and the ``default`` binding also sets\n``DATABASE_URL`` (Postgres) or ``REDIS_URL`` (Redis) with the composed\nDSN so an unmodified client library connects with no code change.\n",
     "inputSchema": {
       "properties": {
         "backend": {
@@ -123,6 +131,7 @@
             }
           ],
           "default": null,
+          "description": "Data backend to provision: ``postgres`` or ``redis``. Omit to use the daemon's ``[databases].default_backend`` (``postgres`` out of the box); an unknown value is refused, never silently defaulted.",
           "title": "Backend"
         },
         "idempotency_key": {
@@ -135,6 +144,7 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
@@ -147,6 +157,7 @@
             }
           ],
           "default": null,
+          "description": "Service name for the new database (lowercase DNS label, \u2264 63 chars). Omit to use the backend's own name prefix. An existing name is a conflict, not a redeploy.",
           "title": "Name"
         }
       },
@@ -155,7 +166,7 @@
     }
   },
   "deploy": {
-    "description": "Use when: the source is a local folder. Asynchronous \u2014 follow with wait_for_service.\n\nDeploys that folder (build + run + URL), or rolls back with\n``rollback=True``. The response carries ``next_step`` \u2014 a machine-shaped\n``{tool, args, why}`` naming the very call to make next \u2014 because a 201\nhere means \"the build was accepted\", never \"the app is up\".\n\nIf the app's ``nerdit.toml`` declares ``[ai.*]`` bindings, each is\ninjected at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\nOPENAI_MODEL`` \u2014 point the app's OpenAI SDK at these; no code change\nneeded. Idempotency key auto-generated if omitted. ``dry_run=True``\nreturns the build/config plan diff (env key names only, values never)\nwith zero writes \u2014 no idempotency key is minted or needed. An ``env``\nvalue of ``None`` deletes that key on redeploy.\n\n``nerdit.toml`` ``[deploy]`` keys \u2014 anything else is IGNORED and\nreported back in the response ``hints``: ``name``, ``port``, ``gpus``,\n``start``, ``health``, ``health_type`` (``http``|``tcp``),\n``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,\n``auto_deploy``, ``edge_auth``, ``build_settings``. Generated Node builds run\n``scripts.build`` automatically;\noverride it through ``[deploy.build_settings]`` or use a Dockerfile.\nOn a successful non-dry-run deploy the\nresponse carries ``summary`` (app/status/version/public_url), ``hints``\n(ordered one-liners, never empty) and ``next_step`` (the structured\nfollow-up call); a ``dry_run`` plan and a ``rollback`` response carry\nnone of the three \u2014 read a plan's advisories from its ``warnings``. On a\nnode in ``path`` proxy mode the app is served at ``/<name>/``, so a\nfrontend must be built with that base\npath; in ``subdomain`` mode it is served at the root of its own\nhostname and needs none \u2014 read ``capabilities.proxy.mode``.\n\n``build_settings`` overrides preset/install/build/start/node_version/package_manager/subdir.\n``preset`` selects node/nextjs/python/dockerfile; null resets to\nrepository/default detection.\nAn existing Dockerfile retains precedence.\nOmit it to preserve saved overrides; a null field resets to repository/default,\nand ``build: false`` skips compilation. Commands run inside the build container.\nBuild-time environment and secret mounts are unsupported; runtime env is unchanged.\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
+    "description": "Use when: the source is a local folder. Asynchronous \u2014 follow with wait_for_service.\n\nDeploys that folder (build + run + URL), or rolls back with\n``rollback=True``. The response carries ``next_step`` \u2014 a machine-shaped\n``{tool, args, why}`` naming the very call to make next \u2014 because a 201\nhere means \"the build was accepted\", never \"the app is up\".\n\nIf the app's ``nerdit.toml`` declares ``[ai.*]`` bindings, each is\ninjected at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\nOPENAI_MODEL`` \u2014 point the app's OpenAI SDK at these; no code change\nneeded. ``dry_run=True``\nreturns the build/config plan diff (env key names only, values never).\n\n``nerdit.toml`` ``[deploy]`` keys \u2014 anything else is IGNORED and\nreported back in the response ``hints``: ``name``, ``port``, ``gpus``,\n``start``, ``health``, ``health_type`` (``http``|``tcp``),\n``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,\n``auto_deploy``, ``edge_auth``, ``build_settings``. Generated Node builds run\n``scripts.build`` automatically;\noverride it through ``[deploy.build_settings]`` or use a Dockerfile.\n\n``release`` runs once inside the new image before traffic moves; if it\nfails the deploy settles ``failed`` and the image reverts, never the data \u2014\nwhatever the migration already committed stays, so write idempotent\nmigrations. ``cutover`` null = zero-downtime swap\nwhen eligible, false = same-port swap.\nOn a successful non-dry-run deploy the\nresponse carries ``summary`` (app/status/version/public_url), ``hints``\n(ordered one-liners, never empty) and ``next_step`` (the structured\nfollow-up call); a ``dry_run`` plan and a ``rollback`` response carry\nnone of the three \u2014 read a plan's advisories from its ``warnings``. On a\nnode in ``path`` proxy mode the app is served at ``/<name>/``, so a\nfrontend must be built with that base\npath; in ``subdomain`` mode it is served at the root of its own\nhostname and needs none \u2014 read ``capabilities.proxy.mode``.\n\n``build_settings`` overrides\npreset/install/build/start/node_version/package_manager/subdir/public_env.\n``preset`` selects node/nextjs/python/dockerfile; null resets to\nrepository/default detection.\nAn existing Dockerfile retains precedence.\nOmit it to preserve saved overrides; a null field resets to repository/default,\nand ``build: false`` skips compilation.\n``public_env`` passes public build-time variables (shown in clear in a dry\nrun; secret references are refused). Secret mounts are unsupported;\nruntime env is unchanged.\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
     "inputSchema": {
       "properties": {
         "build_settings": {
@@ -169,10 +180,12 @@
             }
           ],
           "default": null,
+          "description": "Build overrides, same keys as ``[deploy.build_settings]`` in ``nerdit.toml``: ``preset`` (node/nextjs/python/dockerfile), ``install``, ``build`` (``false`` skips compilation), ``start``, ``node_version``, ``package_manager``, ``subdir``, ``public_env`` (build-time variables baked into the bundle, never secrets). Commands run inside the build container.",
           "title": "Build Settings"
         },
         "dry_run": {
           "default": false,
+          "description": "true = validate and return the plan (what would change) with zero writes; nothing is built, deployed or audited as a change.",
           "title": "Dry Run",
           "type": "boolean"
         },
@@ -196,6 +209,7 @@
             }
           ],
           "default": null,
+          "description": "Runtime env for the container: values are literal strings, never resolved (a ``${secrets.*}`` reference is passed through as text); a null value deletes that key on redeploy. Secrets go through ``set_secret``, which overrides an ``env`` key of the same name at launch.",
           "title": "Env"
         },
         "gpus": {
@@ -208,6 +222,7 @@
             }
           ],
           "default": null,
+          "description": "GPUs to reserve for the container (0 = none). Omit to use ``[deploy].gpus``, else the count already recorded on a redeploy, else 0.",
           "title": "Gpus"
         },
         "health": {
@@ -220,6 +235,7 @@
             }
           ],
           "default": null,
+          "description": "HTTP health path probed on ``port`` (e.g. ``/health``); the app is ``healthy`` once it answers 2xx. Omit to keep ``[deploy].health`` (or the existing app's probe on redeploy).",
           "title": "Health"
         },
         "idempotency_key": {
@@ -232,6 +248,7 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
@@ -244,6 +261,7 @@
             }
           ],
           "default": null,
+          "description": "App name (lowercase DNS label); an existing name redeploys it in place. Omit to use the folder's ``nerdit.toml`` ``[deploy].name``, else the folder's own name. Required with ``rollback=True``.",
           "title": "Name"
         },
         "path": {
@@ -256,6 +274,7 @@
             }
           ],
           "default": null,
+          "description": "Path to the app folder ON THE DAEMON HOST (``~`` expanded); its contents are zipped and uploaded. Required unless ``rollback=True``.",
           "title": "Path"
         },
         "port": {
@@ -268,10 +287,12 @@
             }
           ],
           "default": null,
+          "description": "Port the container listens on: the only port published and health-checked. Omit to use ``nerdit.toml`` ``[deploy].port``, else the port already recorded on a redeploy, else 8000.",
           "title": "Port"
         },
         "rollback": {
           "default": false,
+          "description": "true = re-point the service at its previous image instead of building: only ``name`` and ``idempotency_key`` are read, no folder is zipped and every other argument is ignored. Refused together with ``dry_run``.",
           "title": "Rollback",
           "type": "boolean"
         },
@@ -285,6 +306,7 @@
             }
           ],
           "default": null,
+          "description": "Start command run inside the built image (shell syntax). Omit to use ``[deploy].start`` or the buildpack default.",
           "title": "Start"
         },
         "vendor": {
@@ -297,6 +319,7 @@
             }
           ],
           "default": null,
+          "description": "GPU vendor to reserve when ``gpus`` > 0 (``nvidia`` or ``amd``); omit to let the daemon choose on a fresh deploy \u2014 a redeploy keeps the vendor already recorded.",
           "title": "Vendor"
         }
       },
@@ -305,7 +328,7 @@
     }
   },
   "deploy_app": {
-    "description": "Use when: you used write_app_files. Asynchronous \u2014 follow with wait_for_service.\n\nDistinct from ``deploy`` (which uploads a folder from the machine the MCP\nserver runs on) and from ``deploy_git`` (which clones a repository): this\none deploys the workspace of the same name, so it is the deploy verb for\nan app you wrote in this conversation. Call it again after each\n``write_app_files`` to ship an edit \u2014 ``redeploy_service`` refuses\nworkspace apps by design and points back here.\n\nIf the workspace's ``nerdit.toml`` declares ``[ai.*]`` bindings, each is\ninjected at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\nOPENAI_MODEL``. An ``env`` value of ``None`` deletes that key on\nredeploy. ``dry_run=True`` returns the build/config plan diff (env key\nnames only, values never) with zero writes \u2014 no idempotency key is minted\nor needed. Otherwise a key is auto-generated if omitted.\n\n``nerdit.toml`` ``[deploy]`` keys \u2014 anything else is IGNORED and\nreported back in the response ``hints``: ``name``, ``port``, ``gpus``,\n``start``, ``health``, ``health_type`` (``http``|``tcp``),\n``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,\n``auto_deploy``, ``edge_auth``, ``build_settings``. Use ``[deploy.build_settings]``\nfor build overrides, or a Dockerfile for custom builds.\nOn a successful non-dry-run deploy the\nresponse carries ``summary`` (app/status/version/public_url), ``hints``\n(ordered one-liners, never empty) and ``next_step`` (the structured\nfollow-up call); a ``dry_run`` plan carries none of the three \u2014 read a\nplan's advisories from its ``warnings``. On a node in ``path``\nproxy mode the app is served at ``/<name>/``, so a frontend must be\nbuilt with that base path.\n\n``build_settings`` overrides preset/install/build/start/node_version/package_manager/subdir.\n``preset`` selects node/nextjs/python/dockerfile; null resets to\nrepository/default detection.\nAn existing Dockerfile retains precedence.\nOmit it to preserve saved overrides; a null field resets to repository/default,\nand ``build: false`` skips compilation. Commands run inside the build container.\nBuild-time environment and secret mounts are unsupported; runtime env is unchanged.\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
+    "description": "Use when: you used write_app_files. Asynchronous \u2014 follow with wait_for_service.\n\nDistinct from ``deploy`` (which uploads a folder from the machine the MCP\nserver runs on) and from ``deploy_git`` (which clones a repository): this\none deploys the workspace of the same name, so it is the deploy verb for\nan app you wrote in this conversation. Call it again after each\n``write_app_files`` to ship an edit \u2014 ``redeploy_service`` refuses\nworkspace apps by design and points back here.\n\nIf the workspace's ``nerdit.toml`` declares ``[ai.*]`` bindings, each is\ninjected at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\nOPENAI_MODEL``. A dry run returns the build/config plan diff with env key\nnames only, values never, and mints no idempotency key.\n\n``nerdit.toml`` ``[deploy]`` keys \u2014 anything else is IGNORED and\nreported back in the response ``hints``: ``name``, ``port``, ``gpus``,\n``start``, ``health``, ``health_type`` (``http``|``tcp``),\n``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,\n``auto_deploy``, ``edge_auth``, ``build_settings``. Use ``[deploy.build_settings]``\nfor build overrides, or a Dockerfile for custom builds.\n\n``release`` runs once inside the new image before traffic moves; if it\nfails the deploy settles ``failed`` and the image reverts, never the data \u2014\nwhatever the migration already committed stays, so write idempotent\nmigrations. ``cutover`` null = zero-downtime swap\nwhen eligible, false = same-port swap. ``env`` values are literal and\nnever resolve ``${secrets.*}``: a secret reaches the app through\n``set_secret`` / ``nerdit secrets set`` (injected at launch, overriding\nan ``env`` key of the same name).\nOn a successful non-dry-run deploy the\nresponse carries ``summary`` (app/status/version/public_url), ``hints``\n(ordered one-liners, never empty) and ``next_step`` (the structured\nfollow-up call); a ``dry_run`` plan carries none of the three \u2014 read a\nplan's advisories from its ``warnings``. On a node in ``path``\nproxy mode the app is served at ``/<name>/``, so a frontend must be\nbuilt with that base path.\n\n``build_settings`` overrides\npreset/install/build/start/node_version/package_manager/subdir/public_env.\n``preset`` selects node/nextjs/python/dockerfile; null resets to\nrepository/default detection.\nAn existing Dockerfile retains precedence.\nOmit it to preserve saved overrides; a null field resets to repository/default,\nand ``build: false`` skips compilation. Commands run inside the build container.\n``public_env`` passes public build-time variables (shown in clear in a dry\nrun; secret references are refused). Secret mounts are unsupported;\nruntime env is unchanged.\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
     "inputSchema": {
       "properties": {
         "build_settings": {
@@ -319,10 +342,12 @@
             }
           ],
           "default": null,
+          "description": "Build overrides, same keys as ``[deploy.build_settings]`` in ``nerdit.toml``: ``preset`` (node/nextjs/python/dockerfile), ``install``, ``build`` (``false`` skips compilation), ``start``, ``node_version``, ``package_manager``, ``subdir``, ``public_env`` (build-time variables baked into the bundle, never secrets). Commands run inside the build container.",
           "title": "Build Settings"
         },
         "dry_run": {
           "default": false,
+          "description": "true = validate and return the plan (what would change) with zero writes; nothing is built, deployed or audited as a change.",
           "title": "Dry Run",
           "type": "boolean"
         },
@@ -346,6 +371,7 @@
             }
           ],
           "default": null,
+          "description": "Runtime env for the container: values are literal strings, never resolved (a ``${secrets.*}`` reference is passed through as text); a null value deletes that key on redeploy. Secrets go through ``set_secret``, which overrides an ``env`` key of the same name at launch.",
           "title": "Env"
         },
         "gpus": {
@@ -358,6 +384,7 @@
             }
           ],
           "default": null,
+          "description": "GPUs to reserve for the container (0 = none). Omit to use ``[deploy].gpus``, else the count already recorded on a redeploy, else 0.",
           "title": "Gpus"
         },
         "health": {
@@ -370,6 +397,7 @@
             }
           ],
           "default": null,
+          "description": "HTTP health path probed on ``port`` (e.g. ``/health``); the app is ``healthy`` once it answers 2xx. Omit to keep ``[deploy].health`` (or the existing app's probe on redeploy).",
           "title": "Health"
         },
         "idempotency_key": {
@@ -382,9 +410,11 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
+          "description": "Name of an existing workspace (also the app name it deploys under). No workspace by that name is ``404 workspace.not_found``.",
           "title": "Name",
           "type": "string"
         },
@@ -398,6 +428,7 @@
             }
           ],
           "default": null,
+          "description": "Port the container listens on: the only port published and health-checked. Omit to use ``nerdit.toml`` ``[deploy].port``, else the port already recorded on a redeploy, else 8000.",
           "title": "Port"
         },
         "start": {
@@ -410,6 +441,7 @@
             }
           ],
           "default": null,
+          "description": "Start command run inside the built image (shell syntax). Omit to use ``[deploy].start`` or the buildpack default.",
           "title": "Start"
         },
         "vendor": {
@@ -422,6 +454,7 @@
             }
           ],
           "default": null,
+          "description": "GPU vendor to reserve when ``gpus`` > 0 (``nvidia`` or ``amd``); omit to let the daemon choose on a fresh deploy \u2014 a redeploy keeps the vendor already recorded.",
           "title": "Vendor"
         }
       },
@@ -433,7 +466,7 @@
     }
   },
   "deploy_git": {
-    "description": "Use when: the app lives in a Git repo. Asynchronous \u2014 follow with wait_for_service.\n\nClones ``repo_url`` server-side (public GitHub by default), then builds\nand runs it like ``deploy``. ``ref`` picks a branch/tag, ``subdir``\ndeploys a monorepo subtree. For a private repo, ``token_ref`` is a\nsecret *reference* (``${secrets.shared.GITHUB_TOKEN}``) resolved\nserver-side \u2014 never pass a raw token \u2014 or the literal\n``${github.installation}`` on a node linked to an account with the\nNerdit GitHub App installed on that repo. An existing ``name`` is a\nredeploy. An idempotency key is auto-generated if omitted.\n``dry_run=True`` returns the build/config plan diff (env key names only,\nvalues never) with zero writes \u2014 no idempotency key is minted or needed.\nAn ``env`` value of ``None`` deletes that key on redeploy.\n\nIf the repo's ``nerdit.toml`` declares ``[ai.*]`` bindings, each is\ninjected at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\nOPENAI_MODEL`` \u2014 point the app's OpenAI SDK at these; no code change\nneeded.\n\n``nerdit.toml`` ``[deploy]`` keys \u2014 anything else is IGNORED and\nreported back in the response ``hints``: ``name``, ``port``, ``gpus``,\n``start``, ``health``, ``health_type`` (``http``|``tcp``),\n``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,\n``auto_deploy``, ``edge_auth``, ``build_settings``. Generated Node builds run\n``scripts.build`` automatically;\noverride it through ``[deploy.build_settings]`` or use a Dockerfile.\nOn a successful non-dry-run deploy the\nresponse carries ``summary`` (app/status/version/public_url), ``hints``\n(ordered one-liners, never empty) and ``next_step`` (the structured\nfollow-up call); a ``dry_run`` plan carries none of the three \u2014 read a\nplan's advisories from its ``warnings``. On a node in ``path``\nproxy mode the app is served at ``/<name>/``, so a frontend must be\nbuilt with that base path.\n\n``build_settings`` overrides preset/install/build/start/node_version/package_manager/subdir.\n``preset`` selects node/nextjs/python/dockerfile; null resets to\nrepository/default detection.\nAn existing Dockerfile retains precedence.\nOmit it to preserve saved overrides; a null field resets to repository/default,\nand ``build: false`` skips compilation. Commands run inside the build container.\nBuild-time environment and secret mounts are unsupported; runtime env is unchanged.\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
+    "description": "Use when: the app lives in a Git repo. Asynchronous \u2014 follow with wait_for_service.\n\nClones ``repo_url`` server-side (public GitHub by default), then builds\nand runs it like ``deploy``. The token reference is resolved server-side\n\u2014 a raw credential never passes through the tool.\n``dry_run=True`` returns the build/config plan diff (env key names only,\nvalues never).\n\nIf the repo's ``nerdit.toml`` declares ``[ai.*]`` bindings, each is\ninjected at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\nOPENAI_MODEL`` \u2014 point the app's OpenAI SDK at these; no code change\nneeded.\n\n``nerdit.toml`` ``[deploy]`` keys \u2014 anything else is IGNORED and\nreported back in the response ``hints``: ``name``, ``port``, ``gpus``,\n``start``, ``health``, ``health_type`` (``http``|``tcp``),\n``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,\n``auto_deploy``, ``edge_auth``, ``build_settings``. Generated Node builds run\n``scripts.build`` automatically;\noverride it through ``[deploy.build_settings]`` or use a Dockerfile.\n\n``release`` runs once inside the new image before traffic moves; if it\nfails the deploy settles ``failed`` and the image reverts, never the data \u2014\nwhatever the migration already committed stays, so write idempotent\nmigrations. ``cutover`` null = zero-downtime swap\nwhen eligible, false = same-port swap.\nOn a successful non-dry-run deploy the\nresponse carries ``summary`` (app/status/version/public_url), ``hints``\n(ordered one-liners, never empty) and ``next_step`` (the structured\nfollow-up call); a ``dry_run`` plan carries none of the three \u2014 read a\nplan's advisories from its ``warnings``. On a node in ``path``\nproxy mode the app is served at ``/<name>/``, so a frontend must be\nbuilt with that base path.\n\n``build_settings`` overrides\npreset/install/build/start/node_version/package_manager/subdir/public_env.\n``preset`` selects node/nextjs/python/dockerfile; null resets to\nrepository/default detection.\nAn existing Dockerfile retains precedence.\nOmit it to preserve saved overrides; a null field resets to repository/default,\nand ``build: false`` skips compilation.\n``public_env`` passes public build-time variables (shown in clear in a dry\nrun; secret references are refused). Secret mounts are unsupported;\nruntime env is unchanged.\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
     "inputSchema": {
       "properties": {
         "build_settings": {
@@ -447,10 +480,12 @@
             }
           ],
           "default": null,
+          "description": "Build overrides, same keys as ``[deploy.build_settings]`` in ``nerdit.toml``: ``preset`` (node/nextjs/python/dockerfile), ``install``, ``build`` (``false`` skips compilation), ``start``, ``node_version``, ``package_manager``, ``subdir``, ``public_env`` (build-time variables baked into the bundle, never secrets). Commands run inside the build container.",
           "title": "Build Settings"
         },
         "dry_run": {
           "default": false,
+          "description": "true = validate and return the plan (what would change) with zero writes; nothing is built, deployed or audited as a change.",
           "title": "Dry Run",
           "type": "boolean"
         },
@@ -474,6 +509,7 @@
             }
           ],
           "default": null,
+          "description": "Runtime env for the container: values are literal strings, never resolved (a ``${secrets.*}`` reference is passed through as text); a null value deletes that key on redeploy. Secrets go through ``set_secret``, which overrides an ``env`` key of the same name at launch.",
           "title": "Env"
         },
         "gpus": {
@@ -486,6 +522,7 @@
             }
           ],
           "default": null,
+          "description": "GPUs to reserve for the container (0 = none). Omit to use ``[deploy].gpus``, else the count already recorded on a redeploy, else 0.",
           "title": "Gpus"
         },
         "health": {
@@ -498,6 +535,7 @@
             }
           ],
           "default": null,
+          "description": "HTTP health path probed on ``port`` (e.g. ``/health``); the app is ``healthy`` once it answers 2xx. Omit to keep ``[deploy].health`` (or the existing app's probe on redeploy).",
           "title": "Health"
         },
         "idempotency_key": {
@@ -510,9 +548,11 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
+          "description": "App name (lowercase DNS label). A new name creates the app; an existing one redeploys it in place.",
           "title": "Name",
           "type": "string"
         },
@@ -526,6 +566,7 @@
             }
           ],
           "default": null,
+          "description": "Port the container listens on: the only port published and health-checked. Omit to use ``nerdit.toml`` ``[deploy].port``, else the port already recorded on a redeploy, else 8000.",
           "title": "Port"
         },
         "ref": {
@@ -538,9 +579,11 @@
             }
           ],
           "default": null,
+          "description": "Branch or tag to clone. Omit for the repository's default branch. Recorded on the app, so ``redeploy_service`` re-clones this ref.",
           "title": "Ref"
         },
         "repo_url": {
+          "description": "``https://`` clone URL, on a host the daemon allows (``capabilities.deploy.git_allowed_hosts``, ``github.com`` by default). A URL carrying credentials is refused \u2014 pass ``token_ref`` instead.",
           "title": "Repo Url",
           "type": "string"
         },
@@ -554,6 +597,7 @@
             }
           ],
           "default": null,
+          "description": "Start command run inside the built image (shell syntax). Omit to use ``[deploy].start`` or the buildpack default.",
           "title": "Start"
         },
         "subdir": {
@@ -566,6 +610,7 @@
             }
           ],
           "default": null,
+          "description": "Subdirectory of the repo to build (monorepo subtree). Omit to build from the repository root.",
           "title": "Subdir"
         },
         "token_ref": {
@@ -578,6 +623,7 @@
             }
           ],
           "default": null,
+          "description": "Private-repo credential as a *reference*, never a raw token: ``${secrets.KEY}``, ``${secrets.shared.KEY}``, or the literal ``${github.installation}`` on a node linked to an account with the Nerdit GitHub App installed on that repo. Omit for a public repo.",
           "title": "Token Ref"
         },
         "vendor": {
@@ -590,6 +636,7 @@
             }
           ],
           "default": null,
+          "description": "GPU vendor to reserve when ``gpus`` > 0 (``nvidia`` or ``amd``); omit to let the daemon choose on a fresh deploy \u2014 a redeploy keeps the vendor already recorded.",
           "title": "Vendor"
         }
       },
@@ -602,7 +649,7 @@
     }
   },
   "deploy_template": {
-    "description": "Use when: you want a starter app. Asynchronous \u2014 follow with wait_for_service.\n\nResolves ``template_id`` (see ``list_app_templates``), clones its\ncatalog repo server-side, and deploys it under ``name``. ``env`` and the\ndeploy overrides layer over the template's defaults. An ``env`` value of\n``None`` deletes that key on redeploy. An idempotency key is\nauto-generated if omitted. The response carries ``summary``, ``hints``\n(never empty) and ``next_step`` \u2014 the structured follow-up call \u2014 since\na 201 here means the build was accepted, not that the app is up.\n\n``build_settings`` overrides preset/install/build/start/node_version/package_manager/subdir.\n``preset`` selects node/nextjs/python/dockerfile; null resets to\nrepository/default detection.\nAn existing Dockerfile retains precedence.\nOmission preserves overrides; a null field resets to repository/default;\n``build: false`` skips compilation. ``dry_run=True`` previews without writes,\nbuilding or storing secrets. Build-time env and secret mounts are unsupported.\n\nIf the template declares ``[ai.*]`` bindings, each is injected at launch\nas ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the ``default`` binding also\nsets ``OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL`` \u2014 point the app's\nOpenAI SDK at these; no code change needed. WARNING: the ``secrets`` values you pass\nhere transit this agent's transcript in plaintext; for high-value keys\nprefer ``nerdit secrets set`` from the CLI and deploy without ``secrets``.\n",
+    "description": "Use when: you want a starter app. Asynchronous \u2014 follow with wait_for_service.\n\nResolves ``template_id`` (see ``list_app_templates``), clones its\ncatalog repo server-side, and deploys it under ``name``. ``env`` and the\ndeploy overrides layer over the template's defaults.\nThe response carries ``summary``, ``hints``\n(never empty) and ``next_step`` \u2014 the structured follow-up call \u2014 since\na 201 here means the build was accepted, not that the app is up.\n\nAn existing Dockerfile retains precedence over ``build_settings``.\nOmission preserves overrides; a null field resets to repository/default.\n``dry_run=True`` previews without writes,\nbuilding or storing secrets. ``public_env`` passes public build-time\nvariables (shown in clear in a dry run; secret references are refused);\nsecret mounts are unsupported.\n\nIf the template declares ``[ai.*]`` bindings, each is injected at launch\nas ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the ``default`` binding also\nsets ``OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL`` \u2014 point the app's\nOpenAI SDK at these; no code change needed. WARNING: the ``secrets`` values you pass\nhere transit this agent's transcript in plaintext; for high-value keys\nprefer ``nerdit secrets set`` from the CLI and deploy without ``secrets``.\n",
     "inputSchema": {
       "properties": {
         "build_settings": {
@@ -616,10 +663,12 @@
             }
           ],
           "default": null,
+          "description": "Build overrides, same keys as ``[deploy.build_settings]`` in ``nerdit.toml``: ``preset`` (node/nextjs/python/dockerfile), ``install``, ``build`` (``false`` skips compilation), ``start``, ``node_version``, ``package_manager``, ``subdir``, ``public_env`` (build-time variables baked into the bundle, never secrets). Commands run inside the build container.",
           "title": "Build Settings"
         },
         "dry_run": {
           "default": false,
+          "description": "true = validate and return the plan (what would change) with zero writes; nothing is built, deployed or audited as a change.",
           "title": "Dry Run",
           "type": "boolean"
         },
@@ -643,6 +692,7 @@
             }
           ],
           "default": null,
+          "description": "Runtime env for the container: values are literal strings, never resolved (a ``${secrets.*}`` reference is passed through as text); a null value deletes that key on redeploy. Secrets go through ``set_secret``, which overrides an ``env`` key of the same name at launch.",
           "title": "Env"
         },
         "gpus": {
@@ -655,6 +705,7 @@
             }
           ],
           "default": null,
+          "description": "GPUs to reserve for the container (0 = none). Omit to use the template's default, else the repo's ``[deploy].gpus``.",
           "title": "Gpus"
         },
         "health": {
@@ -667,6 +718,7 @@
             }
           ],
           "default": null,
+          "description": "HTTP health path probed on ``port`` (e.g. ``/health``); the app is ``healthy`` once it answers 2xx. Omit to use the template's default, else the repo's ``[deploy].health``.",
           "title": "Health"
         },
         "idempotency_key": {
@@ -679,9 +731,11 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
+          "description": "App name (lowercase DNS label). A new name creates the app; an existing one redeploys it in place.",
           "title": "Name",
           "type": "string"
         },
@@ -695,6 +749,7 @@
             }
           ],
           "default": null,
+          "description": "Port the container listens on: the only port published and health-checked. Omit to use the template's default, else the repo's ``[deploy].port``, else 8000.",
           "title": "Port"
         },
         "secrets": {
@@ -710,6 +765,7 @@
             }
           ],
           "default": null,
+          "description": "Write-only secrets for the template's required secret inputs; stored server-side right AFTER the app row is written (the row is the authorization point) and before the first launch, so a failed secret write leaves the app created. Only key names are ever read back. Omit when the template declares none.",
           "title": "Secrets"
         },
         "start": {
@@ -722,9 +778,11 @@
             }
           ],
           "default": null,
+          "description": "Start command run inside the built image (shell syntax). Omit to use the template's default, else the repo's ``[deploy].start`` or the buildpack default.",
           "title": "Start"
         },
         "template_id": {
+          "description": "Template id from ``list_app_templates`` (its ``id`` field).",
           "title": "Template Id",
           "type": "string"
         },
@@ -738,6 +796,7 @@
             }
           ],
           "default": null,
+          "description": "GPU vendor to reserve when ``gpus`` > 0 (``nvidia`` or ``amd``); omit to let the daemon choose on a fresh deploy \u2014 a redeploy keeps the vendor already recorded.",
           "title": "Vendor"
         }
       },
@@ -750,15 +809,17 @@
     }
   },
   "diagnose_service": {
-    "description": "Use when: a service is failing and you need the reason, not the logs.\n\nBundles the deploy phase, crash forensics (``last_exit_code``,\n``oom_killed``), a fresh health probe, AI-binding readiness, a bounded\nlog tail and a single ``remediation_code`` to branch on \u2014 call it after\n``wait_for_service`` returns ``failed`` instead of scraping logs.\n``name`` accepts the service name or the job id. Owner-or-admin read:\nthe bundle carries env/secret key *names* and app log lines, never\nsecret values. ``log_tail`` is clamped to [1, 200].\n",
+    "description": "Use when: a service is failing and you need the reason, not the logs.\n\nBundles the deploy phase, crash forensics (``last_exit_code``,\n``oom_killed``), a fresh health probe, AI-binding readiness, a bounded\nlog tail and a single ``remediation_code`` to branch on \u2014 call it after\n``wait_for_service`` returns ``failed`` instead of scraping logs.\nOwner-or-admin read: the bundle carries env/secret key *names* and app\nlog lines, never secret values.\n",
     "inputSchema": {
       "properties": {
         "log_tail": {
           "default": 50,
+          "description": "Log lines bundled into the diagnosis. Default 50; clamped to [1, 200] here and again server-side.",
           "title": "Log Tail",
           "type": "integer"
         },
         "name": {
+          "description": "Service name or job id of an existing service (app, model or database); both resolve to the same row.",
           "title": "Name",
           "type": "string"
         }
@@ -771,7 +832,7 @@
     }
   },
   "doctor": {
-    "description": "Run the daemon's bounded environment health checks (docker/gpu/proxy/db/...).\n\n        Returns per-check ``{status, detail}`` plus a worst-of top-level\n        status. Every check is timeout-bounded server-side; details carry key\n        *names* only, never paths or secret values \u2014 safe for every role.\n        ",
+    "description": "Run the daemon's bounded environment health checks (docker/gpu/proxy/db/...).\n\nReturns per-check ``{status, detail}`` plus a worst-of top-level\nstatus. Every check is timeout-bounded server-side; details carry key\n*names* only, never paths or secret values \u2014 safe for every role.\n",
     "inputSchema": {
       "properties": {},
       "title": "doctorArguments",
@@ -779,15 +840,17 @@
     }
   },
   "dump_database": {
-    "description": "Capture a logical, application-consistent dump of a managed database.\n\n        The daemon runs the engine's own dump tool \u2014 ``pg_dump --format=custom``\n        for Postgres, ``redis-cli --rdb`` for Redis \u2014 from a throwaway container\n        built from the database's OWN image, against the running server. This is\n        the dump to take before a migration or a destructive change: unlike the\n        volume backup (``nerdit backup --volume``, no tool), it is consistent by\n        the engine's rules rather than by the filesystem's.\n\n        CUSTODY: the artifact is a server-side tar under the daemon's backups\n        directory holding **every row** of ``name``; it is never served over\n        HTTP and nothing but metadata comes back here \u2014 basename, size, sha256,\n        engine, format, duration. Treat the basename as the handle: it is what\n        ``nerdit db restore`` takes.\n\n        RETENTION: the daemon keeps the last ``[retention].dump_keep_last``\n        dumps per database (default 5) and prunes older ones on its hourly\n        sweep, so a dump is not an archive. Copy one off the box if it must\n        outlive that window.\n\n        TIMEOUT: ``timeout_s`` (default 300) bounds the dump tool server-side\n        and is capped by ``[services].dump_timeout_max_s`` (``422\n        dump.timeout_too_large`` names the cap, never silently clamped). The\n        default matches the usual MCP client read budget, not the route's own\n        900: if your client gives up first, **a longer dump still completes\n        server-side and appears in ``list_database_dumps``**. So a read timeout\n        here is not a failure \u2014 call ``list_database_dumps`` and take the newest\n        entry. Do NOT blind-retry: this tool mints its own idempotency key per\n        call, so a retry is a second real dump (and the first one may still be\n        running, which answers ``409 dump.in_progress``).\n\n        Authorization is **owner-or-admin plus token scope**: a scoped submitter\n        can dump the databases it created, which is what makes this usable over\n        the (submitter-capped) cloud link. Refusals you should branch on: ``409\n        dump.database_not_ready`` (not running, or still doing initdb \u2014 poll\n        ``list_databases`` for ``db_ready``), ``409 dump.in_progress`` (this\n        database already has one running; distinct from the daemon-wide\n        ``backup.in_progress``), ``409 dump.too_many_in_flight``, ``409\n        dump.insufficient_disk`` (``detail`` carries ``required_bytes`` /\n        ``free_bytes``), ``422 dump.not_a_database``, and ``500 dump.failed``\n        whose ``hint`` is the tool's own last output line. There is deliberately\n        **no restore tool** \u2014 restoring replaces live data and stays on the CLI\n        (``nerdit db restore``) and REST.\n        ",
+    "description": "Capture a logical, application-consistent dump of a managed database.\n\nThe daemon runs the engine's own dump tool \u2014 ``pg_dump --format=custom``\nfor Postgres, ``redis-cli --rdb`` for Redis \u2014 from a throwaway container\nbuilt from the database's OWN image, against the running server. This is\nthe dump to take before a migration or a destructive change: unlike the\nvolume backup (``nerdit backup --volume``, no tool), it is consistent by\nthe engine's rules rather than by the filesystem's.\n\nCUSTODY: the artifact is a server-side tar under the daemon's backups\ndirectory holding **every row** of ``name``; it is never served over\nHTTP and nothing but metadata comes back here \u2014 basename, size, sha256,\nengine, format, duration. Treat the basename as the handle: it is what\n``nerdit db restore`` takes.\n\nRETENTION: the daemon keeps the last ``[retention].dump_keep_last``\ndumps per database (default 5) and prunes older ones on its hourly\nsweep, so a dump is not an archive. Copy one off the box if it must\noutlive that window.\n\nTIMEOUT: the default matches the usual MCP client read budget, not\nthe route's own 900: if your client gives up first, **a longer dump still completes\nserver-side and appears in ``list_database_dumps``**. So a read timeout\nhere is not a failure \u2014 call ``list_database_dumps`` and take the newest\nentry. Do NOT blind-retry: this tool mints its own idempotency key per\ncall, so a retry is a second real dump (and the first one may still be\nrunning, which answers ``409 dump.in_progress``).\n\nAuthorization is **owner-or-admin plus token scope**: a scoped submitter\ncan dump the databases it created, which is what makes this usable over\nthe (submitter-capped) cloud link. Refusals you should branch on: ``409\ndump.database_not_ready`` (not running, or still doing initdb \u2014 poll\n``list_databases`` for ``db_ready``), ``409 dump.in_progress`` (this\ndatabase already has one running; distinct from the daemon-wide\n``backup.in_progress``), ``409 dump.too_many_in_flight``, ``409\ndump.insufficient_disk`` (``detail`` carries ``required_bytes`` /\n``free_bytes``), ``422 dump.not_a_database``, and ``500 dump.failed``\nwhose ``hint`` is the tool's own last output line. There is deliberately\n**no restore tool** \u2014 restoring replaces live data and stays on the CLI\n(``nerdit db restore``) and REST.\n",
     "inputSchema": {
       "properties": {
         "name": {
+          "description": "Name of an existing managed database (``kind=database``); an app or model row is refused.",
           "title": "Name",
           "type": "string"
         },
         "timeout_s": {
           "default": 300,
+          "description": "Seconds the dump tool may run server-side; omit for 300. Floored at 1 and otherwise passed straight through, so a value above the daemon's ``[services].dump_timeout_max_s`` gets the authoritative 422 ``dump.timeout_too_large`` instead of being silently clamped.",
           "title": "Timeout S",
           "type": "integer"
         }
@@ -800,10 +863,11 @@
     }
   },
   "get_app_config": {
-    "description": "Read a deployed app's daemon-persisted config (deploy fields + ai bindings).\n\n        Secret values are never returned \u2014 only ``${secrets.X}`` refs and env\n        key names. Each ``[ai.<name>]`` binding shown here is injected into the\n        app at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n        ``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\n        OPENAI_MODEL`` (drop-in OpenAI SDK).\n        ",
+    "description": "Read a deployed app's daemon-persisted config (deploy fields + ai bindings).\n\nSecret values are never returned \u2014 only ``${secrets.X}`` refs and env\nkey names. Each ``[ai.<name>]`` binding shown here is injected into the\napp at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\nOPENAI_MODEL`` (drop-in OpenAI SDK).\n\n``deploy.release`` is the command run once inside the new image before\ntraffic moves (a failure aborts the deploy and reverts the image,\nnever the data \u2014 write idempotent migrations); ``deploy.cutover`` null =\nzero-downtime swap when eligible, false = same-port swap. ``env_keys``\nare literal runtime env names; secret refs are accepted only by\n``ai.*.api_key``, ``db.*.password``, ``edge_auth.password`` and a git\n``token_ref`` \u2014 a ``${secrets.shared.KEY}`` there resolves at launch for\nany owner, so a human can place the secret and the agent only names it.\n",
     "inputSchema": {
       "properties": {
         "name": {
+          "description": "Name of a deployed app (``kind=service``). A served model or a managed database is a 404 ``config.not_an_app``; an unknown name a 404 ``not_found``.",
           "title": "Name",
           "type": "string"
         }
@@ -816,7 +880,7 @@
     }
   },
   "get_audit": {
-    "description": "Read the audit log (admin-scoped), bounded to ``limit`` entries per page.\n\n        Returns an ``AuditLogPage`` dict; pass ``cursor`` from the previous page\n        to continue. Non-admin tokens get a structured ``forbidden`` (403) error.\n\n        Exact-match filters: ``action`` (e.g. ``deploy.create``), ``result``\n        (ok/error/denied/replay), ``target`` (a target id, e.g. a service name),\n        ``target_type`` (e.g. service, model) and ``principal_id`` (a token id \u2014\n        \"everything this caller did\").\n\n        ``action_prefix`` is the family form: ``deploy.`` returns every\n        ``deploy.*`` action without you enumerating them. It is a **literal**\n        prefix, not a pattern, and must match ``[a-z0-9._]`` (1-40 chars) or the\n        daemon answers ``bad_request``.\n\n        ``since``/``until`` are inclusive ISO-8601 UTC bounds\n        (``2026-08-07T10:00:00Z``). All filters compose with AND, and all are\n        applied in SQL \u2014 narrowing is cheap, so prefer a filter over paging.\n        ",
+    "description": "Read the audit log (admin-scoped), bounded to ``limit`` entries per page.\n\nReturns an ``AuditLogPage`` dict. Non-admin tokens get a structured\n``forbidden`` (403) error.\n\nAll filters compose with AND, and all are applied in SQL \u2014 narrowing is\ncheap, so prefer a filter over paging.\n",
     "inputSchema": {
       "properties": {
         "action": {
@@ -829,6 +893,7 @@
             }
           ],
           "default": null,
+          "description": "Keep only entries whose action equals this exactly (e.g. ``deploy.create``); omit for every action, or use ``action_prefix`` for a family.",
           "title": "Action"
         },
         "action_prefix": {
@@ -841,6 +906,7 @@
             }
           ],
           "default": null,
+          "description": "Keep only actions starting with this **literal** prefix, never a pattern (``deploy.`` matches deploy.create, deploy.git_create, deploy.plan). Grammar ``[a-z0-9._]``, 1-40 chars, else ``bad_request``; omit for every family.",
           "title": "Action Prefix"
         },
         "cursor": {
@@ -853,10 +919,12 @@
             }
           ],
           "default": null,
+          "description": "Opaque paging cursor from the previous page's response; omit for page 1.",
           "title": "Cursor"
         },
         "limit": {
           "default": 50,
+          "description": "Max entries in one page, clamped to [1, 200] before the call (the daemon rejects anything outside that range); omit for 50.",
           "title": "Limit",
           "type": "integer"
         },
@@ -870,6 +938,7 @@
             }
           ],
           "default": null,
+          "description": "Keep only entries written by this token id \u2014 everything that caller did; omit for every principal.",
           "title": "Principal Id"
         },
         "result": {
@@ -882,6 +951,7 @@
             }
           ],
           "default": null,
+          "description": "Keep only entries with this outcome \u2014 ``ok``, ``error``, ``denied`` or ``replay``; omit for all four.",
           "title": "Result"
         },
         "since": {
@@ -894,6 +964,7 @@
             }
           ],
           "default": null,
+          "description": "Keep only entries at or after this inclusive ISO-8601 UTC timestamp (``2026-08-07T10:00:00Z``); omit for no lower bound.",
           "title": "Since"
         },
         "target": {
@@ -906,6 +977,7 @@
             }
           ],
           "default": null,
+          "description": "Keep only entries acting on this exact target id (e.g. a service name); omit for every target.",
           "title": "Target"
         },
         "target_type": {
@@ -918,6 +990,7 @@
             }
           ],
           "default": null,
+          "description": "Keep only entries whose target is of this type (e.g. ``service``, ``model``); omit for every type.",
           "title": "Target Type"
         },
         "until": {
@@ -930,6 +1003,7 @@
             }
           ],
           "default": null,
+          "description": "Keep only entries at or before this inclusive ISO-8601 UTC timestamp (``2026-08-07T10:00:00Z``); omit for no upper bound.",
           "title": "Until"
         }
       },
@@ -938,7 +1012,7 @@
     }
   },
   "get_config": {
-    "description": "Read daemon config: one section view, or all sections when omitted.\n\n        Secret-bearing values are redacted server-side.\n        ",
+    "description": "Read daemon config: one section view, or all sections when omitted.\n\nSecret-bearing values are redacted server-side.\n",
     "inputSchema": {
       "properties": {
         "section": {
@@ -951,6 +1025,7 @@
             }
           ],
           "default": null,
+          "description": "Config section to read (e.g. ``proxy``, ``services``, ``retention``); omit to return every section. An unknown name is a 404 ``config.unknown_section`` listing the known ones.",
           "title": "Section"
         }
       },
@@ -959,7 +1034,7 @@
     }
   },
   "get_events": {
-    "description": "Use when: you need the daemon's own account of what it just did.\n\nThe durable feed of autonomous transitions (``service.failed``,\n``service.degraded``, ``service.deploy_succeeded``, ``model.ready``,\n...), readable by any authenticated token. Two directions, and picking\nthe wrong one walks the wrong way through history: ``cursor`` browses\n**backwards** (id DESC, newest first) \u2014 use it to see what just\nhappened; ``since_id`` replays **forwards** (id ASC, oldest first) \u2014 use\nit to resume from an id you already processed. Passing both is a\n``400``. ``types`` is comma-separated (first 10 honoured); ``limit`` is\nclamped to [1, 200].\n",
+    "description": "Use when: you need the daemon's own account of what it just did.\n\nThe durable feed of autonomous transitions (``service.failed``,\n``service.degraded``, ``service.deploy_succeeded``, ``model.ready``,\n...), readable by any authenticated token. Two directions, and picking\nthe wrong one walks the wrong way through history.\n",
     "inputSchema": {
       "properties": {
         "cursor": {
@@ -972,10 +1047,12 @@
             }
           ],
           "default": null,
+          "description": "Browse **backwards** from here (id DESC, newest first): pass the previous page's ``next_cursor`` to see what just happened. Omit for the newest page; passing it together with ``since_id`` is a 400.",
           "title": "Cursor"
         },
         "limit": {
           "default": 50,
+          "description": "Max rows in one page, clamped to [1, 200] here and server-side; omit for 50.",
           "title": "Limit",
           "type": "integer"
         },
@@ -989,6 +1066,7 @@
             }
           ],
           "default": null,
+          "description": "Keep only events for this exact service name; omit for every service.",
           "title": "Service"
         },
         "since_id": {
@@ -1001,6 +1079,7 @@
             }
           ],
           "default": null,
+          "description": "Replay **forwards** from this event id (id ASC, rows with id > it) \u2014 the resume mode after processing up to that id. Omit to browse backwards instead; passing it together with ``cursor`` is a 400. To keep replaying forward, pass the page's ``next_cursor`` back as ``since_id``, never as ``cursor``.",
           "title": "Since Id"
         },
         "types": {
@@ -1013,6 +1092,7 @@
             }
           ],
           "default": null,
+          "description": "Comma-separated event types to keep (e.g. ``service.failed,model.ready``); only the first 10 entries are honoured. Omit for every type.",
           "title": "Types"
         }
       },
@@ -1021,10 +1101,11 @@
     }
   },
   "get_service": {
-    "description": "Get one service. ``name`` accepts the service name or the job id.",
+    "description": "Get one service.",
     "inputSchema": {
       "properties": {
         "name": {
+          "description": "Service name or job id of an existing service (app, model or database); both resolve to the same row.",
           "title": "Name",
           "type": "string"
         }
@@ -1037,10 +1118,11 @@
     }
   },
   "list_app_files": {
-    "description": "List an app's workspace: paths, sizes, sha256 and totals.\n\n        What this lists is exactly what ``deploy_app`` would build \u2014 the exclude\n        rules are enforced at write time, not at deploy time. Bounded at 500\n        files by construction, so there is no paging.\n        ",
+    "description": "List an app's workspace: paths, sizes, sha256 and totals.\n\nWhat this lists is exactly what ``deploy_app`` would build \u2014 the exclude\nrules are enforced at write time, not at deploy time. Bounded at 500\nfiles by construction, so there is no paging.\n",
     "inputSchema": {
       "properties": {
         "name": {
+          "description": "Name of an existing workspace (also the app name it deploys under). No workspace by that name is ``404 workspace.not_found``.",
           "title": "Name",
           "type": "string"
         }
@@ -1053,7 +1135,7 @@
     }
   },
   "list_app_templates": {
-    "description": "List the app template store \u2014 deployable starter apps (id/name/coordinates).\n\n        Deploy one with ``deploy_template``. Distinct from ``list_jobs``-style\n        job presets: these are full app templates (web/API/AI starters).\n        ",
+    "description": "List the app template store \u2014 deployable starter apps (id/name/coordinates).\n\nDeploy one with ``deploy_template``. Distinct from ``list_jobs``-style\njob presets: these are full app templates (web/API/AI starters).\n",
     "inputSchema": {
       "properties": {},
       "title": "list_app_templatesArguments",
@@ -1061,10 +1143,11 @@
     }
   },
   "list_database_dumps": {
-    "description": "List the dump tars this daemon holds for one managed database.\n\n        Newest first, ``{dump, size_bytes, created_at}`` per row, where\n        ``created_at`` is the tar's mtime (the listing never opens an archive).\n        Metadata only, like ``dump_database``: the tars themselves stay under\n        the daemon's backups directory and are never served over HTTP, and each\n        one holds every row of ``name``.\n\n        Two things this read is for. It is the recovery path when a\n        ``dump_database`` call outran your client's read budget \u2014 **the dump\n        still completes server-side and shows up here**, so list before you\n        retry. And it is how you check retention: the daemon keeps the last\n        ``[retention].dump_keep_last`` per database (default 5) and prunes the\n        rest hourly, so on a default daemon what is listed here is all there is.\n        Retention can be turned off (``dump_keep_last = 0``), so the listing is\n        capped at the newest 500 instead: ``truncated`` is true when older tars\n        exist on the box that this page does not name.\n\n        Owner-or-admin plus token scope \u2014 the same gate as the dump that\n        produced them, because knowing which dumps a database has is knowing\n        something about the data.\n        ",
+    "description": "List the dump tars this daemon holds for one managed database.\n\nNewest first, ``{dump, size_bytes, created_at}`` per row, where\n``created_at`` is the tar's mtime (the listing never opens an archive).\nMetadata only, like ``dump_database``: the tars themselves stay under\nthe daemon's backups directory and are never served over HTTP, and each\none holds every row of ``name``.\n\nTwo things this read is for. It is the recovery path when a\n``dump_database`` call outran your client's read budget \u2014 **the dump\nstill completes server-side and shows up here**, so list before you\nretry. And it is how you check retention: the daemon keeps the last\n``[retention].dump_keep_last`` per database (default 5) and prunes the\nrest hourly, so on a default daemon what is listed here is all there is.\nRetention can be turned off (``dump_keep_last = 0``), so the listing is\ncapped at the newest 500 instead: ``truncated`` is true when older tars\nexist on the box that this page does not name.\n\nOwner-or-admin plus token scope \u2014 the same gate as the dump that\nproduced them, because knowing which dumps a database has is knowing\nsomething about the data.\n",
     "inputSchema": {
       "properties": {
         "name": {
+          "description": "Name of an existing managed database (``kind=database``); an app or model row is refused.",
           "title": "Name",
           "type": "string"
         }
@@ -1077,7 +1160,7 @@
     }
   },
   "list_databases": {
-    "description": "List managed databases (kind=database workloads), bounded to ``limit`` per page.\n\n        Returns a cursor-paginated page; pass ``cursor`` from the previous page\n        to continue. A newly created database shows ``building`` until its\n        off-tick image pull and readiness probe complete (``db_ready`` true).\n        The ``endpoint`` is password-free by construction; lifecycle actions go\n        through the service tools.\n        ",
+    "description": "List managed databases (kind=database workloads), bounded to ``limit`` per page.\n\nReturns a cursor-paginated page. A newly created database shows\n``building`` until its off-tick image pull and readiness probe complete\n(``db_ready`` true).\nThe ``endpoint`` is password-free by construction; lifecycle actions go\nthrough the service tools.\n",
     "inputSchema": {
       "properties": {
         "cursor": {
@@ -1090,6 +1173,7 @@
             }
           ],
           "default": null,
+          "description": "Opaque paging cursor from the previous page's response; omit for page 1.",
           "title": "Cursor"
         },
         "limit": {
@@ -1102,6 +1186,7 @@
             }
           ],
           "default": null,
+          "description": "Databases per page; omit for 50. Clamped to 200, the daemon's own page cap.",
           "title": "Limit"
         }
       },
@@ -1118,7 +1203,7 @@
     }
   },
   "list_models": {
-    "description": "List served AI models (kind=model workloads), bounded to ``limit`` per page.\n\n        Returns a cursor-paginated page; pass ``cursor`` from the previous page\n        to continue. A newly served model shows ``building`` until its off-tick\n        pull completes; lifecycle actions go through the service tools.\n        ",
+    "description": "List served AI models (kind=model workloads), bounded to ``limit`` per page.\n\nReturns a cursor-paginated page; pass ``cursor`` from the previous page\nto continue. A newly served model shows ``building`` until its off-tick\npull completes; lifecycle actions go through the service tools.\n",
     "inputSchema": {
       "properties": {
         "cursor": {
@@ -1131,6 +1216,7 @@
             }
           ],
           "default": null,
+          "description": "Opaque paging cursor from the previous page's response; omit for page 1.",
           "title": "Cursor"
         },
         "limit": {
@@ -1143,6 +1229,7 @@
             }
           ],
           "default": null,
+          "description": "Models per page; a value outside 1\u2013200 is clamped into it (0 becomes 1, 10000 becomes 200). Omit for 50.",
           "title": "Limit"
         }
       },
@@ -1151,7 +1238,7 @@
     }
   },
   "list_routes": {
-    "description": "List the DB-authoritative route inventory, annotated with live Caddy state.\n\n        Cursor-paginated (``limit`` clamped to [1, 200]); pass ``cursor`` from\n        the previous page to continue. Models appear with ``route: null``\n        (loopback-only by design); each row carries its live-table annotation.\n        ",
+    "description": "List the DB-authoritative route inventory, annotated with live Caddy state.\n\nModels appear with ``route: null`` (loopback-only by design); each row\ncarries its live-table annotation.\n",
     "inputSchema": {
       "properties": {
         "cursor": {
@@ -1164,10 +1251,12 @@
             }
           ],
           "default": null,
+          "description": "Opaque paging cursor from the previous page's response; omit for page 1.",
           "title": "Cursor"
         },
         "limit": {
           "default": 50,
+          "description": "Max rows in one page, clamped to [1, 200] here and server-side; omit for 50.",
           "title": "Limit",
           "type": "integer"
         }
@@ -1177,10 +1266,11 @@
     }
   },
   "list_secret_names": {
-    "description": "List a service's secret key names (values are never returned).\n\n        ``service=\"shared\"`` lists the global shared scope's key names;\n        readable by any authenticated principal (owners need the\n        referenceable list), unlike shared writes which are admin-only.\n        ",
+    "description": "List a service's secret key names (values are never returned).",
     "inputSchema": {
       "properties": {
         "service": {
+          "description": "Existing service (app, model or database) whose secret key names to read, or ``shared`` for the global scope, whose names any authenticated principal may read.",
           "title": "Service",
           "type": "string"
         }
@@ -1193,7 +1283,7 @@
     }
   },
   "list_services": {
-    "description": "List services, optionally filtered by status, bounded to ``limit`` per page.",
+    "description": "List services (apps, models and databases), newest first.",
     "inputSchema": {
       "properties": {
         "cursor": {
@@ -1206,10 +1296,12 @@
             }
           ],
           "default": null,
+          "description": "Opaque paging cursor from the previous page's response; omit for page 1.",
           "title": "Cursor"
         },
         "limit": {
           "default": 50,
+          "description": "Services per page. Default 50; clamped to [1, 200] here and bounded again server-side. Page 2 comes from ``next_cursor``, not a larger limit.",
           "title": "Limit",
           "type": "integer"
         },
@@ -1223,6 +1315,7 @@
             }
           ],
           "default": null,
+          "description": "Keep only services in this exact lifecycle state (``building``/``running``/``degraded``/``restarting``/``stopped``/``failed``); omit for every state. A value outside the daemon's job-status enum is a 422; a legacy batch state (``pending``, ``completed``, \u2026) is accepted and simply matches nothing.",
           "title": "Status"
         }
       },
@@ -1231,7 +1324,7 @@
     }
   },
   "proxy_status": {
-    "description": "Get the embedded proxy's typed state (TLS, apex, respawn, live routes).\n\n        Authenticated read: proxy state, TLS subjects + CA fingerprint, apex\n        registration, respawn backoff, and a tri-state live route table read\n        from the Caddy admin API. Complements ``list_routes`` (the\n        DB-authoritative inventory).\n        ",
+    "description": "Get the embedded proxy's typed state (TLS, apex, respawn, live routes).\n\nAuthenticated read: proxy state, TLS subjects + CA fingerprint, apex\nregistration, respawn backoff, and a tri-state live route table read\nfrom the Caddy admin API. Complements ``list_routes`` (the\nDB-authoritative inventory).\n",
     "inputSchema": {
       "properties": {},
       "title": "proxy_statusArguments",
@@ -1239,14 +1332,16 @@
     }
   },
   "read_app_file": {
-    "description": "Read one file back from an app's workspace as text.\n\n        Use it before patching a file you did not write in this conversation, so\n        the next ``write_app_files`` replaces content you have actually seen.\n        ",
+    "description": "Read one file back from an app's workspace as text.\n\nUse it before patching a file you did not write in this conversation, so\nthe next ``write_app_files`` replaces content you have actually seen.\n",
     "inputSchema": {
       "properties": {
         "name": {
+          "description": "Name of an existing workspace (also the app name it deploys under). No workspace by that name is ``404 workspace.not_found``.",
           "title": "Name",
           "type": "string"
         },
         "path": {
+          "description": "Workspace-relative path of one file, exactly as ``list_app_files`` reports it (relative, no ``..``). Its text is returned; \u2264 256 KiB by construction, since that is the per-file write cap. A path naming no file answers the same ``404 workspace.not_found`` as an absent workspace.",
           "title": "Path",
           "type": "string"
         }
@@ -1260,11 +1355,12 @@
     }
   },
   "redeploy_service": {
-    "description": "Use when: a git app needs a new commit. Asynchronous \u2014 follow with wait_for_service.\n\nRe-clones the repository and branch/tag the service was deployed from\nand rebuilds it, so picking up a new commit is one call with the service\nname alone. Use this instead of ``deploy_git`` when the service already\nexists \u2014 every coordinate (repo, ref, subdir, private-repo credential\nreference) is read back off the service. A service deployed from a\nfolder/zip has no recorded source and is refused. An idempotency key is\nauto-generated if omitted. ``dry_run=True`` returns the build/config plan\ndiff (env key names only, values never) with zero writes \u2014 no\nidempotency key is minted or needed. A non-dry-run response carries\n``summary``, ``hints`` (never empty) and ``next_step`` \u2014 the structured\nfollow-up call.\n",
+    "description": "Use when: a git app needs a new commit. Asynchronous \u2014 follow with wait_for_service.\n\nRe-clones the repository and branch/tag the service was deployed from\nand rebuilds it, so picking up a new commit is one call with the service\nname alone. Use this instead of ``deploy_git`` when the service already\nexists \u2014 every coordinate (repo, ref, subdir, private-repo credential\nreference) is read back off the service. A service deployed from a\nfolder/zip has no recorded source and is refused. ``dry_run=True`` returns\nthe build/config plan diff (env key names only, values never). A\nnon-dry-run response carries\n``summary``, ``hints`` (never empty) and ``next_step`` \u2014 the structured\nfollow-up call.\n",
     "inputSchema": {
       "properties": {
         "dry_run": {
           "default": false,
+          "description": "true = validate and return the plan (what would change) with zero writes; nothing is built, deployed or audited as a change.",
           "title": "Dry Run",
           "type": "boolean"
         },
@@ -1278,9 +1374,11 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
+          "description": "Name of an existing app deployed from Git; its recorded repo, ref, subdir and credential reference are re-read, so no coordinates are passed here.",
           "title": "Name",
           "type": "string"
         }
@@ -1297,6 +1395,7 @@
     "inputSchema": {
       "properties": {
         "domain": {
+          "description": "The bound domain to unbind, case and one trailing dot folded as on add. Grammar is not ENFORCED on delete (a legacy or now-reserved binding stays removable): a name that is not bound simply removes nothing.",
           "title": "Domain",
           "type": "string"
         },
@@ -1310,9 +1409,11 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
+          "description": "Name (or row id) of an existing deployed app \u2014 only kind 'service' can be exposed: ``share_service``/``add_domain`` refuse a model or database with 422 ``*.kind_unsupported``, while the remove tools just find nothing to undo.",
           "title": "Name",
           "type": "string"
         }
@@ -1326,7 +1427,7 @@
     }
   },
   "remove_secret": {
-    "description": "Delete one secret key, or all of a service's secrets when key is omitted.\n\n        An idempotency key is auto-generated if omitted, so a retried delete\n        collapses to a single apply. ``service=\"shared\"`` deletes from the\n        global shared scope (admin-only) \u2014 deleting a shared key can break\n        every app still referencing it via ``${secrets.shared.KEY}``.\n        ",
+    "description": "Delete one secret key, or all of a service's secrets when key is omitted.\n\nDeleting a shared key can break every app still referencing it via\n``${secrets.shared.KEY}``.\n",
     "inputSchema": {
       "properties": {
         "idempotency_key": {
@@ -1339,6 +1440,7 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "key": {
@@ -1351,9 +1453,11 @@
             }
           ],
           "default": null,
+          "description": "The one secret key to delete; omit it \u2014 null or an empty string \u2014 to delete ALL of the scope's secrets at once. Deleting a key that does not exist is a 404.",
           "title": "Key"
         },
         "service": {
+          "description": "Existing service (app, model or database) whose secrets this call modifies, or ``shared`` for the global scope \u2014 writing that one is admin-only, and a service reads a shared key only where a ``${secrets.shared.KEY}`` reference is honoured (``[ai.*].api_key``, ``[db.*].password``, ``[deploy].edge_auth.password``, a git ``token_ref``), never through ``env``, whose values stay literal.",
           "title": "Service",
           "type": "string"
         }
@@ -1366,11 +1470,12 @@
     }
   },
   "remove_service": {
-    "description": "Delete a service (teardown + remove).\n\n        ``name`` accepts the service name or the job id. ``purge`` is a CSV of\n        durable-state targets to destroy alongside the row\n        (``secrets``/``data``/``images``; default ``secrets``). ``force`` bypasses\n        the model reference guard (deleting a model still bound by other apps).\n        An idempotency key is auto-generated if omitted.\n        ",
+    "description": "Delete a service (teardown + remove).",
     "inputSchema": {
       "properties": {
         "force": {
           "default": false,
+          "description": "true bypasses the dependency guard (a model or database other apps still bind), kills an in-flight run and cancels an in-flight cutover; a cross-owner dependent makes it admin-only. false (the default) refuses those with 409 ``resource.in_use`` / ``service.run_in_progress`` / ``service.cutover_in_progress``.",
           "title": "Force",
           "type": "boolean"
         },
@@ -1384,14 +1489,17 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
+          "description": "Service name or job id of an existing service (app, model or database); both resolve to the same row.",
           "title": "Name",
           "type": "string"
         },
         "purge": {
           "default": "secrets",
+          "description": "CSV of durable state to destroy alongside the row: ``secrets``, ``data``, ``images``, ``workspace``. Default ``secrets``; an empty string purges nothing; an unknown token is a 422 ``service.invalid_purge``. Deleting a managed DATABASE requires ``data`` in the set (409 ``db.delete_requires_purge``, not bypassable by ``force``), and purging ``data`` always purges ``secrets`` too.",
           "title": "Purge",
           "type": "string"
         }
@@ -1404,11 +1512,12 @@
     }
   },
   "restart_daemon": {
-    "description": "Restart the daemon to apply restart-required config (admin-scoped, audited).\n\n        Returns 202 with drain counts. **Over the HTTP MCP transport this kills\n        the connection serving this call**: a dropped response after issuing it\n        means the restart most likely started. Confirm with ``capabilities``\n        (``uptime_s`` resets); retrying with the same idempotency key answers\n        ``409 daemon.restart_in_progress`` or a fresh 202, never a second\n        restart mid-drain.\n        ",
+    "description": "Restart the daemon to apply restart-required config (admin-scoped, audited).\n\nReturns 202 with drain counts. **Over the HTTP MCP transport this kills\nthe connection serving this call**: a dropped response after issuing it\nmeans the restart most likely started. Confirm with ``capabilities``\n(``uptime_s`` resets); retrying with the same idempotency key answers\n``409 daemon.restart_in_progress`` or a fresh 202, never a second\nrestart mid-drain.\n",
     "inputSchema": {
       "properties": {
         "drain_timeout_s": {
           "default": 60,
+          "description": "Seconds to let in-flight builds, runs and releases drain before the daemon self-execs, clamped server-side to [0, 300]; omit for 60. At 0 the SIGTERM can beat the 202 response.",
           "title": "Drain Timeout S",
           "type": "integer"
         },
@@ -1422,6 +1531,7 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key; the daemon REQUIRES one and the MCP tool mints a fresh uuid4 when you omit it. A retry with the same key is safe: it answers ``409 daemon.restart_in_progress`` (or replays the first 202), never a second restart mid-drain.",
           "title": "Idempotency Key"
         }
       },
@@ -1430,7 +1540,7 @@
     }
   },
   "restart_service": {
-    "description": "Restart a service (clears backoff).\n\n        ``name`` accepts the service name or the job id. An idempotency key is\n        auto-generated if omitted.\n        ",
+    "description": "Restart a service (clears backoff).",
     "inputSchema": {
       "properties": {
         "idempotency_key": {
@@ -1443,9 +1553,11 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
+          "description": "Service name or job id of an existing service (app, model or database); both resolve to the same row.",
           "title": "Name",
           "type": "string"
         }
@@ -1458,10 +1570,11 @@
     }
   },
   "run_command": {
-    "description": "Run a one-off command in a deployed service's image (migrations, seeds).\n\n        The command runs in a throwaway container built from the service's\n        current image with the same env, secrets, AI/DB bindings and named\n        volumes as the live container \u2014 the service itself keeps serving.\n        ``name`` accepts the service name or the job id.\n\n        ``command`` is argv, run unshelled (no globbing, no pipes \u2014 wrap in\n        ``[\"sh\", \"-c\", \"...\"]`` if you need them). It REPLACES the image's\n        ``CMD`` and is APPENDED to its ``ENTRYPOINT`` when the image declares\n        one, so on an image whose entrypoint is e.g. ``python -m gunicorn``\n        your argv arrives as arguments to that, not as a fresh command line.\n\n        **Bounded-synchronous**: this call BLOCKS until the command exits or\n        ``timeout_s`` seconds elapse (default 300; the daemon rejects anything\n        above ``[services].run_timeout_max_s`` with ``run.timeout_too_large``),\n        then returns ``{exit_code, timed_out, oom_killed, duration_s, run_id,\n        log_tail, ...}``. Branch on ``exit_code``/``timed_out`` \u2014 a non-zero\n        exit is a normal 200 result, not an error. One run at a time per\n        service (409 ``service.run_in_progress``). ``log_tail`` is clamped to\n        [1, 200].\n\n        **Never put credentials in ``command`` argv**: argv is visible via\n        ``docker inspect`` on the host and is stored verbatim in the service's\n        ``last_run``. Pass them in ``env`` instead \u2014 those values are masked in\n        the audit trail. ``env`` overrides beat the app's config env and its\n        secrets, but never platform-computed keys (resolved AI/DB binding vars,\n        ``PORT``, ``NERDIT_RUN_ID``), which always win.\n\n        Because the call blocks for minutes, **supply your own\n        ``idempotency_key`` and REUSE it verbatim if you retry** \u2014 that is the\n        only thing standing between a client-side read timeout and a migration\n        running twice. Omitting it auto-generates one, which makes the single\n        call safe but leaves every retry a fresh execution. A retried key\n        REPLAYS an ``idempotent_replay`` envelope, NOT the command's output \u2014\n        the run's stdout is deliberately never cached at rest. Re-run under a\n        fresh key if you need the output again, or read it from\n        ``diagnose_service``'s ``last_run``.\n\n        **Key reuse protects a COMPLETED run only.** A failed call un-pins the\n        key, so a same-key retry really re-executes. In particular ``503\n        run.interrupted`` means the container started and was lost \u2014 the\n        command may have partially applied \u2014 and retrying it, with any key,\n        runs it again: stop and inspect instead. And if the daemon died\n        mid-run, the key stays claimed for 24 h and the retry returns ``409\n        idempotency_in_progress``; mint a fresh key once you have confirmed\n        the run is over.\n        ",
+    "description": "Run a one-off command in a deployed service's image (migrations, seeds).\n\nThe command runs in a throwaway container built from the service's\ncurrent image with the same env, secrets, AI/DB bindings and named\nvolumes as the live container \u2014 the service itself keeps serving.\n\n**Bounded-synchronous**: this call BLOCKS until the command exits or\n``timeout_s`` seconds elapse, then returns ``{exit_code, timed_out,\noom_killed, duration_s, run_id, log_tail, ...}``. Branch on\n``exit_code``/``timed_out`` \u2014 a non-zero exit is a normal 200 result,\nnot an error. One run at a time per service (409\n``service.run_in_progress``).\n\nBecause the call blocks for minutes, **supply your own\n``idempotency_key`` and REUSE it verbatim if you retry** \u2014 that is the\nonly thing standing between a client-side read timeout and a migration\nrunning twice. A retried key REPLAYS an ``idempotent_replay`` envelope,\nNOT the command's output \u2014 the run's stdout is deliberately never\ncached at rest. Re-run under a fresh key if you need the output again,\nor read it from ``diagnose_service``'s ``last_run``.\n\n**Key reuse protects a COMPLETED run only.** A failed call un-pins the\nkey, so a same-key retry really re-executes. In particular ``503\nrun.interrupted`` means the container started and was lost \u2014 the\ncommand may have partially applied \u2014 and retrying it, with any key,\nruns it again: stop and inspect instead. And if the daemon died\nmid-run, the key stays claimed for 24 h and the retry returns ``409\nidempotency_in_progress``; mint a fresh key once you have confirmed\nthe run is over.\n",
     "inputSchema": {
       "properties": {
         "command": {
+          "description": "Argv, run unshelled \u2014 no globbing, no pipes (wrap in ``[\"sh\", \"-c\", \"\u2026\"]`` for those). It REPLACES the image's CMD and is APPENDED to its ENTRYPOINT when one is declared. 1-256 arguments, none empty or NUL-bearing. Never put credentials here: argv is host-visible via ``docker inspect`` and stored verbatim in ``last_run``.",
           "items": {
             "type": "string"
           },
@@ -1481,6 +1594,7 @@
             }
           ],
           "default": null,
+          "description": "Env overrides for this run only (\u2264 64 keys); omit for none. They beat the app's config env and its secrets, but lose to platform-computed keys (resolved AI/DB binding vars, ``PORT``, ``NERDIT_RUN_ID``). Put credentials HERE: values are masked in audit, scrubbed from the returned tail and never echoed back.",
           "title": "Env"
         },
         "idempotency_key": {
@@ -1493,19 +1607,23 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key; omit and a fresh one is minted per call. A retry with the same key replays the first result ONLY if that run completed (2xx). Any other outcome \u2014 including 503 ``run.interrupted``, where the container started and its exit is unknown \u2014 releases the key, so the retry runs the command AGAIN: check ``last_run`` and the app before retrying a migration.",
           "title": "Idempotency Key"
         },
         "log_tail": {
           "default": 200,
+          "description": "Lines of scrubbed output returned. Default 200; clamped to [1, 200] here and again server-side.",
           "title": "Log Tail",
           "type": "integer"
         },
         "name": {
+          "description": "Name (or row id) of a deployed APP. A model or database is refused with 422 ``run.not_supported`` \u2014 their commands and credentials are platform-managed.",
           "title": "Name",
           "type": "string"
         },
         "timeout_s": {
           "default": 300,
+          "description": "Seconds before the container is killed and ``timed_out: true`` returned. Default 300; floored at 1 and otherwise passed straight through, so a value above ``[services].run_timeout_max_s`` gets the authoritative 422 ``run.timeout_too_large`` instead of being silently truncated.",
           "title": "Timeout S",
           "type": "integer"
         }
@@ -1519,7 +1637,7 @@
     }
   },
   "serve": {
-    "description": "Register a service from a prebuilt image. Idempotency key auto-generated if omitted.",
+    "description": "Register a service from a prebuilt image.",
     "inputSchema": {
       "properties": {
         "command": {
@@ -1532,6 +1650,7 @@
             }
           ],
           "default": null,
+          "description": "Command overriding the image's CMD, split into argv like a shell would (``shlex``) but run WITHOUT a shell \u2014 no pipes, redirects or ``$VAR``; write ``sh -c '\u2026'`` for those. Omit to run the image's own CMD.",
           "title": "Command"
         },
         "env": {
@@ -1547,10 +1666,12 @@
             }
           ],
           "default": null,
+          "description": "Environment variables injected into the container, as literal strings. Omit for none. Secrets belong in ``set_secret``, which overrides an ``env`` key of the same name at launch.",
           "title": "Env"
         },
         "gpus": {
           "default": 0,
+          "description": "GPUs the service needs; default 0 = none. Allocation is shared, not exclusive, and is checked against the token's quota.",
           "title": "Gpus",
           "type": "integer"
         },
@@ -1565,6 +1686,7 @@
             }
           ],
           "default": null,
+          "description": "Probe policy ``{path, type: http|tcp, timeout_s, unhealthy_threshold, start_period_s}``; omit for liveness-only supervision. Repeated failures mark the service ``degraded`` and leave it running \u2014 only a dead container is restarted.",
           "title": "Health Check"
         },
         "idempotency_key": {
@@ -1577,23 +1699,28 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "image": {
+          "description": "Tag of an image that already exists on the daemon's runtime; it is never built and never pulled here, and a missing one is refused with 400 ``image_not_found``.",
           "title": "Image",
           "type": "string"
         },
         "name": {
+          "description": "Name for the NEW service: a lowercase DNS label, 1-63 chars (``^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$``). Register-only \u2014 an existing name is refused with 409 ``service.name_taken`` rather than redeployed.",
           "title": "Name",
           "type": "string"
         },
         "port": {
           "default": 8000,
+          "description": "Container port published on the host. Default 8000; 1-65535.",
           "title": "Port",
           "type": "integer"
         },
         "restart_policy": {
           "default": "always",
+          "description": "What the daemon does when the container exits: ``always`` (the default), ``on-failure`` or ``no``.",
           "title": "Restart Policy",
           "type": "string"
         },
@@ -1607,6 +1734,7 @@
             }
           ],
           "default": null,
+          "description": "Host path to a script run under ``nerdit-runtime`` instead of the image CMD. Omit for the image CMD; it bind-mounts a host directory and needs an admin token (403 ``sandbox.script_path_forbidden``).",
           "title": "Script Path"
         },
         "vendor": {
@@ -1619,6 +1747,7 @@
             }
           ],
           "default": null,
+          "description": "GPU vendor to reserve when ``gpus`` > 0 (``nvidia`` or ``amd``); omit to let the daemon choose on a fresh deploy \u2014 a redeploy keeps the vendor already recorded.",
           "title": "Vendor"
         }
       },
@@ -1631,7 +1760,7 @@
     }
   },
   "serve_model": {
-    "description": "Serve a local AI model as an OpenAI-compatible endpoint.\n\n        ``backend`` selects the serving backend: ``ollama`` (default; CPU or\n        GPU) or ``vllm`` (GPU-only, one model per server, weights from Hugging\n        Face \u2014 pass ``gpus>=1``). Omit it to use the daemon's configured\n        default. Serving is asynchronous: the call returns immediately with the\n        model row in ``building`` while the daemon pulls the image and weights\n        off-tick; poll ``list_models`` (or ``get_service``) until it is\n        ``running``. Lifecycle (stop / restart / delete) goes through the\n        existing service tools (``stop_service`` / ``restart_service`` /\n        ``remove_service``). An idempotency key is auto-generated if omitted.\n\n        ``max_model_len`` / ``gpu_memory_utilization`` are vLLM-only engine\n        bounds (context window cap [256, 262144]; VRAM fraction [0.1, 0.95]);\n        other backends reject them (``model.backend_param``).\n\n        An app connects to this model by declaring an ``[ai.<name>]`` binding\n        (provider ``ollama``, model = this model); at each launch it receives\n        ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the ``default`` binding also\n        sets ``OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL`` so an unmodified\n        OpenAI SDK reaches this endpoint with no code change.\n        ",
+    "description": "Serve a local AI model as an OpenAI-compatible endpoint.\n\nServing is asynchronous: the call returns immediately with the\nmodel row in ``building`` while the daemon pulls the image and weights\noff-tick; poll ``list_models`` (or ``get_service``) until it is\n``running``. Lifecycle (stop / restart / delete) goes through the\nexisting service tools (``stop_service`` / ``restart_service`` /\n``remove_service``).\n\nAn app connects to this model by declaring an ``[ai.<name>]`` binding\n(provider ``ollama``, model = this model); at each launch it receives\n``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the ``default`` binding also\nsets ``OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL`` so an unmodified\nOpenAI SDK reaches this endpoint with no code change.\n",
     "inputSchema": {
       "properties": {
         "backend": {
@@ -1644,6 +1773,7 @@
             }
           ],
           "default": null,
+          "description": "Serving backend: ``ollama`` (CPU or GPU) or ``vllm`` (GPU-only, one model per server, weights from Hugging Face). Omit to use the daemon's configured default; an unknown name is refused with ``model.unknown_backend``.",
           "title": "Backend"
         },
         "gpu_memory_utilization": {
@@ -1656,10 +1786,12 @@
             }
           ],
           "default": null,
+          "description": "vLLM only: fraction of VRAM the engine may claim (``--gpu-memory-utilization``), 0.1 to 0.95. Omit and the daemon decides: an operator flag in ``[models].vllm_extra_args``, else 0.85 on a GPU under 16 GB VRAM, else vLLM's own default. Any other backend refuses it with ``model.backend_param``.",
           "title": "Gpu Memory Utilization"
         },
         "gpus": {
           "default": 0,
+          "description": "GPUs to reserve for the model server; 0 (the default) is CPU inference, and allocated GPUs are shared with other workloads. The ``vllm`` backend needs at least 1 and refuses 0 with ``model.gpu_required``.",
           "title": "Gpus",
           "type": "integer"
         },
@@ -1673,6 +1805,7 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "max_model_len": {
@@ -1685,9 +1818,11 @@
             }
           ],
           "default": null,
+          "description": "vLLM only: context-window cap in tokens (``--max-model-len``), 256 to 262144. Omit and the daemon decides: an operator flag in ``[models].vllm_extra_args``, else 4096 on a GPU under 16 GB VRAM, else vLLM's own default. Any other backend refuses it with ``model.backend_param``.",
           "title": "Max Model Len"
         },
         "model": {
+          "description": "Model reference to pull and serve, e.g. ``llama3.1:8b`` (ollama) or a Hugging Face repo id (vLLM): letters, digits, ``. - _ /`` with an optional ``:tag``.",
           "title": "Model",
           "type": "string"
         },
@@ -1701,6 +1836,7 @@
             }
           ],
           "default": null,
+          "description": "Service name for the model (lowercase DNS label). Omit and the name is the backend-prefixed, sanitized model reference (``llama3.1:8b`` on ollama \u2192 ``ollama-llama3-1-8b``).",
           "title": "Name"
         }
       },
@@ -1712,7 +1848,7 @@
     }
   },
   "service_logs": {
-    "description": "Use when: you need the raw output a service or its build printed.\n\n``name`` accepts the service name or the job id. Polling-only: pass\nthe last entry's id as ``since_id`` to fetch only newer lines.\n\n``source`` picks which output you get. ``'runtime'`` is the container's\nown stdout/stderr plus the crash tail; ``'build'`` is the image build's\noutput; ``'all'`` (the default) is both plus the daemon's own lifecycle\nlines. **Pass ``source='runtime'`` when you are debugging a running\napp** \u2014 the build and the app used to share one stream, so a bare\n``grep`` over a deployed app still matches BuildKit layer chatter\n(``404B``, ``CACHED``, ``sha256:\u2026``) from the build that produced it.\nLines written by an older daemon are stored as stdout and therefore read\nas ``'runtime'`` whichever program printed them.\n\n``grep`` keeps only lines CONTAINING that text. It is a plain\n**literal substring**, never a regex \u2014 ``grep='100%'`` finds a literal\n``100%``, ``.*`` finds a literal ``.*``, and there is no anchoring, no\ncharacter class and no escaping to do. ``since`` keeps only lines at or\nafter an ISO-8601 UTC timestamp (``2026-08-07T10:00:00Z``).\n\nAll three filter server-side inside the ``tail`` bound, so ``tail``\ncounts matching lines: ``grep='Traceback', source='runtime', tail=20``\ngives the last 20 app tracebacks out of a million-line log in one\nbounded query. Prefer that over pulling a large tail and searching it\nyourself.\n",
+    "description": "Use when: you need the raw output a service or its build printed.\n\n``source`` picks which output you get. **Pass ``source='runtime'`` when\nyou are debugging a running app** \u2014 the build and the app used to share\none stream, so a bare ``grep`` over a deployed app still matches\nBuildKit layer chatter (``404B``, ``CACHED``, ``sha256:\u2026``) from the\nbuild that produced it. Lines written by an older daemon are stored as\nstdout and therefore read as ``'runtime'`` whichever program printed\nthem.\n\n``grep`` keeps only lines CONTAINING that text. It is a plain\n**literal substring**, never a regex.\n\nAll three filters run server-side inside the ``tail`` bound, so ``tail``\ncounts matching lines: ``grep='Traceback', source='runtime', tail=20``\ngives the last 20 app tracebacks out of a million-line log in one\nbounded query. Prefer that over pulling a large tail and searching it\nyourself.\n",
     "inputSchema": {
       "properties": {
         "grep": {
@@ -1725,9 +1861,11 @@
             }
           ],
           "default": null,
+          "description": "Keep only lines containing this literal substring (never a regex: no anchors, no character classes, nothing to escape). Truncated to its first 200 characters server-side. Omit to keep every line.",
           "title": "Grep"
         },
         "name": {
+          "description": "Service name or job id of an existing service (app, model or database); both resolve to the same row.",
           "title": "Name",
           "type": "string"
         },
@@ -1741,20 +1879,24 @@
             }
           ],
           "default": null,
+          "description": "Keep only lines at or after this ISO-8601 UTC timestamp, inclusive (``2026-08-07T10:00:00Z``). Omit for no lower bound.",
           "title": "Since"
         },
         "since_id": {
           "default": 0,
+          "description": "Exclusive forward cursor: only entries with a larger id. Default 0 = from the start. Ignored whenever ``tail`` is sent \u2014 and this tool always sends it \u2014 so a page is always the NEWEST matching lines, not the ones after this id.",
           "title": "Since Id",
           "type": "integer"
         },
         "source": {
           "default": "all",
+          "description": "Which stream: ``runtime`` (the container's stdout/stderr plus its crash tail), ``build`` (the image build's output), or ``all`` (the default \u2014 both, plus the daemon's own lifecycle lines). Sent only when it is not ``all``; the daemon owns the vocabulary and 422s anything else.",
           "title": "Source",
           "type": "string"
         },
         "tail": {
           "default": 100,
+          "description": "Most recent matching entries to return. Default 100; clamped to [1, 1000] here and bounded again server-side. Counts lines left AFTER ``grep``/``since``/``source``, not lines scanned.",
           "title": "Tail",
           "type": "integer"
         }
@@ -1767,10 +1909,11 @@
     }
   },
   "service_stats": {
-    "description": "Get live CPU, memory, network and PID usage for a running service.\n\n        ``name`` accepts the service name or the job id. Returns\n        ``{available, stats: {cpu_pct, mem_used_bytes, mem_limit_bytes,\n        mem_pct, net_rx_bytes, net_tx_bytes, pids}, gpus, cached}``.\n\n        **Branch on ``available``, never on zeroes.** ``available: false`` with\n        ``stats: null`` is the normal answer when the service has no running\n        container or the daemon cannot reach Docker; every individual counter\n        is likewise ``null`` when unknown, so a missing metric never\n        masquerades as an idle one. ``cpu_pct`` follows the docker convention \u2014\n        ``100.0`` is one fully-used core, so a multi-core host can exceed 100.\n\n        For *why* a service is unhealthy use ``diagnose_service``; this tool\n        answers *how much* a healthy one is consuming. The daemon caches the\n        sample for 2 seconds, so polling it in a loop is cheap.\n        ",
+    "description": "Get live CPU, memory, network and PID usage for a running service.\n\nReturns ``{available, stats: {cpu_pct, mem_used_bytes, mem_limit_bytes,\nmem_pct, net_rx_bytes, net_tx_bytes, pids}, gpus, cached}``.\n\n**Branch on ``available``, never on zeroes.** ``available: false`` with\n``stats: null`` is the normal answer when the service has no running\ncontainer or the daemon cannot reach Docker; every individual counter\nis likewise ``null`` when unknown, so a missing metric never\nmasquerades as an idle one. ``cpu_pct`` follows the docker convention \u2014\n``100.0`` is one fully-used core, so a multi-core host can exceed 100.\n\nFor *why* a service is unhealthy use ``diagnose_service``; this tool\nanswers *how much* a healthy one is consuming. The daemon caches the\nsample for 2 seconds, so polling it in a loop is cheap.\n",
     "inputSchema": {
       "properties": {
         "name": {
+          "description": "Service name or job id of an existing service (app, model or database); both resolve to the same row.",
           "title": "Name",
           "type": "string"
         }
@@ -1783,11 +1926,12 @@
     }
   },
   "set_app_config": {
-    "description": "Write an app's ``deploy`` or ``ai`` config section (admin/owner-scoped).\n\n        ``if_match`` is auto-fetched (current app-config ETag) when omitted,\n        same convention as ``apply_config`` \u2014 pass it explicitly to disable\n        the auto-fetch. ``restart=True`` restarts the service after a\n        successful real write that needs it. ``dry_run=True`` previews\n        without writing. An idempotency key is auto-generated if omitted.\n\n        Writing the ``ai`` section re-wires the app's bindings: on the next\n        launch/restart each ``[ai.<name>]`` binding is injected as\n        ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the ``default`` binding also\n        sets ``OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL`` \u2014 pass\n        ``restart=True`` to apply it immediately.\n        ",
+    "description": "Write an app's ``deploy`` or ``ai`` config section (admin/owner-scoped).\n\nWriting the ``ai`` section re-wires the app's bindings: on the next\nlaunch/restart each ``[ai.<name>]`` binding is injected as\n``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the ``default`` binding also\nsets ``OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL`` \u2014 pass\n``restart=True`` to apply it immediately. A dry run needs neither an\n``If-Match`` nor an idempotency key.\n",
     "inputSchema": {
       "properties": {
         "dry_run": {
           "default": false,
+          "description": "true = validate and return the plan (what would change) with zero writes; nothing is built, deployed or audited as a change.",
           "title": "Dry Run",
           "type": "boolean"
         },
@@ -1801,6 +1945,7 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "if_match": {
@@ -1813,23 +1958,28 @@
             }
           ],
           "default": null,
+          "description": "ETag from a previous read of this app's config, sent as ``If-Match`` (409 ``config.stale`` when it no longer matches). Omit and the current ETag is read and used for you; ``*`` matches unconditionally.",
           "title": "If Match"
         },
         "name": {
+          "description": "Name of a deployed app (``kind=service``). A served model or a managed database is a 404 ``config.not_an_app``; an unknown name a 404 ``not_found``.",
           "title": "Name",
           "type": "string"
         },
         "restart": {
           "default": false,
+          "description": "true = restart the service right after a real write, whether or not the change needed one. false leaves the running container alone and the response's ``requires_restart`` says whether it should be restarted. No effect when ``dry_run`` is true.",
           "title": "Restart",
           "type": "boolean"
         },
         "section": {
+          "description": "Section to write: ``deploy``, ``ai`` or ``db`` (anything else is a 422 ``config.unknown_section``). ``env`` is not writable here \u2014 it belongs to the deploy tools and ``set_secret``.",
           "title": "Section",
           "type": "string"
         },
         "values": {
           "additionalProperties": true,
+          "description": "Keys to merge into that section: an omitted key keeps its value, a null deletes it (a whole binding, or a ``deploy`` key back to its default). In ``ai``/``db`` the unit is the binding \u2014 each ``[ai.<name>]``/``[db.<name>]`` table REPLACES the stored one wholesale, so send the whole binding. In ``deploy`` name and port are immutable (422); ``get_app_config`` lists the writable keys.",
           "title": "Values",
           "type": "object"
         }
@@ -1844,11 +1994,12 @@
     }
   },
   "set_config": {
-    "description": "Write a daemon config section (admin-scoped, validated, audited).\n\n        ``dry_run=True`` validates and returns the would-be section view\n        without writing; ``if_match`` enables optimistic concurrency against\n        the section's current version. An idempotency key is auto-generated if\n        omitted.\n        ",
+    "description": "Write a daemon config section (admin-scoped, validated, audited).",
     "inputSchema": {
       "properties": {
         "dry_run": {
           "default": false,
+          "description": "true = validate and return the plan (what would change) with zero writes; nothing is built, deployed or audited as a change.",
           "title": "Dry Run",
           "type": "boolean"
         },
@@ -1862,6 +2013,7 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "if_match": {
@@ -1874,14 +2026,17 @@
             }
           ],
           "default": null,
+          "description": "ETag from a previous read of this section, sent as ``If-Match``: the write is refused with 409 ``config.stale`` if the config changed since. Omit to write unconditionally (no ETag is fetched for you); ``*`` always matches.",
           "title": "If Match"
         },
         "section": {
+          "description": "Config section to write, one per call (e.g. ``proxy``, ``services``, ``retention``). An unknown name is a 404 ``config.unknown_section``.",
           "title": "Section",
           "type": "string"
         },
         "values": {
           "additionalProperties": true,
+          "description": "Keys to merge into that section: an omitted key keeps its stored value, a null value deletes a NULLABLE key (reverting it to its default; a null on a non-nullable key is a 422 ``config.invalid``), and a nested table is merged one level deep. An unknown key is refused (422 ``config.invalid``) rather than silently dropped; ``auth_token`` is refused (403).",
           "title": "Values",
           "type": "object"
         }
@@ -1895,7 +2050,7 @@
     }
   },
   "set_secret": {
-    "description": "Set/merge write-only secrets for a service; returns key names only.\n\n        An idempotency key is auto-generated if omitted, so a retried write\n        collapses to a single apply. ``service=\"shared\"`` targets the global\n        shared scope (admin-only; readable by every service via\n        ``${secrets.shared.KEY}``) \u2014 use it sparingly. WARNING: the values you\n        pass here transit this agent's transcript in plaintext; for\n        high-value shared keys (broadly-scoped API keys, credentials shared\n        across every app) prefer ``nerdit secrets set --shared`` from the CLI\n        instead of routing them through an agent.\n        ",
+    "description": "Set/merge write-only secrets for a service; returns key names only.\n\nWARNING: the values you pass here transit this agent's transcript in\nplaintext; for high-value shared keys (broadly-scoped API keys,\ncredentials shared across every app) prefer ``nerdit secrets set --shared`` from the CLI\ninstead of routing them through an agent. The leak-free path for any\nvalue: a human runs ``nerdit secrets set <service> --prompt KEY``\n(hidden input) and you only ever name ``KEY``; it is injected at\nlaunch, overriding an ``env`` key of the same name.\n",
     "inputSchema": {
       "properties": {
         "idempotency_key": {
@@ -1908,9 +2063,11 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "service": {
+          "description": "Existing service (app, model or database) whose secrets this call modifies, or ``shared`` for the global scope \u2014 writing that one is admin-only, and a service reads a shared key only where a ``${secrets.shared.KEY}`` reference is honoured (``[ai.*].api_key``, ``[db.*].password``, ``[deploy].edge_auth.password``, a git ``token_ref``), never through ``env``, whose values stay literal.",
           "title": "Service",
           "type": "string"
         },
@@ -1918,6 +2075,7 @@
           "additionalProperties": {
             "type": "string"
           },
+          "description": "KEY \u2192 value pairs merged into the stored set: a listed key is overwritten, an unlisted one kept. Key names are env-var identifiers (``[A-Za-z_][A-Za-z0-9_]*``); a value may be multi-line but may contain no NUL and no control character other than tab/newline/CR. An empty map is refused.",
           "title": "Values",
           "type": "object"
         }
@@ -1931,16 +2089,18 @@
     }
   },
   "share_service": {
-    "description": "Use when: you need a URL you can open (public_url is LAN-only).\n\nExposes the app at ``https://<name>--<slug>.<domain>/`` via the cloud\nlink. ``access='private'`` (default) opens only for signed-in owners of this\nnode in the Nerdit console \u2014 works on every linked node, nothing to\nconfigure. ``access='public'`` makes the URL world-reachable: it needs a\nPro-entitled account (else 409 ``share.not_entitled``) AND either a\n``[deploy].edge_auth`` on the app or ``consent=true`` (else 409\n``share.unprotected``) \u2014 public means public. The node must be linked\n(409 ``share.link_required``). Returns ``{access, url, state}``; ``state``\nis ``ready`` | ``link_down`` | ``not_entitled``. The same URL then appears\nin ``get_service`` / ``list_routes`` under ``public_urls`` (kind\n``hosted``). Idempotent; a key is auto-generated if omitted.\n\n``state`` and ``origin`` answer two DIFFERENT questions and you need\nboth. ``state`` is about the LINK \u2014 is the hosted path provisioned.\n``origin`` is about the APP behind it: ``{status, answers, hint}``, where\n``answers`` is true only while the service is running. A share can be\n``state: ready`` with ``origin.answers: false``, and then the URL returns\n``share.not_shared`` (the hosted resolver refuses a service with no live\norigin) \u2014 which reads exactly like \"never shared\". When ``answers`` is\nfalse, ``origin.hint`` says what to do; call ``diagnose_service``.\n",
+    "description": "Use when: you need a URL you can open (public_url is LAN-only).\n\nExposes the app at ``https://<name>--<slug>.<domain>/`` via the cloud\nlink. ``access='private'`` (default) opens only for signed-in owners of this\nnode in the Nerdit console \u2014 works on every linked node, nothing to\nconfigure. ``access='public'`` makes the URL world-reachable: it needs a\nPro-entitled account (else 409 ``share.not_entitled``) AND either a\n``[deploy].edge_auth`` on the app or ``consent=true`` (else 409\n``share.unprotected``) \u2014 public means public. The node must be linked\n(409 ``share.link_required``). Returns ``{access, url, state}``; ``state``\nis ``ready`` | ``link_down`` | ``not_entitled``. The same URL then appears\nin ``get_service`` / ``list_routes`` under ``public_urls`` (kind\n``hosted``).\n\n``state`` and ``origin`` answer two DIFFERENT questions and you need\nboth. ``state`` is about the LINK \u2014 is the hosted path provisioned.\n``origin`` is about the APP behind it: ``{status, answers, hint}``, where\n``answers`` is true only while the service is running. A share can be\n``state: ready`` with ``origin.answers: false``, and then the URL returns\n``share.not_shared`` (the hosted resolver refuses a service with no live\norigin) \u2014 which reads exactly like \"never shared\". When ``answers`` is\nfalse, ``origin.hint`` says what to do; call ``diagnose_service``.\n",
     "inputSchema": {
       "properties": {
         "access": {
           "default": "private",
+          "description": "Exposure mode: ``private`` (the default \u2014 signed-in owners of this node only) or ``public`` (world-reachable). Any other value is refused by the daemon with a 422.",
           "title": "Access",
           "type": "string"
         },
         "consent": {
           "default": false,
+          "description": "Acknowledges that a public share serves the app to anyone with the URL. Read only when ``access='public'``, where ``false`` (the default) is refused unless the app carries a ``[deploy].edge_auth`` block; ignored for a private share.",
           "title": "Consent",
           "type": "boolean"
         },
@@ -1954,9 +2114,11 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
+          "description": "Name (or row id) of an existing deployed app \u2014 only kind 'service' can be exposed: ``share_service``/``add_domain`` refuse a model or database with 422 ``*.kind_unsupported``, while the remove tools just find nothing to undo.",
           "title": "Name",
           "type": "string"
         }
@@ -1969,7 +2131,7 @@
     }
   },
   "stop_service": {
-    "description": "Stop a service (desired_state \u2192 stopped).\n\n        ``name`` accepts the service name or the job id. An idempotency key is\n        auto-generated if omitted.\n        ",
+    "description": "Stop a service (desired_state \u2192 stopped).",
     "inputSchema": {
       "properties": {
         "idempotency_key": {
@@ -1982,9 +2144,11 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
+          "description": "Service name or job id of an existing service (app, model or database); both resolve to the same row.",
           "title": "Name",
           "type": "string"
         }
@@ -1997,7 +2161,7 @@
     }
   },
   "system_disk": {
-    "description": "Report disk usage: docker totals + named-volume/model/archive/backup trees.\n\n        Any authenticated read. Names and byte counts only (no absolute paths);\n        lists orphan images and orphan data dirs (reclaim them with\n        ``system_gc``). Concurrent ``du`` walks run under a soft budget \u2014 an\n        overrun returns a partial body with a ``scan_timeout`` warning.\n        ",
+    "description": "Report disk usage: docker totals + named-volume/model/archive/backup trees.\n\nAny authenticated read. Names and byte counts only (no absolute paths);\nlists orphan images and orphan data dirs (reclaim them with\n``system_gc``). Concurrent ``du`` walks run under a soft budget \u2014 an\noverrun returns a partial body with a ``scan_timeout`` warning.\n",
     "inputSchema": {
       "properties": {},
       "title": "system_diskArguments",
@@ -2005,11 +2169,12 @@
     }
   },
   "system_gc": {
-    "description": "Garbage-collect orphan app images (admin-scoped, audited).\n\n        Reclaims ``nerdit-app/*`` image repos with no live workload row, verified\n        by re-listing so an in-use tag is reported skipped, never removed.\n        ``include_orphan_data=True`` also deletes service data dirs with no live\n        row (IRREVERSIBLE). ``dry_run=True`` enumerates candidates with zero\n        writes \u2014 no idempotency key is minted or needed; a real run auto-mints\n        one if omitted so a retry collapses to a single gc.\n        ",
+    "description": "Garbage-collect orphan app images (admin-scoped, audited).\n\nReclaims ``nerdit-app/*`` image repos with no live workload row, verified\nby re-listing so an in-use tag is reported skipped, never removed.\n",
     "inputSchema": {
       "properties": {
         "dry_run": {
           "default": false,
+          "description": "true = enumerate what would be reclaimed and remove nothing; false (the default) actually removes.",
           "title": "Dry Run",
           "type": "boolean"
         },
@@ -2023,10 +2188,12 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of running a second gc. Omit and a real run mints a fresh key per call, so each call acts; a dry run mints none and needs none.",
           "title": "Idempotency Key"
         },
         "include_orphan_data": {
           "default": false,
+          "description": "true also deletes service data directories with no live workload row \u2014 IRREVERSIBLE. false (the default) reclaims orphan images only.",
           "title": "Include Orphan Data",
           "type": "boolean"
         }
@@ -2049,9 +2216,11 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
+          "description": "Name (or row id) of an existing deployed app \u2014 only kind 'service' can be exposed: ``share_service``/``add_domain`` refuse a model or database with 422 ``*.kind_unsupported``, while the remove tools just find nothing to undo.",
           "title": "Name",
           "type": "string"
         }
@@ -2064,15 +2233,17 @@
     }
   },
   "wait_for_service": {
-    "description": "Use when: a deploy is in flight and you need its real outcome.\n\nBlocks until the service converges (healthy) or fails, then returns\n``{outcome: converged|failed|timeout|superseded, ...}`` \u2014 always, never\nraising on a timeout. ``name`` accepts the service name or job id.\nAfter a ``deploy``/``deploy_git``/``deploy_app``/``deploy_template``\ncall, pass the 201's ``last_deploy.version`` as ``version`` so a\nconcurrent redeploy resolves ``superseded`` instead of being mistaken\nfor your deploy. ``timeout`` is clamped server-side to [1, 300] seconds.\n\nOn ``outcome: failed`` the response also carries ``diagnosis`` \u2014 the\nFULL ``diagnose_service`` bundle (``remediation.code`` + ``detail``,\ncrash forensics, health probe, binding readiness and a bounded log\ntail), folded in so a failure needs no second call. Branch on\n``diagnosis.remediation.code``. It is ``null`` on every non-failed\noutcome, and ``null`` on a failure your token is not owner-or-admin for\n(the bundle carries app log lines) \u2014 in that case call\n``diagnose_service`` yourself with a token that owns the app.\n",
+    "description": "Use when: a deploy is in flight and you need its real outcome.\n\nBlocks until the service converges (healthy) or fails, then returns\n``{outcome: converged|failed|timeout|superseded, ...}`` \u2014 always, never\nraising on a timeout.\n\nOn ``outcome: failed`` the response also carries ``diagnosis`` \u2014 the\nFULL ``diagnose_service`` bundle (``remediation.code`` + ``detail``,\ncrash forensics, health probe, binding readiness and a bounded log\ntail), folded in so a failure needs no second call. Branch on\n``diagnosis.remediation.code``. It is ``null`` on every non-failed\noutcome, and ``null`` on a failure your token is not owner-or-admin for\n(the bundle carries app log lines) \u2014 in that case call\n``diagnose_service`` yourself with a token that owns the app.\n",
     "inputSchema": {
       "properties": {
         "name": {
+          "description": "Service name or job id of an existing service (app, model or database); both resolve to the same row.",
           "title": "Name",
           "type": "string"
         },
         "timeout": {
           "default": 60,
+          "description": "Seconds to block before returning ``outcome: timeout``. Default 60; the daemon clamps it to [1, 300].",
           "title": "Timeout",
           "type": "integer"
         },
@@ -2086,6 +2257,7 @@
             }
           ],
           "default": null,
+          "description": "Deploy generation to converge on \u2014 the ``last_deploy.version`` from a ``deploy``/``deploy_git``/``deploy_app``/``deploy_template`` 201. Omit and the generation recorded on the row when the call starts is used, so a redeploy that landed between your 201 and this call is reported as ``converged`` as if it were yours.",
           "title": "Version"
         }
       },
@@ -2097,7 +2269,7 @@
     }
   },
   "write_app_files": {
-    "description": "Write files into an app's server-side workspace, then deploy it.\n\nThe two-step idiom for building an app from this conversation:\n``write_app_files`` (as many batches as you like) then ``deploy_app``.\nThe workspace survives the deploy and IS the working copy, so editing is\n\"write the one changed file \u2192 ``deploy_app`` again\".\n\n``files`` maps workspace-relative paths to **UTF-8 text**\n(``{\"main.py\": \"...\", \"requirements.txt\": \"fastapi\\n\"}``); ``delete``\nremoves paths. One batch is all-or-nothing: an invalid entry rejects the\nwhole request and nothing is written. Binary files are refused (deploy\nthose from a repo with ``deploy_git``); assets normally come from the\nbuild (npm/pip).\n\nLimits: 256 KiB per file, 10 MiB and 500 files per workspace. Paths must\nbe relative with no ``..``; ``.git``, ``node_modules``, ``__pycache__``,\n``.venv``, ``data/`` and ``*.pyc`` are refused because they never reach a\nbuild context. ``.env`` / ``.env.*`` are refused by name \u2014 use\n``set_secret``, which injects values at launch without them ever living\nin a file. WARNING: file contents you pass here transit this agent's\ntranscript in plaintext; never write secrets into app files \u2014 use\n``set_secret``. An idempotency key is auto-generated if omitted.\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
+    "description": "Write files into an app's server-side workspace, then deploy it.\n\nThe two-step idiom for building an app from this conversation:\n``write_app_files`` (as many batches as you like) then ``deploy_app``.\nThe workspace survives the deploy and IS the working copy, so editing is\n\"write the one changed file \u2192 ``deploy_app`` again\".\n\nOne batch is all-or-nothing: an invalid entry rejects the whole request\nand nothing is written. Binary content is refused \u2014 deploy binaries from\na repo with ``deploy_git``; assets normally come from the build\n(npm/pip). A secret belongs in ``set_secret``, which injects it at launch\nwithout it ever living in a file. WARNING: file contents you pass here\ntransit this agent's transcript in plaintext; never write secrets into\napp files.\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
     "inputSchema": {
       "properties": {
         "delete": {
@@ -2113,12 +2285,14 @@
             }
           ],
           "default": null,
+          "description": "Workspace-relative paths to remove, applied with the writes in the same all-or-nothing batch. Omit (null) to delete nothing; a path that does not exist is a no-op; a path may not be in both ``files`` and ``delete``.",
           "title": "Delete"
         },
         "files": {
           "additionalProperties": {
             "type": "string"
           },
+          "description": "Workspace-relative path -> that file's full UTF-8 text; a write replaces the file whole. Paths are relative with no ``..``; ``.git``, ``node_modules``, ``__pycache__``, ``.venv``, ``data/`` and ``*.pyc`` are refused, and ``.env`` / ``.env.*`` by name. Text only (NUL or non-UTF-8 is refused). Caps: 256 KiB per file, 10 MiB and 500 files per workspace.",
           "title": "Files",
           "type": "object"
         },
@@ -2132,9 +2306,11 @@
             }
           ],
           "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
           "title": "Idempotency Key"
         },
         "name": {
+          "description": "Workspace name, a DNS label (lowercase a-z0-9 and ``-``, 1-63 chars). A new name creates the workspace; an existing one is edited in place. It is also the app name ``deploy_app`` deploys it under.",
           "title": "Name",
           "type": "string"
         }

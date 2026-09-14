@@ -6,11 +6,25 @@ Split out of ``mcp/server.py`` (Track B WP24, pure motion).
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from nerdit.cli.client import NerditClient
 from nerdit.mcp.errors import _bad_request, _call
-from nerdit.mcp.tools._shared import apply_sandbox_note
+from nerdit.mcp.tools._shared import (
+    AppName,
+    BuildSettings,
+    DeployEnv,
+    DeployGpus,
+    DeployHealth,
+    DeployPort,
+    DeployStart,
+    DeployVendor,
+    DryRun,
+    IdempotencyKey,
+    apply_sandbox_note,
+)
 from nerdit.mcp.transport import _request_client
 
 
@@ -42,7 +56,11 @@ async def _deploy_impl(
     """
     from pathlib import Path
 
-    from nerdit.config.project import find_project_config, load_project_config
+    from nerdit.config.project import (
+        describe_project_config_error,
+        find_project_config,
+        load_project_config,
+    )
 
     if dry_run and rollback:
         return _bad_request("dry_run cannot be combined with rollback")
@@ -63,7 +81,10 @@ async def _deploy_impl(
     if not directory.is_dir():
         return _bad_request(f"Not a directory: {directory}")
 
-    project = load_project_config(find_project_config(directory))
+    try:
+        project = load_project_config(find_project_config(directory))
+    except ValueError as exc:  # pydantic ValidationError is a ValueError
+        return _bad_request(describe_project_config_error(exc))
     dcfg = project.deploy if project and project.deploy else None
     eff_name = name or (dcfg.name if dcfg else None) or directory.name
     eff_port = port if port is not None else (dcfg.port if dcfg else None)
@@ -193,7 +214,8 @@ async def _deploy_template_impl(
 ) -> Any:
     """Deploy an app template (clone catalog repo + build + run), auto-minting a key.
 
-    ``secrets`` are written write-only server-side before the row write. Like
+    ``secrets`` are written write-only server-side right after the row write
+    (the row is the authorization point) and before the first launch. Like
     the other write tools, a UUID key is minted when absent so a retried deploy
     collapses to one build. An ``env`` value of ``None`` deletes that key on
     redeploy.
@@ -228,18 +250,39 @@ async def _deploy_template_impl(
 # there — so neither half can drift from the schema unnoticed.
 # fmt: off
 async def deploy(
-        path: str | None = None,
-        name: str | None = None,
-        port: int | None = None,
-        gpus: int | None = None,
-        start: str | None = None,
-        build_settings: dict[str, Any] | None = None,
-        health: str | None = None,
-        env: dict[str, str | None] | None = None,
-        vendor: str | None = None,
-        rollback: bool = False,
-        dry_run: bool = False,
-        idempotency_key: str | None = None,
+        path: Annotated[
+            str | None,
+            Field(
+                description="Path to the app folder ON THE DAEMON HOST (``~`` expanded); "
+                "its contents are zipped and uploaded. Required unless ``rollback=True``."
+            ),
+        ] = None,
+        name: Annotated[
+            str | None,
+            Field(
+                description="App name (lowercase DNS label); an existing name redeploys it "
+                "in place. Omit to use the folder's ``nerdit.toml`` ``[deploy].name``, else "
+                "the folder's own name. Required with ``rollback=True``."
+            ),
+        ] = None,
+        port: DeployPort = None,
+        gpus: DeployGpus = None,
+        start: DeployStart = None,
+        build_settings: BuildSettings = None,
+        health: DeployHealth = None,
+        env: DeployEnv = None,
+        vendor: DeployVendor = None,
+        rollback: Annotated[
+            bool,
+            Field(
+                description="true = re-point the service at its previous image instead of "
+                "building: only ``name`` and ``idempotency_key`` are read, no folder is "
+                "zipped and every other argument is ignored. Refused together with "
+                "``dry_run``."
+            ),
+        ] = False,
+        dry_run: DryRun = False,
+        idempotency_key: IdempotencyKey = None,
     ) -> Any:
         """Use when: the source is a local folder. Asynchronous — follow with wait_for_service.
 
@@ -252,10 +295,8 @@ async def deploy(
         injected at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the
         ``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/
         OPENAI_MODEL`` — point the app's OpenAI SDK at these; no code change
-        needed. Idempotency key auto-generated if omitted. ``dry_run=True``
-        returns the build/config plan diff (env key names only, values never)
-        with zero writes — no idempotency key is minted or needed. An ``env``
-        value of ``None`` deletes that key on redeploy.
+        needed. ``dry_run=True``
+        returns the build/config plan diff (env key names only, values never).
 
         ``nerdit.toml`` ``[deploy]`` keys — anything else is IGNORED and
         reported back in the response ``hints``: ``name``, ``port``, ``gpus``,
@@ -264,6 +305,12 @@ async def deploy(
         ``auto_deploy``, ``edge_auth``, ``build_settings``. Generated Node builds run
         ``scripts.build`` automatically;
         override it through ``[deploy.build_settings]`` or use a Dockerfile.
+
+        ``release`` runs once inside the new image before traffic moves; if it
+        fails the deploy settles ``failed`` and the image reverts, never the data —
+        whatever the migration already committed stays, so write idempotent
+        migrations. ``cutover`` null = zero-downtime swap
+        when eligible, false = same-port swap.
         On a successful non-dry-run deploy the
         response carries ``summary`` (app/status/version/public_url), ``hints``
         (ordered one-liners, never empty) and ``next_step`` (the structured
@@ -274,13 +321,16 @@ async def deploy(
         path; in ``subdomain`` mode it is served at the root of its own
         hostname and needs none — read ``capabilities.proxy.mode``.
 
-        ``build_settings`` overrides preset/install/build/start/node_version/package_manager/subdir.
+        ``build_settings`` overrides
+        preset/install/build/start/node_version/package_manager/subdir/public_env.
         ``preset`` selects node/nextjs/python/dockerfile; null resets to
         repository/default detection.
         An existing Dockerfile retains precedence.
         Omit it to preserve saved overrides; a null field resets to repository/default,
-        and ``build: false`` skips compilation. Commands run inside the build container.
-        Build-time environment and secret mounts are unsupported; runtime env is unchanged.
+        and ``build: false`` skips compilation.
+        ``public_env`` passes public build-time variables (shown in clear in a dry
+        run; secret references are refused). Secret mounts are unsupported;
+        runtime env is unchanged.
 
         {SANDBOX_NOTE}
         """
@@ -301,34 +351,55 @@ async def deploy(
         )
 
 async def deploy_git(
-        repo_url: str,
-        name: str,
-        ref: str | None = None,
-        subdir: str | None = None,
-        port: int | None = None,
-        gpus: int | None = None,
-        start: str | None = None,
-        build_settings: dict[str, Any] | None = None,
-        health: str | None = None,
-        env: dict[str, str | None] | None = None,
-        vendor: str | None = None,
-        token_ref: str | None = None,
-        dry_run: bool = False,
-        idempotency_key: str | None = None,
+        repo_url: Annotated[
+            str,
+            Field(
+                description="``https://`` clone URL, on a host the daemon allows "
+                "(``capabilities.deploy.git_allowed_hosts``, ``github.com`` by default). A URL "
+                "carrying credentials is refused — pass ``token_ref`` instead."
+            ),
+        ],
+        name: AppName,
+        ref: Annotated[
+            str | None,
+            Field(
+                description="Branch or tag to clone. Omit for the repository's default "
+                "branch. Recorded on the app, so ``redeploy_service`` re-clones this ref."
+            ),
+        ] = None,
+        subdir: Annotated[
+            str | None,
+            Field(
+                description="Subdirectory of the repo to build (monorepo subtree). Omit "
+                "to build from the repository root."
+            ),
+        ] = None,
+        port: DeployPort = None,
+        gpus: DeployGpus = None,
+        start: DeployStart = None,
+        build_settings: BuildSettings = None,
+        health: DeployHealth = None,
+        env: DeployEnv = None,
+        vendor: DeployVendor = None,
+        token_ref: Annotated[
+            str | None,
+            Field(
+                description="Private-repo credential as a *reference*, never a raw token: "
+                "``${secrets.KEY}``, ``${secrets.shared.KEY}``, or the literal "
+                "``${github.installation}`` on a node linked to an account with the Nerdit "
+                "GitHub App installed on that repo. Omit for a public repo."
+            ),
+        ] = None,
+        dry_run: DryRun = False,
+        idempotency_key: IdempotencyKey = None,
     ) -> Any:
         """Use when: the app lives in a Git repo. Asynchronous — follow with wait_for_service.
 
         Clones ``repo_url`` server-side (public GitHub by default), then builds
-        and runs it like ``deploy``. ``ref`` picks a branch/tag, ``subdir``
-        deploys a monorepo subtree. For a private repo, ``token_ref`` is a
-        secret *reference* (``${secrets.shared.GITHUB_TOKEN}``) resolved
-        server-side — never pass a raw token — or the literal
-        ``${github.installation}`` on a node linked to an account with the
-        Nerdit GitHub App installed on that repo. An existing ``name`` is a
-        redeploy. An idempotency key is auto-generated if omitted.
+        and runs it like ``deploy``. The token reference is resolved server-side
+        — a raw credential never passes through the tool.
         ``dry_run=True`` returns the build/config plan diff (env key names only,
-        values never) with zero writes — no idempotency key is minted or needed.
-        An ``env`` value of ``None`` deletes that key on redeploy.
+        values never).
 
         If the repo's ``nerdit.toml`` declares ``[ai.*]`` bindings, each is
         injected at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the
@@ -343,6 +414,12 @@ async def deploy_git(
         ``auto_deploy``, ``edge_auth``, ``build_settings``. Generated Node builds run
         ``scripts.build`` automatically;
         override it through ``[deploy.build_settings]`` or use a Dockerfile.
+
+        ``release`` runs once inside the new image before traffic moves; if it
+        fails the deploy settles ``failed`` and the image reverts, never the data —
+        whatever the migration already committed stays, so write idempotent
+        migrations. ``cutover`` null = zero-downtime swap
+        when eligible, false = same-port swap.
         On a successful non-dry-run deploy the
         response carries ``summary`` (app/status/version/public_url), ``hints``
         (ordered one-liners, never empty) and ``next_step`` (the structured
@@ -351,13 +428,16 @@ async def deploy_git(
         proxy mode the app is served at ``/<name>/``, so a frontend must be
         built with that base path.
 
-        ``build_settings`` overrides preset/install/build/start/node_version/package_manager/subdir.
+        ``build_settings`` overrides
+        preset/install/build/start/node_version/package_manager/subdir/public_env.
         ``preset`` selects node/nextjs/python/dockerfile; null resets to
         repository/default detection.
         An existing Dockerfile retains precedence.
         Omit it to preserve saved overrides; a null field resets to repository/default,
-        and ``build: false`` skips compilation. Commands run inside the build container.
-        Build-time environment and secret mounts are unsupported; runtime env is unchanged.
+        and ``build: false`` skips compilation.
+        ``public_env`` passes public build-time variables (shown in clear in a dry
+        run; secret references are refused). Secret mounts are unsupported;
+        runtime env is unchanged.
 
         {SANDBOX_NOTE}
         """
@@ -380,9 +460,16 @@ async def deploy_git(
         )
 
 async def redeploy_service(
-        name: str,
-        dry_run: bool = False,
-        idempotency_key: str | None = None,
+        name: Annotated[
+            str,
+            Field(
+                description="Name of an existing app deployed from Git; its recorded repo, "
+                "ref, subdir and credential reference are re-read, so no coordinates are "
+                "passed here."
+            ),
+        ],
+        dry_run: DryRun = False,
+        idempotency_key: IdempotencyKey = None,
     ) -> Any:
         """Use when: a git app needs a new commit. Asynchronous — follow with wait_for_service.
 
@@ -391,10 +478,9 @@ async def redeploy_service(
         name alone. Use this instead of ``deploy_git`` when the service already
         exists — every coordinate (repo, ref, subdir, private-repo credential
         reference) is read back off the service. A service deployed from a
-        folder/zip has no recorded source and is refused. An idempotency key is
-        auto-generated if omitted. ``dry_run=True`` returns the build/config plan
-        diff (env key names only, values never) with zero writes — no
-        idempotency key is minted or needed. A non-dry-run response carries
+        folder/zip has no recorded source and is refused. ``dry_run=True`` returns
+        the build/config plan diff (env key names only, values never). A
+        non-dry-run response carries
         ``summary``, ``hints`` (never empty) and ``next_step`` — the structured
         follow-up call.
         """
@@ -414,36 +500,73 @@ async def list_app_templates() -> Any:
         return await _list_app_templates_impl(_request_client())
 
 async def deploy_template(
-        template_id: str,
-        name: str,
-        env: dict[str, str | None] | None = None,
-        secrets: dict[str, str] | None = None,
-        port: int | None = None,
-        gpus: int | None = None,
-        start: str | None = None,
-        build_settings: dict[str, Any] | None = None,
-        health: str | None = None,
-        vendor: str | None = None,
-        dry_run: bool = False,
-        idempotency_key: str | None = None,
+        template_id: Annotated[
+            str,
+            Field(description="Template id from ``list_app_templates`` (its ``id`` field)."),
+        ],
+        name: AppName,
+        env: DeployEnv = None,
+        secrets: Annotated[
+            dict[str, str] | None,
+            Field(
+                description="Write-only secrets for the template's required secret "
+                "inputs; stored server-side right AFTER the app row is written (the row is "
+                "the authorization point) and before the first launch, so a failed secret "
+                "write leaves the app created. Only key names are ever read back. Omit when "
+                "the template declares none."
+            ),
+        ] = None,
+        port: Annotated[
+            int | None,
+            Field(
+                description="Port the container listens on: the only port published and "
+                "health-checked. Omit to use the template's default, else the repo's "
+                "``[deploy].port``, else 8000."
+            ),
+        ] = None,
+        gpus: Annotated[
+            int | None,
+            Field(
+                description="GPUs to reserve for the container (0 = none). Omit to use the "
+                "template's default, else the repo's ``[deploy].gpus``."
+            ),
+        ] = None,
+        start: Annotated[
+            str | None,
+            Field(
+                description="Start command run inside the built image (shell syntax). Omit "
+                "to use the template's default, else the repo's ``[deploy].start`` or the "
+                "buildpack default."
+            ),
+        ] = None,
+        build_settings: BuildSettings = None,
+        health: Annotated[
+            str | None,
+            Field(
+                description="HTTP health path probed on ``port`` (e.g. ``/health``); the app "
+                "is ``healthy`` once it answers 2xx. Omit to use the template's default, "
+                "else the repo's ``[deploy].health``."
+            ),
+        ] = None,
+        vendor: DeployVendor = None,
+        dry_run: DryRun = False,
+        idempotency_key: IdempotencyKey = None,
     ) -> Any:
         """Use when: you want a starter app. Asynchronous — follow with wait_for_service.
 
         Resolves ``template_id`` (see ``list_app_templates``), clones its
         catalog repo server-side, and deploys it under ``name``. ``env`` and the
-        deploy overrides layer over the template's defaults. An ``env`` value of
-        ``None`` deletes that key on redeploy. An idempotency key is
-        auto-generated if omitted. The response carries ``summary``, ``hints``
+        deploy overrides layer over the template's defaults.
+        The response carries ``summary``, ``hints``
         (never empty) and ``next_step`` — the structured follow-up call — since
         a 201 here means the build was accepted, not that the app is up.
 
-        ``build_settings`` overrides preset/install/build/start/node_version/package_manager/subdir.
-        ``preset`` selects node/nextjs/python/dockerfile; null resets to
-        repository/default detection.
-        An existing Dockerfile retains precedence.
-        Omission preserves overrides; a null field resets to repository/default;
-        ``build: false`` skips compilation. ``dry_run=True`` previews without writes,
-        building or storing secrets. Build-time env and secret mounts are unsupported.
+        An existing Dockerfile retains precedence over ``build_settings``.
+        Omission preserves overrides; a null field resets to repository/default.
+        ``dry_run=True`` previews without writes,
+        building or storing secrets. ``public_env`` passes public build-time
+        variables (shown in clear in a dry run; secret references are refused);
+        secret mounts are unsupported.
 
         If the template declares ``[ai.*]`` bindings, each is injected at launch
         as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the ``default`` binding also

@@ -11,7 +11,7 @@ import signal
 import threading
 import time
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -1307,7 +1307,11 @@ class DockerRuntime:
         return verdict
 
     async def build_image(
-        self, context_dir: str, tag: str, dockerfile: str | None = None
+        self,
+        context_dir: str,
+        tag: str,
+        dockerfile: str | None = None,
+        build_args: Mapping[str, str] | None = None,
     ) -> AsyncIterator[str]:
         """Build an image from *context_dir*, streaming build-log lines.
 
@@ -1317,7 +1321,7 @@ class DockerRuntime:
         lines and never terminates, so every real deploy hung forever — and
         docker-py has no BuildKit support to move to. Never `shell=True`; the
         argv is fixed and the only caller-derived members are the context path,
-        the tag and the Dockerfile name.
+        the tag, the Dockerfile name and the `--build-arg KEY=VALUE` pairs.
 
         `-f` is joined onto *context_dir* because the CLI resolves a relative
         `-f` against the CWD, not against the build context. `DOCKER_BUILDKIT`
@@ -1365,8 +1369,10 @@ class DockerRuntime:
             f"{_MANAGED_BY_LABEL}=nerdit",
             "--label",
             f"{_INSTANCE_LABEL}={self._instance_id}",
-            context_dir,
         ]
+        for key, value in sorted((build_args or {}).items()):
+            argv += ["--build-arg", f"{key}={value}"]
+        argv.append(context_dir)
 
         try:
             # (BUG-1) DECISION: DOCKER_CONFIG is deliberately NOT pinned here.

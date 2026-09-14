@@ -94,7 +94,11 @@ def parse_build_settings(value: str | None) -> dict | None:
 
 
 def _render_dry_run(plan: dict) -> None:
-    """Render a `--dry-run` plan diff (1.10 body) — names only, never values."""
+    """Render a `--dry-run` plan diff (1.10 body) — names only, never values.
+
+    One deliberate exception: `build.public_env` prints its values, which are
+    compiled into public build output and carry no secret reference.
+    """
     action = plan.get("action", "?")
     name = plan.get("name", "?")
     console.print(f"[bold]Deploy plan[/bold] ({action}) for [cyan]{name}[/cyan] — dry run")
@@ -113,6 +117,8 @@ def _render_dry_run(plan: dict) -> None:
     ):
         if key in build:
             console.print(f"  {key}: {_plain(str(build[key]))}")
+    for env_key, env_value in sorted((build.get("public_env") or {}).items()):
+        console.print(f"  public_env: {_plain(f'{env_key}={env_value}')}")
     eff = plan.get("effective") or {}
     parts = ", ".join(f"{k}={eff.get(k)}" for k in ("port", "gpus", "start", "health"))
     console.print(f"  effective: {parts}")
@@ -270,7 +276,11 @@ async def _deploy_async(
 ) -> None:
     """Merge effective deploy parameters over nerdit.toml [deploy], zip and POST."""
     from nerdit.cli.client import get_configured_client
-    from nerdit.config.project import find_project_config, load_project_config
+    from nerdit.config.project import (
+        describe_project_config_error,
+        find_project_config,
+        load_project_config,
+    )
 
     unset_env = unset_env or []
 
@@ -337,7 +347,11 @@ async def _deploy_async(
 
     # Locate nerdit.toml from the app directory, then read [deploy].
     config_path = find_project_config(directory)
-    project = load_project_config(config_path)
+    try:
+        project = load_project_config(config_path)
+    except ValueError as exc:  # pydantic ValidationError is a ValueError
+        console.print(f"[red]{_plain(describe_project_config_error(exc))}[/red]")
+        raise typer.Exit(1) from exc
     if config_path:
         console.print(f"[dim]nerdit.toml found at {config_path}[/dim]")
     deploy_cfg = project.deploy if project and project.deploy else None

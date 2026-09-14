@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -821,7 +822,11 @@ def test_github_ref_without_a_link_manager_is_422_with_the_hint(tmp_path, monkey
     q = _queries()
     clone = _fake_clone()
     resp = _post(
-        _gh_client(q, tmp_path, None), monkeypatch, clone, token_ref="${github.installation}"
+        _gh_client(q, tmp_path, None),
+        monkeypatch,
+        clone,
+        raw=LEGACY,
+        token_ref="${github.installation}",
     )
     assert resp.status_code == 422
     body = resp.json()
@@ -830,6 +835,70 @@ def test_github_ref_without_a_link_manager_is_422_with_the_hint(tmp_path, monkey
         "link this node and install the Nerdit GitHub App, or pass a `${secrets.*}` token_ref"
     )
     clone.assert_not_awaited()
+
+
+_SUBMITTER_HINT = (
+    "this token cannot install the Nerdit GitHub App or write a shared secret — "
+    "ask the node owner to install the app on this repository, or to run "
+    "`nerdit secrets set --shared --prompt GITHUB_TOKEN`, then pass "
+    "token_ref '${secrets.shared.GITHUB_TOKEN}'"
+)
+
+
+def test_a_submitter_is_told_to_ask_the_owner_for_the_github_token(tmp_path, monkeypatch):
+    """Audit A22: a submitter can neither install the App nor write the shared
+    scope, so the hint names who can. Status, code and detail are the admin's."""
+    q = _queries()
+    clone = _fake_clone()
+    resp = _post(
+        _gh_client(q, tmp_path, None), monkeypatch, clone, token_ref="${github.installation}"
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["code"] == "deploy.github_token_absent"
+    assert body["hint"] == _SUBMITTER_HINT
+    clone.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            SUB_RAW,
+            "repository not found or private — verify the URL is correct and the repo "
+            "is public; for a private repository this token cannot write a shared "
+            "secret, so ask the node owner to run `nerdit secrets set --shared --prompt "
+            "KEY`, then pass token_ref '${secrets.shared.KEY}'",
+        ),
+        (
+            LEGACY,
+            "repository not found or private — verify the URL is correct and the "
+            "repo is public, or pass token_ref (a ${secrets.shared.KEY} reference) "
+            "for a private repository.",
+        ),
+    ],
+    ids=["submitter", "admin"],
+)
+def test_a_private_repo_clone_hint_matches_the_caller_role(tmp_path, monkeypatch, raw, expected):
+    """Audit A22, second envelope: the unauthenticated clone of a private repo."""
+    q = _queries()
+    clone = AsyncMock(
+        side_effect=GitSourceError(
+            400,
+            "deploy.git_clone_failed",
+            "git clone failed: fatal: could not read Username for 'https://github.com'",
+            hint=(
+                "repository not found or private — verify the URL is correct and the "
+                "repo is public, or pass token_ref (a ${secrets.shared.KEY} reference) "
+                "for a private repository."
+            ),
+        )
+    )
+    resp = _post(_client(q, tmp_path), monkeypatch, clone, raw=raw)
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["code"] == "deploy.git_clone_failed"
+    assert body["hint"] == expected
 
 
 def test_github_ref_for_a_repo_outside_every_installation_is_422(tmp_path, monkeypatch):
@@ -888,7 +957,9 @@ def _absent_envelope(q, tmp_path, monkeypatch, *, link_state: str, pro_mirror: s
     """
     clone = _fake_clone()
     client = _gh_client(q, tmp_path, {}, link_state=link_state, pro_mirror=pro_mirror)
-    resp = _post(client, monkeypatch, clone, token_ref="${github.installation}")
+    # The legacy admin: the generic wording is the admin's. A submitter's is
+    # pinned separately (audit A22).
+    resp = _post(client, monkeypatch, clone, raw=LEGACY, token_ref="${github.installation}")
 
     assert resp.status_code == 422, resp.text
     body = resp.json()
@@ -983,6 +1054,7 @@ def test_github_absent_hint_without_a_link_manager_never_consults_a_tier(tmp_pat
         _gh_client(_queries(), tmp_path, None),
         monkeypatch,
         clone,
+        raw=LEGACY,
         token_ref="${github.installation}",
     )
 

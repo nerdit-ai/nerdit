@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import AsyncIterator, Protocol
@@ -241,12 +242,18 @@ class ContainerRuntime(Protocol):
         ...
 
     def build_image(
-        self, context_dir: str, tag: str, dockerfile: str | None = None
+        self,
+        context_dir: str,
+        tag: str,
+        dockerfile: str | None = None,
+        build_args: Mapping[str, str] | None = None,
     ) -> AsyncIterator[str]:
         """Build an image from *context_dir*, tagging it *tag*.
 
         Yields decoded build-log lines in real time. *dockerfile* is the name
         of the Dockerfile relative to *context_dir* (defaults to `Dockerfile`).
+        *build_args* are passed to the build as `--build-arg KEY=VALUE` pairs;
+        the Dockerfile must declare each `ARG KEY` for the value to be used.
         Raises `BuildError` if the build fails.
 
         An implementation MUST stamp the building daemon's ownership labels on

@@ -433,8 +433,12 @@ class AppImageBuilder:
                     await stamp_last_deploy(
                         self._c._queries, job.id, only_from=("queued",), phase="building"
                     )
+                    # Only passed when non-empty: every runtime fake in the
+                    # test suite implements the 3-argument signature.
+                    public_env = parse_job_config(job).get("public_env") or {}
+                    extra = {"build_args": public_env} if public_env else {}
                     async for line in self._c._runtime.build_image(
-                        context_dir, image, dockerfile=dockerfile
+                        context_dir, image, dockerfile=dockerfile, **extra
                     ):
                         # `build`, not `stdout`: BuildKit's layer
                         # chatter and the app's own output are different

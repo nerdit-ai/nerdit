@@ -239,6 +239,43 @@ def test_cli_set_service_parses_through_argv(fake_client):
     assert fake_client.calls[0][:3] == ("set_secrets", "demo", {"A": "1"})
 
 
+@pytest.mark.parametrize("target", [["demo"], ["--shared"]])
+def test_cli_set_prompts_without_echo_and_merges_pairs(fake_client, target):
+    result = _runner.invoke(
+        secrets_app,
+        ["set", *target, "EXISTING=kept", "--prompt", "API_KEY", "--prompt", "OTHER"],
+        input="hidden-secret\nvalue=with=equals\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert fake_client.calls[0][:3] == (
+        "set_secrets",
+        "shared" if target == ["--shared"] else "demo",
+        {"EXISTING": "kept", "API_KEY": "hidden-secret", "OTHER": "value=with=equals"},
+    )
+    assert "hidden-secret" not in result.output
+    assert "value=with=equals" not in result.output
+
+
+def test_cli_set_prompt_without_pairs(fake_client):
+    result = _runner.invoke(secrets_app, ["set", "demo", "--prompt", "API_KEY"], input="hidden\n")
+    assert result.exit_code == 0, result.output
+    assert fake_client.calls[0][:3] == ("set_secrets", "demo", {"API_KEY": "hidden"})
+    assert "hidden" not in result.output
+
+
+def test_cli_set_invalid_prompt_key_does_not_prompt_or_write(fake_client):
+    result = _runner.invoke(secrets_app, ["set", "demo", "--prompt", "BAD=KEY"])
+    assert result.exit_code == 1
+    assert "Value for" not in result.output
+    assert fake_client.calls == []
+
+
+def test_cli_set_cancelled_prompt_does_not_write_partial_values(fake_client):
+    result = _runner.invoke(secrets_app, ["set", "demo", "A=1", "--prompt", "API_KEY"])
+    assert result.exit_code == 1
+    assert fake_client.calls == []
+
+
 def test_cli_set_shared_with_service_name_stays_mutually_exclusive(fake_client):
     # A real service name (no '=') alongside --shared is still an error.
     result = _runner.invoke(secrets_app, ["set", "--shared", "demo", "A=1"])

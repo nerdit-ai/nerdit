@@ -184,3 +184,23 @@ def test_yarn4_next_uses_turbopack_compatible_layout(tmp_path, next_app):
     plan = detect(tmp_path)
     assert ("ENV YARN_NODE_LINKER=node-modules" in plan.dockerfile_text) is next_app
     assert "RUN yarn run build" in plan.dockerfile_text
+
+
+def test_next_public_env_args_declared_after_install_before_build(tmp_path):
+    _manifest(
+        tmp_path,
+        packageManager="pnpm@10.34.5",
+        dependencies={"next": "16.0.0"},
+        scripts={"build": "next build", "start": "next start"},
+    )
+    text = detect(
+        tmp_path,
+        DeployConfig(
+            name="fixture",
+            port=3000,
+            build_settings={"public_env": {"NEXT_PUBLIC_URL": "https://x.test"}},
+        ),
+    ).dockerfile_text
+    assert text.index("RUN pnpm install") < text.index("ARG NEXT_PUBLIC_URL")
+    assert text.index("ARG NEXT_PUBLIC_URL") < text.index("RUN pnpm run build")
+    assert "NEXT_PUBLIC_URL=" not in text  # values travel as --build-arg, never as a default

@@ -204,8 +204,9 @@ def test_capabilities_admin_has_paths_and_admin_addr():
             "node_version",
             "package_manager",
             "subdir",
+            "public_env",
         ],
-        "public_env": False,
+        "public_env": True,
         "secret_mounts": False,
     }
     assert body["limits"]["wait_concurrency_max"] == 64

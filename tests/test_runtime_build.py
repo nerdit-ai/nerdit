@@ -238,6 +238,58 @@ async def test_build_image_custom_dockerfile(mock_docker, monkeypatch, docker_on
 
 
 @pytest.mark.asyncio
+async def test_build_image_emits_sorted_build_args_before_the_context(
+    mock_docker, monkeypatch, docker_on_path
+):
+    """One ``--build-arg KEY=VALUE`` per key, sorted, ahead of the context path."""
+    from nerdit.core.runtime.docker import DockerRuntime
+
+    captured: dict = {}
+    _patch_exec(monkeypatch, _FakeProc([b"ok\n"]), captured)
+    runtime = DockerRuntime(client=mock_docker)
+    _ = [
+        line
+        async for line in runtime.build_image(
+            "/ctx", "t:1", build_args={"VITE_B": "two", "VITE_A": "one"}
+        )
+    ]
+
+    argv = captured["argv"]
+    pairs = [argv[i + 1] for i, a in enumerate(argv) if a == "--build-arg"]
+    assert pairs == ["VITE_A=one", "VITE_B=two"]
+    assert max(i for i, a in enumerate(argv) if a == "--build-arg") < len(argv) - 1
+    assert argv[-1] == "/ctx"
+    assert "shell" not in captured["kwargs"]
+
+
+@pytest.mark.asyncio
+async def test_build_image_omits_build_arg_when_unset(mock_docker, monkeypatch, docker_on_path):
+    from nerdit.core.runtime.docker import DockerRuntime
+
+    captured: dict = {}
+    _patch_exec(monkeypatch, _FakeProc([b"ok\n"]), captured)
+    runtime = DockerRuntime(client=mock_docker)
+    _ = [line async for line in runtime.build_image("/ctx", "t:1")]
+
+    assert "--build-arg" not in captured["argv"]
+
+
+@pytest.mark.asyncio
+async def test_stub_build_image_accepts_build_args(tmp_path):
+    """The stub keeps signature parity — it refuses for the Docker-absent reason."""
+    from nerdit.core.runtime.protocol import ContainerRuntimeError
+    from nerdit.core.runtime.stub import StubRuntime
+
+    with pytest.raises(ContainerRuntimeError):
+        _ = [
+            line
+            async for line in StubRuntime().build_image(
+                str(tmp_path), "t:1", build_args={"VITE_A": "one"}
+            )
+        ]
+
+
+@pytest.mark.asyncio
 async def test_build_image_raises_on_nonzero_exit(
     mock_docker, monkeypatch, docker_on_path, buildx_present
 ):

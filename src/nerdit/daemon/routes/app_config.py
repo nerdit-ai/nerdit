@@ -163,6 +163,7 @@ _BUILD_TIER_KEYS = frozenset(
         "buildpack",
         "build_overrides",
         "build_plan",
+        "public_env",
         "last_deploy",
     }
 )

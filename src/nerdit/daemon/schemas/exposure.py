@@ -85,6 +85,10 @@ class ShareRequest(StrictRequestModel):
             "access='public': public means public"
         ),
     )
+    preserve_existing: bool = Field(
+        default=False,
+        description="Create a missing share, preserving an existing share's access mode atomically",
+    )
 
 
 class ShareOrigin(BaseModel):

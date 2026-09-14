@@ -537,9 +537,11 @@ class NerditClient:
         if directory is not None and settings is None and not repository:
             return
         settings = {**(repository or {}), **(settings or {})}
-        # Null removes a saved override; a repository preset remains effective.
-        if settings.get("preset") is None and repository and "preset" in repository:
-            settings["preset"] = repository["preset"]
+        # Null removes a saved override; the repository value remains effective,
+        # so the node still needs to support what the repository declares.
+        for key in ("preset", "public_env"):
+            if settings.get(key) is None and repository and key in repository:
+                settings[key] = repository[key]
         capabilities = await self.get_capabilities()
         deploy = capabilities.get("deploy")
         support = deploy.get("build_settings") if isinstance(deploy, dict) else None
@@ -547,6 +549,7 @@ class NerditClient:
             isinstance(support, dict)
             and type(support.get("version")) is int
             and support["version"] == 1
+            and ("public_env" not in settings or support.get("public_env") is True)
             and (
                 "preset" not in settings
                 or (

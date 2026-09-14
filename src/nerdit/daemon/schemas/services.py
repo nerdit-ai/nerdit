@@ -148,7 +148,13 @@ class ServiceResponse(BaseModel):
     exit_code: int | None = Field(default=None, description="Last container exit code")
     error_class: ErrorClass | None = Field(default=None, description="Coarse failure category")
     error_message: str | None = Field(default=None, description="Raw technical failure message")
-    submitted_via: str = Field(default="cli", description="'cli' or 'dashboard'")
+    submitted_via: str = Field(
+        default="cli",
+        description=(
+            "Always 'cli' today: no submit path records its origin, so a deploy over "
+            "the dashboard or MCP carries the same label. Not a signal."
+        ),
+    )
     # (NC-0, cloud D-NC5) REQUIRED, with no default — it joins `id`/`name`/
     # `status`/`gpu_count`/`created_at` as a field a construction site
     # cannot omit, and it is the only *derived* one in that set: every other

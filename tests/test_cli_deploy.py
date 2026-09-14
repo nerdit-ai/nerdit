@@ -416,6 +416,38 @@ async def test_deploy_rejects_malformed_env_pair(tmp_path, fake_client):
     assert fake_client.deploy_calls == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "toml",
+    [
+        '[deploy]\nname = "demo"\n[deploy.build_settings]\nsubdir = "../never-print-this"\n',
+        '[deploy]\nname = "demo"\n[deploy.build_settings.public_env]\n'
+        'VITE_BAD = "${secrets.NEVER_PRINT_THIS}"\n',
+        # Validators that used to interpolate their input (Codex review on #164).
+        '[deploy]\nname = "demo"\nmemory_limit = "password=NEVER_PRINT_THIS"\n',
+        '[deploy]\nname = "demo"\nvolumes = ["tok=NEVER_PRINT_THIS"]\n',
+        '[deploy]\nname = "never-print-this=NEVER_PRINT_THIS"\n',
+        # Syntactically valid TOML whose [deploy] is not a table (TypeError path).
+        'deploy = "never-print-this NEVER_PRINT_THIS"\n',
+    ],
+)
+async def test_deploy_invalid_toml_is_one_value_free_line(tmp_path, fake_client, capsys, toml):
+    """An invalid local ``nerdit.toml`` exits 1 with one line, not a pydantic traceback."""
+    (tmp_path / "app.js").write_text("x")
+    (tmp_path / "nerdit.toml").write_text(toml)
+
+    with pytest.raises(typer.Exit) as excinfo:
+        await _deploy_async(str(tmp_path), None, None, None, None, None, [], None, False)
+
+    assert excinfo.value.exit_code == 1
+    out = capsys.readouterr().out
+    assert "Invalid nerdit.toml" in out or "must be a table" in out
+    assert "never-print-this" not in out
+    assert "NEVER_PRINT_THIS" not in out
+    assert "Traceback" not in out
+    assert fake_client.deploy_calls == []
+
+
 # ---- --wait / --timeout (P13 WP3) ----
 
 
@@ -827,3 +859,24 @@ def test_deploy_renders_nothing_when_hints_is_empty():
         display_deploy_result({**body, "hints": []}, build_hint=False)
     assert cap.get() == without_key
     assert without_key.count("\n") == 3
+
+
+def test_dry_run_plan_prints_public_env_one_entry_per_line():
+    """P38: values in clear (public by construction), one line each, escaped."""
+    with console.capture() as cap:
+        _render_dry_run(
+            {
+                "action": "create",
+                "name": "my-app",
+                "build": {"public_env": {"VITE_API": "https://api[/b].example.com", "VITE_X": "1"}},
+            }
+        )
+    out = cap.get()
+    assert "public_env: VITE_API=https://api[/b].example.com" in out
+    assert "public_env: VITE_X=1" in out
+
+
+def test_dry_run_plan_prints_no_public_env_line_when_empty():
+    with console.capture() as cap:
+        _render_dry_run({"action": "create", "name": "my-app", "build": {"public_env": {}}})
+    assert "public_env" not in cap.get()

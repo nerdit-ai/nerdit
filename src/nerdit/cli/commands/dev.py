@@ -291,7 +291,11 @@ async def _watch(
 
 async def _dev_async(path: str | None, name: str | None, *, wait_timeout: int) -> None:
     from nerdit.cli.client import get_configured_client
-    from nerdit.config.project import find_project_config, load_project_config
+    from nerdit.config.project import (
+        describe_project_config_error,
+        find_project_config,
+        load_project_config,
+    )
 
     directory = Path(path).resolve() if path else Path.cwd()
     if not directory.is_dir():
@@ -302,7 +306,11 @@ async def _dev_async(path: str | None, name: str | None, *, wait_timeout: int) -
     # falls back to searching upward from *cwd*, which would read some unrelated
     # project's [deploy] when the watched folder has no nerdit.toml of its own.
     config_path = find_project_config(directory)
-    project = load_project_config(config_path) if config_path else None
+    try:
+        project = load_project_config(config_path) if config_path else None
+    except ValueError as exc:  # pydantic ValidationError is a ValueError
+        console.print(f"[red]{_plain(describe_project_config_error(exc))}[/red]")
+        raise typer.Exit(1) from exc
     deploy_cfg = project.deploy if project and project.deploy else None
     effective_name = name or (deploy_cfg.name if deploy_cfg else None) or directory.name
 

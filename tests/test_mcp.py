@@ -1040,6 +1040,28 @@ async def test_deploy_impl_rollback_requires_name():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "toml",
+    [
+        '[deploy]\nname = "demo"\nmemory_limit = "password=NEVER_PRINT_THIS"\n',
+        'deploy = "NEVER_PRINT_THIS"\n',
+    ],
+)
+async def test_deploy_impl_invalid_toml_is_bad_request(tmp_path, toml):
+    """An invalid local nerdit.toml is a structured, value-free error, never a raise."""
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "nerdit.toml").write_text(toml)
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - not reached
+        return httpx.Response(200, json={})
+
+    result = await server._deploy_impl(_client(handler), path=str(app))
+    assert result["error"]["code"] == "bad_request"
+    assert "NEVER_PRINT_THIS" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
 async def test_deploy_impl_requires_path():
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - not reached
         return httpx.Response(200, json={})
@@ -1981,6 +2003,30 @@ async def test_build_server_tool_schema_golden():
         )
 
 
+# --- Agent-DX (audit A24): every argument explains itself in the schema ------
+@pytest.mark.asyncio
+async def test_every_tool_property_has_a_description():
+    """An agent that reads only ``inputSchema`` must still get each argument's rule.
+
+    One sentence per property, bounded so the schema stays a schema and the
+    prose stays the place for purpose and refusal codes.
+    """
+    pytest.importorskip("mcp")
+
+    mcp_server = server.build_server()
+    missing = []
+    too_long = []
+    for tool in await mcp_server.list_tools():
+        for prop, spec in tool.inputSchema.get("properties", {}).items():
+            description = spec.get("description", "")
+            if not isinstance(description, str) or not description.strip():
+                missing.append(f"{tool.name}.{prop}")
+            elif len(description) > 400:
+                too_long.append(f"{tool.name}.{prop} ({len(description)})")
+    assert not missing, f"properties without a description: {missing}"
+    assert not too_long, f"property descriptions over 400 chars: {too_long}"
+
+
 # --- Agent-DX: the [deploy]-schema drift guard on the deploy tool descriptions -
 #
 # For an agent the tool description IS the documentation, so the ``[deploy]``
@@ -1996,6 +2042,22 @@ async def _deploy_tool_descriptions() -> dict[str, str]:
     mcp_server = server.build_server()
     tools = await mcp_server.list_tools()
     return {t.name: (t.description or "") for t in tools if t.name in _DEPLOY_DOC_TOOLS}
+
+
+@pytest.mark.asyncio
+async def test_deploy_tool_descriptions_list_every_build_settings_field():
+    """The ``build_settings`` override sentence names every ``BuildSettings`` field.
+
+    Same drift guard as the ``[deploy]`` one below: P38 added ``public_env`` and
+    the four docstrings kept the old seven-key list until a review caught it.
+    """
+    from nerdit.config.build import BuildSettings
+
+    descriptions = await _deploy_tool_descriptions()
+    for name, desc in descriptions.items():
+        match = re.search(r"``build_settings`` overrides\s+([a-z_/]+)\.", desc)
+        assert match, f"{name} lacks the build_settings override sentence"
+        assert set(match.group(1).split("/")) == set(BuildSettings.model_fields), name
 
 
 @pytest.mark.asyncio

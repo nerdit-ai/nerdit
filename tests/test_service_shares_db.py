@@ -14,6 +14,7 @@ Three things are proved here, in the order the row's life runs:
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from datetime import UTC, datetime
 from typing import Any
@@ -80,6 +81,36 @@ async def test_set_refuses_an_access_outside_the_check_constraint(queries):
     with pytest.raises(sqlite3.IntegrityError):
         await queries.set_service_share("demo", "world", job_id=await _jid(queries, "demo"))
     assert await queries.get_service_share("demo") is None
+
+
+@pytest.mark.parametrize("existing", [None, "private", "public"])
+async def test_preserve_existing_creates_only_missing_share(queries, existing):
+    job = await queries.create_job(_job("demo"))
+    first = await queries.set_service_share("demo", existing, job_id=job.id) if existing else None
+    result = await queries.set_service_share(
+        "demo", "private", job_id=job.id, preserve_existing=True
+    )
+    assert result.access == (existing or "private")
+    assert await queries.get_service_share("demo") == result
+    if first:
+        assert result == first
+    assert (
+        await queries.set_service_share(
+            "demo", "private", job_id="deleted-job", preserve_existing=True
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("preview_first", [True, False])
+async def test_preview_cannot_overwrite_concurrent_public_share(queries, preview_first):
+    job = await queries.create_job(_job("demo"))
+    writes = [
+        queries.set_service_share("demo", "private", job_id=job.id, preserve_existing=True),
+        queries.set_service_share("demo", "public", job_id=job.id),
+    ]
+    await asyncio.gather(*(writes if preview_first else reversed(writes)))
+    assert (await queries.get_service_share("demo")).access == "public"
 
 
 async def test_list_is_one_read_keyed_by_name(queries):

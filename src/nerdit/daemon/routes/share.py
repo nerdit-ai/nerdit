@@ -277,7 +277,9 @@ async def set_share(request: Request, name: str, body: ShareRequest) -> ShareVie
                 ),
             )
 
-    share = await queries.set_service_share(service_name, body.access, job_id=job.id)
+    share = await queries.set_service_share(
+        service_name, body.access, job_id=job.id, preserve_existing=body.preserve_existing
+    )
     if share is None:
         # The service was deleted between this route's resolve and the write
         # (the upsert re-checks under the DB write lock — see
@@ -286,6 +288,9 @@ async def set_share(request: Request, name: str, body: ShareRequest) -> ShareVie
         # inventing a share for a name with no service behind it is what would
         # expose the NEXT app deployed under it.
         raise _not_found(name)
+    request.state.audit_params = audit_params(
+        {"service": name, "access": share.access, "consent": body.consent}
+    )
     hosted = await load_hosted_context(request)
     view = _view(service_name, share, hosted, job)
 

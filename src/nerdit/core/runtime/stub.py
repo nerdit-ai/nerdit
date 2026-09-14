@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from typing import AsyncIterator
 
@@ -84,7 +85,11 @@ class StubRuntime:
         return None
 
     async def build_image(
-        self, context_dir: str, tag: str, dockerfile: str | None = None
+        self,
+        context_dir: str,
+        tag: str,
+        dockerfile: str | None = None,
+        build_args: Mapping[str, str] | None = None,
     ) -> AsyncIterator[str]:
         raise ContainerRuntimeError("Docker is not available. Start Docker and restart the daemon.")
         # Make this an async generator

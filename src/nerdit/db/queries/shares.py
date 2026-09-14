@@ -42,13 +42,14 @@ class ShareQueries(QueriesBase):
 
     @_serialized
     async def set_service_share(
-        self, service_name: str, access: str, *, job_id: str
+        self, service_name: str, access: str, *, job_id: str, preserve_existing: bool = False
     ) -> ServiceShare | None:
         """Upsert access while preserving the share's original creation time.
 
         Require the authorized live job_id inside the locked statement: a deleted or
         same-name replacement service must never inherit stale sharing intent. Return
         None when that job vanished; route validation and the column CHECK enforce access.
+        preserve_existing retains access on conflict inside the same statement.
         """
         cursor = await self._db.conn.execute(
             """INSERT INTO service_shares (service_name, access)
@@ -56,8 +57,9 @@ class ShareQueries(QueriesBase):
                    SELECT 1 FROM jobs
                    WHERE id = ? AND service_name = ? AND kind = 'service'
                )
-               ON CONFLICT(service_name) DO UPDATE SET access = excluded.access""",
-            (service_name, access, job_id, service_name),
+               ON CONFLICT(service_name) DO UPDATE SET access =
+                   CASE WHEN ? THEN service_shares.access ELSE excluded.access END""",
+            (service_name, access, job_id, service_name, preserve_existing),
         )
         wrote = (cursor.rowcount or 0) > 0
         await self._db.conn.commit()

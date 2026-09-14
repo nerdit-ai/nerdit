@@ -34,6 +34,34 @@ from nerdit.core.builder import BuildpackNotSupported, detect
         {"package_manager": "npm@latest"},
         {"package_manager": "npm@https://example.com"},
         {"package_manager": "pnpm@8.0.0"},
+        {"public_env": {"1BAD": "x"}},
+        {"public_env": {"BAD-KEY": "x"}},
+        {"public_env": {"": "x"}},
+        {"public_env": {"A" * 129: "x"}},
+        {"public_env": {"VITE_PORT": 3000}},
+        {"public_env": {"VITE_FLAG": True}},
+        {"public_env": {"VITE_X": "a\nb"}},
+        {"public_env": {"VITE_X": "a" * 4097}},
+        {"public_env": {f"VITE_{index}": "x" for index in range(65)}},
+        {"public_env": {"VITE_TOKEN": "${secrets.TOKEN}"}},
+        {"public_env": {"VITE_TOKEN": "prefix ${github.token} suffix"}},
+        {"public_env": {"PATH": "/usr/bin"}},
+        {"public_env": {"HOME": "/root"}},
+        {"public_env": {"NODE_ENV": "production"}},
+        {"public_env": {"COREPACK_ENABLE_STRICT": "0"}},
+        {"public_env": {"DOCKER_HOST": "tcp://x"}},
+        {"public_env": {"NPM_CONFIG_REGISTRY": "https://example.com"}},
+        {"public_env": {"PIP_INDEX_URL": "https://example.com"}},
+        # Docker's predefined build args: honoured with no `ARG` declaration, in
+        # either case, so they are builder control however they are spelled.
+        {"public_env": {"HTTPS_PROXY": "http://elsewhere.example"}},
+        {"public_env": {"http_proxy": "http://elsewhere.example"}},
+        {"public_env": {"NO_PROXY": "example.com"}},
+        {"public_env": {"ALL_PROXY": "socks5://elsewhere.example"}},
+        {"public_env": {"FTP_PROXY": "http://elsewhere.example"}},
+        {"public_env": {"SOURCE_DATE_EPOCH": "0"}},
+        {"public_env": {"BUILDKIT_SYNTAX": "elsewhere.example/frontend"}},
+        {"public_env": {"node_env": "production"}},
         {"env": {"PUBLIC_KEY": "x"}},
         {"build_env": {"TOKEN": "x"}},
         {"unknown": "x"},
@@ -42,6 +70,27 @@ from nerdit.core.builder import BuildpackNotSupported, detect
 def test_invalid_settings(settings):
     with pytest.raises(ValidationError):
         BuildSettings.model_validate(settings)
+
+
+@pytest.mark.parametrize(
+    "public_env",
+    [
+        {"never-print-this": "x"},
+        {"VITE_X": "never-print-this\n"},
+        {"VITE_X": "${secrets.never-print-this}"},
+        {"PATH": "never-print-this"},
+    ],
+)
+def test_rejected_public_env_is_not_echoed(public_env):
+    with pytest.raises(ValidationError) as exc:
+        BuildSettings.model_validate({"public_env": public_env})
+    assert "never-print-this" not in str(exc.value)
+
+
+def test_public_env_round_trips():
+    values = {"VITE_API_URL": "https://api.example.com", "_X": "", "NEXT_PUBLIC_FLAG": "1"}
+    assert BuildSettings(public_env=values).public_env == values
+    assert BuildSettings().public_env is None
 
 
 def test_rejected_commands_are_not_echoed():
@@ -58,6 +107,17 @@ def test_project_build_settings_parse(tmp_path):
     )
     assert load_project_config(path).deploy.build_settings == BuildSettings(
         build=False, subdir="apps/web"
+    )
+
+
+def test_project_public_env_parse(tmp_path):
+    path = tmp_path / "nerdit.toml"
+    path.write_text(
+        '[deploy]\nname="app"\n[deploy.build_settings]\nbuild="npm run build"\n'
+        '[deploy.build_settings.public_env]\nVITE_API_URL="https://api.example.com"\n'
+    )
+    assert load_project_config(path).deploy.build_settings == BuildSettings(
+        build="npm run build", public_env={"VITE_API_URL": "https://api.example.com"}
     )
 
 
