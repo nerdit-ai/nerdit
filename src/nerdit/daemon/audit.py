@@ -405,6 +405,69 @@ async def record_out_of_band(
         logger.warning("Failed to record %s for %s", action, target_id, exc_info=True)
 
 
+# The PLR0913 below is the audit ROW's own shape (action/target pair, result
+# status, principal pair, correlation id) plus the two sinks it writes to —
+# every one of them a distinct column, so bundling them would only move the
+# list. Suppressed inline rather than per-file (the module is otherwise clean).
+async def record_denial(  # noqa: PLR0913
+    *,
+    queries: Any,
+    bus: Any,
+    action: str,
+    target_type: str | None,
+    target_id: str | None,
+    status_code: int,
+    principal_id: str | None,
+    principal_role: str | None,
+    request_id: str | None,
+) -> None:
+    """Append a `result='denied'` audit row and mirror it on the `audit.*` bus.
+
+    The one writer for "a request was refused before any route ran", shared by
+    `ScopedTokenAuthMiddleware._deny` and by the MCP transport's own pre-body
+    refusals — those short-circuit inside the tool body, so the inner loopback
+    hop that used to produce this row never happens, and without it a readonly
+    or out-of-scope caller hammering a write tool leaves no trace at all.
+
+    Best effort in both halves: an audit failure must never mask the denial it
+    is recording. Carries no request body and no token material.
+    """
+    if queries is not None:
+        try:
+            await queries.insert_audit_log(
+                action=action,
+                target_type=target_type,
+                target_id=target_id,
+                result="denied",
+                principal_id=principal_id,
+                principal_role=principal_role,
+                status_code=status_code,
+                request_id=request_id,
+            )
+        except Exception:
+            logger.warning("Failed to record auth denial audit row", exc_info=True)
+
+    if bus is not None:
+        try:
+            bus.publish(
+                {
+                    "type": f"audit.{action}",
+                    "ts": datetime.now(UTC).isoformat(),
+                    "action": action,
+                    "result": "denied",
+                    "status_code": status_code,
+                    "principal_id": principal_id,
+                    "principal_role": principal_role,
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "params": None,
+                    "request_id": request_id,
+                }
+            )
+        except Exception:
+            logger.warning("Failed to publish auth denial event", exc_info=True)
+
+
 async def record_shared_referenced(request: Request, service: str, keys: list[str]) -> None:
     """Insert one `secret.shared_referenced` row attributed to the requester.
 

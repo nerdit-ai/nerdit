@@ -6,7 +6,13 @@ nested AI/database bindings without hard-coded section paths.
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+# Userinfo through the last `@` before the path, as urlsplit reads it —
+# including raw whitespace and an `@` inside the password. Regex, not a parse,
+# so it is safe on a URL that failed to parse at all.
+_URL_USERINFO_RE = re.compile(r"//[^/]*@")
 
 # Leaf key names whose value is a secret and must always be masked. ``password``
 # (P15) is a ``${secrets.X}`` ref by grammar — inherently safe — but is masked
@@ -31,6 +37,18 @@ def redact_value(key: str, value: Any) -> Any:
     if value is not None and is_secret_key(key):
         return REDACTED
     return value
+
+
+def redact_url_userinfo(value: Any) -> Any:
+    """Strip `user:password@` from a URL so it is safe to record.
+
+    Leaf-name masking cannot see a credential embedded IN a value, and a URL
+    is the one config value that routinely carries one. Non-strings pass
+    through untouched so callers can map it over a spec dict.
+    """
+    if not isinstance(value, str):
+        return value
+    return _URL_USERINFO_RE.sub("//", value)
 
 
 def redact_section(values: dict[str, Any]) -> dict[str, Any]:

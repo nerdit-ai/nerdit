@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
@@ -255,6 +256,33 @@ def test_first_touch_fires_when_monotonic_below_interval(monkeypatch):
     client = TestClient(_make_app(queries=q), raise_server_exceptions=False)
     client.post("/mutate", headers={"Authorization": f"Bearer {RAW}"})
     q.touch_api_token.assert_awaited_once_with("tok-1")
+
+
+# --- non-ASCII bearer: an ordinary denial, not a 500 --------------------------
+
+# Starlette decodes header bytes as latin-1, so any byte above 0x7f reaches the
+# middleware as a non-ASCII ``str``. Compared as ``str`` that raised TypeError
+# inside the outermost middleware — a bare 500 outside the envelope handlers,
+# with no denial row. httpx refuses non-ASCII ``str`` header values, so the raw
+# bytes go on the wire the way a curl or an h11 parse would deliver them.
+_NON_ASCII_BEARERS = [b"Bearer caf\xc3\xa9", b"Bearer \xe9"]
+
+
+@pytest.mark.parametrize("method,path", [("GET", "/whoami"), ("POST", "/mutate")])
+@pytest.mark.parametrize("bearer", _NON_ASCII_BEARERS)
+def test_non_ascii_bearer_is_an_ordinary_invalid_token_denial(method, path, bearer):
+    q = _queries(None)
+    client = TestClient(_make_app(queries=q), raise_server_exceptions=False)
+
+    resp = client.request(method, path, headers={b"authorization": bearer})
+
+    assert resp.status_code == 403
+    body = resp.json()
+    assert body["code"] == "invalid_token"
+    assert body["detail"] == {}
+    denials = _denied_calls(q)
+    assert len(denials) == 1
+    assert denials[0]["status_code"] == 403
 
 
 # --- I1: fail-closed default when no principal was attached -------------------

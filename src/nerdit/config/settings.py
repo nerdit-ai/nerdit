@@ -25,7 +25,6 @@ from pydantic import (
 
 from nerdit.config.defaults import (
     DEFAULT_ALLOWED_MOUNT_ROOTS,
-    DEFAULT_CACHE_DIR,
     DEFAULT_CADDY_BINARY,
     DEFAULT_DATA_DIR,
     DEFAULT_DATABASES_BACKEND,
@@ -59,7 +58,6 @@ from nerdit.config.defaults import (
     DEFAULT_RELEASE_TIMEOUT_S,
     DEFAULT_RESTART_WINDOW_SECONDS,
     DEFAULT_RUN_TIMEOUT_MAX_S,
-    DEFAULT_RUNTIME,
     DEFAULT_SERVICE_MAX_RESTARTS,
     DEFAULT_SERVICE_PORT_RANGE,
     DEFAULT_UPLOAD_DIR,
@@ -84,6 +82,26 @@ class DaemonSettings(BaseModel):
     # each sweep only lists/kills containers carrying its own instance_id.
     instance_id: str = "default"
 
+    @field_validator("auth_token")
+    @classmethod
+    def _check_auth_token(cls, value: str | None) -> str | None:
+        # Compared against a bearer decoded from the Authorization header,
+        # which is ASCII by every generator we ship (`secrets.token_urlsafe`).
+        # A hand-edited non-ASCII token would authenticate nothing — the header
+        # arrives latin-1-decoded, so its bytes never round-trip — while
+        # costing a confusing 403 on every request. Fail at load instead.
+        if value is not None and not value.isascii():
+            raise ValueError(
+                "auth_token must be ASCII (it is compared against an "
+                "Authorization header, which carries no other charset). "
+                "Edit [daemon].auth_token in the daemon config by hand: every "
+                "CLI verb loads this file, so no shipped command can repair it "
+                "('nerdit token' only displays the configured value, and "
+                "'nerdit init --auth-token-only' leaves any non-empty token "
+                "alone — clear the line first to have a fresh one minted)."
+            )
+        return value
+
     @field_validator("instance_id")
     @classmethod
     def _check_instance_id(cls, value: str) -> str:
@@ -102,9 +120,7 @@ class DaemonSettings(BaseModel):
 class ContainerSettings(BaseModel):
     """Settings for container runtime behavior."""
 
-    runtime: str = DEFAULT_RUNTIME
     default_image: str = DEFAULT_IMAGE
-    cache_dir: str = DEFAULT_CACHE_DIR
     # Default container resource limits applied to workloads when the workload
     # does not override them. ``None`` means "no limit" (Docker default).
     default_memory_limit: str | None = None

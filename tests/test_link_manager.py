@@ -1607,11 +1607,7 @@ class TestEntitlementSeam:
     def test_pro_mirror_state_three_way(self, identity: NodeIdentity) -> None:
         """(P34 D3, D-X16-37) All four readings, on the one injected clock.
 
-        This is the test the tier-aware deploy hint rests on: everything below
-        ``fresh_false`` in this matrix must NOT be reported as "your plan does
-        not include GitHub deploys", so the boundary between fresh and stale is
-        the difference between a correct message and telling a paying customer
-        their subscription is too small.
+        A stale assertion cannot confirm public sharing, in either direction.
         """
         clock = FakeClock()
         manager = _seam_manager(identity, clock)
@@ -1670,52 +1666,13 @@ class TestEntitlementSeam:
                 state,
             )
 
-    def test_a_real_manager_composed_into_the_tier_decision_fires_it_and_ages_it_out(
-        self, identity: NodeIdentity
-    ) -> None:
-        """(P34 D3, D-X16-37) The deploy hint decision, driven by a REAL manager.
-
-        Every route and redeploy test injects mocks that *speak* the mirror
-        vocabulary as string literals, so a rename of a ``ProMirrorState``
-        token or of the ``"connected"`` link-state literal on either side of
-        :func:`github_absent_is_tier_gated` would keep all of those tests
-        green while the tier hint silently never fired again in production
-        (PR #141 review). Here the exact objects the decision compares — a
-        real ``pro_mirror_state()`` return and a real ``LinkStatus.state`` —
-        flow through the real conjunction, so a vocabulary drift on either
-        side breaks this test instead of quietly disabling D3.
-        """
-        from types import SimpleNamespace
-
-        from nerdit.daemon.deploy_pipeline import github_absent_is_tier_gated
-
-        clock = FakeClock()
-        manager = _seam_manager(identity, clock)
-        # The seam manager is online but never dialled; surface the state the
-        # same way ``_seam_manager`` forces ``_online`` — ``_state`` is the
-        # exact field ``status()`` snapshots, so the decision reads the real
-        # ``LinkStatus.state`` value, not a stand-in.
-        manager._state = "connected"  # noqa: SLF001
-        app = SimpleNamespace(state=SimpleNamespace(link_manager=manager))
-
-        # A recent negative assertion is the ONE tier state…
-        manager.set_hosted_public_entitled(False, clock.now)
-        assert github_absent_is_tier_gated(app) is True
-
-        # …and on the same injected clock it ages out to ``"stale"``, which
-        # must read as generic: stale evidence never earns the tier hint.
-        clock.advance(ENTITLEMENT_TTL_S)
-        assert github_absent_is_tier_gated(app) is False
-
     def test_a_disconnect_leaves_the_mirror_reading_never_not_fresh_false(
         self, identity: NodeIdentity
     ) -> None:
         """The clear is a real forgetting, not a push of ``False`` (D-P32-3).
 
-        It matters to P34 D3 specifically: if clearing recorded a fresh negative
-        instead, every node whose tunnel had merely dropped would start telling
-        its owner their plan is too small. ``clear`` drops the stamp, so the
-        state falls back to the ambiguous ``"never"``.
+        A disconnect is not a new cloud decision. Clearing drops the stamp,
+        so the state falls back to the ambiguous ``"never"``.
         """
         clock = FakeClock()
         manager = _seam_manager(identity, clock)

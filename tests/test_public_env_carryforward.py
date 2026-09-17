@@ -39,7 +39,7 @@ def test_repo_removed_public_env_does_not_resurrect(tmp_path, monkeypatch):
     q = git_queries(previous)
     resp = git_post(git_client(q, tmp_path), monkeypatch, _fake_clone())
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["public_env"] == {}
 
 
@@ -62,7 +62,7 @@ async def test_redeploy_from_source_drops_a_repo_removed_map(tmp_path, fake_clon
         principal="system",
     )
 
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["public_env"] == {}
     assert result["build"]["public_env"] == {}
 

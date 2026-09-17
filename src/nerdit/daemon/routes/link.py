@@ -2080,7 +2080,7 @@ async def push_link_entitlement(
             403,
             "link.cloud_principal_required",
             "This endpoint is written by the Nerdit cloud over the node link only.",
-            hint="Operators do not set entitlement; it mirrors the linked account's plan.",
+            hint="Only the cloud can confirm the linked account's access.",
         )
 
     # `manager.now()`, not `datetime.now(UTC)`: the seam's

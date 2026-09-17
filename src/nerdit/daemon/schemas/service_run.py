@@ -112,13 +112,19 @@ class ServiceRunRequest(StrictRequestModel):
         """
         if value is None:
             return value
-        for key, item in value.items():
+        for index, (key, item) in enumerate(value.items()):
             if not _ENV_KEY_RE.fullmatch(key):
-                # `!r` over a bounded slice: the key is caller-controlled and
-                # of unbounded length until this very check, and repr is what
-                # renders an embedded newline or NUL harmlessly in the envelope.
+                # The offending key is NOT echoed. It just failed the name
+                # check, so it is arbitrary caller bytes — an agent that swaps
+                # a name and a secret value lands exactly here — and this
+                # message is copied verbatim into an MCP caller's transcript by
+                # the `msg` allow-list in `mcp/errors.py`, which no `input`
+                # masking covers. `_SECRET_INPUT_FIELDS` already treats the
+                # whole `env` map as opaque for the same reason; the ordinal is
+                # value-free and locates the entry (JSON objects arrive in
+                # order), which `loc` — a bare `env` — cannot.
                 raise ValueError(
-                    f"Invalid env key {key[:64]!r}: expected an environment "
+                    f"Invalid env key at position {index + 1}: expected an environment "
                     "variable name (letter or '_' followed by letters, digits "
                     "or '_', 1-128 chars)."
                 )

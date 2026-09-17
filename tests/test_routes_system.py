@@ -1241,6 +1241,85 @@ def test_doctor_restart_pending_detail_is_key_names_only(monkeypatch, headers, r
     assert "subdomain" not in pending["detail"]  # the VALUE never leaks
 
 
+def test_doctor_reports_boot_frozen_section_drift(monkeypatch):
+    # Against the REAL _RESTART_KEYS: a TOML edit to a [containers] or [nerdit]
+    # key used to leave the check reporting "no restart-required config drift"
+    # while the running daemon was still on its boot value. [nerdit] also pins
+    # the root-vs-submodel lookup: its keys live on NerditSettings itself.
+    settings = _doctor_settings()
+    settings.log_level = "info"
+    settings.containers = SimpleNamespace(read_only_rootfs=False, drop_all_caps=True)
+    fresh = SimpleNamespace(
+        log_level="debug",
+        data_dir=settings.data_dir,
+        containers=SimpleNamespace(read_only_rootfs=True, drop_all_caps=True),
+    )
+    monkeypatch.setattr(system_routes, "load_settings", lambda: fresh)
+
+    body = _doctor_app(settings=settings).get("/api/doctor", headers=_ADMIN).json()
+    pending = _check(body, "config_restart_pending")
+    assert pending["status"] == "warn"
+    assert "containers.read_only_rootfs" in pending["detail"]
+    assert "nerdit.log_level" in pending["detail"]
+    assert "debug" not in pending["detail"]  # key names only, never values
+
+
+def test_doctor_reports_no_drift_for_a_non_default_upload_dir(monkeypatch, tmp_path):
+    """A normalized boot object vs a raw re-read is not drift.
+
+    The lifespan appends ``[daemon].upload_dir`` to
+    ``containers.allowed_mount_roots`` IN PLACE before the object becomes
+    ``app.state.settings``. Comparing it against an un-normalized re-read
+    reported a permanent, restart-proof ``containers.allowed_mount_roots``
+    drift on every install whose upload dir is not already in the list —
+    which trains the operator to ignore the row that flags a real
+    ``auth_token`` change. Runs against the REAL ``_RESTART_KEYS``.
+    """
+    from nerdit.config.settings import load_settings as real_load_settings
+    from nerdit.daemon.bootstrap import normalize_mount_roots
+
+    config = tmp_path / "config.toml"
+    config.write_text(f'[daemon]\nupload_dir = "{tmp_path / "uploads"}"\n', encoding="utf-8")
+
+    boot = real_load_settings(config)
+    normalize_mount_roots(boot)
+    assert boot.daemon.upload_dir in boot.containers.allowed_mount_roots
+    # The re-read the check performs is deliberately NOT normalized here — the
+    # route has to do it, which is the whole point of the regression.
+    monkeypatch.setattr(system_routes, "load_settings", lambda: real_load_settings(config))
+
+    body = _doctor_app(settings=boot).get("/api/doctor", headers=_ADMIN).json()
+    pending = _check(body, "config_restart_pending")
+    assert pending["status"] == "ok", pending["detail"]
+    assert "allowed_mount_roots" not in pending["detail"]
+
+
+def test_doctor_still_reports_a_real_containers_change_beside_the_upload_dir(monkeypatch, tmp_path):
+    """Positive control: normalizing must not swallow a genuine edit."""
+    from nerdit.config.settings import load_settings as real_load_settings
+    from nerdit.daemon.bootstrap import normalize_mount_roots
+
+    config = tmp_path / "config.toml"
+    config.write_text(f'[daemon]\nupload_dir = "{tmp_path / "uploads"}"\n', encoding="utf-8")
+    boot = real_load_settings(config)
+    normalize_mount_roots(boot)
+
+    edited = tmp_path / "edited.toml"
+    edited.write_text(
+        f'[daemon]\nupload_dir = "{tmp_path / "uploads"}"\n'
+        "[containers]\nread_only_rootfs = "
+        f"{'false' if boot.containers.read_only_rootfs else 'true'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(system_routes, "load_settings", lambda: real_load_settings(edited))
+
+    body = _doctor_app(settings=boot).get("/api/doctor", headers=_ADMIN).json()
+    pending = _check(body, "config_restart_pending")
+    assert pending["status"] == "warn"
+    assert "containers.read_only_rootfs" in pending["detail"]
+    assert "allowed_mount_roots" not in pending["detail"]
+
+
 def test_doctor_db_quick_check_ok_on_real_file():
     # The _db probe reads a dedicated read-only connection off the real file
     # (not the shared aiosqlite conn); a clean db reports ok with a byte count.

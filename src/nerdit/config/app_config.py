@@ -5,7 +5,7 @@ Reuse project schemas and wrap failures in the shared structured 422 envelopes.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -17,8 +17,12 @@ from nerdit.config.project import (
     parse_ai_bindings,
     parse_db_bindings,
 )
+from nerdit.daemon.auth import current_principal, require_service_scope
 from nerdit.daemon.errors import NerditError
-from nerdit.db.models import JobKind, JobStatus
+from nerdit.db.models import Job, JobKind, JobStatus, TokenRole
+
+if TYPE_CHECKING:
+    from starlette.requests import Request
 
 # The [ai.*] shape hint returned with every ``deploy.invalid_ai`` envelope.
 AI_SHAPE_HINT = (
@@ -91,7 +95,9 @@ def validate_deploy_fields(
             hint=(
                 "Name must be a DNS label; port in 1-65535; gpus >= 0; "
                 "memory_limit like '512m'/'2g'; cpu_limit > 0; "
-                "volumes like 'data:/data' (<=8, DNS-label names, absolute paths); "
+                "volumes like 'data:/data' (DNS-label names, absolute paths; at most 8 "
+                "including the implicit data volume, so 7 declared unless one is named "
+                "'data'); "
                 "release a single-line command (<=4096 chars); "
                 "cutover/auto_deploy booleans (null = daemon default); "
                 "edge_auth = {user = '<name>', password = '${secrets.KEY}'} "
@@ -177,31 +183,100 @@ def validate_db_section(
     return bindings
 
 
-async def require_provisioned_databases(  # noqa: ANN001
-    queries, db_bindings: dict[str, DbBindingConfig]
+def _require_bindable_database(
+    request: Request, binding_name: str, database: str, row: Job
 ) -> None:
-    """Require a non-terminal database row for each managed binding's service name.
+    """Authorize the caller to point an app at *row*'s minted credential.
+
+    The row gate, spelled here rather than through `require_owner_or_admin`
+    for two deliberate differences, both named in the refusal:
+
+    * the message says which `[db.<name>]` binding and which database was
+      refused. The generic row denial is byte-identical to the one the app's
+      own ownership check raises, so a caller could not tell which of the two
+      failed — and the binding it names is something the caller just sent.
+    * a **NULL-owner** row is bindable, where `require_owner_or_admin` makes it
+      admin-only. A database with no `submitted_by_token` was created by the
+      legacy global token or in local mode — the single-operator install, where
+      the operator's own scoped CI token and the permanently-`submitter` tunnel
+      principal are the normal callers. Admin-only there breaks the shipped
+      flow (`nerdit db create pg` from the shell, then an app binding it) and
+      its only workaround is minting admin tokens, which is worse than the
+      boundary it enforces. The escalation this gate exists to stop is one
+      submitter reaching ANOTHER submitter's database; that is still refused.
+    """
+    principal = current_principal(request)
+    if principal.role is TokenRole.admin:
+        return
+    owner = getattr(row, "submitted_by_token", None)
+    if owner is None or owner == principal.token_id:
+        return
+    raise NerditError(
+        403,
+        "forbidden",
+        f"[db.{binding_name}] names database '{database}', which belongs to another token.",
+        hint=("Bind a database this token created, or ask an admin to write the binding for you."),
+    )
+
+
+async def require_provisioned_databases(  # noqa: ANN001
+    queries,
+    db_bindings: dict[str, DbBindingConfig],
+    request: Request,
+    *,
+    previous: dict | None = None,
+) -> None:
+    """Require a non-terminal, caller-authorized database row per managed binding.
 
     Building rows are accepted; launch-time resolution checks readiness.
     External bindings need no local row.
+
+    A managed binding hands the app the database's MINTED password at launch
+    (`DATABASE_URL`), so a binding the caller INTRODUCES OR CHANGES is gated:
+    `require_service_scope` on its name and `_require_bindable_database` on the
+    row, both before the caller's write. The existence gate runs first so a name
+    that resolves to nothing stays a 422 (`GET /databases` is any-authenticated,
+    so existence is not a secret). `request` is mandatory: a principal-free call
+    site would be the hole.
+
+    `previous` is the app's already-persisted `config['db']` table. A binding
+    whose spec is byte-identical to it is **carried forward**, not authored, and
+    is therefore existence-checked but not re-authorized. Without that, a
+    foreign binding (admin-authored, or persisted before this gate existed)
+    would lock the app's own owner out of every later `deploy`/`ai` write and
+    every redeploy whose `nerdit.toml` still names it — while a toml-silent
+    redeploy carried the same binding forward untouched, which made the refusal
+    inconsistent as well as wrong.
     """
+    prior = previous or {}
     for binding_name, binding in db_bindings.items():
         if binding.provider != "managed":
             continue
-        row = await queries.get_resource_by_ref(binding.database, JobKind.database)
+        # A managed binding always carries `database` (DbBindingConfig's model
+        # validator); `or ""` only narrows the Optional, and an empty ref
+        # matches no row, so the 422 below still fires.
+        database = binding.database or ""
+        row = await queries.get_resource_by_ref(database, JobKind.database)
         if row is None or row.kind != JobKind.database or row.status in DB_TERMINAL_STATUSES:
             raise NerditError(
                 422,
                 "db.not_provisioned",
-                f"[db.{binding_name}] needs database '{binding.database}', but no active "
+                f"[db.{binding_name}] needs database '{database}', but no active "
                 f"database workload is serving it.",
                 hint="run 'nerdit db create <backend>' first",
             )
+        if binding.model_dump(exclude_none=True) == prior.get(binding_name):
+            continue  # carried forward unchanged — not an authoring act
+        require_service_scope(request, database)
+        _require_bindable_database(request, binding_name, database, row)
 
 
 async def validate_app_config(
     effective_doc: dict,
     queries,  # noqa: ANN001
+    request: Request,
+    *,
+    previous_db: dict | None = None,
 ) -> tuple[DeployConfig, dict[str, AiBindingConfig] | None]:
     """Validate an app's effective config document end to end.
 
@@ -209,6 +284,9 @@ async def validate_app_config(
     values already merged to their effective precedence by the caller. Runs the
     `DeployConfig` field validators, the `[ai.*]` binding schema, and
     the served-model gate; raises the same structured 422s as the deploy route.
+    `request` carries the principal the `[db.*]` gate authorizes against, and
+    `previous_db` the app's persisted `config['db']` so a carried-forward
+    binding is not re-authorized as though the caller had just written it.
     Returns the validated deploy config and bindings (`None` when no `ai`
     section is present).
     """
@@ -240,5 +318,5 @@ async def validate_app_config(
     if db_section is not None:
         db_bindings = validate_db_section(db_section)
         if db_bindings:
-            await require_provisioned_databases(queries, db_bindings)
+            await require_provisioned_databases(queries, db_bindings, request, previous=previous_db)
     return deploy_cfg, bindings

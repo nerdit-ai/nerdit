@@ -72,12 +72,15 @@ class LogQueries(QueriesBase):
         Args:
             since_id: Exclusive forward cursor, ignored when tail is supplied.
             tail: Most recent N matching entries; takes precedence over since_id/limit.
-            limit: Maximum entries for forward reads.
+            limit: Page size for forward reads. None reads the whole matching
+                range — every route caller passes a bound, so an unbounded read
+                is an explicit in-process choice, not a default.
             since_ts: Inclusive space-format UTC lower bound (YYYY-MM-DD HH:MM:SS).
             grep: Literal substring; escape LIKE wildcards rather than interpret regex.
             streams: Bound stream-value filter, or None for all streams.
 
-        Apply every filter before the bound; never materialize unfiltered logs in Python.
+        Apply every filter before the bound, so a bounded read never materializes
+        the non-matching remainder in Python.
         """
         clauses = ["job_id = ?"]
         params: list[object] = [job_id]

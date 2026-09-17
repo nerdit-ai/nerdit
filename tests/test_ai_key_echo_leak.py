@@ -278,3 +278,45 @@ async def test_put_app_config_ai_422_leaves_no_cached_body_to_replay(harness):
     assert retry.status_code == 422
     assert retry.headers.get("Idempotent-Replay") != "true"
     assert_no_canary(retry.text)
+
+
+# --- a credential embedded IN base_url ---------------------------------------
+#
+# Leaf-name masking (`api_key`, `password`) cannot see a credential that lives
+# INSIDE a value, and `validate_ai_section` runs no userinfo check on
+# `base_url`. A `https://user:pw@host/v1` therefore rode a SUCCESSFUL deploy
+# into `audit_log.params_redacted` and the admin `audit.*` bus frame.
+
+USERINFO_CANARY = "pw-CANARY-1111"
+
+
+def test_audit_safe_ai_strips_userinfo_from_base_url():
+    from nerdit.daemon.deploy_pipeline import _audit_safe_ai
+
+    safe = _audit_safe_ai(
+        {
+            "cheap": {
+                "provider": "api",
+                "model": "gpt-4o-mini",
+                "base_url": f"https://svc:{USERINFO_CANARY}@api.example.com/v1",
+                "api_key": "${secrets.OPENAI}",
+            }
+        }
+    )
+
+    assert USERINFO_CANARY not in json.dumps(safe)
+    # The host and path survive, so the audit row still says where it pointed.
+    assert safe["cheap"]["base_url"] == "https://api.example.com/v1"
+    # Every other key is carried through untouched — this is a rendering, not
+    # a filter; the persisted spec the launch path reads is a different dict.
+    assert safe["cheap"]["model"] == "gpt-4o-mini"
+
+
+def test_audit_safe_ai_leaves_a_credential_free_binding_byte_identical():
+    from nerdit.daemon.deploy_pipeline import _audit_safe_ai
+
+    spec = {
+        "default": {"provider": "ollama", "model": "llama3.1:8b"},
+        "cheap": {"provider": "api", "base_url": "https://api.openai.com/v1"},
+    }
+    assert _audit_safe_ai(spec) == spec

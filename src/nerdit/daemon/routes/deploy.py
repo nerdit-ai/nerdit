@@ -46,7 +46,6 @@ from nerdit.daemon.deploy_pipeline import (
     _read_git_source,
     _stamp_queued,
     _validate_request_name,
-    github_absent_is_tier_gated,
     github_token_absent_error,
     private_repo_hint,
     redeploy_from_source,
@@ -202,10 +201,7 @@ async def _resolve_token_ref(
     if token_ref == GITHUB_INSTALLATION_REF:
         token = resolve_github_installation_token(request.app, repo_url)
         if token is None:
-            raise github_token_absent_error(
-                tier_gated=github_absent_is_tier_gated(request.app),
-                role=current_principal(request).role,
-            )
+            raise github_token_absent_error(role=current_principal(request).role)
         return token
     match = SECRET_REF_RE.match(token_ref)
     assert match is not None  # caller pre-validated against SECRET_REF_RE
@@ -492,12 +488,29 @@ async def rollback(request: Request, name: str):
     # is False, so the controller advances queued → launching → healthy directly.
     _stamp_queued(new_cfg, version=int(new_cfg["build_version"]), action="rollback")
 
-    await queries.update_service_config(
+    # Guarded like the redeploy write, and for the same reason: this blob is a
+    # whole-row snapshot taken before the two 409 gates above, and it CARRIES
+    # `max_version` from that read. An unguarded write therefore regresses the
+    # allocator a concurrent redeploy just bumped — the next deploy then hands
+    # out an image tag that is already built, which is exactly the collision the
+    # redeploy CAS exists to prevent. A rollback never MOVES `max_version`, so
+    # the predicate only refuses when a deploy (or a freshly armed cutover)
+    # landed in between, which is the right refusal.
+    committed = await queries.update_service_config_guarded(
         existing.id,
         json.dumps(new_cfg),
+        expect_max_version=int(cfg.get("max_version", cfg.get("build_version", 0)) or 0),
+        expect_cutover_pending=cfg.get("cutover_pending") is not None,
         status=JobStatus.restarting,
         desired_state="running",
     )
+    if not committed:
+        raise NerditError(
+            409,
+            "deploy.concurrent_redeploy",
+            f"Another deploy of '{name}' committed while this rollback was being prepared.",
+            hint="Wait for the in-flight deploy or cutover to settle, then roll back again.",
+        )
     job = await queries.get_service_by_name(name) or existing
     endpoint = await queries.get_service_endpoint(name)
     gpu_ids = await queries.get_job_gpus(job.id)

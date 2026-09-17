@@ -8,6 +8,7 @@ auth_token block, validation diagnostics, and the audit row recorded on commit.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -152,6 +153,28 @@ def test_real_write_applies_and_audits(tmp_path):
     assert kwargs["principal_role"] == "admin"
 
 
+def test_sandbox_hardening_write_reports_requires_restart(tmp_path):
+    # [containers] is captured once at boot (DockerRuntime + ServiceController),
+    # so answering requires_restart=false would tell the operator the hardening
+    # is live when the running daemon is still on the boot value.
+    path = _seed(tmp_path, "[containers]\nread_only_rootfs = false\n")
+    client = _client(path, _queries())
+    resp = client.put(
+        "/api/config/daemon/containers",
+        json={"read_only_rootfs": True, "drop_all_caps": False},
+        headers={**_auth(ADMIN_RAW), "Idempotency-Key": "k-containers"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["applied"] is True
+    assert body["requires_restart"] is True
+    assert sorted(entry["key"] for entry in body["diff"]) == [
+        "containers.drop_all_caps",
+        "containers.read_only_rootfs",
+    ]
+    assert all(entry["requires_restart"] is True for entry in body["diff"])
+
+
 def test_write_is_admin_only(tmp_path):
     path = _seed(tmp_path, "[monitor]\ninterval_seconds = 5\n")
     client = _client(path, _queries())
@@ -224,3 +247,107 @@ def test_invalid_value_returns_diagnostics(tmp_path):
     body = resp.json()
     assert body["code"] == "config.invalid"
     assert body["diagnostics"]
+
+
+# --- no submitted value ever reaches the audit trail --------------------------
+#
+# The stamp the AuditMiddleware reads is set BEFORE validation, so it is what a
+# 422 / 409 / dry run records. Stamping the body (masked only by three leaf
+# names, shallowly) put an operator's literal — pasted where a
+# ${secrets.shared.KEY} ref belonged, and therefore refused — verbatim into
+# `audit_log.params_redacted` and onto the admin `audit.*` stream.
+
+_CANARY = "s3kr3t-HMAC-CANARY"
+
+
+class _RecordingBus:
+    """Event bus stand-in that keeps every published frame."""
+
+    def __init__(self) -> None:
+        self.frames: list[dict] = []
+
+    def publish(self, frame: dict) -> None:
+        self.frames.append(frame)
+
+
+def _audited_client(path: Path, queries: AsyncMock, bus: _RecordingBus) -> TestClient:
+    app = FastAPI()
+    register_error_handlers(app)
+    app.include_router(config_router, prefix="/api")
+    app.state.queries = queries
+    app.state.config_store = ConfigStore(path)
+    app.add_middleware(AuditMiddleware, get_queries=lambda: queries, get_event_bus=lambda: bus)
+    app.add_middleware(ScopedTokenAuthMiddleware, token=LEGACY, get_queries=lambda: queries)
+    app.add_middleware(RequestIdMiddleware)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def _recorded(queries: AsyncMock, bus: _RecordingBus) -> tuple[str, str]:
+    """Return the audit row's params JSON and the published frame, serialized."""
+    queries.insert_audit_log.assert_awaited()
+    row = queries.insert_audit_log.await_args.kwargs["params_redacted"] or ""
+    assert bus.frames
+    return row, json.dumps(bus.frames[-1])
+
+
+def test_section_put_rejection_never_records_the_submitted_value(tmp_path):
+    path = _seed(tmp_path, "")
+    q = _queries()
+    bus = _RecordingBus()
+    resp = _audited_client(path, q, bus).put(
+        "/api/config/daemon/notifications",
+        json={
+            "enabled": True,
+            "targets": [{"url": "https://hooks.example.com/x", "secret_ref": _CANARY}],
+        },
+        headers={**_auth(ADMIN_RAW), "Idempotency-Key": "k1"},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "config.invalid"
+    row, frame = _recorded(q, bus)
+    assert _CANARY not in row and _CANARY not in frame
+    assert json.loads(row) == {
+        "section": "notifications",
+        "dry_run": False,
+        "submitted_keys": ["enabled", "targets"],
+    }
+
+
+def test_section_put_dry_run_never_records_the_submitted_value(tmp_path):
+    # `?dry_run=true` answers 200/ok and writes nothing — the audit row it still
+    # produces must not be where the submitted value lands instead.
+    path = _seed(tmp_path, "")
+    q = _queries()
+    bus = _RecordingBus()
+    resp = _audited_client(path, q, bus).put(
+        "/api/config/daemon/proxy",
+        json={"acme": {"email": f"ops+{_CANARY}@example.com"}},
+        params={"dry_run": "true"},
+        headers=_auth(ADMIN_RAW),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["applied"] is False
+    row, frame = _recorded(q, bus)
+    assert _CANARY not in row and _CANARY not in frame
+    assert json.loads(row) == {"section": "proxy", "dry_run": True, "submitted_keys": ["acme"]}
+
+
+def test_section_put_commit_records_changed_key_names_only(tmp_path):
+    # Success-path content is unchanged: the committed keys, by name.
+    path = _seed(tmp_path, "")
+    q = _queries()
+    bus = _RecordingBus()
+    resp = _audited_client(path, q, bus).put(
+        "/api/config/daemon/proxy",
+        json={"acme": {"email": f"ops+{_CANARY}@example.com"}},
+        headers={**_auth(ADMIN_RAW), "Idempotency-Key": "k1"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["applied"] is True
+    row, frame = _recorded(q, bus)
+    assert _CANARY not in row and _CANARY not in frame
+    assert json.loads(row) == {
+        "section": "proxy",
+        "dry_run": False,
+        "changed_keys": ["proxy.acme"],
+    }

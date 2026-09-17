@@ -429,6 +429,90 @@ async def test_lifespan_amd_inventory_only_hint_logged_once(tmp_path, monkeypatc
     assert "enable_amd" in hints[0].message
 
 
+# --- P13c §3: the MCP session manager is exited whatever startup does ---------
+
+
+class _RecordingSessionCm:
+    """Stand-in for ``StreamableHTTPSessionManager.run()``."""
+
+    def __init__(self) -> None:
+        self.entered = False
+        self.exited = False
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *_exc) -> bool:
+        self.exited = True
+        return False
+
+
+@pytest.mark.asyncio
+async def test_lifespan_exits_the_mcp_session_manager_when_startup_fails(tmp_path, monkeypatch):
+    """A startup step raising after ``run().__aenter__()`` must not leak it.
+
+    The session manager owns an anyio task group that can only be exited from
+    the task that entered it — this lifespan. Without the ``finally`` the
+    context stays entered for the rest of the process: uvicorn logs
+    "Application startup failed. Exiting." and the daemon dies with a live task
+    group and its cancel scope never unwound (under a ``TestClient``, an
+    unexited scope in the middle of the stack). Nothing is inherited across a
+    boot — ``/daemon/restart`` self-execs a new process and
+    ``StreamableHTTPSessionManager.run()`` refuses a second call per instance
+    anyway; the leak is confined to the dying process, which is reason enough.
+    """
+    _settings_for_test(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "nerdit.core.discovery.discover_gpu_system",
+        lambda _path, **_kwargs: _discovery_result([]),
+        raising=False,
+    )
+
+    class _BadDocker:
+        def __init__(self, **_kwargs):
+            raise RuntimeError("docker unavailable in tests")
+
+    monkeypatch.setattr(server_module, "DockerRuntime", _BadDocker)
+
+    session_cm = _RecordingSessionCm()
+
+    class _FakeSessionManager:
+        def run(self):
+            return session_cm
+
+    class _FakeMcpServer:
+        session_manager = _FakeSessionManager()
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("startup step failed after the session manager was entered")
+
+    monkeypatch.setattr(server_module, "_warn_if_unauthenticated_exposure", _boom)
+
+    app = FastAPI(lifespan=server_module.lifespan)
+    app.state.mcp_server = _FakeMcpServer()
+
+    with pytest.raises(RuntimeError, match="startup step failed"):
+        async with app.router.lifespan_context(app):
+            pass  # pragma: no cover — startup never completes
+
+    assert session_cm.entered
+    assert session_cm.exited
+
+    # The failed boot leaves the rest of the lifespan's resources open (the
+    # pre-existing posture — only the session manager is in scope here); tidy
+    # them so the loop shuts down without pending-task warnings.
+    for attr in ("zombie_task", "idempotency_task", "proxy_task", "retention_task"):
+        task = getattr(app.state, attr, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+    await app.state.workload_manager.stop()
+    await app.state.monitor.stop()
+    await app.state.db.close()
+
+
 # --- S9: daemon-restart recovery (re-adopt vs relaunch) -----------------------
 
 

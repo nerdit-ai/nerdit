@@ -4,6 +4,21 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.6.3 (2026-09-17)
+
+A security and correctness hardening release, drawn from two focused audits over the agent/MCP surface and the daemon. No new features and nothing breaking — upgrading is drop-in. Highlights:
+
+- A managed database binding is authorized against the database it names: an app can only bind a managed database its own account created, or one an admin binds for it, checked at both the deploy and app-config paths.
+- Build files the daemon generates into an app's build context are written without following symlinks, so a crafted source tree cannot redirect a daemon-side write out of the context.
+- Over the remote MCP transport, a path-based `deploy` is refused with a clear error instead of reading the daemon host's own filesystem; content-bearing deploys (`deploy_app`, ZIP, git) are unaffected.
+- Configuration-change audit entries record only which keys changed, never the submitted values — on every path, including dry-run and validation failure.
+- A service-logs read without an explicit tail comes back as a bounded page with a continuation cursor instead of the full history.
+- Two overlapping redeploys of one app can no longer land on the same version or leave a superseded build context behind on disk.
+- Changes under `[containers]`, `[nerdit]` and `[monitor]` correctly report that they need a daemon restart.
+- An app declaring the maximum number of volumes deploys and launches instead of being stranded, and per-service disk accounting walks each data directory once.
+- A bearer token carrying non-ASCII characters is rejected as a normal 403.
+- Agent path: MCP validation errors report sanitized field locations without echoing the submitted input, `wait_for_service` floors a negative timeout, the CLI brackets IPv6 daemon hosts when composing the daemon URL, `dump_database` surfaces its disk numbers at the top level, and a failed MCP-over-HTTP startup shuts its session manager down cleanly.
+
 ## 0.6.2 (2026-09-14)
 
 Build-time variables for browser apps, secrets that never touch the command line, and an MCP surface an agent can drive from the schema alone. Highlights:

@@ -441,6 +441,12 @@ async def _disk_preflight(data_dir: Path, service_name: str) -> None:
             "margin; free space under the daemon's data directory, or prune old "
             "dumps (`nerdit gc`, [retention].dump_keep_last).",
             detail={"required_bytes": required, "free_bytes": free},
+            # Top-level too, matching the ``restore.in_use`` / ``resource.in_use``
+            # shape: the MCP error mapper drops ``detail`` wholesale (it can echo
+            # submitted values), so numbers an agent must branch on have to sit
+            # on the envelope itself.
+            required_bytes=required,
+            free_bytes=free,
         )
 
 
@@ -472,6 +478,10 @@ async def _recheck_disk(data_dir: Path, output_path: str) -> None:
             hint="The dump itself was captured but the tar does not fit; free space "
             "under the daemon's data directory and retry.",
             detail={"required_bytes": required, "free_bytes": free},
+            # Top-level too — see ``_disk_preflight``: ``detail`` never reaches
+            # an MCP caller.
+            required_bytes=required,
+            free_bytes=free,
         )
 
 

@@ -24,8 +24,8 @@ _STATE_NOTES = {
         "the tunnel is down — the URL answers once the link reconnects (check: nerdit link)"
     ),
     "not_entitled": (
-        "public hosted shares need a Pro plan on the linked account; the share "
-        "is stored and opens once the account is entitled"
+        "public sharing is free during the public beta; the share is stored, "
+        "but cloud access is not confirmed — check nerdit link and the Nerdit console"
     ),
 }
 
@@ -60,7 +60,7 @@ def share(
         "--public",
         help=(
             "Make the URL world-reachable instead of owner-only. Needs an "
-            "entitled account AND either --consent or a \\[deploy].edge_auth "
+            "active linked account AND either --consent or a \\[deploy].edge_auth "
             "block on the app."
         ),
     ),
@@ -102,7 +102,7 @@ async def _share_async(name: str, *, public: bool, consent: bool, show: bool) ->
         )
     except Exception as exc:  # noqa: BLE001 — rendered for the user
         # The envelope carries the hint that tells the operator what to do next
-        # ("pass --consent", "run nerdit link refresh", "upgrade the plan") —
+        # ("pass --consent", "run nerdit link refresh", "check account status") —
         # there is deliberately no local guess layered on top of it.
         render_client_error(exc)
         raise typer.Exit(1) from exc

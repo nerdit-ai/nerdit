@@ -11,6 +11,64 @@ from ._base import _ACTIVE_STATUSES, QueriesBase, _serialized
 
 _LAST_DUMP_PATCH_PATHS = {"dump": "'$.last_dump.dump'", "reason": "'$.last_dump.reason'"}
 
+#: The row's current build-version allocator, read at UPDATE time. Mirrors the
+#: deploy pipeline's ``int(prev_cfg.get("max_version", prev_cfg.get("build_version", 0)))``
+#: exactly, including the tolerant fallbacks: a NULL/invalid config blob parses
+#: to ``{}`` there and must compare as 0 here, and a rollback lowers
+#: ``build_version`` while leaving ``max_version`` as the allocator. CAST keeps a
+#: version stored as text comparing equal to the integer the caller read.
+_MAX_VERSION_EXPR = (
+    "CASE WHEN json_valid(config) THEN CAST(COALESCE("
+    "json_extract(config, '$.max_version'), json_extract(config, '$.build_version'), 0"
+    ") AS INTEGER) ELSE 0 END"
+)
+
+#: 1 when the row carries no cutover marker, 0 when it does, read at UPDATE
+#: time. An invalid blob reads as "absent" so it matches the tolerant `{}` a
+#: caller's `parse_job_config` produced for the same row.
+_CUTOVER_ABSENT_EXPR = (
+    "CASE WHEN json_valid(config) AND json_extract(config, '$.cutover_pending') "
+    "IS NOT NULL THEN 0 ELSE 1 END"
+)
+
+
+def _redeploy_sets(
+    *,
+    config: str,
+    status: JobStatus,
+    desired_state: str,
+    gpu_count: int | None,
+    health_check: dict | None,
+) -> tuple[list[str], list[object]]:
+    """Build the SET clause shared by the guarded and unguarded config rewrites.
+
+    Rewrite GPU/health columns only when supplied, so a caller that passes
+    neither leaves them untouched.
+    """
+    sets = [
+        "config = ?",
+        "status = ?",
+        "desired_state = ?",
+        "restart_count = 0",
+        "last_exit_at = NULL",
+        "restart_window_start = NULL",
+        "finished_at = NULL",
+        "exit_code = NULL",
+        # F2-STALE-ERR: a redeploy/rollback that converges healthy must not
+        # surface a prior generation's error through the row-column-precedence
+        # reads in _build_wait_response / diagnose_service.
+        "error_class = NULL",
+        "error_message = NULL",
+    ]
+    params: list[object] = [config, status.value, desired_state]
+    if gpu_count is not None:
+        sets.append("gpu_count = ?")
+        params.append(gpu_count)
+    if health_check is not None:
+        sets.append("health_check = ?")
+        params.append(json.dumps(health_check))
+    return sets, params
+
 
 class ServiceConfigQueries(QueriesBase):
     """Service/app config rewrites, including the guarded revert and quota re-check."""
@@ -60,28 +118,13 @@ class ServiceConfigQueries(QueriesBase):
         quota and update in one BEGIN IMMEDIATE transaction, excluding this row's old
         footprint. Concurrency count does not change. Do not nest in another transaction.
         """
-        sets = [
-            "config = ?",
-            "status = ?",
-            "desired_state = ?",
-            "restart_count = 0",
-            "last_exit_at = NULL",
-            "restart_window_start = NULL",
-            "finished_at = NULL",
-            "exit_code = NULL",
-            # F2-STALE-ERR: a redeploy/rollback that converges healthy must not
-            # surface a prior generation's error through the row-column-precedence
-            # reads in _build_wait_response / diagnose_service.
-            "error_class = NULL",
-            "error_message = NULL",
-        ]
-        params: list[object] = [config, status.value, desired_state]
-        if gpu_count is not None:
-            sets.append("gpu_count = ?")
-            params.append(gpu_count)
-        if health_check is not None:
-            sets.append("health_check = ?")
-            params.append(json.dumps(health_check))
+        sets, params = _redeploy_sets(
+            config=config,
+            status=status,
+            desired_state=desired_state,
+            gpu_count=gpu_count,
+            health_check=health_check,
+        )
         params.append(job_id)
         sql = f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?"
 
@@ -101,6 +144,72 @@ class ServiceConfigQueries(QueriesBase):
 
         await self._db.conn.execute(sql, params)
         await self._db.conn.commit()
+
+    @_serialized
+    async def update_service_config_guarded(
+        self,
+        job_id: str,
+        config: str,
+        *,
+        expect_max_version: int,
+        expect_cutover_pending: bool = False,
+        status: JobStatus,
+        desired_state: str,
+        gpu_count: int | None = None,
+        health_check: dict | None = None,
+        token_id: str | None = None,
+    ) -> bool:
+        """Rewrite deploy config only while the expected build-version allocator owns the row.
+
+        The redeploy twin of :meth:`update_service_config`: the new generation's
+        version is derived from a config read that happens well before this write,
+        and nothing serializes the two, so two overlapping redeploys would both
+        stamp the same version and the loser's image tag would name code that is
+        never built. Return False on that supersession; the caller must refuse its
+        own deploy and clean up its build context, never retry unguarded.
+
+        `expect_cutover_pending` states whether the caller's own read saw a
+        cutover marker. The route's in-flight 409 is a task-registry check, and
+        `CutoverManager._arm` commits the marker, releases the write lock and
+        awaits before it registers the task — so a redeploy that passed the 409
+        can still take the lock next, pop a LIVE marker and leave the verify
+        probing a superseded row. Guarding on "the marker is in the state I read
+        it in" refuses exactly that interleaving, and still lets a redeploy land
+        over a stale marker left by an abandoned verify.
+
+        Raise QuotaExceeded exactly as the unguarded twin does; a quota breach is a
+        different answer from a lost race and must not be flattened into False.
+        """
+        sets, params = _redeploy_sets(
+            config=config,
+            status=status,
+            desired_state=desired_state,
+            gpu_count=gpu_count,
+            health_check=health_check,
+        )
+        params.extend((job_id, expect_max_version, 0 if expect_cutover_pending else 1))
+        sql = (
+            f"UPDATE jobs SET {', '.join(sets)} "
+            f"WHERE id = ? AND {_MAX_VERSION_EXPR} = ? AND {_CUTOVER_ABSENT_EXPR} = ?"
+        )
+
+        if token_id is not None and gpu_count is not None:
+            await self._db.conn.execute("BEGIN IMMEDIATE")
+            try:
+                await self._recheck_gpu_quota_locked(token_id, job_id, gpu_count)
+                cursor = await self._db.conn.execute(sql, params)
+                await self._db.conn.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            return cursor.rowcount == 1
+
+        cursor = await self._db.conn.execute(sql, params)
+        await self._db.conn.commit()
+        return cursor.rowcount == 1
 
     @_serialized
     async def revert_service_config_guarded(

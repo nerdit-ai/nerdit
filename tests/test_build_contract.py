@@ -98,7 +98,7 @@ def test_git_saved_override_survives_new_source_and_reset(tmp_path, monkeypatch)
     q = git_queries(previous)
     response = git_post(git_client(q, tmp_path), monkeypatch, _fake_clone())
     assert response.status_code == 201, response.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["build_overrides"] == {"build": False, "node_version": "22.23.2"}
     assert response.json()["build"]["sources"]["build"] == "saved"
     assert response.json()["build"]["commit_sha"] == "a" * 40
@@ -106,7 +106,7 @@ def test_git_saved_override_survives_new_source_and_reset(tmp_path, monkeypatch)
         git_client(q, tmp_path), monkeypatch, _fake_clone(), build_settings={"node_version": None}
     )
     assert response.status_code == 201, response.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["build_overrides"] == {"build": False}
     assert response.json()["build"]["node_version"] == "24.20.0"
 
@@ -153,7 +153,7 @@ def test_explicit_legacy_start_beats_saved_override(tmp_path, monkeypatch):
     response = git_post(git_client(q, tmp_path), monkeypatch, _fake_clone(), start="node new.js")
     assert response.status_code == 201, response.text
     assert response.json()["build"]["start"] == "node new.js"
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["build_overrides"]["start"] == "node new.js"
 
 
@@ -175,7 +175,7 @@ def test_nested_null_start_resets_even_with_legacy_start(tmp_path, monkeypatch):
     )
     assert response.status_code == 201, response.text
     assert response.json()["build"]["start"] == "npm start"
-    assert json.loads(q.update_service_config.call_args.args[1])["build_overrides"] == {}
+    assert json.loads(q.update_service_config_guarded.call_args.args[1])["build_overrides"] == {}
 
 
 def test_preset_saved_and_reset_precedence():
@@ -227,11 +227,11 @@ def test_stale_saved_next_preset_explains_reset_and_recovers(tmp_path, monkeypat
     assert rejected.status_code == 400, rejected.text
     assert rejected.json()["code"] == "deploy.no_buildpack"
     assert 'build_settings={"preset": null}' in rejected.json()["hint"]
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
     recovered = git_post(client, monkeypatch, _fake_clone(), build_settings={"preset": None})
     assert recovered.status_code == 201, recovered.text
     assert recovered.json()["build"]["framework"] == "node"
-    assert json.loads(q.update_service_config.call_args.args[1])["build_overrides"] == {}
+    assert json.loads(q.update_service_config_guarded.call_args.args[1])["build_overrides"] == {}
 
 
 @pytest.mark.parametrize("layer", ["request", "repository", "saved"])
@@ -259,7 +259,7 @@ def test_credential_commands_rejected_in_every_settings_layer(tmp_path, monkeypa
     assert response.status_code == 422, response.text
     assert "private-sentinel" not in response.text
     q.reserve_service_for_token.assert_not_called()
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
 
 
 @pytest.mark.parametrize("replacement", [None, "npm ci"])
@@ -270,7 +270,7 @@ def test_unsafe_saved_command_can_be_reset_or_replaced(tmp_path, monkeypatch, re
     )
     assert response.status_code == 201, response.text
     assert "private-sentinel" not in response.text
-    config = q.update_service_config.call_args.args[1]
+    config = q.update_service_config_guarded.call_args.args[1]
     assert "private-sentinel" not in config
     expected = {} if replacement is None else {"install": replacement}
     assert json.loads(config)["build_overrides"] == expected
@@ -314,7 +314,7 @@ def test_git_saved_public_env_survives_and_null_resets(tmp_path, monkeypatch):
     q = git_queries(previous)
     response = git_post(git_client(q, tmp_path), monkeypatch, _fake_clone())
     assert response.status_code == 201, response.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["build_overrides"] == {"public_env": {"VITE_API": "saved"}}
     assert cfg["public_env"] == {"VITE_API": "saved"}
     assert response.json()["build"]["public_env"] == {"VITE_API": "saved"}
@@ -322,7 +322,7 @@ def test_git_saved_public_env_survives_and_null_resets(tmp_path, monkeypatch):
         git_client(q, tmp_path), monkeypatch, _fake_clone(), build_settings={"public_env": None}
     )
     assert response.status_code == 201, response.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert "public_env" not in cfg["build_overrides"]
     assert cfg["public_env"] == {}
     assert response.json()["build"]["public_env"] == {}

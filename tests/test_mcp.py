@@ -187,6 +187,102 @@ async def test_call_never_merges_diagnostics_into_an_agent_visible_error():
 
 
 @pytest.mark.asyncio
+async def test_call_forwards_validation_errors_without_the_submitted_value():
+    """A 422 must be actionable without echoing what the caller submitted.
+
+    ``detail``/``diagnostics`` stay dropped; a sanitized ``errors`` list carries
+    only ``loc``/``type``/``msg``, never ``input``/``ctx``/``url``.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        errors = [
+            {
+                "loc": ["body", "env", "BAD=KEY"],
+                "type": "string_pattern_mismatch",
+                "msg": "String should match pattern",
+                "input": "s3cr3t-value",
+                "ctx": {"pattern": "s3cr3t-value"},
+                "url": "https://errors.pydantic.dev/2/v/string_pattern_mismatch",
+            }
+        ]
+        return httpx.Response(
+            422,
+            json={
+                "code": "validation_error",
+                "message": "Request validation failed.",
+                "detail": errors,
+                "diagnostics": errors,
+                "request_id": "req-11",
+            },
+        )
+
+    result = await server._list_gpus_impl(_client(handler))
+    assert "s3cr3t-value" not in json.dumps(result)
+    assert "detail" not in result["error"]
+    assert "diagnostics" not in result["error"]
+    assert result["error"]["errors"] == [
+        {
+            "loc": ["body", "env", "BAD=KEY"],
+            "type": "string_pattern_mismatch",
+            "msg": "String should match pattern",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_call_never_stringifies_a_detail_list_into_message():
+    """A stock FastAPI 422 (no envelope) must not leak ``input`` via ``message``.
+
+    ``message`` falls back to ``detail`` only when it is a STRING. An upstream
+    proxy — or any non-Nerdit 422 — answers with the bare pydantic list, whose
+    entries carry the submitted value; the sanitizer keeps it out of ``errors``,
+    and this keeps it out of the one field that is always rendered.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={"detail": [{"loc": ["body", "env"], "type": "x", "msg": "m", "input": "s3cr3t"}]},
+        )
+
+    result = await server._list_gpus_impl(_client(handler))
+    assert "s3cr3t" not in json.dumps(result)
+    assert result["error"]["code"] == "validation_error"
+    assert isinstance(result["error"]["message"], str)
+    assert result["error"]["errors"] == [{"loc": ["body", "env"], "type": "x", "msg": "m"}]
+
+
+@pytest.mark.asyncio
+async def test_call_keeps_a_string_detail_as_the_message_fallback():
+    """The fallback itself is preserved for the shape that motivated it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    result = await server._list_gpus_impl(_client(handler))
+    assert result["error"]["message"] == "Not Found"
+
+
+@pytest.mark.asyncio
+async def test_call_drops_a_detail_list_on_a_non_validation_error():
+    """Only ``validation_error`` gets the sanitized projection."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={
+                "code": "resource.in_use",
+                "message": "still referenced",
+                "detail": [{"loc": ["body"], "type": "x", "msg": "y"}],
+            },
+        )
+
+    result = await server._list_gpus_impl(_client(handler))
+    assert "errors" not in result["error"]
+    assert "detail" not in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_call_never_lets_an_extra_overwrite_a_fixed_field():
     """A hostile/odd envelope must not be able to rewrite the four fixed keys.
 
@@ -215,6 +311,18 @@ async def test_call_normalizes_connection_error():
     result = await server._cluster_stats_impl(client)
     assert result["error"]["code"] == "connection_error"
     assert result["error"]["status"] is None
+
+
+@pytest.mark.asyncio
+async def test_call_names_a_message_less_transport_error():
+    """``httpx.ConnectTimeout`` stringifies to "" — never return an empty message."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("", request=request)
+
+    result = await server._cluster_stats_impl(_client(handler))
+    assert result["error"]["code"] == "connection_error"
+    assert result["error"]["message"] == "ConnectTimeout"
 
 
 # --- read tools -------------------------------------------------------------
@@ -403,6 +511,29 @@ async def test_remove_service_impl_defaults_purge_secrets():
     await server._remove_service_impl(_client(handler), "web")
     assert seen["query"]["purge"] == "secrets"
     assert "force" not in seen["query"]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_service_impl_floors_timeout_at_one():
+    """A non-positive timeout reaches the daemon as the floored 1.
+
+    The daemon's own [1, 300] clamp would have caught ``0`` or ``-5`` on its
+    own; what it cannot catch is a value at or below ``-30``, because the
+    client derives its transport deadline from it (``timeout + 30``) and a
+    negative deadline fails as a transport error before the request is sent —
+    the tool would answer ``connection_error`` against a perfectly healthy
+    daemon. Hence ``-100`` here, and hence the floor in the tool, which also
+    makes the documented "floored at 1 here" true for every value.
+    """
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["query"] = dict(request.url.params)
+        return httpx.Response(200, json={"outcome": "converged"})
+
+    result = await services_tools._wait_for_service_impl(_client(handler), "web", timeout=-100)
+    assert seen["query"]["timeout"] == "1"
+    assert result == {"outcome": "converged"}
 
 
 # The run tool is reached through its domain module rather than the ``server``
@@ -766,9 +897,10 @@ async def test_dump_database_impl_readonly_403_becomes_forbidden_envelope():
 
 @pytest.mark.asyncio
 async def test_dump_database_impl_passes_the_daemon_envelope_through():
-    # D-P37-11's hint and D-P37-10's detail are the actionable half of a
+    # D-P37-11's hint and D-P37-10's numbers are the actionable half of a
     # refusal: ``_call`` copies envelope extras through, and the tool must not
-    # swallow them.
+    # swallow them. ``detail`` is dropped on purpose (it can echo submitted
+    # values), which is why the route duplicates the numbers top-level.
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             409,
@@ -777,6 +909,8 @@ async def test_dump_database_impl_passes_the_daemon_envelope_through():
                 "message": "not enough free space to dump 'pg'",
                 "hint": "estimate from the volume size",
                 "detail": {"required_bytes": 10, "free_bytes": 1},
+                "required_bytes": 10,
+                "free_bytes": 1,
             },
         )
 
@@ -784,6 +918,9 @@ async def test_dump_database_impl_passes_the_daemon_envelope_through():
     assert result["error"]["code"] == "dump.insufficient_disk"
     assert result["error"]["status"] == 409
     assert result["error"]["hint"] == "estimate from the volume size"
+    assert result["error"]["required_bytes"] == 10
+    assert result["error"]["free_bytes"] == 1
+    assert "detail" not in result["error"]
 
 
 @pytest.mark.asyncio

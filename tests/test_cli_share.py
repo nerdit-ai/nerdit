@@ -188,7 +188,7 @@ async def test_share_not_ready_prints_the_state_note(monkeypatch, capsys):
     assert "tunnel is down" in out
 
 
-async def test_share_not_entitled_note_names_the_plan(monkeypatch, capsys):
+async def test_share_not_entitled_note_names_beta_and_account_status(monkeypatch, capsys):
     client = _fake_client(
         set_share=AsyncMock(return_value={**_SHARE_OK, "access": "public", "state": "not_entitled"})
     )
@@ -198,7 +198,9 @@ async def test_share_not_entitled_note_names_the_plan(monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "not_entitled" in out
-    assert "Pro plan" in out
+    assert "free during the public beta" in out
+    assert "Nerdit console" in " ".join(out.split())
+    assert "Pro plan" not in out
 
 
 async def test_share_ready_prints_no_state_note(fake_client, capsys):

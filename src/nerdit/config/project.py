@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from nerdit.config.build import BuildSettings
+from nerdit.config.redaction import redact_url_userinfo
 
 PROJECT_CONFIG_NAME = "nerdit.toml"
 
@@ -59,21 +60,17 @@ DB_BINDING_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 # is rejected so the injected env is always a plain, driver-agnostic DSN.
 _DB_URL_SCHEMES = frozenset({"postgresql", "redis", "rediss"})
 
-# Match userinfo through the last @ before the path, as urlsplit does, including
-# raw whitespace and @ inside passwords. Redact rejected URLs before diagnostics.
-_URL_USERINFO_RE = re.compile(r"//[^/]*@")
-
 
 def _redact_db_url(value: str) -> str:
     """A credential-free rendering of a `[db] url` for error messages.
 
-    Strips any `user:password@` userinfo and any query string (which may carry
-    a `?password=`/`?sslpassword=`), keeping the scheme/host/path so the
+    Strips any `user:password@` userinfo (the shared
+    `config.redaction.redact_url_userinfo`) and any query string (which may
+    carry a `?password=`/`?sslpassword=`), keeping the scheme/host/path so the
     message stays actionable without ever echoing the credential it rejects.
     Regex-based so it is safe even on a URL that failed to parse.
     """
-    masked = _URL_USERINFO_RE.sub("//", value)
-    return masked.split("?", 1)[0]
+    return str(redact_url_userinfo(value)).split("?", 1)[0]
 
 
 # Parse-time volume grammar; launch revalidates untrusted persisted specs.

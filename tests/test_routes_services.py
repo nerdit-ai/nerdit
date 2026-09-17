@@ -1248,6 +1248,132 @@ def test_detail_route_computes_data_dir_bytes(tmp_path):
     assert listing.json()["items"][0]["data_dir_bytes"] is None
 
 
+async def test_data_dir_walk_is_coalesced_under_concurrency(tmp_path, monkeypatch):
+    """M4: N concurrent detail reads cost at most one walk per TTL.
+
+    Unguarded, each read dispatched its own recursive `du` onto the loop's
+    DEFAULT executor — the pool every `DockerRuntime` call and the reconciler
+    share (measured: 42 concurrent readonly GETs delayed a pooled call 13.8 s).
+    """
+    import asyncio
+    import time
+
+    from nerdit.daemon.routes import services as svc_mod
+
+    svc_dir = tmp_path / "services" / "demo"
+    svc_dir.mkdir(parents=True)
+    (svc_dir / "app.db").write_bytes(b"x" * 512)
+
+    calls: list[str] = []
+    real_du = svc_mod.du_bytes
+
+    def counting_du(path):
+        calls.append(str(path))
+        time.sleep(0.05)  # widen the window so an unguarded fan-out is certain
+        return real_du(path)
+
+    monkeypatch.setattr(svc_mod, "du_bytes", counting_du)
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(settings=SimpleNamespace(data_dir=str(tmp_path))))
+    )
+    job = _service("tok-sub")
+
+    results = await asyncio.gather(
+        *[svc_mod._compute_data_dir_bytes(request, job) for _ in range(20)]
+    )
+    assert results == [512] * 20
+    assert len(calls) == 1, f"expected one coalesced walk, got {len(calls)}"
+
+    # Still one within the TTL window — a follow-up read is served from cache.
+    assert await svc_mod._compute_data_dir_bytes(request, job) == 512
+    assert len(calls) == 1
+
+
+async def test_a_slow_walk_does_not_block_another_service(tmp_path, monkeypatch):
+    """The single-flight is per NAME, not daemon-wide.
+
+    A daemon-wide lock coalesces a hammer on one service at the price of making
+    a slow tree hold up the detail read of every OTHER service for a whole
+    budget — cross-service head-of-line blocking the route never had before it
+    was serialized.
+    """
+    import asyncio
+    import time
+
+    from nerdit.daemon.routes import services as svc_mod
+
+    for name, payload in (("big", b"x" * 64), ("small", b"y" * 8)):
+        d = tmp_path / "services" / name
+        d.mkdir(parents=True)
+        (d / "blob").write_bytes(payload)
+
+    _real_du = svc_mod.du_bytes
+
+    def slow_du(path):
+        if path.name == "big":
+            time.sleep(0.4)
+        return _real_du(path)
+
+    monkeypatch.setattr(svc_mod, "du_bytes", slow_du)
+    monkeypatch.setattr(svc_mod, "_DATA_DIR_BUDGET_S", 2.0)
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(settings=SimpleNamespace(data_dir=str(tmp_path))))
+    )
+    big = _service("tok-sub", service_name="big")
+    small = _service("tok-sub", service_name="small")
+
+    started = time.monotonic()
+    big_task = asyncio.create_task(svc_mod._compute_data_dir_bytes(request, big))
+    await asyncio.sleep(0.05)
+    assert await svc_mod._compute_data_dir_bytes(request, small) == 8
+    assert time.monotonic() - started < 0.35, "the small read waited on big's walk"
+    assert await big_task == 64
+
+
+async def test_an_overrun_walk_lands_in_the_cache_instead_of_being_thrown_away(
+    tmp_path, monkeypatch
+):
+    """An overrunning walk used to be cancelled and its result dropped, so a
+    tree slower than the budget reported ``null`` forever WHILE the daemon
+    started a complete new walker every TTL. Now it finishes once and fills the
+    cache, and a second read inside the TTL never starts a second walker."""
+    import asyncio
+    import time
+
+    from nerdit.daemon.routes import services as svc_mod
+
+    d = tmp_path / "services" / "demo"
+    d.mkdir(parents=True)
+    (d / "blob").write_bytes(b"z" * 32)
+
+    calls: list[str] = []
+    real_du = svc_mod.du_bytes
+
+    def slow_du(path):
+        calls.append(str(path))
+        time.sleep(0.3)
+        return real_du(path)
+
+    monkeypatch.setattr(svc_mod, "du_bytes", slow_du)
+    monkeypatch.setattr(svc_mod, "_DATA_DIR_BUDGET_S", 0.05)
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(settings=SimpleNamespace(data_dir=str(tmp_path))))
+    )
+    job = _service("tok-sub")
+
+    assert await svc_mod._compute_data_dir_bytes(request, job) is None  # overran
+    # A read while it is still running joins it rather than spawning a second.
+    assert await svc_mod._compute_data_dir_bytes(request, job) is None
+    assert len(calls) == 1
+
+    await asyncio.sleep(0.4)  # let the detached walk land
+    assert await svc_mod._compute_data_dir_bytes(request, job) == 32
+    assert len(calls) == 1  # served from the cache the walk itself filled
+
+
 def test_detail_route_data_dir_bytes_null_when_dir_absent(tmp_path):
     """A row whose data dir was never created reports null, not 0 (#6)."""
     q = _queries()
@@ -2600,6 +2726,15 @@ def test_run_invalid_env_key_422_does_not_echo_the_env_value():
     forbids: no secret value in a response body or an error message. The
     handler now masks ``input`` for secret-bearing field names
     while keeping type/loc/msg intact.
+
+    The REJECTED key is masked too, and that supersedes the earlier round's
+    "the key name is not a secret, keep it" pin. It held while ``msg`` went
+    only to the same caller over HTTP; it stopped holding when
+    ``mcp/errors.py`` began copying ``msg`` into an agent transcript — and
+    the pin's premise is false on this branch anyway, because a key that
+    FAILED the name check is by definition not a name (an agent that swaps a
+    key and a value lands exactly here). The ordinal replaces it: value-free,
+    and more than ``loc``'s bare ``env`` gives.
     """
     app, _q, _controller = _run_env()
     resp = _post_run(app, json={"command": ["a"], "env": {"BAD=KEY": "s3cr3t-value"}})
@@ -2610,9 +2745,8 @@ def test_run_invalid_env_key_422_does_not_echo_the_env_value():
     body = resp.json()
     assert body["diagnostics"], "masking must not empty the pydantic error list"
     assert any("env" in (e.get("loc") or []) for e in body["diagnostics"])
-    # The rejected KEY name is not a secret and stays visible (it is what the
-    # caller has to fix), mirroring the audit trail's names-kept/values-masked rule.
-    assert "BAD=KEY" in resp.text
+    assert "BAD=KEY" not in resp.text
+    assert "position 1" in resp.text
 
 
 def test_run_sibling_missing_field_422_does_not_echo_the_env_value():

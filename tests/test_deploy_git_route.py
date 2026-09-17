@@ -17,6 +17,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import nerdit.daemon.deploy_pipeline as pipeline
 import nerdit.daemon.routes.deploy as deploy_mod
 from nerdit.core.gitsource import GitSourceError, GitSourceInfo
 from nerdit.daemon.audit import AuditMiddleware, derive_action
@@ -51,7 +52,8 @@ def _queries(existing: Job | None = None) -> AsyncMock:
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
     q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
-    q.update_service_config = AsyncMock()
+    q.update_service_config = AsyncMock()  # rollback / app-build revert
+    q.update_service_config_guarded = AsyncMock()  # redeploy (CAS on max_version)
     return q
 
 
@@ -226,8 +228,9 @@ def test_r2_git_redeploy_stamps_queued_and_clears_forensics(tmp_path, monkeypatc
     async def _apply(job_id, config_json, **kwargs):
         written["cfg"] = json.loads(config_json)
         existing.config = config_json
+        return True
 
-    q.update_service_config = AsyncMock(side_effect=_apply)
+    q.update_service_config_guarded = AsyncMock(side_effect=_apply)
     resp = _post(_client(q, tmp_path), monkeypatch, _fake_clone(commit="b" * 40))
     assert resp.status_code == 201, resp.text
     cfg = written["cfg"]
@@ -309,7 +312,7 @@ def test_r2_redeploy_bumps_version_and_replaces_stamp(tmp_path, monkeypatch):
     resp = _post(_client(q, tmp_path), monkeypatch, _fake_clone(commit="b" * 40))
     assert resp.status_code == 201, resp.text
     q.reserve_service_for_token.assert_not_called()
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["image"] == "nerdit-app/demo:2"
     assert cfg["build_version"] == 2
     assert cfg["previous_image"] == "nerdit-app/demo:1"
@@ -491,7 +494,7 @@ def test_r5_redeploy_non_owner_forbidden_before_clone(tmp_path, monkeypatch):
     assert resp.status_code == 403
     assert resp.json()["code"] == "forbidden"
     clone.assert_not_called()
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
 
 
 def test_r5_userinfo_url_422_leaves_no_audit_trace(tmp_path, monkeypatch):
@@ -622,7 +625,7 @@ def test_git_redeploy_env_null_delete(tmp_path, monkeypatch):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), monkeypatch, _fake_clone(), env={"DROP": None, "NEW": "3"})
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     # P14 WP-A1: the implicit /data wedge injects NERDIT_DATA_DIR via setdefault.
     assert cfg["env"] == {"KEEP": "1", "NEW": "3", "NERDIT_DATA_DIR": "/data"}
 
@@ -644,7 +647,7 @@ def test_git_dry_run_writes_nothing_and_cleans_clone(tmp_path, monkeypatch):
     assert body["action"] == "create"
     assert body["buildpack"] == "node"
     q.reserve_service_for_token.assert_not_called()
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
     clone.assert_awaited_once()
     # The clone ROOT (dest_dir under upload_dir) is removed on the dry-run path.
     upload_dir = Path(tmp_path) / "uploads"
@@ -697,7 +700,7 @@ def test_git_dry_run_token_ref_redacted_under_deploy_git_plan(tmp_path, monkeypa
     assert plan, "expected a deploy.git_plan audit row"
     assert json.loads(plan[0]["params_redacted"])["token_ref"] == "***"
     q.reserve_service_for_token.assert_not_called()
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
 
 
 # --- audit action mapping ----------------------------------------------------
@@ -754,15 +757,7 @@ def _link_manager(
     link_state: str = "connected",
     pro_mirror: str = "never",
 ) -> MagicMock:
-    """A stand-in for the two reads the P33/P34 GitHub paths make of the link.
-
-    ``link_state`` and ``pro_mirror`` are spelled out rather than left as bare
-    ``MagicMock`` attributes because P34 D3 branches on both: a mock whose
-    ``status().state`` merely happens not to equal ``"connected"`` would give
-    the generic hint by accident, and an accident is not a pin. The defaults are
-    the ordinary P33 node — online, with the cloud never having asserted
-    anything about the plan — which is the generic-hint case.
-    """
+    """Model repository tokens and independent public-share eligibility."""
     mgr = MagicMock()
     mgr.github_token_for_repo = MagicMock(side_effect=lambda slug: tokens.get(slug))
     # The auth middleware also consults a wired manager for relay capabilities:
@@ -933,150 +928,20 @@ def test_github_ref_is_never_offered_to_a_non_github_host(tmp_path, monkeypatch)
     clone.assert_not_awaited()
 
 
-# --- P34 D3: the hint (and ONLY the hint) is tier-aware (D-X16-37) ----------
-
-#: The wire contract, pinned byte-for-byte here rather than imported from the
-#: source: an import would follow the source wherever it moved and prove
-#: nothing. Clients, the CLI renderer and the poller's ``(422, code)`` match all
-#: key off these two, so they must be identical in every mirror state.
-_ABSENT_DETAIL = (
-    "token_ref '${github.installation}' resolves to no installation token for this repository."
-)
-_GENERIC_HINT = (
-    "link this node and install the Nerdit GitHub App, or pass a `${secrets.*}` token_ref"
-)
-_TIER_HINT = "this account's plan does not include GitHub deploys — see the Nerdit console"
-
-
-def _absent_envelope(q, tmp_path, monkeypatch, *, link_state: str, pro_mirror: str) -> dict:
-    """Provoke the 422 on a node whose link reads ``link_state``/``pro_mirror``.
-
-    Asserts the invariant half of the envelope — status, ``code``, ``detail``,
-    and that nothing was cloned — and hands back the body so each case has one
-    thing left to say: which hint it got.
-    """
+@pytest.mark.parametrize("pro_mirror", ["fresh_false", "fresh_true", "stale", "never"])
+@pytest.mark.parametrize("role", [LEGACY, SUB_RAW])
+def test_github_absence_ignores_public_share_eligibility(tmp_path, monkeypatch, pro_mirror, role):
+    """Missing repository authorization never sends a beta user to a paid plan."""
     clone = _fake_clone()
-    client = _gh_client(q, tmp_path, {}, link_state=link_state, pro_mirror=pro_mirror)
-    # The legacy admin: the generic wording is the admin's. A submitter's is
-    # pinned separately (audit A22).
-    resp = _post(client, monkeypatch, clone, raw=LEGACY, token_ref="${github.installation}")
-
+    client = _gh_client(_queries(), tmp_path, {}, pro_mirror=pro_mirror)
+    resp = _post(client, monkeypatch, clone, raw=role, token_ref="${github.installation}")
     assert resp.status_code == 422, resp.text
     body = resp.json()
     assert body["code"] == "deploy.github_token_absent"
-    assert body["detail"] == _ABSENT_DETAIL
-    assert body["message"] == _ABSENT_DETAIL
-    clone.assert_not_awaited()
-    return body
-
-
-def test_github_absent_hint_fresh_negative_tier(tmp_path, monkeypatch):
-    """The one state that earns the tier hint: online link, recent cloud "no".
-
-    Nothing is refused that was not already refused — the status and code are
-    the P33 ones — and the hint carries no URL, slug or account identifier
-    (D-X16-O11).
-    """
-    body = _absent_envelope(
-        _queries(), tmp_path, monkeypatch, link_state="connected", pro_mirror="fresh_false"
-    )
-
-    assert body["hint"] == _TIER_HINT
-    assert "http" not in body["hint"]
+    assert "Nerdit GitHub App" in body["hint"]
+    assert "plan" not in body["hint"]
     assert "upgrade" not in body["hint"]
-
-
-def test_github_absent_hint_fresh_positive_generic(tmp_path, monkeypatch):
-    """A Pro account that has not installed the App is the GENERIC case.
-
-    Telling a subscriber their plan lacks GitHub deploys when the cloud has just
-    said the opposite would be the worst reading of all, so ``fresh_true``
-    falls through to the wording that actually describes what is missing.
-    """
-    body = _absent_envelope(
-        _queries(), tmp_path, monkeypatch, link_state="connected", pro_mirror="fresh_true"
-    )
-
-    assert body["hint"] == _GENERIC_HINT
-
-
-def test_github_absent_hint_stale_generic(tmp_path, monkeypatch):
-    """A mirror older than the 24 h TTL is evidence of nothing (D-X16-37).
-
-    This is the case the asymmetry exists for: a paying customer whose node has
-    been out of touch with the cloud for a day must not be told their plan is
-    too small on the strength of a value nobody has re-asserted.
-    """
-    body = _absent_envelope(
-        _queries(), tmp_path, monkeypatch, link_state="connected", pro_mirror="stale"
-    )
-
-    assert body["hint"] == _GENERIC_HINT
-
-
-def test_github_absent_hint_never_asserted_generic(tmp_path, monkeypatch):
-    """The cloud has never spoken about this account — silence is not a "no".
-
-    The state a freshly-linked node sits in for its first seconds, and the one
-    a node whose tunnel has just been cleared falls back to.
-    """
-    body = _absent_envelope(
-        _queries(), tmp_path, monkeypatch, link_state="connected", pro_mirror="never"
-    )
-
-    assert body["hint"] == _GENERIC_HINT
-
-
-def test_github_absent_hint_link_down_generic(tmp_path, monkeypatch):
-    """Every not-``connected`` state is generic, even holding a fresh negative.
-
-    The independent connection check is defence in depth over the mirror clear
-    on the offline edge; ``backoff`` is the state that makes it observable,
-    since a reconnecting node is exactly the one whose mirror is least worth
-    quoting back at its owner.
-    """
-    for state in ("connecting", "backoff", "displaced", "terminal"):
-        body = _absent_envelope(
-            _queries(), tmp_path, monkeypatch, link_state=state, pro_mirror="fresh_false"
-        )
-        assert body["hint"] == _GENERIC_HINT, state
-
-
-def test_github_absent_hint_without_a_link_manager_never_consults_a_tier(tmp_path, monkeypatch):
-    """``[link].enabled=false`` reaches the generic hint without asking anything.
-
-    D-X16-O15/D-ENT-2: an unlinked daemon is not a degraded daemon, and D3 adds
-    no entitlement read to a path that had none — the tier decision short-
-    circuits on ``manager is None`` before any status or mirror call exists.
-    """
-    clone = _fake_clone()
-    resp = _post(
-        _gh_client(_queries(), tmp_path, None),
-        monkeypatch,
-        clone,
-        raw=LEGACY,
-        token_ref="${github.installation}",
-    )
-
-    assert resp.status_code == 422
-    assert resp.json()["hint"] == _GENERIC_HINT
-
-
-def test_the_tier_decision_reads_the_mirror_only_after_the_link_state(tmp_path):
-    """The two reads are ordered and short-circuited, not just ANDed.
-
-    ``status()`` is the cheap field read and the one that fails safe; a node
-    whose link is down must reach the generic hint without the mirror being
-    consulted at all, so a future mirror read that acquired a lock or did I/O
-    could never be reached from an offline node.
-    """
-    from nerdit.daemon.deploy_pipeline import github_absent_is_tier_gated
-
-    mgr = _link_manager({}, link_state="backoff", pro_mirror="fresh_false")
-    app = SimpleNamespace(state=SimpleNamespace(link_manager=mgr))
-
-    assert github_absent_is_tier_gated(app) is False
-    mgr.pro_mirror_state.assert_not_called()
+    clone.assert_not_awaited()
 
 
 def test_github_ref_variants_are_not_the_literal(tmp_path, monkeypatch):
@@ -1103,3 +968,127 @@ def test_secret_refs_are_untouched_by_a_wired_link_manager(tmp_path, monkeypatch
     assert resp.status_code == 201, resp.text
     assert clone.await_args.kwargs["token"] == "tok-value"
     client.app.state.link_manager.github_token_for_repo.assert_not_called()
+
+
+# --- generated-file writes never follow a symlink (H1) ------------------------
+
+
+def _fake_clone_with_link(link_name: str, target: Path) -> AsyncMock:
+    """A clone materializing a Node context plus *link_name* -> *target*.
+
+    A real ``git clone`` checks committed symlinks out verbatim, which is how a
+    submitter gets an attacker-chosen destination under a name the daemon
+    generates into.
+    """
+
+    async def _run(repo_url, *, dest_dir, ref=None, subdir=None, **_kw) -> GitSourceInfo:
+        ctx = Path(dest_dir)
+        ctx.mkdir(parents=True, exist_ok=True)
+        (ctx / "package.json").write_text(
+            json.dumps({"name": "demo", "scripts": {"start": "node index.js"}})
+        )
+        (ctx / "index.js").write_text("console.log('hi')")
+        (ctx / link_name).symlink_to(target)
+        return GitSourceInfo(commit_sha="a" * 40, resolved_ref=ref or "main", context_dir=ctx)
+
+    return AsyncMock(side_effect=_run)
+
+
+def test_symlinked_generated_dockerfile_refused(tmp_path, monkeypatch):
+    """A cloned ``Dockerfile.nerdit`` symlink never becomes an arbitrary write."""
+    victim = tmp_path / "secrets.key"
+    victim.write_bytes(b"master-key-sentinel")
+    q = _queries()
+    resp = _post(
+        _client(q, tmp_path), monkeypatch, _fake_clone_with_link("Dockerfile.nerdit", victim)
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["code"] == "deploy.unsafe_generated_file"
+    assert "Dockerfile.nerdit" in body["message"]
+    assert victim.read_bytes() == b"master-key-sentinel"
+    q.reserve_service_for_token.assert_not_called()
+
+
+def test_dangling_dockerignore_symlink_creates_nothing(tmp_path, monkeypatch):
+    """A dangling ``.dockerignore`` symlink is a file-CREATION primitive: refuse
+    it rather than read it as absent and write through it."""
+    victim = tmp_path / "absent.key"
+    q = _queries()
+    resp = _post(_client(q, tmp_path), monkeypatch, _fake_clone_with_link(".dockerignore", victim))
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "deploy.unsafe_generated_file"
+    assert not victim.exists()
+    q.reserve_service_for_token.assert_not_called()
+
+
+def test_dry_run_does_not_write_through_a_symlink(tmp_path, monkeypatch):
+    """The ``?dry_run`` contract is zero writes — the generated files included."""
+    victim = tmp_path / "secrets.key"
+    victim.write_bytes(b"master-key-sentinel")
+    q = _queries()
+    monkeypatch.setattr(
+        deploy_mod, "clone_source", _fake_clone_with_link("Dockerfile.nerdit", victim)
+    )
+    resp = _client(q, tmp_path).post(
+        "/deploy/git",
+        params={"dry_run": "true"},
+        json={"repo_url": REPO, "name": "demo"},
+        headers=_auth(SUB_RAW),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["dry_run"] is True
+    assert victim.read_bytes() == b"master-key-sentinel"
+
+
+def test_dry_run_materializes_no_generated_files(tmp_path, monkeypatch):
+    """The same contract without an attacker: the clone is removed carrying
+    neither generated file, and the plan body is unchanged."""
+    seen: dict[str, list[str]] = {}
+    real_rmtree = pipeline.shutil.rmtree
+
+    def _spy(path, **kwargs):
+        seen.setdefault("entries", sorted(p.name for p in Path(path).rglob("*")))
+        return real_rmtree(path, **kwargs)
+
+    monkeypatch.setattr(pipeline.shutil, "rmtree", _spy)
+    monkeypatch.setattr(deploy_mod, "clone_source", _fake_clone())
+    resp = _client(_queries(), tmp_path).post(
+        "/deploy/git",
+        params={"dry_run": "true"},
+        json={"repo_url": REPO, "name": "demo"},
+        headers=_auth(SUB_RAW),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["buildpack"] == "node"
+    assert seen["entries"] == ["index.js", "package.json"]
+
+
+def test_symlinked_project_toml_refused_and_leaks_nothing(tmp_path, monkeypatch):
+    """The READ side of the same class: ``_read_project_toml`` used ``is_file()``
+    + ``read_text()``, both of which follow a committed symlink, and then
+    rendered the decode failure verbatim into a ``422 deploy.invalid_ai``
+    message — one byte of the target plus its offset, handed to a submitter."""
+    victim = tmp_path / "secrets.key"
+    victim.write_bytes(bytes([0x00, 0x01, 0xB8, 0x7F]))  # not UTF-8
+    q = _queries()
+    resp = _post(_client(q, tmp_path), monkeypatch, _fake_clone_with_link("nerdit.toml", victim))
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["code"] == "deploy.unsafe_source_file"
+    assert "nerdit.toml" in body["message"]
+    # No byte of the target, and no offset into it.
+    assert "0xb8" not in resp.text.lower()
+    assert "position" not in resp.text.lower()
+    q.reserve_service_for_token.assert_not_called()
+
+
+def test_generated_files_land_on_the_real_deploy(tmp_path, monkeypatch):
+    """The non-regression half: a real deploy still writes both generated files."""
+    q = _queries()
+    resp = _post(_client(q, tmp_path), monkeypatch, _fake_clone())
+    assert resp.status_code == 201, resp.text
+    cfg = json.loads(q.reserve_service_for_token.call_args.args[0].config)
+    ctx = Path(cfg["build_context_dir"])
+    assert (ctx / "Dockerfile.nerdit").is_file()
+    assert "Dockerfile.nerdit" in (ctx / ".dockerignore").read_text()

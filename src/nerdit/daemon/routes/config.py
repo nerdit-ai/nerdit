@@ -12,7 +12,6 @@ import logging
 
 from fastapi import APIRouter, Body, Query, Request, Response
 
-from nerdit.config.redaction import redact_section
 from nerdit.config.store import ConfigError, ConfigStore
 from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import require_role
@@ -97,9 +96,15 @@ async def put_daemon_config_section(
 ) -> ConfigWriteResponse:
     """Validate and (unless `dry_run`) persist a daemon config section."""
     require_role(request, TokenRole.admin)
-    # Redacted params recorded for audit even if the write later fails (the
-    # AuditMiddleware reads this on the way back out).
-    request.state.audit_params = redact_section(dict(body))
+    # Names, never submitted values: this stamp is what the AuditMiddleware
+    # records on EVERY early exit (422 config.invalid, 409 config.stale, dry
+    # run). A rejected body is exactly the one carrying a literal where a
+    # ${secrets.…} ref belonged, and `redact_section` masks three leaf names
+    # shallowly — too little to make a raw body safe to persist.
+    request.state.audit_params = {
+        **audit_params({"section": section, "dry_run": dry_run}),
+        "submitted_keys": sorted(str(key) for key in body),
+    }
 
     store = _store(request)
     try:
@@ -175,10 +180,13 @@ async def apply_daemon_config(
     same ETag, no write).
     """
     require_role(request, TokenRole.admin)
-    # Redacted params recorded for audit even if the apply later fails (the
-    # AuditMiddleware reads this on the way back out).
+    # Names, never submitted values — see `put_daemon_config_section`. This is
+    # what gets recorded on every early exit (422, 400, 409, dry run).
     request.state.audit_params = {
-        section: redact_section(dict(values)) for section, values in body.sections.items()
+        **audit_params({"dry_run": dry_run}),
+        "submitted_keys": {
+            section: sorted(str(key) for key in values) for section, values in body.sections.items()
+        },
     }
 
     store = _store(request)

@@ -11,9 +11,12 @@ follows both, and data-volume setup follows the environment merge.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
+import os
 import shutil
+import stat
 import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -42,6 +45,7 @@ from nerdit.config.project import (
     shared_secret_keys,
     shared_secret_keys_for,
 )
+from nerdit.config.redaction import redact_url_userinfo
 from nerdit.core.bindings.secretref import walk_secret_ref
 from nerdit.core.builder import (
     GENERATED_DOCKERFILE_NAME,
@@ -204,9 +208,27 @@ def _unknown_keys_message(unknown_deploy_keys: list[str]) -> str:
 def _read_project_toml(
     context_dir: Path,
 ) -> tuple[dict, tomllib.TOMLDecodeError | UnicodeDecodeError | None]:
-    """Read once; defer parse errors until after deploy/buildpack validation."""
+    """Read once; defer parse errors until after deploy/buildpack validation.
+
+    The read side of the H1 class: a git clone materializes a committed
+    `nerdit.toml -> ../../secrets.key` verbatim, and `is_file()`/`read_text()`
+    both follow it — the daemon would read a file of the submitter's choosing
+    and then render its decode failure into a `422 deploy.invalid_ai` message
+    carrying one byte of the target and its offset. `lstat`, so a symlink is
+    refused by name instead. Anything else non-regular (a directory, a fifo)
+    stays "absent", exactly as `is_file()` reported it.
+
+    Raises:
+        NerditError: 422 when the entry exists and is a symlink.
+    """
     path = context_dir / PROJECT_CONFIG_NAME
-    if not path.is_file():
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        return {}, None
+    if stat.S_ISLNK(mode):
+        raise _unsafe_source_file(PROJECT_CONFIG_NAME)
+    if not stat.S_ISREG(mode):
         return {}, None
     try:
         return tomllib.loads(path.read_text(encoding="utf-8")), None
@@ -272,7 +294,9 @@ def _parse_deploy_defaults(data: dict, fallback_name: str) -> tuple[dict, list[s
 _DEPLOY_SHAPE_HINT = (
     "[deploy] takes name (DNS label), port (1-65535), gpus (>= 0), start, "
     "health, health_type ('http'|'tcp'), memory_limit (e.g. '512m'), "
-    "cpu_limit (> 0), volumes (['data:/data'] — <=8, DNS-label names, "
+    "cpu_limit (> 0), volumes (['data:/data'] — at most 7 declared, or 8 when "
+    "one of them is named 'data', since the implicit data volume counts "
+    "towards the limit of 8; DNS-label names, "
     "absolute container paths), release (a single-line pre-swap command, "
     "<=4096 chars), cutover (false disarms the zero-downtime swap), "
     "auto_deploy (true opts into push-triggered redeploy) and edge_auth "
@@ -437,6 +461,92 @@ def _dockerignore_patterns() -> list[str]:
     return out
 
 
+def _unsafe_generated_file(filename: str) -> NerditError:
+    """The refusal both generated-file writes share. Names the entry, never a path."""
+    return NerditError(
+        422,
+        "deploy.unsafe_generated_file",
+        f"The build context has a non-regular file at '{filename}'; the daemon "
+        "generates that file and refuses to write through it.",
+        hint=f"Remove '{filename}' (a symlink or special file) from the source tree.",
+    )
+
+
+def _audit_safe_ai(ai_spec: dict) -> dict:
+    """An `[ai.*]` spec with every `base_url` credential stripped, for the audit row.
+
+    The persisted spec is unchanged — the launch path needs the URL as written.
+    This is the rendering that rides into `audit_log.params_redacted` and the
+    admin `audit.*` bus frame, where a userinfo password must never appear.
+    """
+    out: dict = {}
+    for name, spec in ai_spec.items():
+        if isinstance(spec, dict) and "base_url" in spec:
+            out[name] = {**spec, "base_url": redact_url_userinfo(spec["base_url"])}
+        else:
+            out[name] = spec
+    return out
+
+
+def _unsafe_source_file(filename: str) -> NerditError:
+    """The refusal for a non-regular file the daemon READS out of the context.
+
+    Twin of `_unsafe_generated_file` for the read side: the daemon does not
+    generate this one, it parses it, and following a committed symlink means
+    parsing a file the submitter never uploaded.
+    """
+    return NerditError(
+        422,
+        "deploy.unsafe_source_file",
+        f"The build context has a symlink at '{filename}'; the daemon reads that "
+        "file and refuses to follow a link out of the tree.",
+        hint=f"Commit '{filename}' as an ordinary file.",
+    )
+
+
+def _existing_regular_file(target: Path) -> bool:
+    """Report whether *target* is an ordinary file, refusing anything else.
+
+    `lstat`, never `exists()`: the build context is caller-supplied and a git
+    clone materializes committed symlinks verbatim, so a `.dockerignore`
+    symlink pointing outside the tree must not read as "absent" (dangling) or
+    as "a user's file" (resolvable).
+
+    Raises:
+        NerditError: 422 when the path exists and is not a regular file.
+    """
+    try:
+        mode = os.lstat(target).st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(mode):
+        raise _unsafe_generated_file(target.name)
+    return True
+
+
+def _write_generated_file(target: Path, text: str) -> None:
+    """Write a daemon-generated file into the build context, never through a link.
+
+    `O_NOFOLLOW` is the enforcement; the `_existing_regular_file` pre-check only
+    buys the clear error message. Without it a committed
+    `Dockerfile.nerdit -> ../../secrets.key` makes a submitter deploy an
+    arbitrary-file overwrite, and a pre-check alone would lose the race against
+    a symlink created after it.
+    """
+    _existing_regular_file(target)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    try:
+        fd = os.open(target, flags, 0o644)
+    except OSError as exc:
+        # ELOOP (Linux/macOS) / EMLINK (some BSDs): the final component became a
+        # symlink between the check and the open.
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise _unsafe_generated_file(target.name) from exc
+        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 def _write_generated_dockerignore(context_dir: Path) -> None:
     """Add buildpack exclusions without overwriting a user's .dockerignore.
 
@@ -444,11 +554,11 @@ def _write_generated_dockerignore(context_dir: Path) -> None:
     BuildKit reads the selected Dockerfile separately.
     """
     target = context_dir / ".dockerignore"
-    if target.exists():
+    if _existing_regular_file(target):
         return  # respect a user-provided .dockerignore
     patterns = _dockerignore_patterns() + [GENERATED_DOCKERFILE_NAME]
     header = "# Generated by Nerdit (P13) — regenerated on deploy.\n"
-    target.write_text(header + "\n".join(patterns) + "\n", encoding="utf-8")
+    _write_generated_file(target, header + "\n".join(patterns) + "\n")
 
 
 def _build_health_blob(path: str | None, health_type: str | None) -> dict | None:
@@ -533,11 +643,19 @@ def resolve_effective_fields(
         eff_cpu_limit = prev_cfg.get("cpu_limit")
     # P14 WP-A1: named volumes are a list (no form field) — the ZIP [deploy]
     # value wins, else the prior row's list carries forward on a redeploy.
-    # The implicit `data:/data` is added by `_ensure_data_volume` later in
-    # the pipeline, so `eff_volumes` here is only the user-declared set.
     eff_volumes = zip_deploy.get("volumes")
     if eff_volumes is None and existing is not None:
         eff_volumes = prev_cfg.get("volumes")
+    # Fold the implicit `data:/data` in BEFORE validation so the validated list
+    # is the list that gets persisted and re-validated at launch: appending it
+    # afterwards let an app declaring the cap's worth of volumes persist one
+    # over it and fail `core.volumes.resolve_named_volumes` forever. Idempotent
+    # (a declared `data` volume re-targets rather than doubling), so the
+    # effective declared budget is MAX_VOLUMES - 1, or MAX_VOLUMES when one of
+    # them is named `data`. `_ensure_data_volume` still runs downstream for the
+    # NERDIT_DATA_DIR half and re-folds a no-op here.
+    if isinstance(eff_volumes, list):
+        eff_volumes = _resolve_data_volume(eff_volumes)[0]
     # The release command has no form/body field either (nerdit.toml +
     # config API only, like the resource caps): the ZIP/repo [deploy].release
     # wins, else the prior row's value carries forward on a redeploy so a
@@ -867,6 +985,46 @@ def build_plan_body(
     }
 
 
+async def _remove_superseded_context(prev_cfg: dict, build_fields: dict) -> None:
+    """Remove a redeploy predecessor's now-unreferenced build context.
+
+    A successful `write_redeploy` overwrites `build_context_dir`/`build_context_root`
+    in the row, so the generation it supersedes is no longer named anywhere. The
+    controller's builder only cleans the CURRENT row's context (the
+    `build_context_root or build_context_dir` it reads back), so a generation
+    superseded BEFORE its build ran — two redeploys that both commit with
+    sequential versions, neither hitting the 409 — would leak its extracted tree
+    under `upload_dir` forever. The §7 live run reproduced exactly this: two
+    concurrent ZIP redeploys, both 201, one cutover, and the loser's tree left
+    behind with its generated Dockerfile.
+
+    Safe unconditionally: a service container serves from its IMAGE, never the
+    context dir, so removing a superseded (or already-built, or image-reused)
+    context never touches a running generation, and aborting an in-flight build
+    of an already-superseded version only saves work. Best-effort and tolerant —
+    the builder's own `cleanup_context` contract — because a leftover tree is a
+    disk leak, never a reason to fail a committed deploy.
+    """
+    prev_root = prev_cfg.get("build_context_root") or prev_cfg.get("build_context_dir")
+    if not prev_root:
+        return
+    new_root = build_fields.get("build_context_root") or build_fields.get("build_context_dir")
+    # Ids are unique per extraction/clone, so prev != new always; guard anyway so
+    # a degenerate equal-path config can never delete the generation just written.
+    if prev_root == new_root:
+        return
+    try:
+        await asyncio.to_thread(shutil.rmtree, prev_root)
+    except FileNotFoundError:
+        pass  # already gone: built-and-cleaned, or a concurrent build's cleanup
+    except OSError:
+        logger.warning(
+            "Failed to remove superseded build context %s (leaked dir)",
+            prev_root,
+            exc_info=True,
+        )
+
+
 async def write_redeploy(
     request: Request,
     queries: Queries,
@@ -889,8 +1047,16 @@ async def write_redeploy(
 
     Use max_version for a fresh tag even after rollback lowers build_version. Keep
     source metadata, queued generation and data-volume updates in their stated order.
+
+    Commit through a compare-and-swap on that same max_version, so an overlapping
+    deploy that already took the version makes this one a 409 rather than a
+    silently discarded write.
+
+    Raises:
+        NerditError: 409 `deploy.concurrent_redeploy` when the version was taken.
     """
-    next_ver = int(prev_cfg.get("max_version", prev_cfg.get("build_version", 0))) + 1
+    expect_max_version = int(prev_cfg.get("max_version", prev_cfg.get("build_version", 0)))
+    next_ver = expect_max_version + 1
     config: dict = dict(prev_cfg)
     config.update(build_fields)
     # A stale command from the previous deploy must not survive a
@@ -985,9 +1151,11 @@ async def write_redeploy(
     # GPU quota is charged to the service OWNER (not the actor), so an
     # admin redeploying does not launder another token's quota.
     try:
-        await queries.update_service_config(
+        committed = await queries.update_service_config_guarded(
             existing.id,
             json.dumps(config),
+            expect_max_version=expect_max_version,
+            expect_cutover_pending=prev_cfg.get("cutover_pending") is not None,
             status=JobStatus.restarting,
             desired_state="running",
             gpu_count=effective.eff_gpus,
@@ -996,6 +1164,26 @@ async def write_redeploy(
         )
     except QuotaExceeded as exc:
         raise exc.to_error() from exc
+    if not committed:
+        # Another deploy allocated this version — or a cutover armed its marker
+        # under us — between the config read far upstream and this write.
+        # Refusing is the only honest answer: the blob above names an image tag
+        # the winner already claimed, so committing it would hand this caller a
+        # 201 for code that is never built and silently discard one of the two
+        # deploys. The caller's extracted tree is removed by
+        # `_finalize_deploy`'s failure path.
+        raise NerditError(
+            409,
+            "deploy.concurrent_redeploy",
+            f"Another deploy of '{name}' committed while this one was being prepared.",
+            hint="Wait for the in-flight deploy or cutover to settle, then deploy again.",
+        )
+    # This write overwrote build_context_dir/build_context_root, orphaning the
+    # generation it superseded. Remove that generation's context so a redeploy
+    # landing before its predecessor's build ran does not leak the extracted tree
+    # (the CAS above prevents a duplicate version; this prevents the tree leak on
+    # the sequential-version path the CAS lets through).
+    await _remove_superseded_context(prev_cfg, build_fields)
     return await queries.get_service_by_name(name) or existing
 
 
@@ -1345,13 +1533,6 @@ async def _finalize_deploy(
                 ),
             ) from exc
 
-        if plan.dockerfile_text is not None:
-            (context_dir / plan.dockerfile_name).write_text(plan.dockerfile_text, encoding="utf-8")
-            # mirror the ZIP-upload excludes into a generated
-            # .dockerignore (buildpack-generated Dockerfiles only; never
-            # overwrites a user-authored file).
-            _write_generated_dockerignore(context_dir)
-
         # P5 (S8): parse+gate [ai.*] server-side on a served-model row; only
         # the SPEC persists (config['ai']) — resolved to OPENAI_* at launch.
         if project_error is not None:
@@ -1374,8 +1555,12 @@ async def _finalize_deploy(
             else None
         )
         if ai_spec:
-            # audit_params masks api_key leaves — even secret refs, verbatim.
-            request.state.audit_params["ai"] = audit_params(ai_spec)
+            # audit_params masks api_key leaves — even secret refs, verbatim —
+            # but leaf-name masking cannot see a credential embedded IN a value,
+            # and `validate_ai_section` runs no userinfo check on `base_url`.
+            # A `https://user:pw@host/v1` therefore reached the audit row and
+            # the admin `audit.*` frame: the M7 hazard, on the other binding.
+            request.state.audit_params["ai"] = audit_params(_audit_safe_ai(ai_spec))
 
         # identical [db.*] gate (D-A mirror) on a provisioned database
         # row; only the SPEC persists — the credential DSN resolves at launch.
@@ -1385,7 +1570,9 @@ async def _finalize_deploy(
             else None
         )
         if db_bindings:
-            await require_provisioned_databases(queries, db_bindings)
+            await require_provisioned_databases(
+                queries, db_bindings, request, previous=prev_cfg.get("db")
+            )
         db_spec = (
             {bname: b.model_dump(exclude_none=True) for bname, b in db_bindings.items()}
             if db_bindings
@@ -1471,6 +1658,16 @@ async def _finalize_deploy(
             cleanup_root = context_root or context_dir
             await asyncio.to_thread(shutil.rmtree, cleanup_root, ignore_errors=True)
             return body
+
+        # Materialize the generated Dockerfile — AFTER the dry-run return, which
+        # promises zero writes, and before the row is written so the off-tick
+        # build finds it.
+        if plan.dockerfile_text is not None:
+            _write_generated_file(context_dir / plan.dockerfile_name, plan.dockerfile_text)
+            # mirror the ZIP-upload excludes into a generated
+            # .dockerignore (buildpack-generated Dockerfiles only; never
+            # overwrites a user-authored file).
+            _write_generated_dockerignore(context_dir)
 
         if existing:
             # A plain redeploy landing mid-cutover is the same
@@ -1599,7 +1796,7 @@ def _source_credential_error(name: str, detail: str) -> NerditError:
 #: role can neither install the GitHub App nor write the shared scope, so the
 #: hint names the person who can and the exact reference to pass afterwards
 #: (audit A22). Admin wording is untouched: the poller and CLI key off status
-#: and code, and the tier sentence (D-X16-37) still wins when it applies.
+#: and code; neither depends on a subscription.
 _SUBMITTER_PRIVATE_REPO_HINT = (
     "this token cannot install the Nerdit GitHub App or write a shared secret — "
     "ask the node owner to install the app on this repository, or to run "
@@ -1619,22 +1816,14 @@ _SUBMITTER_CLONE_HINT = (
 )
 
 
-def github_token_absent_error(
-    *, tier_gated: bool = False, role: TokenRole | None = None
-) -> NerditError:
+def github_token_absent_error(*, role: TokenRole | None = None) -> NerditError:
     """Build the explicit-action GitHub-token absence error.
 
-    GitWatch treats this exact 422/code pair as quiet backoff. Tier gating and
-    the caller's role change only the hint; status, code and detail remain
-    stable. Hints contain no URL, account identifier or slug.
+    GitWatch treats this exact 422/code pair as quiet backoff. The caller's role
+    changes only the hint; status, code and detail remain stable. Public-share
+    eligibility does not determine repository authorization.
     """
-    if tier_gated:
-        # Soft on purpose, and never "upgrade to Pro": an account that pays
-        # mid-poll keeps a stale-false mirror until the cloud's next push
-        # (~5 min), so this line has to stay true for the customer who has
-        # just paid and is looking at it.
-        hint = "this account's plan does not include GitHub deploys — see the Nerdit console"
-    elif role is TokenRole.submitter:
+    if role is TokenRole.submitter:
         hint = _SUBMITTER_PRIVATE_REPO_HINT
     else:
         hint = (
@@ -1658,19 +1847,6 @@ def private_repo_hint(exc: GitSourceError, *, role: TokenRole, had_token: bool) 
     if role is TokenRole.submitter and not had_token and _is_auth_failure(exc):
         return _SUBMITTER_CLONE_HINT
     return exc.hint
-
-
-def github_absent_is_tier_gated(app: Any) -> bool:
-    """Return true only for a connected link with a fresh_false Pro mirror.
-
-    Every other state uses generic wording, including fresh_true, stale, never and
-    missing manager. A link race may degrade to generic copy, never deny access;
-    this decides hint text only.
-    """
-    manager = getattr(app.state, "link_manager", None)
-    if manager is None:
-        return False
-    return manager.status().state == "connected" and manager.pro_mirror_state() == "fresh_false"
 
 
 def resolve_github_installation_token(app: Any, repo_url: str) -> str | None:
@@ -1715,10 +1891,7 @@ async def _resolve_source_token(
     if token_ref == GITHUB_INSTALLATION_REF:
         token = resolve_github_installation_token(request.app, repo_url)
         if token is None:
-            raise github_token_absent_error(
-                tier_gated=github_absent_is_tier_gated(request.app),
-                role=current_principal(request).role,
-            )
+            raise github_token_absent_error(role=current_principal(request).role)
         return token
     if secrets is None:  # pragma: no cover - always wired in the daemon
         raise NerditError(500, "internal", "Secret manager is not configured.")

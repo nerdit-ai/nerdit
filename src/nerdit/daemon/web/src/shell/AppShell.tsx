@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { LogOut, Menu as MenuIcon, Search, X } from "lucide-react";
+import { LogOut, Mail, Menu as MenuIcon, Search, X } from "lucide-react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useClusterEvents } from "../api/clusterEvents";
 import { useAuthRole, useClusterInfo, useDaemonStatus } from "../api/queries";
@@ -131,6 +131,13 @@ function SidebarFooter({
           <kbd className="font-mono text-12 text-subtle-foreground">⌘K</kbd>
         </button>
       )}
+      <a href="mailto:feedback@nerdit.ai" className={rowCls}>
+        <Mail size={16} aria-hidden="true" />
+        <span>
+          Give feedback
+          <span className="block text-12">feedback@nerdit.ai</span>
+        </span>
+      </a>
       <button type="button" onClick={onSignOut} className={rowCls}>
         <LogOut size={16} aria-hidden="true" />
         Sign out

@@ -36,6 +36,17 @@ def _encode_dot_segment(segment: str) -> str:
     return quoted.replace(".", "%2E") if segment in (".", "..") else quoted
 
 
+def _http_base_url(host: str, port: int) -> str:
+    """Build the daemon base URL, bracketing an IPv6 literal (already-bracketed too).
+
+    `httpx` raises `InvalidURL` — NOT a subclass of `HTTPError` — on an
+    unbracketed `http://::1:9321`, so it would escape every caller's error
+    mapping. Mirrors the daemon's own `_loopback_base_url`.
+    """
+    host = host.strip().strip("[]")
+    return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
+
+
 class NerditClient:
     """Async HTTP client wrapping the nerditd REST API."""
 
@@ -47,7 +58,7 @@ class NerditClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.host = host
-        self._base_url = f"http://{host}:{port}"
+        self._base_url = _http_base_url(host, port)
         self._headers: dict[str, str] = {}
         if token:
             self._headers["Authorization"] = f"Bearer {token}"
@@ -452,7 +463,11 @@ class NerditClient:
         """Wait for service convergence or failure.
 
         The server clamps `timeout` to 1–300 seconds and returns HTTP 200 with one
-        of four outcomes. The client allows `timeout + 30` seconds.
+        of four outcomes. The transport deadline is `max(1, timeout) + 30` seconds:
+        the request value is passed through unfloored so the daemon's clamp stays
+        authoritative, but the httpx deadline is floored because a `timeout` at or
+        below -30 would otherwise be a negative one, which fails as a transport
+        error before the request is ever sent — i.e. before the clamp can apply.
         """
         params: dict[str, int] = {"timeout": timeout}
         if version is not None:
@@ -461,7 +476,7 @@ class NerditClient:
             "GET",
             f"{self._base_url}/api/services/{ident}/wait",
             params=params,
-            timeout=timeout + 30,
+            timeout=max(1, int(timeout)) + 30,
         )
 
     async def diagnose_service(self, ident: str, *, log_tail: int = 50) -> dict:

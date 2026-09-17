@@ -260,8 +260,9 @@ async def set_share(request: Request, name: str, body: ShareRequest) -> ShareVie
                 "share.not_entitled",
                 "Public hosted shares are not enabled for this node's account.",
                 hint=(
-                    "Public hosted shares need a Pro plan on the linked account; "
-                    "private shares work on every linked node."
+                    "Public sharing is free during the public beta. Check `nerdit link` "
+                    "and the account status in the Nerdit console; the cloud must "
+                    "confirm access before you publish."
                 ),
             )
         # (D-P26-H3) `edge_auth` is a Caddy handler and is NOT on the hosted

@@ -61,11 +61,20 @@ async def _wait_for_service_impl(
 
     A read (no idempotency key). The server long-polls and **always** returns a
     four-way ``outcome`` (``converged``/``failed``/``timeout``/``superseded``);
-    the daemon clamps ``timeout`` to [1, 300]. Pass ``version`` **explicitly**
-    from a deploy's 201 ``last_deploy.version`` so a concurrent redeploy is
-    reported as ``superseded`` rather than silently converged on.
+    the daemon clamps ``timeout`` into [1, 300], so a non-positive one already
+    reached it as 1. The floor is applied HERE anyway, like
+    ``_run_command_impl``'s, so the tool's own contract ("floored at 1 here")
+    holds without depending on the daemon's clamp — and so the value never
+    approaches the one range the clamp cannot rescue: the client derives its
+    httpx deadline from it, and at or below -30 that deadline goes negative and
+    fails as a transport error before the request is sent (the client floors
+    that deadline too). Pass ``version``
+    **explicitly** from a deploy's 201 ``last_deploy.version`` so a concurrent
+    redeploy is reported as ``superseded`` rather than silently converged on.
     """
-    return await _call(client.wait_for_service(ident, version=version, timeout=timeout))
+    return await _call(
+        client.wait_for_service(ident, version=version, timeout=max(1, int(timeout)))
+    )
 
 
 async def _service_logs_impl(
@@ -329,7 +338,7 @@ async def wait_for_service(
             int,
             Field(
                 description="Seconds to block before returning ``outcome: timeout``. "
-                "Default 60; the daemon clamps it to [1, 300]."
+                "Default 60; floored at 1 here and capped at 300 by the daemon."
             ),
         ] = 60,
     ) -> Any:
@@ -667,8 +676,10 @@ async def run_command(
         only thing standing between a client-side read timeout and a migration
         running twice. A retried key REPLAYS an ``idempotent_replay`` envelope,
         NOT the command's output — the run's stdout is deliberately never
-        cached at rest. Re-run under a fresh key if you need the output again,
-        or read it from ``diagnose_service``'s ``last_run``.
+        cached at rest. That replay is an HTTP 200 carrying ``code:
+        "idempotent_replay"`` and NO ``exit_code``, so check for that code
+        before reading ``exit_code``. Re-run under a fresh key if you need the
+        output again, or read it from ``diagnose_service``'s ``last_run``.
 
         **Key reuse protects a COMPLETED run only.** A failed call un-pins the
         key, so a same-key retry really re-executes. In particular ``503

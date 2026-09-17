@@ -537,7 +537,8 @@ def test_public_is_refused_without_the_account_entitlement() -> None:
 
     assert response.status_code == 409
     assert response.json()["code"] == "share.not_entitled"
-    assert "Pro plan" in response.json()["hint"]
+    assert "free during the public beta" in response.json()["hint"]
+    assert "Pro plan" not in response.json()["hint"]
     q.set_service_share.assert_not_awaited()
 
 

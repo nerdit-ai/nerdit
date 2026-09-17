@@ -697,6 +697,110 @@ async def test_an_unfiltered_page_carries_no_watermark_header(queries):
     assert "X-Nerdit-Scan-Watermark" not in tailed.headers
 
 
+async def _bulk_logs(queries, job_id: str, count: int) -> None:
+    """Insert *count* stdout lines in one statement (20k append_log calls is a minute)."""
+    await queries._db.conn.executemany(
+        "INSERT INTO job_logs (job_id, stream, message) VALUES (?, 'stdout', ?)",
+        [(job_id, f"line {i}") for i in range(count)],
+    )
+    await queries._db.conn.commit()
+
+
+async def test_a_parameterless_page_is_capped_and_resumable(queries):
+    """M3: the bare documented call must be bounded, and the rest reachable.
+
+    With no ``tail`` the forward branch used to run without a LIMIT, so one
+    ~50-byte GET materialized the whole retained history (measured: 55.9 MB of
+    JSON at 200k rows). The cap is the page size, and ``since_id`` is the way
+    past it — the same contract the SSE twin drains on.
+    """
+    from nerdit.daemon.limits import _MAX_LOG_TAIL
+    from nerdit.daemon.routes.services import get_service_logs
+
+    request = _StubRequest()
+    request.app = _App()  # type: ignore[attr-defined]
+    request.app.state.queries = queries  # type: ignore[attr-defined]
+    job = await _service(queries, name="chatty")
+    await _bulk_logs(queries, job.id, 20_000)
+
+    first = await get_service_logs(
+        request, Response(), "chatty", since_id=0, tail=None, grep=None, since=None
+    )
+    assert len(first) == _MAX_LOG_TAIL
+    assert first[0].message == "line 0"
+
+    second = await get_service_logs(
+        request, Response(), "chatty", since_id=first[-1].id, tail=None, grep=None, since=None
+    )
+    assert len(second) == _MAX_LOG_TAIL
+    assert second[0].id == first[-1].id + 1  # the remainder, not a re-read
+
+
+async def test_a_capped_filtered_page_withholds_the_watermark(queries):
+    """A full page stopped at the BOUND, so the pre-scan max is not decided yet.
+
+    Handing it to the follower would jump the cursor past the undrained
+    remainder — the cap would silently eat the backlog it was added to bound.
+    """
+    from nerdit.daemon.limits import _MAX_LOG_TAIL
+    from nerdit.daemon.routes.services import get_service_logs
+
+    request = _StubRequest()
+    request.app = _App()  # type: ignore[attr-defined]
+    request.app.state.queries = queries  # type: ignore[attr-defined]
+    job = await _service(queries, name="grepped")
+    await _bulk_logs(queries, job.id, _MAX_LOG_TAIL + 100)
+
+    full = Response()
+    entries = await get_service_logs(
+        request, full, "grepped", since_id=0, tail=None, grep="line", since=None
+    )
+    assert len(entries) == _MAX_LOG_TAIL
+    assert "X-Nerdit-Scan-Watermark" not in full.headers
+
+    # The short page that finishes the range does carry it again.
+    short = Response()
+    rest = await get_service_logs(
+        request, short, "grepped", since_id=entries[-1].id, tail=None, grep="line", since=None
+    )
+    assert len(rest) == 100
+    assert "X-Nerdit-Scan-Watermark" in short.headers
+
+
+async def test_the_cli_drains_every_capped_page(monkeypatch):
+    """The CLI half of M3: one bounded page is no longer the whole log."""
+    import nerdit.cli.client as client_mod
+    from nerdit.cli.commands import logs as logs_mod
+
+    pages = [
+        [
+            {"id": i, "stream": "stdout", "message": f"a{i}", "timestamp": "2026-01-01T00:00:00"}
+            for i in range(1, 6)
+        ],
+        [
+            {"id": i, "stream": "stdout", "message": f"b{i}", "timestamp": "2026-01-01T00:00:00"}
+            for i in range(6, 9)
+        ],
+        [],
+    ]
+    cursors: list[int] = []
+
+    class _Fake:
+        async def get_service_logs(self, ident, since_id=0, **kw):
+            cursors.append(since_id)
+            return pages.pop(0)
+
+    shown: list[int] = []
+    monkeypatch.setattr(client_mod, "get_configured_client", lambda: _Fake())
+    monkeypatch.setattr(
+        logs_mod, "display_logs", lambda entries: shown.extend(e["id"] for e in entries)
+    )
+
+    await logs_mod._logs_async("demo", False)
+    assert cursors == [0, 5, 8]  # resumed from the last id of each page
+    assert shown == list(range(1, 9))  # nothing dropped at a page boundary
+
+
 async def test_the_cli_follower_advances_to_the_scan_watermark(monkeypatch):
     """The CLI half of the fix: an all-filtered page still moves the cursor."""
     import nerdit.cli.client as client_mod
@@ -726,6 +830,57 @@ async def test_the_cli_follower_advances_to_the_scan_watermark(monkeypatch):
     await logs_mod._logs_async("demo", True, grep="nope")
     # 0 → 43 (first watermark) → 44 (second), then the terminal drain reuses it.
     assert cursors == [0, 43, 44]
+
+
+async def test_the_follower_drains_a_full_backlog_without_a_status_poll_between_pages(
+    monkeypatch,
+):
+    """A page that fills the server cap means "there is more backlog".
+
+    Taking one capped page per 1 s status poll put a chatty service's retained
+    history minutes ahead of its first LIVE line, so a full page must loop
+    straight back into the next read.
+    """
+    import nerdit.cli.client as client_mod
+    from nerdit.cli.commands import logs as logs_mod
+    from nerdit.daemon.limits import _MAX_LOG_TAIL
+
+    full = [
+        {"id": i, "stream": "stdout", "message": "backlog", "timestamp": "2026-01-01T00:00:00"}
+        for i in range(1, _MAX_LOG_TAIL + 1)
+    ]
+    tail = [
+        {"id": 99999, "stream": "stdout", "message": "live", "timestamp": "2026-01-01T00:00:00"}
+    ]
+    calls: list[str] = []
+    shown: list[str] = []
+
+    class _Fake:
+        def __init__(self) -> None:
+            self.pages = [full, tail]
+
+        async def get_service_logs_page(self, ident, *, since_id=0, grep=None, since=None):
+            calls.append("page")
+            return (self.pages.pop(0) if self.pages else []), None
+
+        async def get_service_logs(self, ident, since_id=0, **kw):
+            return []
+
+        async def get_service(self, ident):
+            calls.append("status")
+            return {"status": "stopped"}
+
+    monkeypatch.setattr(client_mod, "get_configured_client", lambda: _Fake())
+    monkeypatch.setattr(
+        logs_mod, "display_logs", lambda entries: shown.extend(e["message"] for e in entries)
+    )
+    await logs_mod._logs_async("demo", True)
+
+    # Two reads back to back, no status poll wedged between them: the capped
+    # page was drained straight into the next read.
+    assert calls == ["page", "page", "status"]
+    # And the live line arrived through the follower itself.
+    assert shown[-1] == "live"
 
 
 # --- CLI + client surface parity ----------------------------------------------

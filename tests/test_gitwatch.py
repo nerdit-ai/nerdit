@@ -889,19 +889,10 @@ async def test_github_token_absent_mid_redeploy_backs_off_without_pinning(
 
 
 async def test_poller_backoff_never_renders_hint(queries, tmp_path, fake_ls, caplog):
-    """(P34 D3) The tier hint is unreachable from the poll path, by construction.
-
-    The poller matches on the ``(422, code)`` pair alone (``_GITHUB_TOKEN_ABSENT``)
-    and turns it into a bounded backoff — it never renders the envelope. That is
-    what keeps D3 from becoming a recurring "your plan does not include GitHub
-    deploys" in a node's event log every poll interval, for an account that may
-    well have upgraded five minutes ago. Fed the most dangerous envelope the new
-    code can build — ``tier_gated=True`` — nothing carrying either hint reaches
-    an event, an audit row or the log.
-    """
+    """Missing repository credentials back off without repeating setup hints."""
     await queries.create_job(_job(source=_source(token_ref="${github.installation}")))
     fake_ls.sha = NEW_SHA
-    redeploy = _Redeploys(error=github_token_absent_error(tier_gated=True))
+    redeploy = _Redeploys(error=github_token_absent_error())
     controller = _gh_controller(
         queries, tmp_path, _GithubTokens({"o/r": "ghs-x"}), redeploy=redeploy
     )

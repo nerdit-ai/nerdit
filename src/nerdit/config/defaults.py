@@ -13,7 +13,7 @@ DEFAULT_DB_NAME = "nerdit.db"
 DEFAULT_LOG_LEVEL: Final = "info"
 
 DEFAULT_IMAGE = "nerdit-runtime:0.1"
-DEFAULT_RUNTIME = "docker"
+# Not a [containers] key: the sandbox mount allow-list below is its only reader.
 DEFAULT_CACHE_DIR = "~/.nerdit/cache"
 
 # Shared NVIDIA-library probe paths, including WSL2 passthrough.

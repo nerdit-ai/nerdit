@@ -42,6 +42,7 @@ from nerdit.daemon.auth import (
     require_role,
     require_service_scope,
 )
+from nerdit.daemon.deploy_pipeline import _resolve_data_volume
 from nerdit.daemon.errors import NerditError
 from nerdit.db.models import (
     AppConfigView,
@@ -392,6 +393,20 @@ def _merge_deploy(job: Job, cfg: dict, body: dict) -> tuple[dict, list[str]]:
             effective[key] = []
         else:
             effective[key] = value
+    # (M9, second ingress) Fold the implicit `data:/data` wedge in BEFORE the
+    # `changed` diff and the validator, exactly as `resolve_effective_fields`
+    # does on the deploy path — otherwise this surface accepts MAX_VOLUMES
+    # declared without a `data` entry under a hint that says the declared
+    # budget is one less, persists them verbatim, and the next silent redeploy
+    # 422s on a list one over the cap while the row runs with NERDIT_DATA_DIR
+    # pointing at an unmounted path. Only for a row that already carries the
+    # wedge: a `POST /services` row never gets one from the deploy path, and
+    # the config API must not invent one for it. And only for a NON-EMPTY
+    # list, so `volumes=null` stays the documented "mount nothing" disarm
+    # rather than quietly becoming "mount only the wedge".
+    volumes = effective["volumes"]
+    if isinstance(volumes, list) and volumes and _data_volume_path(cfg.get("volumes")) is not None:
+        effective["volumes"] = _resolve_data_volume(volumes)[0]
     changed = [k for k in _DEPLOY_TRACKED_KEYS if effective[k] != current[k]]
     return effective, changed
 
@@ -465,10 +480,14 @@ async def put_app_config_section(
     # (P25 D-P25-3 leg b) Explicit path-name check beside the row-level owner
     # gate further down; the path name is authoritative for the target row.
     require_service_scope(request, name)
-    # Redacted params recorded for audit even if the write later fails.
+    # Names, never submitted values: this stamp is what the AuditMiddleware
+    # records on every early exit (422 config.invalid, 409 config.stale, dry
+    # run). `audit_params` masks by leaf name, which misses a credential
+    # embedded in a value — an external `[db.*]` url carries its password in
+    # the userinfo, and `[ai.*] base_url` can too.
     request.state.audit_params = {
         "section": section,
-        "values": audit_params(dict(body)),
+        "submitted_keys": sorted(str(key) for key in body),
         "restart": restart,
     }
 
@@ -533,7 +552,9 @@ async def put_app_config_section(
         effective_doc["ai"] = merged_ai
     if merged_db:
         effective_doc["db"] = merged_db
-    deploy_cfg, _ = await validate_app_config(effective_doc, queries)
+    deploy_cfg, _ = await validate_app_config(
+        effective_doc, queries, request, previous_db=cfg.get("db")
+    )
 
     current_view = _build_view(job)
     if_match = request.headers.get("If-Match")

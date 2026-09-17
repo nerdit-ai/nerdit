@@ -608,36 +608,47 @@ async def lifespan(app: FastAPI):
 
     # (P13c §3) Drive the mounted MCP sub-app's session manager: its Starlette
     # lifespan never runs under Mount, so its run() context is entered here and
-    # exited first on shutdown (same-task requirement of anyio task groups).
+    # exited in the `finally` below — same task as the enter (the same-task
+    # requirement of anyio task groups), and unconditionally, so a startup step
+    # that raises after this point still tears the session manager down.
+    # It is NOT the first thing exited on shutdown: the tunnel is stopped
+    # before it — not to protect in-flight `/api/mcp` streams (uvicorn has
+    # already closed the listener and drained every connection by the time a
+    # lifespan shutdown runs, so the mux's loopback dial is refused long
+    # before this line), but for the reason recorded below the `yield`: the
+    # manager's `link.disconnected` row must land while the event recorder and
+    # the DB are still open.
     mcp_session_cm = None
     mcp_server = getattr(app.state, "mcp_server", None)
     if mcp_server is not None:
         mcp_session_cm = mcp_server.session_manager.run()
         await mcp_session_cm.__aenter__()
 
-    _warn_if_unauthenticated_exposure(settings.daemon, settings.proxy)
-    logger.info("nerditd started on %s:%d", settings.daemon.host, settings.daemon.port)
+    try:
+        _warn_if_unauthenticated_exposure(settings.daemon, settings.proxy)
+        logger.info("nerditd started on %s:%d", settings.daemon.host, settings.daemon.port)
 
-    # Durable bookend. A consumer resuming from a cursor uses the
-    # started/stopping pair to bound the window in which the daemon was not
-    # observing anything at all — and the in-memory coalescing map is reset by
-    # the same restart, so a repeated condition is allowed to re-emit.
-    await event_recorder.record("daemon.started")
-    yield
-    await event_recorder.record("daemon.stopping")
+        # Durable bookend. A consumer resuming from a cursor uses the
+        # started/stopping pair to bound the window in which the daemon was not
+        # observing anything at all — and the in-memory coalescing map is reset by
+        # the same restart, so a repeated condition is allowed to re-emit.
+        await event_recorder.record("daemon.started")
+        yield
+        await event_recorder.record("daemon.stopping")
 
-    # (P27 WP-C1) Stop the tunnel FIRST, immediately after the stopping bookend
-    # and before any task cancellation: closing the relay socket is what stops
-    # tunnelled ingress, so it must happen before the controllers drain — and
-    # doing it here means the manager's `link.disconnected` (reason
-    # "shutdown") row still lands while the event recorder is installed and the
-    # DB is open.
-    if link_manager is not None:
-        await link_manager.stop()
+        # (P27 WP-C1) Stop the tunnel FIRST, immediately after the stopping
+        # bookend and before any task cancellation: closing the relay socket is
+        # what stops tunnelled ingress, so it must happen before the controllers
+        # drain — and doing it here means the manager's `link.disconnected`
+        # (reason "shutdown") row still lands while the event recorder is
+        # installed and the DB is open.
+        if link_manager is not None:
+            await link_manager.stop()
+    finally:
+        if mcp_session_cm is not None:
+            await mcp_session_cm.__aexit__(None, None, None)
 
     # Shutdown
-    if mcp_session_cm is not None:
-        await mcp_session_cm.__aexit__(None, None, None)
     zombie_task.cancel()
     idempotency_task.cancel()
     if retention_task is not None:

@@ -24,6 +24,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from nerdit.config.project import MAX_VOLUMES
 from nerdit.config.settings import ServicesSettings
 from nerdit.core.models import sanitize_model_name
 from nerdit.core.runtime.protocol import BuildError
@@ -39,6 +40,7 @@ from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, TokenRole
 LEGACY = "legacy-global"
 SUB_RAW = "sub-raw"
 RO_RAW = "ro-raw"
+SCOPED_RAW = "scoped-raw"
 
 _TOKENS = {
     hash_token(SUB_RAW): ApiToken(
@@ -46,6 +48,14 @@ _TOKENS = {
     ),
     hash_token(RO_RAW): ApiToken(
         id="tok-ro", name="r", role=TokenRole.readonly, token_hash=hash_token(RO_RAW)
+    ),
+    # A submitter narrowed to the app it deploys — the H2 scope leg.
+    hash_token(SCOPED_RAW): ApiToken(
+        id="tok-scoped",
+        name="c",
+        role=TokenRole.submitter,
+        token_hash=hash_token(SCOPED_RAW),
+        scope_services=["demo"],
     ),
 }
 
@@ -86,7 +96,10 @@ def _queries(existing: Job | None = None) -> AsyncMock:
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
     q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
-    q.update_service_config = AsyncMock()
+    q.update_service_config = AsyncMock()  # app-build revert (unguarded twin)
+    # redeploy AND rollback (CAS on max_version + the cutover marker); `True` =
+    # committed, the steady state these rigs model.
+    q.update_service_config_guarded = AsyncMock(return_value=True)
     return q
 
 
@@ -160,7 +173,7 @@ def test_deploy_rejects_model_name_kind_mismatch(tmp_path):
     assert resp.json()["code"] == "deploy.kind_mismatch"
     # Rejected on the fast path — no row reuse, no fresh reserve.
     q.reserve_service_for_token.assert_not_called()
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
 
 
 def test_deploy_dry_run_rejects_model_name_kind_mismatch(tmp_path):
@@ -198,7 +211,7 @@ def test_deploy_rejects_database_name_kind_mismatch(tmp_path):
     # secrets), so it must name `--purge data`.
     assert "--purge data" in body["hint"]
     q.reserve_service_for_token.assert_not_called()
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
 
 
 def test_deploy_form_name_misattribution_names_request_field(tmp_path):
@@ -279,7 +292,7 @@ def test_deploy_redeploy_bumps_version(tmp_path):
     assert resp.status_code == 201, resp.text
     # Row reused (not a fresh reserve), config bumped + previous_image recorded.
     q.reserve_service_for_token.assert_not_called()
-    args, kwargs = q.update_service_config.call_args
+    args, kwargs = q.update_service_config_guarded.call_args
     assert args[0] == "svc-1"
     cfg = json.loads(args[1])
     assert cfg["image"] == "nerdit-app/demo:2"
@@ -311,7 +324,7 @@ def test_redeploy_carries_forward_prior_memory_limit(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip())  # no nerdit.toml caps
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["memory_limit"] == "512m"
     assert cfg["cpu_limit"] == 2.0
 
@@ -368,7 +381,7 @@ def test_redeploy_buildpack_switch_clears_stale_command(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip())  # now a Node app
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert "command" not in cfg  # stale Dockerfile command must not survive
 
 
@@ -475,11 +488,12 @@ def test_redeploy_response_exposes_rollback(tmp_path):
     q = _queries(existing)
 
     # Mirror the real write: the route re-fetches the row after
-    # update_service_config, so reflect the new blob on the mocked row.
+    # update_service_config_guarded, so reflect the new blob on the mocked row.
     async def _apply(job_id, config_json, **kwargs):
         existing.config = config_json
+        return True
 
-    q.update_service_config = AsyncMock(side_effect=_apply)
+    q.update_service_config_guarded = AsyncMock(side_effect=_apply)
     resp = _post(_client(q, tmp_path), _node_zip())
     assert resp.status_code == 201, resp.text
     body = resp.json()
@@ -533,8 +547,9 @@ def test_redeploy_stamps_queued_and_clears_stale_forensics(tmp_path):
     async def _apply(job_id, config_json, **kwargs):
         written["cfg"] = json.loads(config_json)
         existing.config = config_json
+        return True
 
-    q.update_service_config = AsyncMock(side_effect=_apply)
+    q.update_service_config_guarded = AsyncMock(side_effect=_apply)
     resp = _post(_client(q, tmp_path), _node_zip())
     assert resp.status_code == 201, resp.text
     cfg = written["cfg"]
@@ -565,8 +580,9 @@ def test_rollback_stamps_queued_at_lowered_version(tmp_path):
     async def _apply(job_id, config_json, **kwargs):
         written["cfg"] = json.loads(config_json)
         existing.config = config_json
+        return True
 
-    q.update_service_config = AsyncMock(side_effect=_apply)
+    q.update_service_config_guarded = AsyncMock(side_effect=_apply)
     resp = _client(q, tmp_path).post("/deploy/demo/rollback", headers=_auth(SUB_RAW))
     assert resp.status_code == 200, resp.text
     ld = written["cfg"]["last_deploy"]
@@ -652,7 +668,7 @@ def test_redeploy_non_owner_forbidden(tmp_path):
     resp = _post(_client(q, tmp_path), _node_zip())  # SUB_RAW = tok-sub
     assert resp.status_code == 403
     assert resp.json()["code"] == "forbidden"
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
 
 
 def test_redeploy_owner_succeeds(tmp_path):
@@ -694,7 +710,7 @@ def test_deploy_is_refused_409_while_a_cutover_is_in_flight(tmp_path):
     resp = _post(client, _node_zip())
     assert resp.status_code == 409
     assert resp.json()["code"] == "service.cutover_in_progress"
-    q.update_service_config.assert_not_awaited()
+    q.update_service_config_guarded.assert_not_awaited()
 
     # NOT sticky — and the redeploy that follows drops the (now abandoned)
     # marker rather than carrying it into the new generation, where a later
@@ -702,7 +718,7 @@ def test_deploy_is_refused_409_while_a_cutover_is_in_flight(tmp_path):
     controller._cutover_tasks.pop("svc-1")
     resp = _post(client, _node_zip())
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert "cutover_pending" not in cfg
     assert cfg["build_version"] == 2
 
@@ -726,7 +742,7 @@ def test_redeploy_retrofits_data_volume_for_pre_p14_row(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip())
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["volumes"] == ["data:/data"]
     assert cfg["env"]["NERDIT_DATA_DIR"] == "/data"
 
@@ -737,7 +753,7 @@ def test_redeploy_wedge_is_idempotent(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip())
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["volumes"] == ["data:/data"]  # exactly one
 
 
@@ -770,7 +786,7 @@ def test_redeploy_retarget_moves_nerdit_data_dir(tmp_path):
     zip_bytes = _node_ai_zip('[deploy]\nname = "demo"\nvolumes = ["data:/var/lib/app"]\n')
     resp = _post(_client(q, tmp_path), zip_bytes)
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["volumes"] == ["data:/var/lib/app"]
     # The mount moved, so NERDIT_DATA_DIR must follow it — not stay stale at /data.
     assert cfg["env"]["NERDIT_DATA_DIR"] == "/var/lib/app"
@@ -784,7 +800,7 @@ def test_redeploy_preserves_user_overridden_nerdit_data_dir(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip())  # silent redeploy
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["env"]["NERDIT_DATA_DIR"] == "/custom"  # user override untouched
 
 
@@ -795,6 +811,49 @@ def test_deploy_rejects_invalid_volume_spec(tmp_path):
     resp = _post(_client(q, tmp_path), zip_bytes)
     assert resp.status_code == 422
     q.reserve_service_for_token.assert_not_called()
+
+
+def _volumes_zip(count: int, *, first_named_data: bool = False) -> bytes:
+    """A Node app ZIP declaring *count* named volumes in its nerdit.toml."""
+    specs = [f"v{i}:/m{i}" for i in range(count)]
+    if first_named_data:
+        specs[0] = "data:/m0"
+    body = ", ".join(f'"{spec}"' for spec in specs)
+    return _node_ai_zip(f'[deploy]\nname = "demo"\nvolumes = [{body}]\n')
+
+
+def test_volume_cap_counts_the_implicit_wedge(tmp_path):
+    """MAX_VOLUMES declared volumes are refused: the wedge would make it one over.
+
+    The wedge is folded in BEFORE validation, so a list that would only fail at
+    launch (leaving the row terminally `volume_invalid`) fails at the ingress.
+    """
+    q = _queries()
+    resp = _post(_client(q, tmp_path), _volumes_zip(MAX_VOLUMES))
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "deploy.invalid"
+    q.reserve_service_for_token.assert_not_called()
+
+
+def test_volume_cap_accepts_one_below_it_plus_the_wedge(tmp_path):
+    """The boundary the other side: MAX_VOLUMES - 1 declared persists as exactly
+    MAX_VOLUMES, which is what `core.volumes` re-validates at launch."""
+    q = _queries()
+    resp = _post(_client(q, tmp_path), _volumes_zip(MAX_VOLUMES - 1))
+    assert resp.status_code == 201, resp.text
+    cfg = json.loads(q.reserve_service_for_token.call_args.args[0].config)
+    assert cfg["volumes"] == [f"v{i}:/m{i}" for i in range(MAX_VOLUMES - 1)] + ["data:/data"]
+    assert len(cfg["volumes"]) == MAX_VOLUMES
+
+
+def test_volume_cap_allows_max_when_one_is_named_data(tmp_path):
+    """A declared `data` volume re-targets the wedge, so MAX_VOLUMES declared fit."""
+    q = _queries()
+    resp = _post(_client(q, tmp_path), _volumes_zip(MAX_VOLUMES, first_named_data=True))
+    assert resp.status_code == 201, resp.text
+    cfg = json.loads(q.reserve_service_for_token.call_args.args[0].config)
+    assert len(cfg["volumes"]) == MAX_VOLUMES
+    assert cfg["env"]["NERDIT_DATA_DIR"] == "/m0"
 
 
 # --- route: optional port + redeploy field preservation ----------------------
@@ -842,7 +901,7 @@ def test_redeploy_preserves_env_when_not_supplied(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip())  # no env field
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     # P14 WP-A1: the implicit /data wedge injects NERDIT_DATA_DIR via setdefault.
     assert cfg["env"] == {"KEEP_ME": "yes", "NERDIT_DATA_DIR": "/data"}
 
@@ -852,7 +911,7 @@ def test_redeploy_merges_env_over_previous(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip(), env=json.dumps({"OVERRIDE": "new"}))
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["env"] == {"KEEP_ME": "yes", "OVERRIDE": "new", "NERDIT_DATA_DIR": "/data"}
 
 
@@ -861,7 +920,7 @@ def test_redeploy_preserves_vendor_when_not_supplied(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip())
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["vendor"] == "amd"
 
 
@@ -871,7 +930,7 @@ def test_redeploy_updates_gpus_and_health(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip(), gpus=2, health="/healthz")
     assert resp.status_code == 201, resp.text
-    kwargs = q.update_service_config.call_args.kwargs
+    kwargs = q.update_service_config_guarded.call_args.kwargs
     assert kwargs["gpu_count"] == 2
     assert kwargs["health_check"] == {"path": "/healthz"}
 
@@ -912,7 +971,7 @@ def test_redeploy_carries_forward_tcp_health_type(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip())  # no toml, no --health
     assert resp.status_code == 201, resp.text
-    assert q.update_service_config.call_args.kwargs["health_check"] == {"type": "tcp"}
+    assert q.update_service_config_guarded.call_args.kwargs["health_check"] == {"type": "tcp"}
 
 
 def test_redeploy_explicit_health_path_overrides_tcp(tmp_path):
@@ -923,7 +982,7 @@ def test_redeploy_explicit_health_path_overrides_tcp(tmp_path):
     resp = _post(_client(q, tmp_path), _node_zip(), health="/healthz")
     assert resp.status_code == 201, resp.text
     # The explicit path is honoured — the tcp type is NOT carried forward.
-    assert q.update_service_config.call_args.kwargs["health_check"] == {"path": "/healthz"}
+    assert q.update_service_config_guarded.call_args.kwargs["health_check"] == {"path": "/healthz"}
 
 
 def test_redeploy_explicit_http_type_overrides_tcp(tmp_path):
@@ -933,7 +992,7 @@ def test_redeploy_explicit_http_type_overrides_tcp(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_deploy_zip('[deploy]\nhealth_type = "http"\n'))
     assert resp.status_code == 201, resp.text
-    assert q.update_service_config.call_args.kwargs["health_check"] == {"path": "/"}
+    assert q.update_service_config_guarded.call_args.kwargs["health_check"] == {"path": "/"}
 
 
 def test_deploy_rejects_invalid_health_type(tmp_path):
@@ -956,7 +1015,7 @@ def test_redeploy_without_gpus_keeps_existing(tmp_path):
         headers=_auth(SUB_RAW),
     )
     assert resp.status_code == 201, resp.text
-    assert q.update_service_config.call_args.kwargs["gpu_count"] == 3
+    assert q.update_service_config_guarded.call_args.kwargs["gpu_count"] == 3
 
 
 def test_redeploy_after_rollback_allocates_fresh_tag(tmp_path):
@@ -977,7 +1036,7 @@ def test_redeploy_after_rollback_allocates_fresh_tag(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip())
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["image"] == "nerdit-app/demo:4"
     assert cfg["build_version"] == 4
     assert cfg["max_version"] == 4
@@ -991,7 +1050,7 @@ def test_rollback_non_owner_forbidden(tmp_path):
     q = _queries(existing)
     resp = _client(q, tmp_path).post("/deploy/demo/rollback", headers=_auth(SUB_RAW))
     assert resp.status_code == 403
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
 
 
 def test_rollback_admin_succeeds(tmp_path):
@@ -1018,7 +1077,7 @@ def test_rollback_preserves_max_version(tmp_path):
     q = _queries(existing)
     resp = _client(q, tmp_path).post("/deploy/demo/rollback", headers=_auth(SUB_RAW))
     assert resp.status_code == 200, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["build_version"] == 2
     assert cfg["max_version"] == 3  # unchanged
 
@@ -1201,7 +1260,7 @@ def test_rollback_swaps_to_previous(tmp_path):
     q = _queries(existing)
     resp = _client(q, tmp_path).post("/deploy/demo/rollback", headers=_auth(SUB_RAW))
     assert resp.status_code == 200, resp.text
-    args, kwargs = q.update_service_config.call_args
+    args, kwargs = q.update_service_config_guarded.call_args
     cfg = json.loads(args[1])
     assert cfg["image"] == "nerdit-app/demo:1"  # rolled back
     assert cfg["previous_image"] == "nerdit-app/demo:2"  # can roll forward
@@ -1272,7 +1331,7 @@ def test_rollback_is_refused_409_while_a_release_is_in_flight(tmp_path):
     assert resp.json()["code"] == "service.run_in_progress"
     # Zero writes: the image is not swapped and the in-flight generation's
     # crash marker is still armed.
-    q.update_service_config.assert_not_awaited()
+    q.update_service_config_guarded.assert_not_awaited()
 
     # NOT sticky: once the release settles and frees its slot, the very same
     # rollback goes through — and only then clears the (now wedged) marker,
@@ -1280,7 +1339,7 @@ def test_rollback_is_refused_409_while_a_release_is_in_flight(tmp_path):
     controller._discard_run("svc-1", "rel-1")
     resp = client.post("/deploy/demo/rollback", headers=_auth(SUB_RAW))
     assert resp.status_code == 200, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["image"] == "nerdit-app/demo:1"
     assert "release_pending" not in cfg
     assert "cutover_pending" not in cfg
@@ -1301,7 +1360,8 @@ def test_rollback_gate_is_skipped_when_no_controller_is_wired(tmp_path):
         "/deploy/demo/rollback", headers=_auth(SUB_RAW)
     )
     assert resp.status_code == 200, resp.text
-    assert json.loads(q.update_service_config.call_args.args[1])["image"] == "nerdit-app/demo:1"
+    written = json.loads(q.update_service_config_guarded.call_args.args[1])
+    assert written["image"] == "nerdit-app/demo:1"
 
 
 # --- route: [ai.*] server-side parse + model gating (P5 / S8) ----------------
@@ -1481,7 +1541,7 @@ def test_redeploy_replaces_ai_spec(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_ai_zip(_AI_API_TOML))
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert set(cfg["ai"]) == {"default"}  # replaced, never merged
     assert cfg["ai"]["default"]["provider"] == "api"
 
@@ -1494,7 +1554,7 @@ def test_redeploy_drops_ai_when_absent(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip())  # no nerdit.toml at all
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert "ai" not in cfg
 
 
@@ -1512,7 +1572,7 @@ def test_rollback_leaves_ai_intact(tmp_path):
     q = _queries(existing)
     resp = _client(q, tmp_path).post("/deploy/demo/rollback", headers=_auth(SUB_RAW))
     assert resp.status_code == 200, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["ai"] == ai  # untouched by the image swap
     assert cfg["image"] == "nerdit-app/demo:1"
 
@@ -1541,7 +1601,7 @@ def test_redeploy_preserves_ai_when_api_marked_and_source_silent(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip())  # no nerdit.toml
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["ai"] == {"default": {"provider": "ollama", "model": "llama3.1:8b"}}
     assert cfg["ai_source"] == "api"  # marker survives for the NEXT silent redeploy
 
@@ -1560,7 +1620,7 @@ def test_second_silent_redeploy_still_preserves_ai(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip())
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["ai"] == {"default": {"provider": "ollama", "model": "llama3.1:8b"}}
     assert cfg["ai_source"] == "api"
 
@@ -1577,7 +1637,7 @@ def test_redeploy_declared_ai_replaces_and_pops_marker(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_ai_zip(_AI_API_TOML))
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert set(cfg["ai"]) == {"default"}  # replaced
     assert "ai_source" not in cfg  # marker popped
 
@@ -1591,7 +1651,7 @@ def test_redeploy_env_null_delete_removes_key(tmp_path):
     q = _queries(existing)
     resp = _post(_client(q, tmp_path), _node_zip(), env=json.dumps({"DROP": None, "NEW": "3"}))
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["env"] == {"KEEP": "1", "NEW": "3", "NERDIT_DATA_DIR": "/data"}
 
 
@@ -1650,7 +1710,7 @@ def test_dry_run_writes_nothing_and_returns_plan(tmp_path):
     assert body["overwrote_api_config"] is False
     assert isinstance(body["warnings"], list)
     q.reserve_service_for_token.assert_not_called()
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
 
 
 def test_dry_run_redeploy_env_diff_names_only(tmp_path):
@@ -1666,7 +1726,7 @@ def test_dry_run_redeploy_env_diff_names_only(tmp_path):
         "changed": [],
         "kept": 1,
     }
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
 
 
 def test_dry_run_audited_as_deploy_plan_with_env_masked(tmp_path):
@@ -1695,7 +1755,7 @@ def test_dry_run_redeploy_non_owner_403_before_diff(tmp_path):
     resp = _dry_post(_client(q, tmp_path), _node_zip())  # SUB_RAW = tok-sub
     assert resp.status_code == 403
     assert resp.json()["code"] == "forbidden"
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
     q.reserve_service_for_token.assert_not_called()
 
 
@@ -2120,9 +2180,10 @@ async def test_redeploy_gpu_increase_enforces_owner_quota(queries):
     svc = await _running_service(queries, token.id, gpus=0)
 
     with pytest.raises(QuotaExceeded) as exc:
-        await queries.update_service_config(
+        await queries.update_service_config_guarded(
             svc.id,
             json.dumps({"image": "nerdit-app/app:2"}),
+            expect_max_version=0,
             status=JobStatus.restarting,
             desired_state="running",
             gpu_count=2,
@@ -2140,9 +2201,10 @@ async def test_redeploy_within_gpu_cap_succeeds(queries):
     token = await _owner_token(queries, max_gpus=2)
     svc = await _running_service(queries, token.id, gpus=0)
 
-    await queries.update_service_config(
+    await queries.update_service_config_guarded(
         svc.id,
         json.dumps({"image": "nerdit-app/app:2"}),
+        expect_max_version=0,
         status=JobStatus.restarting,
         desired_state="running",
         gpu_count=2,
@@ -2162,9 +2224,10 @@ async def test_redeploy_gpu_not_double_counted(queries):
     token = await _owner_token(queries, max_gpus=2)
     svc = await _running_service(queries, token.id, gpus=2)
 
-    await queries.update_service_config(
+    await queries.update_service_config_guarded(
         svc.id,
         json.dumps({"image": "nerdit-app/app:2"}),
+        expect_max_version=0,
         status=JobStatus.restarting,
         desired_state="running",
         gpu_count=2,
@@ -2474,7 +2537,7 @@ def test_zip_deploy_stamps_source(tmp_path):
     q2 = _queries(existing)
     resp = _post(_client(q2, tmp_path), _node_zip())
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q2.update_service_config.call_args.args[1])
+    cfg = json.loads(q2.update_service_config_guarded.call_args.args[1])
     assert cfg["source"] == {"type": "zip"}
 
 
@@ -2488,7 +2551,11 @@ _DB_EXTERNAL_TOML = (
 )
 
 
-def _db_row(status: JobStatus = JobStatus.running, name: str = "pg") -> Job:
+def _db_row(
+    status: JobStatus = JobStatus.running, name: str = "pg", owner: str | None = "tok-sub"
+) -> Job:
+    # `POST /databases` stamps `submitted_by_token`, so a realistic row is
+    # owned; `owner` drives the H2 cross-owner regressions.
     return Job(
         id="db-1",
         service_name=name,
@@ -2497,6 +2564,7 @@ def _db_row(status: JobStatus = JobStatus.running, name: str = "pg") -> Job:
         gpu_count=0,
         status=status,
         config=json.dumps({"backend": "postgres"}),
+        submitted_by_token=owner,
     )
 
 
@@ -2538,6 +2606,92 @@ def test_deploy_gate_db_building_passes(tmp_path):
     q = _queries_with_db(_db_row(JobStatus.building))
     resp = _post(_client(q, tmp_path), _node_ai_zip(_DB_MANAGED_TOML))
     assert resp.status_code == 201, resp.text
+
+
+# --- H2: the managed [db.*] gate authorizes the REFERENCED database row ------
+#
+# A managed binding hands the app the database's minted password at launch
+# (DATABASE_URL), so binding to a row is acting on it: without an ownership /
+# scope check any submitter could read another owner's database.
+
+
+def test_deploy_gate_db_cross_owner_forbidden(tmp_path):
+    """A submitter binding to another owner's database is 403, nothing written."""
+    q = _queries_with_db(_db_row(owner="tok-other"))
+    resp = _post(_client(q, tmp_path), _node_ai_zip(_DB_MANAGED_TOML))
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["code"] == "forbidden"
+    q.reserve_service_for_token.assert_not_called()
+
+
+def test_deploy_gate_db_out_of_scope_forbidden(tmp_path):
+    """A token scoped to its own app may not bind a database outside that scope."""
+    q = _queries_with_db(_db_row(owner="tok-scoped"))
+    resp = _post(_client(q, tmp_path), _node_ai_zip(_DB_MANAGED_TOML), raw=SCOPED_RAW)
+    assert resp.status_code == 403, resp.text
+    body = resp.json()
+    assert body["code"] == "forbidden"
+    assert "pg" in body["message"]  # the scope refusal names the target
+    q.reserve_service_for_token.assert_not_called()
+
+
+def test_deploy_gate_db_owner_passes(tmp_path):
+    """The database's own owner binds it (the pre-fix behaviour for this case)."""
+    q = _queries_with_db(_db_row(owner="tok-sub"))
+    resp = _post(_client(q, tmp_path), _node_ai_zip(_DB_MANAGED_TOML))
+    assert resp.status_code == 201, resp.text
+
+
+def test_deploy_gate_db_admin_bypasses(tmp_path):
+    """Admin binds any database, as everywhere else."""
+    q = _queries_with_db(_db_row(owner="tok-other"))
+    resp = _post(_client(q, tmp_path), _node_ai_zip(_DB_MANAGED_TOML), raw=LEGACY)
+    assert resp.status_code == 201, resp.text
+
+
+def test_deploy_gate_db_null_owner_passes(tmp_path):
+    """A database created with the legacy global token (NULL owner) — the
+    single-operator install's mainstream case — stays bindable by a scoped CI
+    token and by the permanently-submitter tunnel principal. Admin-only there
+    would break `nerdit db create pg` + `[db.default] database = "pg"`."""
+    q = _queries_with_db(_db_row(owner=None))
+    resp = _post(_client(q, tmp_path), _node_ai_zip(_DB_MANAGED_TOML))
+    assert resp.status_code == 201, resp.text
+
+
+def test_deploy_gate_db_cross_owner_refusal_names_the_binding(tmp_path):
+    """The owner leg must not reuse the generic row denial: at this ingress
+    that envelope is byte-identical to "you do not own the APP", so the caller
+    could not tell which check failed."""
+    q = _queries_with_db(_db_row(owner="tok-other"))
+    resp = _post(_client(q, tmp_path), _node_ai_zip(_DB_MANAGED_TOML))
+    assert resp.status_code == 403, resp.text
+    message = resp.json()["message"]
+    assert "db.default" in message
+    assert "'pg'" in message
+
+
+def test_redeploy_over_an_unchanged_foreign_binding_passes(tmp_path):
+    """An owner redeploying its OWN app whose nerdit.toml still names a
+    database it does not own is carrying the binding forward, not authoring
+    it — refusing there breaks `nerdit deploy .` on a flow that already runs
+    (and that a toml-silent redeploy carries forward ungated anyway)."""
+    existing = _redeploy_existing({"db": {"default": {"provider": "managed", "database": "pg"}}})
+    q = _queries_with_db(_db_row(owner="tok-other"), existing)
+    q.update_service_config_guarded = AsyncMock(return_value=True)
+    resp = _post(_client(q, tmp_path), _node_ai_zip(_DB_MANAGED_TOML))
+    assert resp.status_code == 201, resp.text
+
+
+def test_redeploy_that_changes_a_foreign_binding_is_refused(tmp_path):
+    """Carry-forward is not a laundering path: a spec that differs from the
+    persisted one is authored by this caller and re-gated."""
+    existing = _redeploy_existing({"db": {"default": {"provider": "managed", "database": "old"}}})
+    q = _queries_with_db(_db_row(owner="tok-other"), existing)
+    q.update_service_config_guarded = AsyncMock(return_value=True)
+    resp = _post(_client(q, tmp_path), _node_ai_zip(_DB_MANAGED_TOML))
+    assert resp.status_code == 403, resp.text
+    q.update_service_config_guarded.assert_not_called()
 
 
 def test_deploy_external_db_needs_no_row(tmp_path):
@@ -2597,8 +2751,9 @@ def test_redeploy_preserves_db_when_api_marked_and_source_silent(tmp_path):
 
     async def _apply(job_id, config_json, **kwargs):
         _apply.cfg = json.loads(config_json)
+        return True
 
-    q.update_service_config = AsyncMock(side_effect=_apply)
+    q.update_service_config_guarded = AsyncMock(side_effect=_apply)
     resp = _post(_client(q, tmp_path), _node_zip())  # no [db] in the source
     assert resp.status_code == 201, resp.text
     assert _apply.cfg["db"] == {"default": {"provider": "managed", "database": "pg"}}
@@ -2613,8 +2768,9 @@ def test_redeploy_db_declared_replaces_and_drops_marker(tmp_path):
 
     async def _apply(job_id, config_json, **kwargs):
         _apply.cfg = json.loads(config_json)
+        return True
 
-    q.update_service_config = AsyncMock(side_effect=_apply)
+    q.update_service_config_guarded = AsyncMock(side_effect=_apply)
     resp = _post(_client(q, tmp_path), _node_ai_zip(_DB_MANAGED_TOML))
     assert resp.status_code == 201, resp.text
     assert _apply.cfg["db"] == {"default": {"provider": "managed", "database": "pg"}}
@@ -2629,8 +2785,9 @@ def test_redeploy_silent_no_marker_drops_db(tmp_path):
 
     async def _apply(job_id, config_json, **kwargs):
         _apply.cfg = json.loads(config_json)
+        return True
 
-    q.update_service_config = AsyncMock(side_effect=_apply)
+    q.update_service_config_guarded = AsyncMock(side_effect=_apply)
     resp = _post(_client(q, tmp_path), _node_zip())
     assert resp.status_code == 201, resp.text
     assert "db" not in _apply.cfg
@@ -2648,8 +2805,8 @@ _RELEASE_TOML = '[deploy]\nname = "demo"\nrelease = "alembic upgrade head"\n'
 
 def _written_cfg(q) -> dict:
     """The config blob the pipeline handed to the write branch (fresh or redeploy)."""
-    if q.update_service_config.call_args is not None:
-        return json.loads(q.update_service_config.call_args.args[1])
+    if q.update_service_config_guarded.call_args is not None:
+        return json.loads(q.update_service_config_guarded.call_args.args[1])
     return json.loads(q.reserve_service_for_token.await_args.args[0].config)
 
 
@@ -2735,7 +2892,7 @@ def test_dry_run_plan_carries_the_release_it_would_run(tmp_path):
     assert resp.status_code == 200, resp.text
     assert resp.json()["effective"]["release"] == "alembic upgrade head"
     q.reserve_service_for_token.assert_not_called()
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
 
 
 def test_dry_run_plan_shows_a_carried_forward_release_on_a_silent_redeploy(tmp_path):
@@ -2813,7 +2970,7 @@ def test_rollback_clears_a_stale_release_marker_but_keeps_the_command(tmp_path):
     q = _queries(existing)
     resp = _client(q, tmp_path).post("/deploy/demo/rollback", headers=_auth(SUB_RAW))
     assert resp.status_code == 200, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert "release_pending" not in cfg
     assert cfg["release"] == "alembic upgrade head"
     assert cfg["build_version"] == 1
@@ -2923,7 +3080,7 @@ def test_dry_run_plan_carries_the_edge_auth_it_would_apply(tmp_path):
     assert resp.status_code == 200, resp.text
     assert resp.json()["effective"]["edge_auth"] == _EDGE_AUTH_BLOB
     q.reserve_service_for_token.assert_not_called()
-    q.update_service_config.assert_not_called()
+    q.update_service_config_guarded.assert_not_called()
 
 
 def test_dry_run_plan_shows_a_carried_forward_edge_auth_on_a_silent_redeploy(tmp_path):

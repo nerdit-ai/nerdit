@@ -231,8 +231,9 @@ async def dump_database(
         ``list_databases`` for ``db_ready``), ``409 dump.in_progress`` (this
         database already has one running; distinct from the daemon-wide
         ``backup.in_progress``), ``409 dump.too_many_in_flight``, ``409
-        dump.insufficient_disk`` (``detail`` carries ``required_bytes`` /
-        ``free_bytes``), ``422 dump.not_a_database``, and ``500 dump.failed``
+        dump.insufficient_disk`` (the error object carries top-level
+        ``required_bytes`` / ``free_bytes``), ``422 dump.not_a_database``, and
+        ``500 dump.failed``
         whose ``hint`` is the tool's own last output line. There is deliberately
         **no restore tool** — restoring replaces live data and stays on the CLI
         (``nerdit db restore``) and REST.

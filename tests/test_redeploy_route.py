@@ -94,7 +94,8 @@ def _queries(existing: Job | None) -> AsyncMock:
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
     q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
-    q.update_service_config = AsyncMock()
+    q.update_service_config = AsyncMock()  # rollback / app-build revert
+    q.update_service_config_guarded = AsyncMock()  # redeploy (CAS on max_version)
     return q
 
 
@@ -244,7 +245,7 @@ def test_active_run_is_409(tmp_path, fake_clone):
     assert resp.json()["code"] == "service.run_in_progress"
     # The shared factory's default hint reaches the wire, naming the bound.
     assert "[services].release_timeout_s" in resp.json()["hint"]
-    q.update_service_config.assert_not_awaited()
+    q.update_service_config_guarded.assert_not_awaited()
     assert not fake_clone.calls
 
 
@@ -265,7 +266,7 @@ def test_a_run_registering_during_the_clone_is_409(tmp_path, fake_clone):
     assert resp.status_code == 409
     assert resp.json()["code"] == "service.run_in_progress"
     assert fake_clone.calls, "the refusal is the POST-clone one"
-    q.update_service_config.assert_not_awaited()
+    q.update_service_config_guarded.assert_not_awaited()
     # The cloned context is cleaned up on refusal, like every other late failure.
     assert not list((tmp_path / "uploads").iterdir())
 
@@ -279,7 +280,7 @@ def test_active_cutover_is_409(tmp_path, fake_clone):
     assert resp.status_code == 409
     assert resp.json()["code"] == "service.cutover_in_progress"
     assert "[services].cutover_verify_timeout_s" in resp.json()["hint"]
-    q.update_service_config.assert_not_awaited()
+    q.update_service_config_guarded.assert_not_awaited()
     assert not fake_clone.calls
 
 
@@ -397,7 +398,7 @@ def test_recorded_coordinates_drive_the_clone(tmp_path, fake_clone):
     assert call["subdir"] == "apps/web"
     assert call["token"] is None
     # The freshly resolved commit replaces the recorded one.
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["source"]["commit_sha"] == "1" * 40
     assert cfg["source"]["subdir"] == "apps/web"
 
@@ -432,7 +433,7 @@ def test_recorded_token_ref_is_resolved_and_carried_forward(tmp_path, fake_clone
     resp = _post(client)
     assert resp.status_code == 201, resp.text
     assert fake_clone.calls[0]["token"] == "ghp-live"
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     # The REFERENCE survives so the next redeploy is still unattended; the raw
     # token never reaches the persisted blob.
     assert cfg["source"]["token_ref"] == "${secrets.GH_TOKEN}"
@@ -462,7 +463,7 @@ def test_private_repo_without_a_recorded_token_ref_is_409(tmp_path, monkeypatch)
     # behind --name (a positional path + --repo is rejected by the git-mode
     # guard).
     assert "--name" in body["hint"]
-    q.update_service_config.assert_not_awaited()
+    q.update_service_config_guarded.assert_not_awaited()
 
 
 def test_a_non_auth_clone_failure_keeps_its_own_code(tmp_path, monkeypatch):
@@ -507,7 +508,7 @@ def test_the_git_route_stamps_token_ref_into_source_meta(tmp_path, monkeypatch):
         headers=_auth(SUB_RAW),
     )
     assert resp.status_code == 201, resp.text
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["source"]["token_ref"] == "${secrets.GH_TOKEN}"
     assert "ghp-live" not in json.dumps(cfg)
 
@@ -521,7 +522,7 @@ def test_dry_run_writes_nothing_and_returns_the_plan(tmp_path, fake_clone):
     assert resp.status_code == 200, resp.text
     assert resp.json()["dry_run"] is True
     assert fake_clone.calls, "the clone still runs — the plan is computed from the real tree"
-    q.update_service_config.assert_not_awaited()
+    q.update_service_config_guarded.assert_not_awaited()
     q.reserve_service_for_token.assert_not_awaited()
 
 
@@ -578,7 +579,7 @@ async def test_system_shim_redeploys_without_a_request(tmp_path, fake_clone):
 
     assert result["name"] == "demo"
     assert fake_clone.calls, "the recorded source is re-cloned"
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["source"]["commit_sha"] == "1" * 40
     assert cfg["build_overrides"] == config["build_overrides"]
     assert result["build"]["build"] is False
@@ -610,7 +611,7 @@ async def test_system_shim_is_refused_while_a_run_is_active(tmp_path, fake_clone
         )
 
     assert (exc.value.status_code, exc.value.code) == (409, "service.run_in_progress")
-    q.update_service_config.assert_not_awaited()
+    q.update_service_config_guarded.assert_not_awaited()
     assert not fake_clone.calls
 
 
@@ -719,7 +720,7 @@ def test_same_key_replays_instead_of_rebuilding(tmp_path, fake_clone):
     assert second.status_code == 201
     assert second.headers.get("Idempotent-Replay") == "true"
     assert len(fake_clone.calls) == 1, "a replay must not re-clone or rebuild"
-    assert q.update_service_config.await_count == 1
+    assert q.update_service_config_guarded.await_count == 1
 
 
 def test_a_stray_key_on_a_dry_run_does_not_poison_the_later_real_redeploy(tmp_path, fake_clone):
@@ -736,7 +737,7 @@ def test_a_stray_key_on_a_dry_run_does_not_poison_the_later_real_redeploy(tmp_pa
 
     real = _post(client, **headers)
     assert real.status_code == 201, real.text
-    assert q.update_service_config.await_count == 1
+    assert q.update_service_config_guarded.await_count == 1
 
 
 def test_a_key_in_flight_is_409(tmp_path, fake_clone):
@@ -839,7 +840,7 @@ def test_redeploy_carries_edge_auth_forward(tmp_path, fake_clone):
     q = _queries(row)
     resp = _post(_client(q, tmp_path))
     assert resp.status_code == 201, resp.text
-    written = json.loads(q.update_service_config.await_args.args[1])
+    written = json.loads(q.update_service_config_guarded.await_args.args[1])
     assert written["edge_auth"] == edge_auth
 
 
@@ -852,13 +853,7 @@ def _link_manager(
     link_state: str = "connected",
     pro_mirror: str = "never",
 ) -> MagicMock:
-    """As in ``tests/test_deploy_git_route.py``: both link reads spelled out.
-
-    P34 D3 branches on ``status().state`` and ``pro_mirror_state()``; leaving
-    them as bare ``MagicMock`` attributes would make the generic hint an
-    accident of mock identity rather than a decision. Defaults are the ordinary
-    P33 node: online, nothing asserted about the plan.
-    """
+    """Keep link and mirror states explicit while repository grants stay separate."""
     mgr = MagicMock()
     mgr.github_token_for_repo = MagicMock(side_effect=lambda slug: tokens.get(slug))
     # The auth middleware also consults a wired manager for relay capabilities:
@@ -869,50 +864,27 @@ def _link_manager(
     return mgr
 
 
-def test_the_redeploy_raise_site_is_tier_aware_too(tmp_path, fake_clone):
-    """(P34 D3) The pipeline's ``_resolve_source_token`` is the SECOND raise
-    site of ``github_token_absent_error`` — the redeploy path a user triggers by
-    hand — and it takes the same one decision function as the git route, so the
-    two cannot drift into telling the same account two different stories.
-
-    Everything but the hint stays the P33 envelope: same status, same code.
-    """
+@pytest.mark.parametrize("pro_mirror", ["fresh_false", "fresh_true", "stale", "never"])
+@pytest.mark.parametrize("role", [LEGACY, SUB_RAW])
+def test_redeploy_github_absence_ignores_public_share_eligibility(
+    tmp_path, fake_clone, pro_mirror, role
+):
+    """Redeploy preserves the repository refusal without sending users to billing."""
     source = {**_GIT_SOURCE, "token_ref": "${github.installation}"}
     q = _queries(_git_row(source=source))
     app = _make_app(q, tmp_path, secret_manager=_secret_manager({}))
-    app.state.link_manager = _link_manager({}, link_state="connected", pro_mirror="fresh_false")
+    app.state.link_manager = _link_manager({}, pro_mirror=pro_mirror)
 
     resp = TestClient(app, raise_server_exceptions=False).post(
-        "/deploy/demo/redeploy", headers=_auth(SUB_RAW)
+        "/deploy/demo/redeploy", headers=_auth(role)
     )
 
     assert resp.status_code == 422
     body = resp.json()
     assert body["code"] == "deploy.github_token_absent"
-    assert body["hint"] == (
-        "this account's plan does not include GitHub deploys — see the Nerdit console"
-    )
-    assert not fake_clone.calls
-
-
-def test_the_redeploy_hint_stays_generic_on_a_stale_mirror(tmp_path, fake_clone):
-    """The failure D-X16-37 exists to prevent, pinned on the redeploy path too:
-    a day of cloud silence must not turn into "your plan is too small"."""
-    source = {**_GIT_SOURCE, "token_ref": "${github.installation}"}
-    q = _queries(_git_row(source=source))
-    app = _make_app(q, tmp_path, secret_manager=_secret_manager({}))
-    app.state.link_manager = _link_manager({}, link_state="connected", pro_mirror="stale")
-
-    # The legacy admin: the generic wording is the admin's (a submitter's is
-    # pinned in test_recorded_github_ref_without_a_token_is_422_before_the_clone).
-    resp = TestClient(app, raise_server_exceptions=False).post(
-        "/deploy/demo/redeploy", headers=_auth(LEGACY)
-    )
-
-    assert resp.status_code == 422
-    assert resp.json()["hint"] == (
-        "link this node and install the Nerdit GitHub App, or pass a `${secrets.*}` token_ref"
-    )
+    assert "Nerdit GitHub App" in body["hint"]
+    assert "plan" not in body["hint"]
+    assert "upgrade" not in body["hint"]
     assert not fake_clone.calls
 
 
@@ -932,7 +904,7 @@ def test_recorded_github_ref_resolves_by_repo_and_is_carried_forward(tmp_path, f
     # The secret store is never consulted for the literal.
     mgr.load.assert_not_called()
     # The reference NAME rides forward; the value never lands anywhere.
-    cfg = json.loads(q.update_service_config.await_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.await_args.args[1])
     assert cfg["source"]["token_ref"] == "${github.installation}"
     assert sentinel not in json.dumps(cfg)
     assert sentinel not in json.dumps([c.kwargs for c in q.insert_audit_log.await_args_list])
@@ -952,7 +924,7 @@ def test_recorded_github_ref_without_a_token_is_422_before_the_clone(tmp_path, f
     assert body["hint"].startswith("this token cannot install the Nerdit GitHub App")
     assert "${secrets.shared.GITHUB_TOKEN}" in body["hint"]
     assert not fake_clone.calls
-    q.update_service_config.assert_not_awaited()
+    q.update_service_config_guarded.assert_not_awaited()
 
 
 def test_recorded_github_ref_for_a_repo_outside_every_installation_is_422(tmp_path, fake_clone):
@@ -987,6 +959,6 @@ async def test_saved_public_env_survives_a_redeploy_from_source(tmp_path, fake_c
         principal="system",
     )
 
-    cfg = json.loads(q.update_service_config.call_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["public_env"] == {"VITE_API": "https://api.example.com"}
     assert result["build"]["public_env"] == {"VITE_API": "https://api.example.com"}

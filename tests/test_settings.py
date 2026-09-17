@@ -514,3 +514,44 @@ def test_proxy_acme_is_restart_required():
     from nerdit.config.store import _RESTART_KEYS
 
     assert "acme" in _RESTART_KEYS["proxy"]
+
+
+# --- [daemon].auth_token charset ---------------------------------------------
+
+
+def test_non_ascii_auth_token_fails_at_load(tmp_path):
+    """A hand-edited non-ASCII token is refused at boot rather than silently
+    matching nothing: the Authorization header carries no charset that would
+    round-trip it, so every request would 403."""
+    config = tmp_path / "config.toml"
+    config.write_text('[daemon]\nauth_token = "café"\n')
+
+    with pytest.raises(ValidationError, match="ASCII"):
+        load_settings(config)
+
+
+def test_non_ascii_auth_token_hint_points_at_the_file_not_a_command(tmp_path):
+    """The refusal must name a repair that exists.
+
+    Every CLI verb loads this file, so a wedged token means no shipped command
+    can run at all: `nerdit token` only DISPLAYS the configured value and
+    `nerdit init --auth-token-only` leaves a non-empty token alone. Telling the
+    operator to "generate one with 'nerdit token'" sent them in a circle.
+    """
+    config = tmp_path / "config.toml"
+    config.write_text('[daemon]\nauth_token = "caf\u00e9"\n')
+
+    with pytest.raises(ValidationError) as excinfo:
+        load_settings(config)
+
+    message = str(excinfo.value)
+    assert "[daemon].auth_token" in message
+    assert "by hand" in message
+    assert "Generate one with 'nerdit token'" not in message
+
+
+def test_ascii_auth_token_loads(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text('[daemon]\nauth_token = "nrd_abc123"\n')
+
+    assert load_settings(config).daemon.auth_token == "nrd_abc123"

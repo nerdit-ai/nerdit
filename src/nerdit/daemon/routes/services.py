@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -49,7 +50,7 @@ from nerdit.db.models import (
     TokenRole,
 )
 from nerdit.db.queries import ServiceNameTaken
-from nerdit.utils.disk import du_bytes
+from nerdit.utils.disk import du_bytes, spawn_walk
 
 logger = logging.getLogger(__name__)
 
@@ -305,15 +306,98 @@ async def get_service(request: Request, ident: str) -> ServiceResponse:
     )
 
 
+#: Cache window for one service's data-dir size, seconds. Long enough that the
+#: `nerdit logs -f` / dashboard 1 s poll collapses to one walk, short enough
+#: that a size on screen still moves. A coalescing detail, not policy — so not
+#: configurable, mirroring `service_stats._STATS_TTL_S`.
+_DATA_DIR_TTL_S = 10.0
+
+#: Soft budget for one walk. On overrun this request answers `null` rather than
+#: blocking on a huge tree: `data_dir_bytes` is one informational field on a
+#: read whose other fields are cheap. The walk itself is NOT cancelled — it
+#: keeps running and fills the cache when it lands, so the next TTL window
+#: reports a real number instead of re-answering `null` forever while spawning
+#: a fresh walker each time.
+_DATA_DIR_BUDGET_S = 5.0
+
+#: Belt-and-braces bound on retained cache entries (expired rows are dropped on
+#: every read, so the steady state is "services read in the last TTL").
+_DATA_DIR_CACHE_MAX = 256
+
+#: `app.state` attributes holding the cache and the per-name in-flight walks.
+#: On the app, never module globals, so parallel test apps never share entries
+#: (the `service_stats` precedent).
+_DATA_DIR_CACHE_ATTR = "service_data_dir_cache"
+_DATA_DIR_INFLIGHT_ATTR = "service_data_dir_inflight"
+
+
+def _data_dir_cache(request: Request) -> dict[str, tuple[float, int | None]]:
+    """The per-app `{service_name: (monotonic_deadline, bytes_or_None)}` cache."""
+    state = request.app.state
+    cache = getattr(state, _DATA_DIR_CACHE_ATTR, None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(state, _DATA_DIR_CACHE_ATTR, cache)
+    return cache
+
+
+def _data_dir_inflight(request: Request) -> dict[str, asyncio.Future]:
+    """The `{service_name: running walk}` registry — one walk per name at a time.
+
+    Single-flight, but keyed by SERVICE rather than daemon-wide: a shared lock
+    coalesces a hammer on one name at the price of making a slow tree block the
+    detail read of every OTHER service behind it for a whole budget, which the
+    route never did before it was serialized. Per-name keeps the coalescing —
+    a readonly-token hammer still costs one walk per name per TTL, never one
+    per request — without coupling unrelated services.
+    """
+    state = request.app.state
+    inflight = getattr(state, _DATA_DIR_INFLIGHT_ATTR, None)
+    if not isinstance(inflight, dict):
+        inflight = {}
+        setattr(state, _DATA_DIR_INFLIGHT_ATTR, inflight)
+    return inflight
+
+
+def _data_dir_cached(
+    cache: dict[str, tuple[float, int | None]], name: str, now: float
+) -> tuple[bool, int | None]:
+    """`(hit, value)` — expired rows are pruned as a side effect.
+
+    A `None` value is cached like a real one: a missing dir and an overrunning
+    walk are the cases most likely to be polled hardest, and re-answering them
+    from scratch every second is the expensive answer to a settled question.
+    """
+    for key, entry in list(cache.items()):
+        if entry[0] <= now:
+            cache.pop(key, None)
+    hit = cache.get(name)
+    return (False, None) if hit is None else (True, hit[1])
+
+
+def _walk_result(fut: asyncio.Future) -> int | None:
+    """A finished walk's value, or None when it raised."""
+    try:
+        return fut.result()
+    except Exception:  # noqa: BLE001 — an informational field never 500s a read
+        logger.debug("data_dir walk failed", exc_info=True)
+        return None
+
+
 async def _compute_data_dir_bytes(request: Request, job: Job) -> int | None:
     """On-disk size of a service's named-volume data dir, or None if unavailable.
 
     Detail-route only (P14 WP-A1): walks `<data_dir>/services/<name>` off the
-    event loop. Returns `None` when the daemon has no `data_dir` configured,
-    the name fails the seam's re-validation, or the data dir does not exist yet
-    (a row that has never mounted a volume) — the last case reports `None` rather
-    than `0` so "no data dir" is distinguishable from "an empty data dir". Never
-    raises into the response.
+    event loop, behind a `_DATA_DIR_TTL_S` cache and a PER-NAME single-flight
+    registry, so N concurrent reads of one service cost at most one walk per
+    TTL and a slow tree never delays another service's read. Returns `None`
+    when the daemon has no `data_dir` configured, the name fails the seam's
+    re-validation, the data dir does not exist yet (a row that has never mounted
+    a volume — reported as `None` rather than `0` so it stays distinguishable
+    from an empty dir), or the walk overran this request's budget. An overrun
+    walk is left running and caches its own result, so the next read past the
+    TTL reports a real number. The value may be up to one TTL stale; it is an
+    informational field, not an accounting one. Never raises into the response.
     """
     settings = getattr(request.app.state, "settings", None)
     name = job.service_name
@@ -323,9 +407,37 @@ async def _compute_data_dir_bytes(request: Request, job: Job) -> int | None:
         root = service_data_root(Path(settings.data_dir).expanduser(), name)
     except VolumeSpecError:
         return None
-    if not await asyncio.to_thread(root.exists):
+    cache = _data_dir_cache(request)
+    hit, value = _data_dir_cached(cache, name, time.monotonic())
+    if hit:
+        return value
+
+    inflight = _data_dir_inflight(request)
+    fut = inflight.get(name)
+    if fut is None:
+        fut = spawn_walk(lambda: du_bytes(root) if root.exists() else None)
+        inflight[name] = fut
+
+        def _store(done: asyncio.Future, key: str = name) -> None:
+            # Runs on the loop thread when the walk lands — including long
+            # after the request that started it answered `null`. Writing the
+            # cache here is what stops a slow tree from being re-walked every
+            # TTL forever, and dropping the registry entry is what bounds the
+            # walker threads to one per name.
+            inflight.pop(key, None)
+            if len(cache) >= _DATA_DIR_CACHE_MAX and key not in cache:
+                cache.clear()
+            cache[key] = (time.monotonic() + _DATA_DIR_TTL_S, _walk_result(done))
+
+        fut.add_done_callback(_store)
+
+    # `asyncio.wait` neither cancels nor consumes the future, so an overrun (or
+    # a client that disconnects mid-read) leaves the walk running for the
+    # callback above. The exception, if any, is always retrieved there.
+    await asyncio.wait([fut], timeout=_DATA_DIR_BUDGET_S)
+    if not fut.done():
         return None
-    return await asyncio.to_thread(du_bytes, root)
+    return _walk_result(fut)
 
 
 #: `?source=` → the `job_logs.stream` values it selects. `all` maps
@@ -376,11 +488,18 @@ async def get_service_logs(  # noqa: PLR0913
 ) -> list[LogEntry]:
     """Return bounded service logs to any authenticated principal.
 
+    Every branch is bounded: tail reads the newest N matching lines, and the
+    forward (paged) branch is capped at _MAX_LOG_TAIL entries in ascending id
+    order. A caller that wants the rest resumes from the last returned id via
+    since_id, the way the SSE twin drains its backlog.
+
     Apply grep, since and source inside SQL; tail counts matching lines only.
     Filtered forward pages expose the pre-scan maximum ID in
-    X-Nerdit-Scan-Watermark so empty matches still advance polling. The body remains
-    a bare LogEntry list; unfiltered and tail reads omit that header. Build/app source
-    filters exclude daemon system lines, which appear only under all.
+    X-Nerdit-Scan-Watermark so empty matches still advance polling; a page that
+    filled the cap omits it, because the scan stopped at the bound rather than at
+    the end of the range. The body remains a bare LogEntry list; unfiltered and
+    tail reads omit that header. Build/app source filters exclude daemon system
+    lines, which appear only under all.
     """
     queries = request.app.state.queries
     job = await _resolve_service(queries, ident)
@@ -400,10 +519,24 @@ async def get_service_logs(  # noqa: PLR0913
     # strictly larger id, which is what makes skipping to it safe.
     paged = (grep or since_ts) and not (tail is not None and tail > 0)
     watermark = await queries.max_log_id() if paged else None
+    # The forward branch carries the SAME cap as `tail` (the tail branch ignores
+    # `limit`): without one, a parameterless GET returns the whole retained
+    # history of a chatty service — tens of MB materialized as `LogEntry` objects
+    # and re-serialized, while the scan holds the shared connection.
     entries = await queries.get_logs(
-        job.id, since_id=since_id, tail=tail, grep=grep, since_ts=since_ts, streams=streams
+        job.id,
+        since_id=since_id,
+        tail=tail,
+        grep=grep,
+        since_ts=since_ts,
+        streams=streams,
+        limit=_MAX_LOG_TAIL,
     )
-    if watermark is not None:
+    # A page that filled the cap stopped at the bound, not at the end of the
+    # range, so the pre-scan maximum is NOT decided yet — handing it to a
+    # follower would skip the undrained remainder. Same rule as the stream's
+    # `len(entries) < _POLL_CHUNK` short-page test.
+    if watermark is not None and len(entries) < _MAX_LOG_TAIL:
         response.headers["X-Nerdit-Scan-Watermark"] = str(watermark)
     return entries
 

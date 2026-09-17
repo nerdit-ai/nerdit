@@ -32,9 +32,7 @@ pid_file = "~/.nerdit/nerditd.pid"
 # auth_token = "replace-with-a-strong-token"   # REQUIRED before binding to 0.0.0.0
 
 [containers]
-runtime = "docker"              # docker | podman (future)
 default_image = "nvidia/cuda:12.4.1-runtime-ubuntu22.04"
-cache_dir = "~/.nerdit/cache"
 
 [monitor]
 interval_seconds = 5

@@ -18,7 +18,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from nerdit.daemon.audit import derive_action, is_mcp_path
+from nerdit.daemon.audit import derive_action, is_mcp_path, record_denial
 from nerdit.daemon.auth import (
     LEGACY_ADMIN,
     LINK_TOKEN_PREFIX,
@@ -180,7 +180,22 @@ class ScopedTokenAuthMiddleware(BaseHTTPMiddleware):
         presented = parts[1]
 
         # Legacy global token → admin principal (no breaking change).
-        if secrets.compare_digest(presented, self.token):
+        #
+        # Compared as **bytes**, never as `str`: `compare_digest` raises
+        # `TypeError` on a `str` holding any non-ASCII character, and
+        # `presented` comes straight out of an attacker-controlled
+        # `Authorization` header (Starlette decodes headers as latin-1, so
+        # `Bearer é` is a reachable input). Raised here the error would escape
+        # the FastAPI exception handlers — auth is outermost — as a bare 500
+        # with no envelope and no denial audit row. On the encoded form it is
+        # the `False` it always meant, so such a bearer falls through to the
+        # ordinary `invalid_token` denial. `LinkManager.validate_capability`
+        # fixes the same hazard on the tunnel path. `[daemon].auth_token` is
+        # ASCII-validated at settings load, so no legitimate credential is
+        # affected.
+        if secrets.compare_digest(
+            presented.encode("utf-8", "replace"), self.token.encode("utf-8", "replace")
+        ):
             request.state.principal = LEGACY_ADMIN
             return await call_next(request)
 
@@ -355,49 +370,20 @@ class ScopedTokenAuthMiddleware(BaseHTTPMiddleware):
         effort: an audit failure must never mask the original denial.
         """
         action, target_type, target_id = derive_action(request.method, request.url.path)
-        principal_id = principal.token_id if principal else None
-        principal_role = principal.role.value if principal else None
-        rid = request_id_of(request)
-
-        queries = self._queries()
-        if queries is not None:
-            try:
-                await queries.insert_audit_log(
-                    action=action,
-                    target_type=target_type,
-                    target_id=target_id,
-                    result="denied",
-                    principal_id=principal_id,
-                    principal_role=principal_role,
-                    status_code=status_code,
-                    request_id=rid,
-                )
-            except Exception:
-                logger.warning("Failed to record auth denial audit row", exc_info=True)
-
-        # Mirror the denial onto the admin-gated audit.* stream so an admin
-        # watching live sees denials in real time (L5). Best-effort; never
-        # include token plaintext.
-        bus = getattr(request.app.state, "event_bus", None)
-        if bus is not None:
-            try:
-                bus.publish(
-                    {
-                        "type": f"audit.{action}",
-                        "ts": datetime.now(UTC).isoformat(),
-                        "action": action,
-                        "result": "denied",
-                        "status_code": status_code,
-                        "principal_id": principal_id,
-                        "principal_role": principal_role,
-                        "target_type": target_type,
-                        "target_id": target_id,
-                        "params": None,
-                        "request_id": rid,
-                    }
-                )
-            except Exception:
-                logger.warning("Failed to publish auth denial event", exc_info=True)
+        # One writer for both halves (row + the admin-gated `audit.*` mirror an
+        # admin watching live depends on), shared with the MCP transport's
+        # pre-body refusals — see `audit.record_denial`.
+        await record_denial(
+            queries=self._queries(),
+            bus=getattr(request.app.state, "event_bus", None),
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            status_code=status_code,
+            principal_id=principal.token_id if principal else None,
+            principal_role=principal.role.value if principal else None,
+            request_id=request_id_of(request),
+        )
 
     async def _touch(self, principal: Principal, method: str) -> None:
         """Throttled `last_used_at` update; skipped on safe methods.

@@ -25,7 +25,11 @@ from nerdit.mcp.tools._shared import (
     IdempotencyKey,
     apply_sandbox_note,
 )
-from nerdit.mcp.transport import _request_client
+from nerdit.mcp.transport import (
+    _local_path_refusal,
+    _readonly_write_refusal,
+    _request_client,
+)
 
 
 async def _deploy_impl(
@@ -53,6 +57,12 @@ async def _deploy_impl(
     collapses to one build. ``dry_run=True`` returns the build/config plan diff
     (env key names only, values never) with zero writes — no idempotency key is
     minted or needed. An ``env`` value of ``None`` deletes that key on redeploy.
+
+    ``path`` reads the filesystem of the process running this body, so over the
+    HTTP transport — where that process IS the daemon — it is refused before any
+    of it is touched. Authorization comes first: a readonly caller is refused
+    ahead of both, since the coarse readonly gate exempts the MCP mount and the
+    inner hop's 403 would otherwise arrive only after the walk and the zip.
     """
     from pathlib import Path
 
@@ -61,6 +71,10 @@ async def _deploy_impl(
         find_project_config,
         load_project_config,
     )
+
+    refusal = await _readonly_write_refusal("/api/deploy")
+    if refusal is not None:
+        return refusal
 
     if dry_run and rollback:
         return _bad_request("dry_run cannot be combined with rollback")
@@ -77,6 +91,11 @@ async def _deploy_impl(
 
     if not path:
         return _bad_request("path is required to deploy")
+    # Before resolving it: under HTTP the path names the daemon host, and
+    # resolving/walking it is itself the disclosure.
+    refusal = await _local_path_refusal("/api/deploy")
+    if refusal is not None:
+        return refusal
     directory = Path(path).expanduser().resolve()
     if not directory.is_dir():
         return _bad_request(f"Not a directory: {directory}")
@@ -254,7 +273,11 @@ async def deploy(
             str | None,
             Field(
                 description="Path to the app folder ON THE DAEMON HOST (``~`` expanded); "
-                "its contents are zipped and uploaded. Required unless ``rollback=True``."
+                "its contents are zipped and uploaded. Required unless ``rollback=True``. "
+                "Usable ONLY from the local ``nerdit mcp`` process: over a remote/HTTP "
+                "connection to a daemon it is refused with ``mcp.local_path_unavailable``, "
+                "since it would read that host's disk and not yours — send the source with "
+                "``write_app_files`` + ``deploy_app`` instead."
             ),
         ] = None,
         name: Annotated[
@@ -290,6 +313,12 @@ async def deploy(
         ``rollback=True``. The response carries ``next_step`` — a machine-shaped
         ``{tool, args, why}`` naming the very call to make next — because a 201
         here means "the build was accepted", never "the app is up".
+
+        ``path`` is read by the process serving this tool, so it works only on
+        the local ``nerdit mcp`` process; on a remote/HTTP connection it is
+        refused with ``mcp.local_path_unavailable``. Use ``write_app_files`` +
+        ``deploy_app`` there, or ``deploy_git`` / ``deploy_template``.
+        ``rollback=True`` needs no path and works over either transport.
 
         If the app's ``nerdit.toml`` declares ``[ai.*]`` bindings, each is
         injected at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the
@@ -494,8 +523,8 @@ async def redeploy_service(
 async def list_app_templates() -> Any:
         """List the app template store — deployable starter apps (id/name/coordinates).
 
-        Deploy one with ``deploy_template``. Distinct from ``list_jobs``-style
-        job presets: these are full app templates (web/API/AI starters).
+        Deploy one with ``deploy_template``. These are full app templates
+        (web/API/AI starters), not per-service presets.
         """
         return await _list_app_templates_impl(_request_client())
 

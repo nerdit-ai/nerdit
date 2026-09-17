@@ -11,6 +11,24 @@ from nerdit.db.models import Gpu, Job, JobKind, JobStatus
 from nerdit.db.queries import Queries
 
 
+@pytest.fixture(autouse=True)
+def _isolate_mcp_transport_mode():
+    """Keep ``nerdit.mcp.transport``'s process globals from leaking between tests.
+
+    ``build_http_app()`` flips them and never resets — correct for a daemon
+    (one process, one transport), wrong inside a shared pytest process: any
+    test that calls ``create_app()`` while the ambient ``~/.nerdit/config.toml``
+    carries ``[mcp].http_enabled`` turns every later test's tool call into an
+    HTTP-mode one, and the HTTP-only refusals (``_local_path_refusal`` /
+    ``_readonly_write_refusal``) then fire in files that never asked for them.
+    """
+    from nerdit.mcp import transport
+
+    saved = (transport._HTTP_MODE, transport._HTTP_HOST, transport._HTTP_PORT)
+    yield
+    transport._HTTP_MODE, transport._HTTP_HOST, transport._HTTP_PORT = saved
+
+
 @pytest.fixture
 async def db():
     """In-memory database fixture."""

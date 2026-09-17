@@ -340,3 +340,86 @@ def test_apply_audited_with_redacted_params(tmp_path):
         "daemon": ["daemon.port"],
         "monitor": ["monitor.interval_seconds"],
     }
+
+
+# --- no submitted value ever reaches the audit trail --------------------------
+#
+# Same defect as the section PUT: the pre-validation stamp carried the submitted
+# document, masked only by three leaf names, so a refused literal landed in
+# `audit_log.params_redacted` and on the admin `audit.*` stream.
+
+_CANARY = "s3kr3t-HMAC-CANARY"
+
+
+class _RecordingBus:
+    """Event bus stand-in that keeps every published frame."""
+
+    def __init__(self) -> None:
+        self.frames: list[dict] = []
+
+    def publish(self, frame: dict) -> None:
+        self.frames.append(frame)
+
+
+def _audited_client(path: Path, queries: AsyncMock, bus: _RecordingBus) -> TestClient:
+    app = FastAPI()
+    register_error_handlers(app)
+    app.include_router(config_router, prefix="/api")
+    app.state.queries = queries
+    app.state.config_store = ConfigStore(path)
+    app.add_middleware(AuditMiddleware, get_queries=lambda: queries, get_event_bus=lambda: bus)
+    app.add_middleware(ScopedTokenAuthMiddleware, token=LEGACY, get_queries=lambda: queries)
+    app.add_middleware(RequestIdMiddleware)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def _recorded(queries: AsyncMock, bus: _RecordingBus) -> tuple[str, str]:
+    """Return the audit row's params JSON and the published frame, serialized."""
+    queries.insert_audit_log.assert_awaited()
+    row = queries.insert_audit_log.await_args.kwargs["params_redacted"] or ""
+    assert bus.frames
+    return row, json.dumps(bus.frames[-1])
+
+
+def test_apply_rejection_never_records_the_submitted_value(tmp_path):
+    path = _seed(tmp_path, "")
+    q = _queries()
+    bus = _RecordingBus()
+    client = _audited_client(path, q, bus)
+    resp = client.post(
+        APPLY,
+        json={
+            "sections": {
+                "notifications": {
+                    "enabled": True,
+                    "targets": [{"url": "https://hooks.example.com/x", "secret_ref": _CANARY}],
+                }
+            }
+        },
+        headers=_apply_headers(client),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "config.invalid"
+    row, frame = _recorded(q, bus)
+    assert _CANARY not in row and _CANARY not in frame
+    assert json.loads(row) == {
+        "dry_run": False,
+        "submitted_keys": {"notifications": ["enabled", "targets"]},
+    }
+
+
+def test_apply_dry_run_never_records_the_submitted_value(tmp_path):
+    path = _seed(tmp_path, "")
+    q = _queries()
+    bus = _RecordingBus()
+    resp = _audited_client(path, q, bus).post(
+        APPLY,
+        json={"sections": {"proxy": {"acme": {"email": f"ops+{_CANARY}@example.com"}}}},
+        params={"dry_run": "true"},
+        headers=_auth(ADMIN_RAW),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["applied"] is False
+    row, frame = _recorded(q, bus)
+    assert _CANARY not in row and _CANARY not in frame
+    assert json.loads(row) == {"dry_run": True, "submitted_keys": {"proxy": ["acme"]}}

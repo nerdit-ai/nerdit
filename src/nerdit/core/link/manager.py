@@ -93,11 +93,7 @@ BACKOFF_STABLE_S = 30.0
 #: fire while the daemon is suspended.
 ENTITLEMENT_TTL_S = 86400
 
-#: The vocabulary of `LinkManager.pro_mirror_state` — machine
-#: tokens, never rendered text, so a caller branches on a closed set that
-#: mypy checks rather than on a string it hopes is spelled right. The three
-#: non-`fresh_false` members exist to be *rejected* by the one caller that
-#: reads them (D-X16-37): only a fresh negative assertion is evidence.
+#: Internal mirror states; only a fresh positive assertion permits publication.
 ProMirrorState = Literal["fresh_true", "fresh_false", "stale", "never"]
 
 #: How far ahead of the daemon's clock a push's `issued_at` may sit
@@ -450,7 +446,7 @@ class LinkManager:
           `_hosted_public_effective` answers `True` for.
         * `"fresh_false"` — a recent *negative* assertion: the cloud looked at
           this account and said no. The only state a caller may read as
-          evidence about the plan (D-X16-37); the other three are ambiguous
+          evidence about hosted access; the other three are ambiguous
           and every caller must fall back to saying nothing specific.
 
         Read-only and synchronous, like every other reader of the mirror, and
@@ -735,17 +731,11 @@ class LinkManager:
         cloud re-pushes on the next node-online edge, so the cost of
         forgetting is one push per installation.
 
-        Deliberately NOT wired to `set_hosted_public_entitled`. Post-X16
-        that flag is the Pro bit, so a `False` push and "no GitHub deploys"
-        now coincide, and the wiring has to be argued rather than assumed. It
-        stays off because the cloud owns the downgrade sequence (D-X16-30,
-        D-X16-40): it pushes `repos: []` to quiesce this mirror first and
-        revokes the installation token upstream second, so a push-driven clear
-        here would race a teardown the cloud already completes, keyed off the
-        entitlement edge instead of the token edge the cloud is driving. A
-        lapse that ends hosted access altogether is enforced by the relay
-        closing the link, which lands here as the offline edge (plan
-        D-GH-2 as amended in the review round).
+        Independent of `set_hosted_public_entitled`: repository authorization
+        is separate from public sharing. The cloud quiesces a revoked installation
+        with `repos: []` before revoking its token upstream. Clearing here on a
+        public-share assertion would race that sequence. Account standing is
+        enforced by the relay closing the link, which clears both mirrors.
         """
         self._github_tokens.clear()
 

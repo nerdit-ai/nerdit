@@ -20,6 +20,28 @@ def _make_client(handler, *, token: str | None = None) -> NerditClient:
     )
 
 
+# ---- base URL construction ----
+
+
+@pytest.mark.parametrize(
+    "host, expected",
+    [
+        ("127.0.0.1", "http://127.0.0.1:9321"),
+        ("localhost", "http://localhost:9321"),
+        ("nerdit.example", "http://nerdit.example:9321"),
+        ("::1", "http://[::1]:9321"),
+        ("[::1]", "http://[::1]:9321"),
+        ("fd00::5", "http://[fd00::5]:9321"),
+    ],
+)
+def test_base_url_brackets_ipv6_literals(host, expected):
+    # An unbracketed `http://::1:9321` makes httpx raise InvalidURL, which is
+    # NOT an HTTPError and so escapes every caller's error mapping.
+    client = NerditClient(host=host, port=9321)
+    assert client._base_url == expected
+    assert httpx.URL(client._base_url).port == 9321
+
+
 # ---- simple GET / POST happy paths ----
 
 
@@ -600,3 +622,24 @@ async def test_wait_for_service_preserves_query_and_long_poll_timeout():
 
     result = await _make_client(handler).wait_for_service("demo", version=0, timeout=75)
     assert result == {"outcome": "ready"}
+
+
+@pytest.mark.asyncio
+async def test_wait_for_service_floors_only_the_transport_deadline():
+    """A `--timeout -100` must still reach the daemon and hit its clamp.
+
+    The transport deadline is `max(1, timeout) + 30`: unfloored it would be
+    negative, and httpx fails a negative timeout before any I/O — so
+    `nerdit services wait --timeout -100` answered `connection_error` against a
+    healthy daemon instead of the documented [1, 300] clamp. The request value
+    stays unfloored on purpose: the daemon owns the clamp and answers with the
+    value it actually used.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert dict(request.url.params) == {"timeout": "-100"}
+        assert request.extensions["timeout"]["read"] == 31
+        return httpx.Response(200, json={"outcome": "converged", "timeout": 1})
+
+    result = await _make_client(handler).wait_for_service("demo", timeout=-100)
+    assert result["outcome"] == "converged"

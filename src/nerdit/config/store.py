@@ -99,7 +99,48 @@ _SECTION_MODELS: dict[str, type[BaseModel]] = {
 # ``service_port_range`` is bound once at startup by the ServiceController, so a
 # change needs a restart to take effect.
 _RESTART_KEYS: dict[str, frozenset[str]] = {
-    "daemon": frozenset({"host", "port", "auth_token", "instance_id"}),
+    # The top-level ``[nerdit]`` section. ``data_dir`` is resolved once in the
+    # lifespan (database, secrets, volumes, workspaces, backups all hang off the
+    # boot value) and ``log_level`` is consumed once by ``setup_logging``, so
+    # both are restart-required. Note the keys live on the ``NerditSettings``
+    # root, not on a ``settings.nerdit`` attribute — the doctor drift check
+    # resolves that via ``restart_section_holder``.
+    "nerdit": frozenset({"data_dir", "log_level"}),
+    # ``upload_dir``/``max_upload_bytes`` are read off the BOOT
+    # ``app.state.settings`` by every ingress (deploy, workspaces, templates,
+    # ``/capabilities``), and ``upload_dir`` is additionally folded into
+    # ``containers.allowed_mount_roots`` once in the lifespan; ``pid_file`` is
+    # where the running daemon's pid was written, so moving it only takes
+    # effect for the next start. All boot-frozen, like the four above.
+    "daemon": frozenset(
+        {
+            "host",
+            "port",
+            "auth_token",
+            "instance_id",
+            "upload_dir",
+            "max_upload_bytes",
+            "pid_file",
+        }
+    ),
+    # ``[containers]`` is captured once at boot in two places — ``DockerRuntime``
+    # (``daemon/server.py``) and ``ServiceController`` (``daemon/bootstrap.py``),
+    # whose copy ``core/launch.py`` reads at every launch — so a config PUT only
+    # rewrites TOML until the daemon restarts. That includes the sandbox
+    # hardening trio, where an untruthful ``requires_restart: false`` would read
+    # as "hardening is live" when it is not. Whole-section frozenset.
+    "containers": frozenset(
+        {
+            "default_image",
+            "default_memory_limit",
+            "default_cpu_limit",
+            "allowed_mount_roots",
+            "denied_mount_paths",
+            "drop_all_caps",
+            "no_new_privileges",
+            "read_only_rootfs",
+        }
+    ),
     # The P20 trio is read off the settings captured at startup (the run route
     # off ``app.state.settings``, the release hook off the controller's copy),
     # so a config PUT only rewrites TOML until the daemon restarts. The P24b
@@ -122,10 +163,26 @@ _RESTART_KEYS: dict[str, frozenset[str]] = {
             # construction, exactly like the P20 run trio above.
             "dump_timeout_max_s",
             "max_concurrent_dumps",
+            # The restart-policy pair is snapshotted by ``ServiceController``
+            # at construction (``core/services.py``) exactly like the trio
+            # above, so a PUT only rewrites TOML until the daemon restarts.
+            "service_max_restarts",
+            "restart_window_seconds",
         }
     ),
-    # ``enable_amd`` is read once by GPU discovery in create_app().
-    "monitor": frozenset({"enable_amd"}),
+    # ``enable_amd`` is read once by GPU discovery in create_app(); the probe
+    # budgets are captured by the ``ResourceMonitor`` at construction and
+    # ``zml_smi_path`` by the boot-time discovery call, so the whole section is
+    # restart-required.
+    "monitor": frozenset(
+        {
+            "interval_seconds",
+            "gpu_temp_warning",
+            "gpu_temp_critical",
+            "zml_smi_path",
+            "enable_amd",
+        }
+    ),
     # (P25) The whole ``[security]`` section is bound once at startup: the
     # idempotency middleware and the SecretManager capture their setting at
     # construction, and ``token_default_ttl_s`` is read off
@@ -280,7 +337,22 @@ _RESTART_KEYS: dict[str, frozenset[str]] = {
     # a restart (and a dashboard reload) is needed to pick the change up. Whole-
     # section frozenset, the ``[git]``/``[mcp]``/``[retention]`` precedent.
     "posthog": frozenset({"enabled", "project_key", "host"}),
+    # ``[client]`` is deliberately absent and must stay absent: its only
+    # consumer is ``get_client_config()``, re-read on every CLI invocation, so
+    # ``requires_restart: false`` is already the truthful answer.
 }
+
+
+def restart_section_holder(settings: Any, section: str) -> Any:
+    """Return the object carrying a config section's keys on a settings tree.
+
+    Every section is a sub-model attribute except ``[nerdit]``, whose keys
+    (``data_dir``, ``log_level``) live on the ``NerditSettings`` root. Callers
+    comparing boot settings against a fresh load need that distinction, or a
+    ``[nerdit]`` drift silently compares ``None`` to ``None``.
+    """
+    return settings if section == "nerdit" else getattr(settings, section, None)
+
 
 # Leaf keys that may never be written through the config API (rotate via
 # ``/api/tokens``). Section-qualified so only the real secret slots are blocked.

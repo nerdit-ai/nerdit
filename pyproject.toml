@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nerdit"
-version = "0.6.2"
+version = "0.6.3"
 description = "The local AI PaaS — deploy and operate apps on your own hardware, with first-class local AI"
 readme = "README.md"
 license = "Apache-2.0"
@@ -257,7 +257,7 @@ extend-immutable-calls = [
 "src/nerdit/daemon/remediation.py" = ["PLR0912", "SIM103"] # idiom — derive_remediation is a flat error-class-to-remediation-code lookup ladder
 "src/nerdit/daemon/routes/app_config.py" = ["C901", "PLR0912", "PLR0913", "PLR0915"] # idiom — put_app_config_section validates every [deploy]/[ai] field inline
 "src/nerdit/daemon/routes/audit.py" = ["PLR0913"] # idiom — list_audit surfaces every audit filter as a query parameter
-"src/nerdit/daemon/routes/system.py" = ["C901", "PLR0912", "PLR0915", "SIM105"] # idiom — get_doctor's check ladder + _run_gc's orchestration
+"src/nerdit/daemon/routes/system.py" = ["C901", "PLR0912", "PLR0915"] # idiom — get_doctor's check ladder + _run_gc's orchestration
 "src/nerdit/daemon/uploads.py" = ["B904", "SIM115"] # idiom — extract_upload re-raises with a user-facing message around a multi-step ZIP-safety extraction
 "src/nerdit/utils/logging.py" = ["SIM115"] # idiom — the rotating handler owns the fd
 

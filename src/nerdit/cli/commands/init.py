@@ -39,9 +39,7 @@ pid_file = "~/.nerdit/nerditd.pid"
 auth_token = "{token}"
 
 [containers]
-runtime = "docker"
 default_image = "nerdit-runtime:0.1"
-cache_dir = "~/.nerdit/cache"
 
 [monitor]
 interval_seconds = 5
@@ -322,7 +320,7 @@ def _report_daemon_start_failure(port: int, lifecycle: DaemonLifecycle | None = 
 
 async def _init_async() -> None:
     """Run the full init flow: config, Docker checks, daemon start, GPU display."""
-    from nerdit.cli.client import NerditClient
+    from nerdit.cli.client import NerditClient, _http_base_url
     from nerdit.cli.display import display_gpu_table
     from nerdit.daemon.lifecycle import DaemonLifecycle
 
@@ -399,7 +397,13 @@ async def _init_async() -> None:
 
     # Start daemon
     daemon = load_settings().daemon
-    host = "127.0.0.1" if daemon.host == "0.0.0.0" else daemon.host
+    # Every wildcard spelling covers loopback, so dial (and advertise) 127.0.0.1
+    # there — the IPv6 ones included, matching `_loopback_base_url`
+    # (`daemon/bootstrap.py`) and `_inner_hop_host` (`mcp/transport.py`).
+    # Brackets are stripped first, so `::` and `[::]` are one value.
+    host = daemon.host.strip().strip("[]")
+    if host in ("0.0.0.0", "::", "::0", ""):
+        host = "127.0.0.1"
     lifecycle = DaemonLifecycle(host=host, port=daemon.port, pid_file=daemon.pid_file)
     if not lifecycle.is_running():
         console.print("Starting daemon...")
@@ -440,7 +444,9 @@ async def _init_async() -> None:
     console.print()
     console.print("[bold]Health check:[/bold]")
     console.print(f"  [green]✓[/green] Daemon running on {host}:{daemon.port}")
-    console.print(f"  [green]✓[/green] Dashboard open on http://{host}:{daemon.port}/")
+    # Built the same way the client dials it, so an IPv6 `[daemon].host` prints
+    # a URL that can actually be opened (`http://[::1]:9321/`, not `http://::1:…`).
+    console.print(f"  [green]✓[/green] Dashboard open on {_http_base_url(host, daemon.port)}/")
 
     if docker_ok:
         console.print("  [green]✓[/green] Docker available")

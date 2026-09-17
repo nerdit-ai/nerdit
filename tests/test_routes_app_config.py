@@ -26,6 +26,7 @@ LEGACY = "legacy-global"
 SUB_RAW = "sub-raw"
 RO_RAW = "ro-raw"
 OTHER_RAW = "other-raw"
+SCOPED_RAW = "scoped-raw"
 
 _TOKENS = {
     hash_token(SUB_RAW): ApiToken(
@@ -36,6 +37,14 @@ _TOKENS = {
     ),
     hash_token(OTHER_RAW): ApiToken(
         id="tok-other", name="o", role=TokenRole.submitter, token_hash=hash_token(OTHER_RAW)
+    ),
+    # A submitter narrowed to the app it owns — the H2 scope leg.
+    hash_token(SCOPED_RAW): ApiToken(
+        id="tok-scoped",
+        name="c",
+        role=TokenRole.submitter,
+        token_hash=hash_token(SCOPED_RAW),
+        scope_services=["demo"],
     ),
 }
 
@@ -992,12 +1001,12 @@ def test_redeploy_over_api_config_no_explicit_change_does_not_flag_clobber(tmp_p
     q = _queries(existing)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.update_service_config = AsyncMock()
+    q.update_service_config_guarded = AsyncMock()
     client = _deploy_client(q, tmp_path)
     r = _deploy_zip(client, _node_zip(), gpus=1)
     assert r.status_code == 201, r.text
     assert r.json()["overwrote_api_config"] is False
-    cfg = json.loads(q.update_service_config.await_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.await_args.args[1])
     assert cfg["config_source"] == "deploy"
     assert cfg["config_revision"] == 6
 
@@ -1032,7 +1041,7 @@ def test_redeploy_buildpack_toml_start_over_api_does_not_flag_clobber(tmp_path):
     q = _queries(existing)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.update_service_config = AsyncMock()
+    q.update_service_config_guarded = AsyncMock()
     client = _deploy_client(q, tmp_path)
     zip_bytes = _node_zip_with_toml('[deploy]\nname = "demo"\nstart = "npm run prod"\n')
     r = _deploy_zip(client, zip_bytes, gpus=1)
@@ -1054,7 +1063,7 @@ def test_redeploy_changed_start_over_api_command_baseline_flags_clobber(tmp_path
     q = _queries(existing)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.update_service_config = AsyncMock()
+    q.update_service_config_guarded = AsyncMock()
     client = _deploy_client(q, tmp_path)
     zip_bytes = _node_zip_with_toml('[deploy]\nname = "demo"\nstart = "npm run prod"\n')
     r = _deploy_zip(client, zip_bytes, gpus=1)
@@ -1068,7 +1077,7 @@ def test_redeploy_explicit_gpu_change_over_api_flags_clobber(tmp_path):
     q = _queries(existing)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.update_service_config = AsyncMock()
+    q.update_service_config_guarded = AsyncMock()
     client = _deploy_client(q, tmp_path)
     r = _deploy_zip(client, _node_zip(), gpus=5)
     assert r.status_code == 201, r.text
@@ -1088,12 +1097,12 @@ def test_redeploy_declared_ai_over_api_marker_flags_clobber(tmp_path):
     q = _queries(existing)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.update_service_config = AsyncMock()
+    q.update_service_config_guarded = AsyncMock()
     client = _deploy_client(q, tmp_path)
     r = _deploy_zip(client, _ai_api_zip(), gpus=1)
     assert r.status_code == 201, r.text
     assert r.json()["overwrote_api_config"] is True
-    cfg = json.loads(q.update_service_config.await_args.args[1])
+    cfg = json.loads(q.update_service_config_guarded.await_args.args[1])
     assert cfg["ai"]["default"]["provider"] == "api"  # replaced
     assert "ai_source" not in cfg  # marker popped — API no longer owns it
 
@@ -1168,10 +1177,10 @@ def test_put_ai_then_silent_redeploys_preserve_chain(tmp_path):
         q = _queries(_app_job(config=json.dumps(cfg)))
         q.get_service_endpoint = AsyncMock(return_value=None)
         q.get_job_gpus = AsyncMock(return_value=[])
-        q.update_service_config = AsyncMock()
+        q.update_service_config_guarded = AsyncMock()
         r = _deploy_zip(_deploy_client(q, tmp_path), _node_zip())  # no nerdit.toml
         assert r.status_code == 201, f"redeploy #{leg}: {r.text}"
-        cfg = json.loads(q.update_service_config.await_args.args[1])
+        cfg = json.loads(q.update_service_config_guarded.await_args.args[1])
         assert cfg["ai"]["cheap"]["model"] == "gpt-4o-mini", f"redeploy #{leg}"
         assert cfg["ai_source"] == "api", f"redeploy #{leg}"
         assert cfg["config_source"] == "deploy", f"redeploy #{leg}"
@@ -1197,7 +1206,9 @@ def test_audit_row_config_app_update():
 # --- section: db (P15 / WP4) --------------------------------------------------
 
 
-def _db_row(status: JobStatus = JobStatus.running) -> Job:
+def _db_row(status: JobStatus = JobStatus.running, owner: str | None = "tok-sub") -> Job:
+    # `POST /databases` stamps `submitted_by_token` via new_workload_row, so a
+    # realistic row is owned; `owner` drives the H2 cross-owner regressions.
     return Job(
         kind=JobKind.database,
         service_name="pg",
@@ -1205,6 +1216,7 @@ def _db_row(status: JobStatus = JobStatus.running) -> Job:
         status=status,
         gpu_count=0,
         config=json.dumps({"backend": "postgres"}),
+        submitted_by_token=owner,
     )
 
 
@@ -1230,6 +1242,53 @@ def test_db_section_not_provisioned_rejected_on_config_put():
     assert r.status_code == 422
     assert r.json()["code"] == "db.not_provisioned"
     q.update_app_config.assert_not_awaited()
+
+
+# --- H2: the managed [db.*] gate authorizes the REFERENCED database row ------
+#
+# A managed binding hands the app the database's minted password at launch
+# (DATABASE_URL), so binding to a row is acting on it: without an ownership /
+# scope check any submitter could read another owner's database.
+
+
+def test_db_section_cross_owner_database_forbidden():
+    """A submitter binding its own app to another owner's database is 403."""
+    q = _queries_db(_app_job(), _db_row(owner="tok-other"))
+    r = _put(_client(q), section="db", body={"main": {"provider": "managed", "database": "pg"}})
+    assert r.status_code == 403, r.text
+    assert r.json()["code"] == "forbidden"
+    q.update_app_config.assert_not_awaited()
+
+
+def test_db_section_out_of_scope_database_forbidden():
+    """A token scoped to its own app may not bind a database outside that scope."""
+    job = _app_job(submitted_by_token="tok-scoped")
+    q = _queries_db(job, _db_row(owner="tok-scoped"))
+    r = _put(
+        _client(q),
+        section="db",
+        body={"main": {"provider": "managed", "database": "pg"}},
+        raw=SCOPED_RAW,
+    )
+    assert r.status_code == 403, r.text
+    body = r.json()
+    assert body["code"] == "forbidden"
+    assert "pg" in body["message"]  # the scope refusal names the target
+    q.update_app_config.assert_not_awaited()
+
+
+def test_db_section_admin_binds_any_database():
+    """Admin bypasses both legs, as everywhere else."""
+    q = _queries_db(_app_job(), _db_row(owner="tok-other"))
+    r = _put(
+        _client(q),
+        section="db",
+        body={"main": {"provider": "managed", "database": "pg"}},
+        raw=LEGACY,
+    )
+    assert r.status_code == 200, r.text
+    new_cfg = json.loads(q.update_app_config.await_args.args[1])
+    assert new_cfg["db"] == {"main": {"provider": "managed", "database": "pg"}}
 
 
 def test_db_section_external_needs_no_row():
@@ -1448,12 +1507,11 @@ def test_put_deploy_edge_auth_leaves_platform_owned_build_state_alone():
 
 
 def test_edge_auth_audit_params_mask_the_password_ref():
-    """Audit parity pin (§3.4.6): ``password`` is already in
-    ``daemon/audit.py::_REDACT_KEYS`` and ``redact()`` recurses into nested
-    dicts, so the ref is masked in ``config.app_update`` params. Masking a ref is
-    harmless today — this pins it so a refactor that ever turned the ref into a
-    resolved VALUE could not quietly start persisting it to the audit log."""
-    # A REJECTED write is where the body-shaped stamp is what gets recorded (the
+    """A rejected credential-shaped declaration reaches the audit row as key
+    NAMES only. Leaf-name masking (``password`` is in ``_REDACT_KEYS``) was the
+    old defence; the stamp now carries no submitted values at all, so a refactor
+    that turned the ref into a resolved VALUE still could not persist it."""
+    # A REJECTED write is where the up-front stamp is what gets recorded (the
     # success path replaces it with the changed-keys summary) — and it is the
     # case that matters: the rejected value is the credential-shaped one.
     q = _queries(_app_job())
@@ -1466,8 +1524,7 @@ def test_edge_auth_audit_params_mask_the_password_ref():
     kwargs = q.insert_audit_log.await_args.kwargs
     assert kwargs["action"] == "config.app_update"
     params = json.loads(kwargs["params_redacted"])
-    assert params["values"]["edge_auth"]["password"] == "***"
-    assert params["values"]["edge_auth"]["user"] == "ops"
+    assert params == {"section": "deploy", "submitted_keys": ["edge_auth"], "restart": False}
     assert "hunter2-FORGED" not in kwargs["params_redacted"]
 
     # The accepted write records the changed key by NAME, never the declaration.
@@ -1479,3 +1536,224 @@ def test_edge_auth_audit_params_mask_the_password_ref():
     assert params2["changed_keys"] == ["deploy.edge_auth"]
     assert params2["requires_restart"] is False
     assert "APP_PW" not in kwargs2["params_redacted"]
+
+
+# --- no submitted value ever reaches the audit trail --------------------------
+#
+# The pre-validation stamp is what a 422 or a dry run records, and leaf-name
+# masking cannot see a credential embedded IN a value: an external `[db.*]` url
+# carries its password in the userinfo, which `config/project.py` already treats
+# as a leak hazard on the 422 envelope, `BindingNotReady`, `job_logs` and
+# diagnose. The audit row and the admin `audit.*` stream were the gap.
+
+_DB_CANARY = "P4ssw0rdCANARY"
+
+
+class _RecordingBus:
+    """Event bus stand-in that keeps every published frame."""
+
+    def __init__(self) -> None:
+        self.frames: list[dict] = []
+
+    def publish(self, frame: dict) -> None:
+        self.frames.append(frame)
+
+
+def _bus_client(queries: AsyncMock, bus: _RecordingBus) -> TestClient:
+    app = FastAPI()
+    register_error_handlers(app)
+    app.include_router(app_config_router)
+    app.state.queries = queries
+    app.add_middleware(AuditMiddleware, get_queries=lambda: queries, get_event_bus=lambda: bus)
+    app.add_middleware(ScopedTokenAuthMiddleware, token=LEGACY, get_queries=lambda: queries)
+    app.add_middleware(RequestIdMiddleware)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def _recorded(queries: AsyncMock, bus: _RecordingBus) -> tuple[str, str]:
+    """Return the audit row's params JSON and the published frame, serialized."""
+    queries.insert_audit_log.assert_awaited()
+    row = queries.insert_audit_log.await_args.kwargs["params_redacted"] or ""
+    assert bus.frames
+    return row, json.dumps(bus.frames[-1])
+
+
+def test_db_url_password_never_reaches_the_audit_row_on_rejection():
+    q = _queries_db(_app_job(), None)
+    bus = _RecordingBus()
+    r = _put(
+        _bus_client(q, bus),
+        section="db",
+        body={
+            "default": {
+                "provider": "external",
+                "url": f"postgresql://user:{_DB_CANARY}@db.example.com:5432/app",
+                "password": "${secrets.DB_PW}",
+            }
+        },
+    )
+    assert r.status_code == 422
+    assert _DB_CANARY not in r.text
+    row, frame = _recorded(q, bus)
+    assert _DB_CANARY not in row and _DB_CANARY not in frame
+    assert json.loads(row) == {"section": "db", "submitted_keys": ["default"], "restart": False}
+
+
+def test_db_binding_dry_run_records_names_only():
+    q = _queries_db(_app_job(), None)
+    bus = _RecordingBus()
+    r = _put(
+        _bus_client(q, bus),
+        section="db",
+        body={
+            "cache": {
+                "provider": "external",
+                "url": f"redis://{_DB_CANARY}.example.com/0",
+                "password": "${secrets.P}",
+            }
+        },
+        dry_run="true",
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["applied"] is False
+    row, frame = _recorded(q, bus)
+    assert _DB_CANARY not in row and _DB_CANARY not in frame
+    assert json.loads(row) == {"section": "db", "submitted_keys": ["cache"], "restart": False}
+
+
+def test_db_binding_commit_records_changed_key_names_only():
+    q = _queries_db(_app_job(), None)
+    bus = _RecordingBus()
+    r = _put(
+        _bus_client(q, bus),
+        section="db",
+        body={
+            "cache": {
+                "provider": "external",
+                "url": f"redis://{_DB_CANARY}.example.com/0",
+                "password": "${secrets.P}",
+            }
+        },
+    )
+    assert r.status_code == 200, r.text
+    row, frame = _recorded(q, bus)
+    assert _DB_CANARY not in row and _DB_CANARY not in frame
+    params = json.loads(row)
+    assert params["changed_keys"] == ["db.cache"]
+    assert params["section"] == "db"
+    assert params["requires_restart"] is True
+
+
+# --- M9 second ingress: the config API folds the implicit data wedge ----------
+#
+# `resolve_effective_fields` folds `data:/data` in BEFORE validating, so the
+# validated list is the persisted list. This route validated the DECLARED list
+# and persisted it verbatim, so it accepted MAX_VOLUMES without a `data` entry
+# — a row that then launched with no data mount under a live NERDIT_DATA_DIR
+# and 422'd on every later silent redeploy.
+
+_WEDGED = {"config_extra": {"volumes": ["data:/data"], "env": {"NERDIT_DATA_DIR": "/data"}}}
+
+
+def test_put_deploy_volumes_folds_the_data_wedge():
+    q = _queries(_app_job(**_WEDGED))
+    r = _put(_client(q), body={"volumes": ["cache:/var/cache"]})
+    assert r.status_code == 200, r.text
+    new_cfg = json.loads(q.update_app_config.await_args.args[1])
+    # The persisted list is the VALIDATED list, wedge included.
+    assert new_cfg["volumes"] == ["cache:/var/cache", "data:/data"]
+
+
+def test_put_deploy_volumes_declared_cap_counts_the_wedge():
+    """8 declared without a `data` entry is 9 persisted — refused at the ingress.
+
+    Pre-fix this returned 200 and poisoned the row: the launch mounted 8
+    volumes with no `/data`, and the next `nerdit deploy .` / `nerdit dev` /
+    workspace deploy 422'd on `at most 8 volumes allowed, got 9`.
+    """
+    q = _queries(_app_job(**_WEDGED))
+    r = _put(_client(q), body={"volumes": [f"v{i}:/m{i}" for i in range(8)]})
+    assert r.status_code == 422, r.text
+    body = r.json()
+    assert body["code"] == "deploy.invalid"
+    assert "at most 8 volumes allowed, got 9" in body["message"]
+    q.update_app_config.assert_not_awaited()
+
+
+def test_put_deploy_volumes_seven_declared_plus_wedge_is_accepted():
+    q = _queries(_app_job(**_WEDGED))
+    r = _put(_client(q), body={"volumes": [f"v{i}:/m{i}" for i in range(7)]})
+    assert r.status_code == 200, r.text
+    new_cfg = json.loads(q.update_app_config.await_args.args[1])
+    assert len(new_cfg["volumes"]) == 8
+    assert new_cfg["volumes"][-1] == "data:/data"
+
+
+def test_put_deploy_volumes_no_wedge_on_a_row_that_never_had_one():
+    """A `POST /services` row gets no implicit data volume from the deploy path,
+    so the config API must not invent one for it either."""
+    q = _queries(_app_job())  # no `volumes` in config
+    r = _put(_client(q), body={"volumes": ["cache:/var/cache"]})
+    assert r.status_code == 200, r.text
+    new_cfg = json.loads(q.update_app_config.await_args.args[1])
+    assert new_cfg["volumes"] == ["cache:/var/cache"]
+
+
+# --- H2 follow-ups: who the [db.*] gate may refuse ----------------------------
+
+
+def test_db_section_null_owner_database_is_bindable_by_its_app_owner():
+    """A database created with the legacy global token (NULL owner) is the
+    single-operator install's normal case; admin-only there would break
+    `nerdit db create pg` + a scoped CI/tunnel token deploying against it."""
+    q = _queries_db(_app_job(), _db_row(owner=None))
+    r = _put(_client(q), section="db", body={"main": {"provider": "managed", "database": "pg"}})
+    assert r.status_code == 200, r.text
+    new_cfg = json.loads(q.update_app_config.await_args.args[1])
+    assert new_cfg["db"] == {"main": {"provider": "managed", "database": "pg"}}
+
+
+def test_db_cross_owner_refusal_names_the_binding_and_the_database():
+    """The owner leg must not reuse the generic row denial: at the deploy
+    ingress that envelope is byte-identical to "you do not own the APP"."""
+    q = _queries_db(_app_job(), _db_row(owner="tok-other"))
+    r = _put(_client(q), section="db", body={"main": {"provider": "managed", "database": "pg"}})
+    assert r.status_code == 403, r.text
+    body = r.json()
+    assert "db.main" in body["message"]
+    assert "'pg'" in body["message"]
+
+
+def test_unrelated_section_write_survives_a_carried_forward_foreign_binding():
+    """An admin-authored (or pre-fix) foreign binding must not lock the app's
+    own owner out of every later `deploy`/`ai` edit — the carried-forward spec
+    is not an authoring act."""
+    job = _app_job(config_extra={"db": {"main": {"provider": "managed", "database": "pg"}}})
+    q = _queries_db(job, _db_row(owner="tok-other"))
+    r = _put(_client(q), body={"memory_limit": "512m"})
+    assert r.status_code == 200, r.text
+    new_cfg = json.loads(q.update_app_config.await_args.args[1])
+    assert new_cfg["memory_limit"] == "512m"
+    assert new_cfg["db"] == {"main": {"provider": "managed", "database": "pg"}}
+
+
+def test_restating_a_foreign_binding_unchanged_is_still_allowed():
+    """An idempotent re-PUT of the very spec already persisted changes nothing,
+    so it is not a new authorization either."""
+    job = _app_job(config_extra={"db": {"main": {"provider": "managed", "database": "pg"}}})
+    q = _queries_db(job, _db_row(owner="tok-other"))
+    r = _put(_client(q), section="db", body={"main": {"provider": "managed", "database": "pg"}})
+    assert r.status_code == 200, r.text
+
+
+def test_changing_a_foreign_binding_is_still_refused():
+    """Carry-forward is not a laundering path: any edit to the spec re-gates."""
+    job = _app_job(config_extra={"db": {"main": {"provider": "managed", "database": "pg"}}})
+    q = _queries_db(job, _db_row(owner="tok-other"))
+    r = _put(
+        _client(q),
+        section="db",
+        body={"other": {"provider": "managed", "database": "pg"}},
+    )
+    assert r.status_code == 403, r.text
+    q.update_app_config.assert_not_awaited()

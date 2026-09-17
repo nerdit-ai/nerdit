@@ -1004,8 +1004,35 @@ async def test_dump_insufficient_disk_is_409_with_detail(tmp_path, monkeypatch):
     assert body["code"] == "dump.insufficient_disk"
     assert body["detail"]["free_bytes"] == 1024
     assert body["detail"]["required_bytes"] == 5 * 1024**3 + 64 * 1024 * 1024
+    # Top-level as well: the MCP error mapper drops ``detail`` wholesale, so an
+    # agent can only branch on these numbers if they sit on the envelope.
+    assert body["free_bytes"] == 1024
+    assert body["required_bytes"] == 5 * 1024**3 + 64 * 1024 * 1024
     # A refused dump claims no slot and starts no container.
     assert controller.dump_calls == []
+
+
+@pytest.mark.asyncio
+async def test_disk_recheck_refusal_carries_the_numbers_top_level(tmp_path, monkeypatch):
+    """The post-capture 409 mirrors the pre-flight's shape, for the same reason.
+
+    Both raise sites must stay in step: ``detail`` never survives the MCP error
+    mapper, so an agent branching on free space reads the envelope fields.
+    """
+    monkeypatch.setattr(databases_routes, "_free_bytes_for", lambda _p: 1024)
+    artifact = tmp_path / "dump.bin"
+    artifact.write_bytes(b"x" * 2048)
+
+    with pytest.raises(NerditError) as excinfo:
+        await databases_routes._recheck_disk(tmp_path, str(artifact))
+
+    err = excinfo.value
+    assert err.status_code == 409
+    assert err.code == "dump.insufficient_disk"
+    expected = 2048 + 64 * 1024 * 1024
+    assert err.extra["required_bytes"] == expected
+    assert err.extra["free_bytes"] == 1024
+    assert err.extra["detail"] == {"required_bytes": expected, "free_bytes": 1024}
 
 
 @pytest.mark.asyncio

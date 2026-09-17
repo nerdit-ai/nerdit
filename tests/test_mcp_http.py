@@ -220,13 +220,35 @@ def test_request_client_pins_loopback_with_context_token():
         ("127.0.0.1", "127.0.0.1"),  # loopback default
         ("0.0.0.0", "127.0.0.1"),  # wildcard covers loopback
         ("::", "127.0.0.1"),  # v6 wildcard
+        ("[::]", "127.0.0.1"),  # bracketed v6 wildcard: same value
         ("", "127.0.0.1"),  # empty == wildcard
         ("192.168.1.50", "192.168.1.50"),  # specific interface: sole listener
         ("localhost", "localhost"),  # loopback name kept
+        ("::1", "::1"),  # v6 loopback literal is a specific bind
+        ("[::1]", "::1"),  # ...and brackets are not part of the host
     ],
 )
 def test_inner_hop_host_resolution(daemon_host, expected):
     assert mcp_transport._inner_hop_host(daemon_host) == expected
+
+
+def test_request_client_brackets_an_ipv6_inner_hop():
+    # httpx.InvalidURL is not an HTTPError, so an unbracketed `::1` would escape
+    # the MCP error mapper and surface raw on every tool call.
+    mcp_transport._HTTP_MODE = True
+    mcp_transport._HTTP_PORT = 9321
+    # Unbracketed on purpose: `_inner_hop_host` strips brackets, so this is the
+    # value it really hands the client, and it is the one the old
+    # `f"http://{host}:{port}"` turned into the invalid `http://::1:9321`.
+    mcp_transport._HTTP_HOST = mcp_transport._inner_hop_host("::1")
+    tok = mcp_transport._REQUEST_TOKEN.set("alice-token")
+    try:
+        client = mcp_transport._request_client()
+    finally:
+        mcp_transport._REQUEST_TOKEN.reset(tok)
+        mcp_transport._HTTP_HOST = "127.0.0.1"
+    assert client._base_url == "http://[::1]:9321"
+    assert httpx.URL(client._base_url).port == 9321
 
 
 def test_request_client_dials_specific_interface_host():
@@ -429,6 +451,63 @@ async def test_absent_origin_allowed():
     assert reached["v"] is True
 
 
+async def _drive_guard_headers(guard, scope) -> tuple[int, bytes, dict[str, str]]:
+    """Drive the guard once and also return the response headers."""
+    sent: dict = {}
+    chunks: list[bytes] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            sent["status"] = message["status"]
+            sent["headers"] = {
+                k.decode("latin-1").lower(): v.decode("latin-1") for k, v in message["headers"]
+            }
+        elif message["type"] == "http.response.body":
+            chunks.append(message.get("body", b""))
+
+    await guard(scope, receive, send)
+    return sent.get("status"), b"".join(chunks), sent.get("headers", {})
+
+
+@pytest.mark.asyncio
+async def test_transport_rejection_carries_a_request_id():
+    """A transport refusal is the one daemon error a route never sees — it must
+    still be correlatable: echo the caller's/middleware's id, else mint one, and
+    mirror it into ``X-Request-Id`` the way ``RequestIdMiddleware`` does."""
+    guard = mcp_transport._TransportGuard(
+        lambda *a: pytest.fail("inner reached"), allowed_hostnames=frozenset({"localhost"})
+    )
+
+    # Echoed from the request header.
+    scope = _http_scope(
+        headers={"host": "localhost:9321", "x-request-id": "cafe1234"}, content_length=None
+    )
+    status, body, resp_headers = await _drive_guard_headers(guard, scope)
+    assert status == 411
+    assert json.loads(body)["request_id"] == "cafe1234"
+    assert resp_headers["x-request-id"] == "cafe1234"
+
+    # Taken from the scope state RequestIdMiddleware populates, when it ran.
+    scope = _http_scope(headers={"host": "rebind.attacker.example"}, content_length=0)
+    scope["state"] = {"request_id": "from-middleware"}
+    status, body, resp_headers = await _drive_guard_headers(guard, scope)
+    assert status == 421
+    assert json.loads(body)["request_id"] == "from-middleware"
+    assert resp_headers["x-request-id"] == "from-middleware"
+
+    # Neither present: minted, never null, and consistent with the header.
+    scope = _http_scope(
+        headers={"host": "localhost:9321", "origin": "https://evil.example"}, content_length=0
+    )
+    status, body, resp_headers = await _drive_guard_headers(guard, scope)
+    assert status == 403
+    minted = json.loads(body)["request_id"]
+    assert minted and minted == resp_headers["x-request-id"]
+
+
 # --- full-stack: mount gating + startup hard-errors ---------------------------
 
 
@@ -587,3 +666,222 @@ def test_idempotency_key_ignored_on_mcp_path():
             },
         )
     q.insert_idempotency_inprogress.assert_not_called()
+
+
+# --- full-stack: the deploy tool body never touches the daemon host -----------
+
+
+def _in_proc_client(monkeypatch, app):
+    """Pin the inner loopback hop onto the test app — never a real daemon."""
+    real_client_cls = mcp_transport.NerditClient
+
+    class _InProcClient(real_client_cls):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("transport", httpx.ASGITransport(app=app))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_transport, "NerditClient", _InProcClient)
+
+
+def _no_zip(monkeypatch):
+    """Make any host walk/zip a loud failure; return the (empty) call log."""
+    import nerdit.cli.upload as upload
+
+    calls: list = []
+
+    def _boom(directory, *args, **kwargs):  # noqa: ANN001, ANN202
+        calls.append(directory)
+        raise AssertionError(f"create_dir_zip ran on the daemon host: {directory}")
+
+    monkeypatch.setattr(upload, "create_dir_zip", _boom)
+    return calls
+
+
+def _tool_error(response) -> dict:  # noqa: ANN001
+    """The ``{"error": {...}}`` dict a tool returned, out of its SSE frame."""
+    content = _sse_result(response)["result"]["content"]
+    return json.loads(content[0]["text"])["error"]
+
+
+def test_http_deploy_with_path_refused_before_any_host_read(monkeypatch, tmp_path):
+    """H3: the HTTP transport refuses a caller-supplied daemon-host path."""
+    app = _build_app(_settings(), _queries({"sub-token": TokenRole.submitter}))
+    _in_proc_client(monkeypatch, app)
+    calls = _no_zip(monkeypatch)
+    victim = tmp_path / "secrets"
+    victim.mkdir()
+    (victim / "id_ed25519").write_text("SENTINEL-PRIVATE-KEY")
+
+    with _client(app) as c:
+        r = c.post(
+            "/api/mcp",
+            json=_rpc(
+                "tools/call",
+                name="deploy",
+                arguments={"path": str(victim), "name": "pwn"},
+            ),
+            headers={**_MCP_HEADERS, "Authorization": "Bearer sub-token"},
+        )
+
+    assert r.status_code == 200
+    error = _tool_error(r)
+    assert error["code"] == "mcp.local_path_unavailable"
+    for alternative in ("deploy_app", "deploy_git", "deploy_template"):
+        assert alternative in error["hint"]
+    assert calls == []
+    # The refusal echoes neither the path it was handed nor anything behind it.
+    assert str(victim) not in r.text
+    assert "SENTINEL-PRIVATE-KEY" not in r.text
+
+
+def test_http_deploy_rollback_still_works_without_a_path(monkeypatch):
+    """The path refusal is scoped to the path branch: rollback is untouched."""
+    app = _build_app(_settings(), _queries({"sub-token": TokenRole.submitter}))
+    _in_proc_client(monkeypatch, app)
+    _no_zip(monkeypatch)
+
+    with _client(app) as c:
+        r = c.post(
+            "/api/mcp",
+            json=_rpc(
+                "tools/call",
+                name="deploy",
+                arguments={"name": "demo", "rollback": True},
+            ),
+            headers={**_MCP_HEADERS, "Authorization": "Bearer sub-token"},
+        )
+
+    assert r.status_code == 200
+    # The harness app mounts no /api/deploy route, so the hop 404s — which is
+    # itself the proof that the body ran past the refusal and reached it.
+    assert _tool_error(r)["code"] != "mcp.local_path_unavailable"
+
+
+def test_readonly_deploy_refused_before_the_tool_body_runs(monkeypatch, tmp_path):
+    """M2: a readonly caller never reaches the host walk/zip, only the 403."""
+    app = _build_app(_settings(), _queries({"ro-token": TokenRole.readonly}))
+    _in_proc_client(monkeypatch, app)
+    calls = _no_zip(monkeypatch)
+    source = tmp_path / "app"
+    source.mkdir()
+    (source / "package.json").write_text("{}")
+
+    with _client(app) as c:
+        r = c.post(
+            "/api/mcp",
+            json=_rpc(
+                "tools/call",
+                name="deploy",
+                arguments={"path": str(source), "name": "demo"},
+            ),
+            headers={**_MCP_HEADERS, "Authorization": "Bearer ro-token"},
+        )
+
+    assert r.status_code == 200
+    error = _tool_error(r)
+    assert error["code"] == "forbidden"
+    assert error["status"] == 403
+    assert calls == []
+
+
+def _denial_rows(queries) -> list[dict]:
+    """Every ``result='denied'`` audit row the harness recorded."""
+    return [
+        call.kwargs
+        for call in queries.insert_audit_log.call_args_list
+        if call.kwargs.get("result") == "denied"
+    ]
+
+
+def test_readonly_refusal_still_records_the_denial(monkeypatch, tmp_path):
+    """The pre-body short-circuit skips the inner loopback hop, and that hop is
+    what wrote the ``deploy.create result=denied`` row. Recording it here keeps
+    the standing "auth denials are themselves audit-logged" invariant true for
+    the one path the fix touches — an admin watching ``/audit`` must still see a
+    readonly token hammering a write tool."""
+    queries = _queries({"ro-token": TokenRole.readonly})
+    app = _build_app(_settings(), queries)
+    _in_proc_client(monkeypatch, app)
+    _no_zip(monkeypatch)
+    source = tmp_path / "app"
+    source.mkdir()
+
+    with _client(app) as c:
+        c.post(
+            "/api/mcp",
+            json=_rpc(
+                "tools/call",
+                name="deploy",
+                arguments={"path": str(source), "name": "demo"},
+            ),
+            headers={**_MCP_HEADERS, "Authorization": "Bearer ro-token"},
+        )
+
+    rows = _denial_rows(queries)
+    assert len(rows) == 1
+    assert rows[0]["action"] == "deploy.create"
+    assert rows[0]["status_code"] == 403
+    assert rows[0]["principal_role"] == "readonly"
+    assert rows[0]["principal_id"] == "tok-readonly"
+
+
+def test_host_path_refusal_records_the_denial(monkeypatch, tmp_path):
+    """A submitter (the tunnel principal's role) probing daemon-host paths is
+    exactly the attempt an admin needs on the record; pre-fix it was silent."""
+    queries = _queries({"sub-token": TokenRole.submitter})
+    app = _build_app(_settings(), queries)
+    _in_proc_client(monkeypatch, app)
+    _no_zip(monkeypatch)
+    victim = tmp_path / "secrets"
+    victim.mkdir()
+
+    with _client(app) as c:
+        r = c.post(
+            "/api/mcp",
+            json=_rpc(
+                "tools/call",
+                name="deploy",
+                arguments={"path": str(victim), "name": "pwn"},
+            ),
+            headers={**_MCP_HEADERS, "Authorization": "Bearer sub-token"},
+        )
+
+    rows = _denial_rows(queries)
+    assert len(rows) == 1
+    assert rows[0]["action"] == "deploy.create"
+    assert rows[0]["principal_role"] == "submitter"
+    # The row names no path, the same discipline as the envelope.
+    assert str(victim) not in json.dumps(rows[0])
+    assert str(victim) not in r.text
+
+
+@pytest.mark.asyncio
+async def test_transport_guard_captures_and_resets_the_role():
+    seen: dict = {}
+
+    async def _inner(scope, receive, send):
+        seen["role"] = mcp_transport._REQUEST_ROLE.get()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    guard = mcp_transport._TransportGuard(_inner, allowed_hostnames=frozenset({"localhost"}))
+    scope = _http_scope(
+        headers={"host": "localhost:9321", "authorization": "Bearer ro-token"},
+        content_length=0,
+    )
+    scope["state"] = {"principal": SimpleNamespace(role=TokenRole.readonly)}
+    status, _ = await _drive_guard(guard, scope)
+    assert status == 200
+    assert seen["role"] == "readonly"
+    assert mcp_transport._REQUEST_ROLE.get() is None
+
+
+async def test_stdio_mode_keeps_path_deploy_and_needs_no_role():
+    """Stdio (``nerdit mcp``) is unchanged: both refusals are HTTP-only."""
+    mcp_transport._HTTP_MODE = False
+    assert await mcp_transport._local_path_refusal("/api/deploy") is None
+    ctx = mcp_transport._REQUEST_ROLE.set("readonly")
+    try:
+        assert await mcp_transport._readonly_write_refusal("/api/deploy") is None
+    finally:
+        mcp_transport._REQUEST_ROLE.reset(ctx)

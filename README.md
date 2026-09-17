@@ -1,16 +1,17 @@
 # Nerdit
 
-Nerdit runs your apps on your own machine the way a PaaS would: build from a
-folder, run as a supervised service, get an HTTPS URL, restart on crash, roll
-back on a bad deploy. When an app needs an AI model, Nerdit serves one locally
-on your GPU or proxies an external API, and the app sees the same OpenAI-style
-endpoint either way.
+Nerdit helps independent builders and small teams deploy and update the tools
+they create with AI, on their own infrastructure. Build from a folder or Git
+repository, run the app as a supervised service, open its URL and connect it
+to persistent databases or local models when needed.
 
-Your code and your data stay on your hardware.
+**All current features are free during the public beta**, with up to **five
+linked machines per account**. You provide the machines and pay for any
+external services you choose. Apps depend on their host staying available.
 
 ```bash
 nerdit serve llama3.1:8b --gpus 1   # local model, OpenAI-compatible endpoint
-nerdit deploy ./my-app              # build, run, HTTPS URL, model wired in
+nerdit deploy ./my-app --wait       # build, run and wait for health
 ```
 
 ## How an app declares what it needs
@@ -27,8 +28,9 @@ provider = "ollama"      # or "api" for an external endpoint
 model = "llama3.1:8b"
 ```
 
-The app starts with `OPENAI_BASE_URL` and `OPENAI_API_KEY` set, is reachable at
-`https://<host>/my-app`, and comes back after a reboot. Switching the model
+The app starts with `OPENAI_BASE_URL` and `OPENAI_API_KEY` set. Enable the
+[HTTPS proxy](https://docs.nerdit.ai/engine/networking) to serve it at
+`https://<host>/my-app`; otherwise use its local loopback endpoint. Switching the model
 from local to an external API is a config change; the app code does not move.
 
 ## Install
@@ -40,9 +42,9 @@ curl -fsSL https://get.nerdit.ai | sh
 One signed archive with the CLI, the daemon and a pinned Caddy build. No
 Python needed. It installs a service unit and starts the daemon.
 
-User guides and API documentation are maintained separately for the
-[Nerdit website](https://nerdit.ai/). This repository contains the source,
-tests and contributor instructions.
+Follow the [getting-started guide](https://docs.nerdit.ai/engine/quickstart)
+for prerequisites, deployment and opening your app. This repository contains
+the source, tests and contributor instructions.
 
 From source:
 
@@ -75,8 +77,9 @@ venv/bin/nerdit init
 
 ## No telemetry
 
-The daemon sends nothing anywhere. The one analytics hook, `[posthog]`, is off
-by default and points at your own PostHog project if you turn it on.
+The daemon has no product telemetry. Optional cloud links, public relay traffic
+and external AI APIs send the data needed for those features. The `[posthog]`
+dashboard analytics hook is off by default and uses your own project if enabled.
 
 ## Platforms
 
@@ -86,10 +89,20 @@ experimental and behind a flag.
 
 ## Nerdit Cloud
 
-Everything above is free and local. [app.nerdit.ai](https://app.nerdit.ai) is a
-separate paid service that adds remote access to your node and hosted URLs for
-apps you choose to share. It gates nothing local: a daemon that never links
-keeps deploying, proxying and serving models.
+[app.nerdit.ai](https://app.nerdit.ai) adds remote access, GitHub deployment
+and hosted URLs through an outbound connection from your machine. These
+features are included in the free public beta, for active accounts with up
+to five linked machines; no subscription is required.
+
+Hosted shares are private to the signed-in owner by default. Public access
+requires explicit publication and is subject to the
+[Terms](https://nerdit.ai/terms) and abuse enforcement. An unlinked daemon
+keeps deploying, proxying and serving models locally.
+
+Future fleet/cluster management and a separate Managed infrastructure offer
+are not available as part of this delivery.
+
+Questions or feedback: [feedback@nerdit.ai](mailto:feedback@nerdit.ai).
 
 ## License
 

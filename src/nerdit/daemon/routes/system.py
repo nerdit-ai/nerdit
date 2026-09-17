@@ -23,7 +23,6 @@ import signal
 import socket
 import sqlite3
 import stat
-import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -36,7 +35,7 @@ from pydantic import Field
 
 from nerdit.config.defaults import DEFAULT_DB_NAME
 from nerdit.config.settings import load_settings
-from nerdit.config.store import _RESTART_KEYS
+from nerdit.config.store import _RESTART_KEYS, restart_section_holder
 from nerdit.core.backup import (
     DUMP_TAR_GLOB,
     BackupError,
@@ -64,6 +63,7 @@ from nerdit.core.secrets import SecretDecryptError, SecretRotationInProgress
 from nerdit.core.volumes import VolumeSpecError, dump_staging_root, tombstone_service_name
 from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import current_principal, require_role
+from nerdit.daemon.bootstrap import normalize_mount_roots
 from nerdit.daemon.errors import NerditError, request_id_of
 from nerdit.daemon.imagegc import (
     DEFAULT_INSTANCE_ID,
@@ -91,7 +91,7 @@ from nerdit.daemon.schemas._base import StrictRequestModel
 from nerdit.daemon.schemas.tokens import seconds_until
 from nerdit.db.models import BackupResponse, JobKind, TokenRole, VolumeBackupResponse
 from nerdit.db.queries._base import mark_request_side_effect
-from nerdit.utils.disk import du_bytes, resolve_archive_dir
+from nerdit.utils.disk import du_bytes, resolve_archive_dir, spawn_walk
 
 logger = logging.getLogger(__name__)
 
@@ -843,11 +843,25 @@ async def get_doctor(request: Request) -> dict[str, Any]:
         # Key NAMES only — config values (paths, hosts, addresses) must not leak.
         # `load_settings()` is file I/O + a full pydantic build, so run it off
         # the event loop.
+        #
+        # Normalize the fresh copy the way the lifespan normalized the boot one:
+        # `normalize_mount_roots` appends `[daemon].upload_dir` IN PLACE to
+        # `containers.allowed_mount_roots` before that object becomes
+        # `app.state.settings`. Comparing it against an un-normalized re-read
+        # would report a permanent, restart-proof drift on every install whose
+        # upload dir is not already in the list — untruthful in exactly the
+        # direction this check exists to avoid, and it would train the operator
+        # to ignore the row that flags a real `auth_token`/`link.*` change.
         fresh = await asyncio.to_thread(load_settings)
+        # Tolerant like the `link` check below: a lightweight settings object
+        # (test harnesses, a stubbed loader) may not carry either section, and
+        # a doctor check must never turn that into a `fail`.
+        if hasattr(fresh, "daemon") and hasattr(fresh, "containers"):
+            normalize_mount_roots(fresh)
         pending: list[str] = []
         for section, keys in _RESTART_KEYS.items():
-            old_sec = getattr(state.settings, section, None)
-            new_sec = getattr(fresh, section, None)
+            old_sec = restart_section_holder(state.settings, section)
+            new_sec = restart_section_holder(fresh, section)
             for key in keys:
                 if getattr(old_sec, key, None) != getattr(new_sec, key, None):
                     pending.append(f"{section}.{key}")
@@ -1452,41 +1466,6 @@ def _instance_id(settings: Any) -> str:
     return value if isinstance(value, str) and value else DEFAULT_INSTANCE_ID
 
 
-def _spawn_walk(fn: Callable[[], Any]) -> asyncio.Future[Any]:
-    """Run a blocking walk on a dedicated **daemon** thread; resolve a Future.
-
-    Deliberately NOT `asyncio.to_thread`: that borrows the loop's *default*
-    executor, and a walk abandoned past the soft budget would stay alive in it —
-    `asyncio.run` teardown then joins that executor, which under uvloop blocks
-    **unboundedly**, wedging the `/daemon/restart` re-exec (live-run leg 8). A
-    daemon thread is joined by nothing — an overrunning walk dies with the
-    process/execv instead of holding the loop hostage.
-    """
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future[Any] = loop.create_future()
-
-    def _resolve(result: Any, exc: BaseException | None) -> None:
-        if fut.done():  # runs on the loop thread; cancelled walks are dropped
-            return
-        if exc is not None:
-            fut.set_exception(exc)
-        else:
-            fut.set_result(result)
-
-    def _runner() -> None:
-        try:
-            result, exc = fn(), None
-        except BaseException as e:  # noqa: BLE001 — marshalled to the Future
-            result, exc = None, e
-        try:
-            loop.call_soon_threadsafe(_resolve, result, exc)
-        except RuntimeError:
-            pass  # loop already closed — the walk outlived the daemon
-
-    threading.Thread(target=_runner, name="nerdit-du-walk", daemon=True).start()
-    return fut
-
-
 async def _bounded_walks(
     walks: dict[str, Callable[[], Any]], budget: float
 ) -> tuple[dict[str, Any], bool]:
@@ -1497,9 +1476,9 @@ async def _bounded_walks(
     `timed_out` (the caller surfaces a `scan_timeout` warning). Overrunning
     threads are detached daemon threads, not awaited — the budget is soft on
     purpose, and detachment must never touch the default executor (see
-    `_spawn_walk`).
+    `utils.disk.spawn_walk`).
     """
-    futures = {name: _spawn_walk(fn) for name, fn in walks.items()}
+    futures = {name: spawn_walk(fn) for name, fn in walks.items()}
     if futures:
         await asyncio.wait(list(futures.values()), timeout=budget)
     results: dict[str, Any] = {}

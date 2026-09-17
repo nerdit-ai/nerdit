@@ -8,6 +8,12 @@ import typer
 
 from nerdit.cli.display import _plain, console, display_logs, render_client_error
 
+# The daemon's own forward-page cap. Read here only to recognise a FULL page —
+# "there is more backlog" — so the follower can drain it without waiting a poll
+# per page. A remote daemon with a different cap degrades to the old cadence,
+# never to a wrong result.
+from nerdit.daemon.limits import _MAX_LOG_TAIL
+
 # Terminal statuses for ``--follow``. A service settles at
 # ``stopped/failed/completed/cancelled`` (a clean ``on-failure``/``no`` exit
 # reaches ``completed``); ``restarting/degraded/building`` are transient
@@ -53,10 +59,7 @@ async def _logs_async(
         # from the query string, so an unfiltered read stays byte-identical to
         # the pre-P24 request without a second omission rule here.
         if not follow:
-            entries = await client.get_service_logs(target, since_id=0, grep=grep, since=since)
-            if entries:
-                display_logs(entries)
-            else:
+            if await _drain(client, target, grep=grep, since=since) == 0:
                 console.print("[dim]No logs available[/dim]")
             return
 
@@ -70,6 +73,25 @@ async def _logs_async(
     except Exception as exc:
         render_client_error(exc)
         raise typer.Exit(1)
+
+
+async def _drain(
+    client, ident: str, *, since_id: int = 0, grep: str | None = None, since: str | None = None
+) -> int:
+    """Display every log page from *since_id* onward; return the new cursor.
+
+    A forward page is server-capped, so one request is not the whole backlog.
+    The loop terminates because every non-empty page strictly advances the
+    cursor (ids ascend and the query is `id > since_id`), and an empty page
+    means no matching row past the cursor at all — the cap is applied after the
+    filters, inside SQL.
+    """
+    while True:
+        entries = await client.get_service_logs(ident, since_id=since_id, grep=grep, since=since)
+        if not entries:
+            return since_id
+        display_logs(entries)
+        since_id = entries[-1]["id"]
 
 
 async def _follow_polling(
@@ -88,16 +110,23 @@ async def _follow_polling(
         if entries:
             display_logs(entries)
             since_id = entries[-1]["id"]
+            if len(entries) >= _MAX_LOG_TAIL:
+                # The page filled the server cap, so more backlog is already
+                # waiting: draining it at one page per poll would put a chatty
+                # service's retained history minutes ahead of its first LIVE
+                # line. Loop straight back without the status poll or the
+                # sleep — ids ascend, so this terminates at the first short
+                # page and the steady-state cadence below is unchanged. A
+                # daemon with a smaller cap simply never takes this branch.
+                continue
         if watermark is not None:
             since_id = max(since_id, watermark)
 
         service = await client.get_service(ident)
         if service["status"] in _SERVICE_TERMINAL:
-            entries = await client.get_service_logs(
-                ident, since_id=since_id, grep=grep, since=since
-            )
-            if entries:
-                display_logs(entries)
+            # Drain, not one last page: the dying lines of a chatty service can
+            # exceed one server-capped page, and this is the caller's last read.
+            await _drain(client, ident, since_id=since_id, grep=grep, since=since)
             # ``_plain``: the status is server-derived, and every server-derived
             # string is escaped at every Rich sink (the four-times-shipped bug).
             console.print(f"\n[bold]Service finished: {_plain(service['status'])}[/bold]")

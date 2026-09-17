@@ -9,8 +9,10 @@ from datetime import datetime, timezone
 
 from nerdit.daemon.errors import NerditError
 
-# Hard cap on a single service `tail` log request so a caller can't pull an
-# unbounded log set into daemon memory (mirrors the jobs route).
+# Hard cap on a single service log request — BOTH branches, `tail` and the
+# forward paged read — so a caller can't pull an unbounded log set into daemon
+# memory (mirrors the jobs route). The forward branch applies it as the page
+# size; a caller resumes past it with `since_id`.
 _MAX_LOG_TAIL = 5000
 
 # P13 WP3 — the `/wait` converge primitive.

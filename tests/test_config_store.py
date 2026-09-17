@@ -138,7 +138,42 @@ def test_diff_for_non_secret_change_is_clean(tmp_path):
 def test_requires_restart_for_host_port(tmp_path):
     store = _store(tmp_path, "[daemon]\nport = 9321\n")
     assert store.stage("daemon", {"port": 9999}).requires_restart is True
-    assert store.stage("monitor", {"interval_seconds": 3}).requires_restart is False
+    # [client] is re-read per CLI invocation, so it is honestly not restart-keyed.
+    assert store.stage("client", {"remote_host": "10.0.0.1"}).requires_restart is False
+
+
+@pytest.mark.parametrize(
+    ("section", "body", "keys"),
+    [
+        # Sandbox hardening: reported inert until restart, because it is.
+        ("containers", {"read_only_rootfs": True}, ["containers.read_only_rootfs"]),
+        (
+            "containers",
+            {"drop_all_caps": False, "default_memory_limit": "256m"},
+            ["containers.default_memory_limit", "containers.drop_all_caps"],
+        ),
+        ("nerdit", {"log_level": "debug"}, ["nerdit.log_level"]),
+        ("nerdit", {"data_dir": "~/elsewhere"}, ["nerdit.data_dir"]),
+        ("monitor", {"interval_seconds": 3}, ["monitor.interval_seconds"]),
+        ("monitor", {"zml_smi_path": "/opt/zml-smi"}, ["monitor.zml_smi_path"]),
+        ("monitor", {"gpu_temp_warning": 70}, ["monitor.gpu_temp_warning"]),
+    ],
+)
+def test_boot_frozen_sections_report_requires_restart(tmp_path, section, body, keys):
+    # Every key of [containers]/[nerdit]/[monitor] is captured once at boot, so a
+    # PUT that answered requires_restart=false would tell the operator the change
+    # is live when it is not.
+    staged = _store(tmp_path).stage(section, body)
+    assert staged.requires_restart is True
+    assert sorted(staged.restart_keys) == keys
+    assert all(entry.requires_restart is True for entry in staged.diff)
+
+
+def test_dead_container_knobs_are_gone(tmp_path):
+    # runtime/cache_dir had no consumer; deleted rather than minted a restart key.
+    with pytest.raises(ConfigError) as exc:
+        _store(tmp_path).stage("containers", {"runtime": "podman"})
+    assert exc.value.code == "config.invalid"
 
 
 # --- atomic commit + preservation --------------------------------------------
@@ -228,9 +263,21 @@ def test_services_port_range_requires_restart(tmp_path):
     assert staged.requires_restart is True
 
 
-def test_services_max_restarts_does_not_require_restart(tmp_path):
-    staged = _store(tmp_path).stage("services", {"service_max_restarts": 5})
-    assert staged.requires_restart is False
+def test_services_restart_policy_requires_restart(tmp_path):
+    """The restart-policy pair is snapshotted by ``ServiceController.__init__``.
+
+    It used to answer ``False`` here, which was the same untruthfulness M6
+    closed for ``[containers]``: the row is rewritten, the running controller
+    keeps enforcing its boot values.
+    """
+    staged = _store(tmp_path).stage(
+        "services", {"service_max_restarts": 5, "restart_window_seconds": 120}
+    )
+    assert staged.requires_restart is True
+    assert staged.restart_keys == [
+        "services.restart_window_seconds",
+        "services.service_max_restarts",
+    ]
 
 
 def test_services_max_concurrent_builds_requires_restart(tmp_path):
@@ -961,14 +1008,14 @@ def test_stage_many_restart_keys_aggregation(tmp_path):
         {
             "daemon": {"port": 9999},
             "proxy": {"enabled": True},
-            "monitor": {"interval_seconds": 3},
+            "client": {"remote_host": "10.0.0.1"},
         }
     )
     assert staged.requires_restart is True
     assert staged.restart_keys == ["daemon.port", "proxy.enabled"]
     by_key = {e.key: e for e in staged.diff}
     assert by_key["daemon.port"].requires_restart is True
-    assert by_key["monitor.interval_seconds"].requires_restart is False
+    assert by_key["client.remote_host"].requires_restart is False
 
 
 def test_stage_many_noop_reapply_is_idempotent(tmp_path):
