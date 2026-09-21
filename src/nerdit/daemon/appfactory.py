@@ -42,6 +42,7 @@ from nerdit.daemon.routes.images import router as images_router
 from nerdit.daemon.routes.license import router as license_router
 from nerdit.daemon.routes.link import router as link_router
 from nerdit.daemon.routes.models import router as models_router
+from nerdit.daemon.routes.projects import router as projects_router
 from nerdit.daemon.routes.proxy import router as proxy_router
 from nerdit.daemon.routes.secrets import router as secrets_router
 from nerdit.daemon.routes.services import router as services_router
@@ -244,6 +245,9 @@ def build_app(
         # mount: it is the second way an operator publishes an app, and a
         # generated client should find both under one heading.
         (domains_router, "Exposure"),
+        # (P40b / D-P40-10) The project noun, registered LAST, `/api` only —
+        # a brand-new surface with no legacy CLI to serve.
+        (projects_router, "Projects"),
     ):
         api_router.include_router(router, tags=[tag])
     app.include_router(api_router)

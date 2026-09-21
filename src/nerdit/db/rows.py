@@ -123,6 +123,45 @@ class Job(BaseModel):
     restart_window_start: datetime | None = Field(
         default=None, description="Start of the current restart rate-limit window"
     )
+    # --- Project triple (P40a; NULL on model/database/batch rows) ---
+    # ``service_name`` stays the wire/filesystem/proxy key (D-P40-2); the
+    # triple only groups rows. All default ``None`` so the ~52 test files that
+    # build ``Job(service_name=...)`` stay untouched.
+    project_id: str | None = Field(default=None, description="Owning ``projects.id``")
+    environment: str | None = Field(
+        default=None, description="Environment within the project ('production' in phase 1)"
+    )
+    service: str | None = Field(
+        default=None, description="Service name within the project ('web' for a bare name)"
+    )
+    project: str | None = Field(
+        default=None,
+        description="The project's name, read by LEFT JOIN (D-P40-7); never written",
+    )
+
+
+class Project(BaseModel):
+    """A project: the grouping row every ``kind=service`` job points at (P40a / D-P40-5).
+
+    ``submitted_by_token`` ``None`` means a LOCAL/LEGACY_ADMIN owner, admin-only
+    -- the ``jobs`` precedent and the ``SecretClaim`` posture. In P40a the row
+    exists iff a service references it; P40b lets it outlive its services.
+    """
+
+    id: str = Field(description="``prj_`` + 16 base32 chars")
+    name: str = Field(description="Unique project name; a migrated row's legacy label")
+    submitted_by_token: str | None = Field(
+        default=None, description="Owner token id, NULL = admin-only"
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC), description="When the project was created"
+    )
+
+    @field_validator("created_at")
+    @classmethod
+    def _aware_utc(cls, value: datetime) -> datetime:
+        """Attach UTC to naive stored timestamps so disk and live values serialize identically."""
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
 class ServiceEndpoint(BaseModel):
@@ -209,6 +248,39 @@ class ServiceShare(BaseModel):
         return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
+class VariableFlag(BaseModel):
+    """Whether one variable key is plain, per scope (P40c / D-P40-1). Never carries a value.
+
+    ``service`` is ``''`` for the project scope (the storage sentinel), else
+    the service name within the project's production environment.
+    """
+
+    key: str = Field(description="Variable key name")
+    service: str = Field(default="", description="'' = project scope, else the service name")
+    plain: bool = Field(description="True = shown to the owner; False = write-only secret")
+
+
+class SecretClaim(BaseModel):
+    """A service name reserved by the token that set its secrets before any row exists (P39).
+
+    ``token_id`` ``None`` means a LOCAL/LEGACY_ADMIN claimant: consumable by
+    admin only. A revoked claimant keeps its id (revocation is a soft delete),
+    which nobody can present any more, so that claim is admin-only too.
+    """
+
+    service_name: str = Field(description="Reserved service name")
+    token_id: str | None = Field(default=None, description="Claimant token id, NULL = admin-only")
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC), description="When the claim was minted"
+    )
+
+    @field_validator("created_at")
+    @classmethod
+    def _aware_utc(cls, value: datetime) -> datetime:
+        """Attach UTC to naive stored timestamps so disk and live values serialize identically."""
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
 class ServiceDomain(BaseModel):
     """A domain claimed by exactly one service, with certificate policy stored alongside it.
 
@@ -249,6 +321,8 @@ class ActiveServiceRoute(BaseModel):
     host_port: int
     status: str
     route: str | None = None
+    project_id: str | None = None
+    """The row's ``jobs.project_id``: scopes the merged edge-auth secret read (P40c)."""
     edge_auth: dict[str, Any] | None = None
     """(P25 D-P25-8) The row's ``config['edge_auth']`` blob, verbatim.
 

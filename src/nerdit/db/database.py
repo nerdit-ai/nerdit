@@ -7,6 +7,9 @@ from pathlib import Path
 
 import aiosqlite
 
+# Stdlib-only module (no ``nerdit.db`` import), so this cannot cycle.
+from nerdit.core.project_identity import mint_project_id
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS gpus (
     id                TEXT PRIMARY KEY,
@@ -54,7 +57,16 @@ CREATE TABLE IF NOT EXISTS jobs (
     health_check TEXT,
     service_name TEXT,
     last_exit_at TEXT,
-    restart_window_start TEXT
+    restart_window_start TEXT,
+    -- (P40a / D-P40-4) The project triple; NULL on model/database/batch rows.
+    -- ``service_name`` stays the wire/filesystem/proxy key (D-P40-2); these
+    -- three only group rows. Existing installs gain them through the second
+    -- ``ADD COLUMN`` loop at the END of ``_migrate`` (after the ``jobs_new``
+    -- rebuild, which must never learn them), and the partial unique index on
+    -- the triple lives there too, for the ``idx_jobs_service_name`` reason.
+    project_id  TEXT,
+    environment TEXT,
+    service     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS gpu_allocations (
@@ -238,6 +250,56 @@ CREATE TABLE IF NOT EXISTS service_domains (
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_service_domains_service ON service_domains(service_name);
+
+-- Secret claims (P39 D-P39-1): one row per service name that has secrets but
+-- no ``jobs`` row yet. The first ``POST /secrets/{name}`` on a rowless name
+-- mints it for the caller's token; ``reserve_service_for_token`` consumes it
+-- inside the row-insert transaction, so a stranger can never deploy over a
+-- name whose secrets someone else set. No FK to ``jobs``, for the
+-- ``service_shares`` reason above -- and because a claim exists precisely
+-- when no row does. No FK to ``api_tokens`` either: a claimant token may be
+-- revoked, and the claim must then survive as an admin-only row rather than
+-- vanish and reopen the name. ``token_id`` NULL = a LOCAL/LEGACY_ADMIN
+-- claimant (admin anyway). A wholly new table, so it rides ``_SCHEMA``
+-- unconditionally -- no ``_migrate`` block.
+CREATE TABLE IF NOT EXISTS secret_claims (
+    service_name TEXT PRIMARY KEY,
+    token_id     TEXT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Projects (P40a / D-P40-5): one row per project name, the project-scope
+-- reservation. ``submitted_by_token`` is the owner's token id (the ``jobs``
+-- precedent); NULL = a LOCAL/LEGACY_ADMIN owner, admin-only. No FK to
+-- ``api_tokens``, for the ``secret_claims`` reason above: a revoked owner
+-- must leave an admin-only row, never a vanished one that reopens the name.
+-- ``jobs.project_id`` points here without an FK either -- it is added by
+-- ``ALTER TABLE`` on every existing install, and P40a backfills it. A wholly
+-- new table, so it rides ``_SCHEMA`` unconditionally -- no ``_migrate`` block.
+CREATE TABLE IF NOT EXISTS projects (
+    id                 TEXT PRIMARY KEY,
+    name               TEXT NOT NULL UNIQUE,
+    submitted_by_token TEXT,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Variable flags (P40c / D-P40-1): one row per key set through the variables
+-- API, recording only whether it is plain. There is NO value column -- every
+-- value, plain or secret, lives in the scope's encrypted file; a key with no
+-- row here is secret. ``environment`` / ``service`` use '' (never NULL) for
+-- the project scope because NULLs never collide in a SQLite primary key.
+-- The FK is legal because ``projects.id`` is a real PK (D-P40-17): deleting
+-- the project row removes its flags. Rides ``_SCHEMA`` with no ``_migrate``
+-- block, like ``projects``.
+CREATE TABLE IF NOT EXISTS variables (
+    project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    environment TEXT NOT NULL DEFAULT '',
+    service     TEXT NOT NULL DEFAULT '',
+    key         TEXT NOT NULL,
+    plain       INTEGER NOT NULL CHECK (plain IN (0, 1)),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (project_id, environment, service, key)
+);
 """
 
 
@@ -390,7 +452,57 @@ class Database:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_service_name "
             "ON jobs(service_name) WHERE service_name IS NOT NULL"
         )
+        # (P40a / D-P40-4) Placed AFTER the rebuild and its index, on purpose
+        # -- see the method for why the order is load-bearing.
+        await self._migrate_project_identity()
         await self._conn.commit()
+
+    async def _migrate_project_identity(self) -> None:
+        """Add the P40a project triple, its index and the name-keyed backfill.
+
+        Runs last in ``_migrate``: the ``jobs_new`` rebuild fires only on a
+        pre-P1 database, which has never seen these columns, so placing this
+        after it means the 33-column literals can never drop them (D-P40-4).
+        """
+        assert self._conn is not None
+        # ``PRAGMA table_info`` is re-read: the rebuild may have replaced the
+        # table since ``_migrate`` read it at the top.
+        existing = {row[1] for row in await self._get_jobs_table_info()}
+        for col in ("project_id", "environment", "service"):
+            if col not in existing:
+                await self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
+        # (D-P40-3) One row per triple, beside ``idx_jobs_service_name`` -- never
+        # instead of it. Partial so untripled rows (models, databases, batch)
+        # stay out of the constraint.
+        await self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_project_service "
+            "ON jobs(project_id, environment, service) WHERE project_id IS NOT NULL"
+        )
+        # Backfill: every tripleless service row is ``(name, production, web)``
+        # in a project named after it (D-P40-2, the legacy label is the
+        # project name), owned by the row's token. Find-or-create by name keeps
+        # ids stable across boots; ``project_id IS NULL`` makes a second boot a
+        # no-op. A row with ``service_name`` NULL (the P1-P2 window) stays
+        # tripleless: unreachable by name today, fails closed in auth.
+        cursor = await self._conn.execute(
+            "SELECT id, service_name, submitted_by_token FROM jobs "
+            "WHERE kind = 'service' AND service_name IS NOT NULL AND project_id IS NULL"
+        )
+        for job_id, name, owner in await cursor.fetchall():
+            row = await (
+                await self._conn.execute("SELECT id FROM projects WHERE name = ?", (name,))
+            ).fetchone()
+            project_id = row[0] if row else mint_project_id()
+            if row is None:
+                await self._conn.execute(
+                    "INSERT INTO projects (id, name, submitted_by_token) VALUES (?, ?, ?)",
+                    (project_id, name, owner),
+                )
+            await self._conn.execute(
+                "UPDATE jobs SET project_id = ?, environment = 'production', service = 'web' "
+                "WHERE id = ?",
+                (project_id, job_id),
+            )
 
     async def _get_jobs_table_info(self) -> list[aiosqlite.Row]:
         assert self._conn is not None
@@ -404,7 +516,25 @@ class Database:
         if script_path_col is None or script_path_col[3] == 0:
             return
 
+        # ``PRAGMA foreign_keys`` is a silent no-op inside a transaction, and
+        # ``_migrate`` has already opened Python's implicit one. Commit first,
+        # or ``DROP TABLE jobs`` runs its implicit DELETE with FKs on and any
+        # job_logs / gpu_allocations / service_endpoints child row fails the
+        # boot. The explicit BEGIN keeps jobs_new/DROP/RENAME atomic.
+        await self._conn.commit()
         await self._conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            await self._conn.execute("BEGIN")
+            await self._rebuild_jobs_nullable_script_path()
+            await self._conn.commit()
+        except BaseException:
+            await self._conn.rollback()
+            raise
+        finally:
+            await self._conn.execute("PRAGMA foreign_keys=ON")
+
+    async def _rebuild_jobs_nullable_script_path(self) -> None:
+        assert self._conn is not None
         await self._conn.execute(
             """
             CREATE TABLE jobs_new (
@@ -460,7 +590,6 @@ class Database:
         )
         await self._conn.execute("DROP TABLE jobs")
         await self._conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
-        await self._conn.execute("PRAGMA foreign_keys=ON")
 
     async def __aenter__(self) -> Database:
         await self.connect()

@@ -84,7 +84,33 @@ _TOKENS = {
         scope_services=[OTHER_NAME],
     ),
 }
+# (P40d / D-P40-7) A scope entry names a label OR a project. `PROJECT_RAW` holds
+# the project `asso`, `LABEL_RAW` the composed label of its `api` service.
+PROJECT = "asso"
+LABEL = "api--asso"
+PROJECT_RAW = "project-scope-raw"
+LABEL_RAW = "label-scope-raw"
+_TOKENS.update(
+    {
+        hash_token(PROJECT_RAW): ApiToken(
+            id="tok-project",
+            name="p",
+            role=TokenRole.submitter,
+            token_hash=hash_token(PROJECT_RAW),
+            scope_services=[PROJECT],
+        ),
+        hash_token(LABEL_RAW): ApiToken(
+            id="tok-label",
+            name="l",
+            role=TokenRole.submitter,
+            token_hash=hash_token(LABEL_RAW),
+            scope_services=[LABEL],
+        ),
+    }
+)
 _TOKEN_IDS = {
+    PROJECT_RAW: "tok-project",
+    LABEL_RAW: "tok-label",
     ADMIN_RAW: "tok-admin",
     UNSCOPED_RAW: "tok-unscoped",
     IN_RAW: "tok-in",
@@ -161,7 +187,11 @@ def _queries(existing: Job | None = None) -> AsyncMock:
     q.get_model_by_ref = AsyncMock(return_value=None)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
+    q.reserve_service_for_token = AsyncMock(side_effect=lambda job, **kw: job)
+    q.get_secret_claim = AsyncMock(return_value=None)
+    # (P40b) No `projects` row unless a test plants one: a bare AsyncMock would
+    # return a truthy MagicMock and read as a foreign project.
+    q.get_project_by_name = AsyncMock(return_value=None)
     q.update_service_config = AsyncMock()
     q.update_app_config = AsyncMock()
     q.set_desired_state = AsyncMock()
@@ -549,6 +579,224 @@ def test_diagnose_inherits_the_scope_leg(tmp_path):
     queries = _queries(_service_row("tok-out"))
     resp = _client(queries, tmp_path).get(f"/services/{NAME}/diagnose", headers=_auth(OUT_RAW))
     _assert_scope_denied(resp)
+
+
+# --- (P40d / D-P40-7) project scope widens by the ROW's project ------------------
+
+
+def _project_row(owner: str | None, *, project: str | None, name: str = LABEL) -> Job:
+    """A git-sourced, rollback-able row, so every row-bearing route accepts it."""
+    row = _service_row(
+        owner,
+        name=name,
+        config={
+            "image": f"nerdit-app/{name}:2",
+            "previous_image": f"nerdit-app/{name}:1",
+            "build_version": 2,
+            "max_version": 2,
+            "port": 8000,
+            "source": dict(_GIT_SOURCE),
+        },
+    )
+    row.project = project
+    return row
+
+
+# Every row-bearing route, addressed by LABEL.
+_ROW_CALLS: dict[str, tuple[Callable[[TestClient, str, str], object], int]] = {
+    "stop": (lambda c, n, raw: c.post(f"/services/{n}/stop", headers=_auth(raw)), 200),
+    "redeploy_zip": (
+        lambda c, n, raw: c.post(
+            "/deploy",
+            data={"name": n, "port": "8000", "gpus": "0"},
+            files={"archive": ("app.zip", _zip_bytes(), "application/zip")},
+            headers=_auth(raw),
+        ),
+        201,
+    ),
+    "redeploy_git": (
+        lambda c, n, raw: c.post(
+            "/deploy/git",
+            json={"repo_url": "https://github.com/acme/demo", "name": n},
+            headers=_auth(raw),
+        ),
+        201,
+    ),
+    "rollback": (lambda c, n, raw: c.post(f"/deploy/{n}/rollback", headers=_auth(raw)), 200),
+    "redeploy": (lambda c, n, raw: c.post(f"/deploy/{n}/redeploy", headers=_auth(raw)), 201),
+    "template": (
+        lambda c, n, raw: c.post(
+            "/app-templates/node-starter/deploy", json={"name": n}, headers=_auth(raw)
+        ),
+        201,
+    ),
+    "post_secrets": (
+        lambda c, n, raw: c.post(f"/secrets/{n}", json={"values": {"K": "v"}}, headers=_auth(raw)),
+        200,
+    ),
+    "get_secrets": (lambda c, n, raw: c.get(f"/secrets/{n}", headers=_auth(raw)), 200),
+    "delete_secrets": (lambda c, n, raw: c.delete(f"/secrets/{n}", headers=_auth(raw)), 200),
+    "get_app_config": (lambda c, n, raw: c.get(f"/config/apps/{n}", headers=_auth(raw)), 200),
+    "put_app_config": (
+        lambda c, n, raw: c.put(
+            f"/config/apps/{n}/deploy",
+            json={"gpus": 0},
+            headers={**_auth(raw), "Idempotency-Key": "ik-1"},
+        ),
+        200,
+    ),
+}
+_ROW_CALL_IDS = list(_ROW_CALLS)
+# The row is in hand when scope is judged, so its project widens the check.
+_WIDENED = [
+    "stop",
+    "redeploy_zip",
+    "redeploy_git",
+    "redeploy",
+    "rollback",
+    "get_app_config",
+    "put_app_config",
+]
+# Scope is judged BEFORE any lookup here (the P39 no-oracle order), so there is
+# no row to widen by: a project-scoped token is refused, a label-scoped one passes.
+_LABEL_ONLY = [route for route in _ROW_CALL_IDS if route not in _WIDENED]
+
+
+def _row_call(route: str, tmp_path: Path, raw: str, row: Job):
+    call, ok_status = _ROW_CALLS[route]
+    queries = _queries(row)
+    return call(_client(queries, tmp_path), row.service_name or "", raw), ok_status
+
+
+@pytest.mark.parametrize("route", _WIDENED)
+def test_project_scoped_token_reaches_a_composed_label_through_its_row(route, tmp_path):
+    """`asso` reaches `api--asso` because the ROW says project `asso`."""
+    row = _project_row("tok-project", project=PROJECT)
+    resp, ok_status = _row_call(route, tmp_path, PROJECT_RAW, row)
+    assert resp.status_code == ok_status, resp.text
+
+
+@pytest.mark.parametrize("route", _LABEL_ONLY)
+def test_scope_before_lookup_routes_stay_label_only(route, tmp_path):
+    """The named ceiling: no lookup precedes the scope verdict, so no widening."""
+    row = _project_row("tok-project", project=PROJECT)
+    call, _ = _ROW_CALLS[route]
+    queries = _queries(row)
+    resp = call(_client(queries, tmp_path), LABEL, PROJECT_RAW)
+    _assert_scope_denied(resp, target=LABEL, scope=PROJECT)
+    queries.get_service_by_name.assert_not_awaited()
+
+
+@pytest.mark.parametrize("route", _ROW_CALL_IDS)
+def test_label_scoped_token_keeps_working_on_its_label(route, tmp_path):
+    row = _project_row("tok-label", project=PROJECT)
+    resp, ok_status = _row_call(route, tmp_path, LABEL_RAW, row)
+    assert resp.status_code == ok_status, resp.text
+
+
+@pytest.mark.parametrize("route", _ROW_CALL_IDS)
+def test_a_legacy_row_named_like_a_composed_label_is_not_in_the_project(route, tmp_path):
+    """Never parsed: a hand-deployed `api--asso` is its OWN implicit project."""
+    row = _project_row("tok-project", project=LABEL)
+    resp, _ = _row_call(route, tmp_path, PROJECT_RAW, row)
+    _assert_scope_denied(resp, target=LABEL, scope=PROJECT)
+
+
+@pytest.mark.parametrize("route", ["stop", "get_secrets", "get_app_config", "rollback"])
+def test_a_row_with_no_project_is_label_only(route, tmp_path):
+    """Model, database and unstamped rows carry `project = None`: nothing to widen by."""
+    row = _project_row("tok-project", project=None)
+    resp, _ = _row_call(route, tmp_path, PROJECT_RAW, row)
+    _assert_scope_denied(resp, target=LABEL, scope=PROJECT)
+
+
+@pytest.mark.parametrize("route", _ROW_CALL_IDS)
+def test_project_scope_is_still_403_on_another_project(route, tmp_path):
+    row = _project_row("tok-project", project="blog", name="blog")
+    resp, _ = _row_call(route, tmp_path, PROJECT_RAW, row)
+    _assert_scope_denied(resp, target="blog", scope=PROJECT)
+
+
+@pytest.mark.parametrize("route", [route for route in _ROW_CALL_IDS if route != "stop"])
+def test_a_rowless_composed_label_is_the_same_403_as_a_foreign_row(route, tmp_path):
+    """The P39 no-oracle order survives: same envelope with or without a row."""
+    call, _ = _ROW_CALLS[route]
+    absent = call(_client(_queries(None), tmp_path), LABEL, PROJECT_RAW)
+    foreign = call(
+        _client(_queries(_project_row("tok-other", project=LABEL)), tmp_path), LABEL, PROJECT_RAW
+    )
+    _assert_scope_denied(absent, target=LABEL, scope=PROJECT)
+    assert absent.json()["message"] == foreign.json()["message"]
+    assert absent.json()["hint"] == foreign.json()["hint"]
+
+
+def test_project_scope_never_widens_ownership(tmp_path):
+    """Scope is one leg; a project-scoped token still cannot stop a stranger's row."""
+    queries = _queries(_project_row("tok-label", project=PROJECT))
+    resp = _client(queries, tmp_path).post(f"/services/{LABEL}/stop", headers=_auth(PROJECT_RAW))
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["message"] == "You do not have permission to act on this job."
+    queries.set_desired_state.assert_not_awaited()
+
+
+def test_project_scoped_token_reads_logs_of_its_composed_label(tmp_path):
+    """Reads stay role-only (D-P25-3): open before P40d, open after."""
+    queries = _queries(_project_row("tok-project", project=PROJECT))
+    queries.get_job_logs = AsyncMock(return_value=[])
+    resp = _client(queries, tmp_path).get(f"/services/{LABEL}/logs", headers=_auth(PROJECT_RAW))
+    assert resp.status_code == 200, resp.text
+
+
+def test_project_scoped_token_diagnoses_its_label_and_is_403_on_blog(tmp_path):
+    """The owner-gated read: widened by the row's project, refused outside it."""
+    mine = _client(_queries(_project_row("tok-project", project=PROJECT)), tmp_path)
+    resp = mine.get(f"/services/{LABEL}/diagnose", headers=_auth(PROJECT_RAW))
+    assert resp.status_code == 200, resp.text
+    blog = _client(_queries(_project_row("tok-project", project="blog", name="blog")), tmp_path)
+    resp = blog.get("/services/blog/diagnose", headers=_auth(PROJECT_RAW))
+    _assert_scope_denied(resp, target="blog", scope=PROJECT)
+
+
+def test_in_scope_unit():
+    from nerdit.daemon.auth import Principal
+
+    def scoped(*names: str) -> Principal:
+        return Principal(
+            token_id="t", name="t", role=TokenRole.submitter, scope_services=frozenset(names)
+        )
+
+    unscoped = Principal(token_id="t", name="t", role=TokenRole.submitter)
+    assert unscoped.in_scope("anything") and unscoped.in_scope("anything", "any-project")
+    assert scoped(PROJECT).in_scope(PROJECT)
+    assert scoped(PROJECT).in_scope(LABEL, PROJECT)
+    assert scoped(PROJECT).in_scope(LABEL, project=PROJECT)
+    assert not scoped(PROJECT).in_scope(LABEL)
+    assert not scoped(PROJECT).in_scope(LABEL, None)
+    assert not scoped(PROJECT).in_scope(LABEL, LABEL)
+    assert not scoped(PROJECT).in_scope("blog", "blog")
+    assert scoped(LABEL).in_scope(LABEL, PROJECT)
+    assert not scoped(LABEL).in_scope(PROJECT, PROJECT)
+    assert not scoped().in_scope(LABEL, PROJECT)
+
+
+def test_may_manage_job_widens_with_the_gate(tmp_path):
+    """The projected `manageable` bit and the write gate share one predicate."""
+    from nerdit.daemon.auth import Principal, may_manage_job
+
+    request = MagicMock()
+    request.state.principal = Principal(
+        token_id="tok-project",
+        name="p",
+        role=TokenRole.submitter,
+        scope_services=frozenset({PROJECT}),
+    )
+    assert may_manage_job(request, _project_row("tok-project", project=PROJECT))
+    assert not may_manage_job(request, _project_row("tok-project", project=LABEL))
+    assert not may_manage_job(request, _project_row("tok-project", project=None))
+    assert not may_manage_job(request, _project_row("tok-other", project=PROJECT))
+    nameless = _project_row("tok-project", project=PROJECT)
+    nameless.service_name = None
+    assert not may_manage_job(request, nameless)
 
 
 # --- derived names ------------------------------------------------------------

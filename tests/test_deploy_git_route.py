@@ -25,7 +25,16 @@ from nerdit.daemon.auth import hash_token
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers
 from nerdit.daemon.middleware import ScopedTokenAuthMiddleware
 from nerdit.daemon.routes.deploy import router as deploy_router
-from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, TokenRole
+from nerdit.db.models import (
+    ApiToken,
+    Job,
+    JobKind,
+    JobStatus,
+    Project,
+    SecretClaim,
+    TokenRole,
+)
+from nerdit.db.queries import ServiceNameClaimed
 
 LEGACY = "legacy-global"
 SUB_RAW = "sub-raw"
@@ -51,7 +60,11 @@ def _queries(existing: Job | None = None) -> AsyncMock:
     q.get_model_by_ref = AsyncMock(return_value=None)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
+    q.reserve_service_for_token = AsyncMock(side_effect=lambda job, **kw: job)
+    q.get_secret_claim = AsyncMock(return_value=None)
+    # (P40b) No `projects` row unless a test plants one: a bare AsyncMock would
+    # return a truthy MagicMock and read as a foreign project.
+    q.get_project_by_name = AsyncMock(return_value=None)
     q.update_service_config = AsyncMock()  # rollback / app-build revert
     q.update_service_config_guarded = AsyncMock()  # redeploy (CAS on max_version)
     return q
@@ -1092,3 +1105,263 @@ def test_generated_files_land_on_the_real_deploy(tmp_path, monkeypatch):
     ctx = Path(cfg["build_context_dir"])
     assert (ctx / "Dockerfile.nerdit").is_file()
     assert "Dockerfile.nerdit" in (ctx / ".dockerignore").read_text()
+
+
+# --- P39: a name claimed by setting its secrets first -------------------------
+
+
+def _claim(token_id: str | None) -> SecretClaim:
+    return SecretClaim(service_name="demo", token_id=token_id)
+
+
+def test_fresh_git_deploy_by_the_claimant_consumes_the_claim(tmp_path, monkeypatch):
+    q = _queries()
+    q.get_secret_claim = AsyncMock(return_value=_claim("tok-sub"))
+    resp = _post(_client(q, tmp_path), monkeypatch, _fake_clone())
+    assert resp.status_code == 201, resp.text
+    assert q.reserve_service_for_token.call_args.args[0].submitted_by_token == "tok-sub"
+    assert q.reserve_service_for_token.call_args.kwargs == {"admin": False}
+
+
+def test_fresh_git_deploy_over_a_foreign_claim_409_before_clone(tmp_path, monkeypatch):
+    q = _queries()
+    q.get_secret_claim = AsyncMock(return_value=_claim("tok-other"))
+    clone = _fake_clone()
+    resp = _post(_client(q, tmp_path), monkeypatch, clone)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["code"] == "service.name_claimed"
+    assert "tok-other" not in resp.text
+    clone.assert_not_awaited()
+    q.reserve_service_for_token.assert_not_called()
+
+
+def test_admin_git_deploys_over_a_foreign_claim(tmp_path, monkeypatch):
+    q = _queries()
+    q.get_secret_claim = AsyncMock(return_value=_claim("tok-other"))
+    resp = _post(_client(q, tmp_path), monkeypatch, _fake_clone(), raw=LEGACY)
+    assert resp.status_code == 201, resp.text
+    assert q.reserve_service_for_token.call_args.kwargs == {"admin": True}
+
+
+def test_git_claim_raced_into_the_transaction_maps_to_409(tmp_path, monkeypatch):
+    q = _queries()
+    q.reserve_service_for_token = AsyncMock(side_effect=ServiceNameClaimed("demo"))
+    resp = _post(_client(q, tmp_path), monkeypatch, _fake_clone())
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "service.name_claimed"
+
+
+def test_r3_fresh_deploy_unscoped_token_ref_resolves_on_a_claimed_name(tmp_path, monkeypatch):
+    """D-P39-4: the claim proves the per-service scope is the caller's, so a
+    private repo's first deploy no longer needs the shared scope."""
+    q = _queries()
+    q.get_secret_claim = AsyncMock(return_value=_claim("tok-sub"))
+    mgr = _secret_manager({"demo": {"GH": "svc-value"}})
+    clone = _fake_clone()
+    resp = _post(
+        _client(q, tmp_path, secret_manager=mgr), monkeypatch, clone, token_ref="${secrets.GH}"
+    )
+    assert resp.status_code == 201, resp.text
+    assert clone.await_args.kwargs["token"] == "svc-value"
+    assert "svc-value" not in resp.text
+
+
+def test_r3_fresh_deploy_token_ref_on_a_foreign_claim_403_never_reads_the_scope(
+    tmp_path, monkeypatch
+):
+    """A foreign claim is refused (409) before the ref could touch the file."""
+    q = _queries()
+    q.get_secret_claim = AsyncMock(return_value=_claim("tok-other"))
+    mgr = _secret_manager({"demo": {"GH": "svc-value"}})
+    clone = _fake_clone()
+    resp = _post(
+        _client(q, tmp_path, secret_manager=mgr), monkeypatch, clone, token_ref="${secrets.GH}"
+    )
+    assert resp.status_code == 409
+    mgr.load.assert_not_called()
+    clone.assert_not_awaited()
+
+
+def test_r3_fresh_deploy_unscoped_token_ref_hint_names_the_claim_path(tmp_path, monkeypatch):
+    q = _queries()  # fresh, unclaimed
+    mgr = _secret_manager({"demo": {"GH": "svc-value"}})
+    resp = _post(
+        _client(q, tmp_path, secret_manager=mgr),
+        monkeypatch,
+        _fake_clone(),
+        token_ref="${secrets.GH}",
+    )
+    assert resp.status_code == 403
+    assert resp.json()["code"] == "deploy.git_token_scope"
+    assert resp.json()["hint"] == (
+        "Set it first with `nerdit secrets set demo GH=...` — that reserves the name "
+        "for your token — or use `${secrets.shared.GH}`."
+    )
+    mgr.load.assert_not_called()
+
+
+# --- P40c: the project scope under the service scope (the include_project gate) --
+
+PRJ_ID = "prj_" + "a" * 16
+PRJ_FILE = f"_project-{PRJ_ID}"
+
+
+def _project(owner: str | None) -> Project:
+    return Project(id=PRJ_ID, name="demo", submitted_by_token=owner)
+
+
+def test_fresh_deploy_token_ref_resolves_from_the_callers_project_scope(tmp_path, monkeypatch):
+    """The owner's project file backs a fresh label; a leftover service file stays unread."""
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-sub"))
+    mgr = _secret_manager({PRJ_FILE: {"GH": "prj-value"}, "demo": {"GH": "leftover"}})
+    clone = _fake_clone()
+    resp = _post(
+        _client(q, tmp_path, secret_manager=mgr), monkeypatch, clone, token_ref="${secrets.GH}"
+    )
+    assert resp.status_code == 201, resp.text
+    assert clone.await_args.kwargs["token"] == "prj-value"
+    assert [c.args[0] for c in mgr.load.call_args_list] == [PRJ_FILE]
+    assert "prj-value" not in resp.text
+
+
+def test_fresh_deploy_inside_a_foreign_project_is_409_before_any_scope_read(tmp_path, monkeypatch):
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-other"))
+    mgr = _secret_manager({PRJ_FILE: {"GH": "a-secret"}})
+    clone = _fake_clone()
+    resp = _post(
+        _client(q, tmp_path, secret_manager=mgr), monkeypatch, clone, token_ref="${secrets.GH}"
+    )
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "project.owned"
+    mgr.load.assert_not_called()
+    clone.assert_not_awaited()
+
+
+@pytest.mark.parametrize("owner", ["tok-other", None], ids=["foreign", "null-owner"])
+def test_the_include_project_gate_holds_without_the_pre_ingress_fast_path(
+    tmp_path, monkeypatch, owner
+):
+    """B on a fresh label inside A's project, `${secrets.GH}` in A's project file.
+
+    `reject_foreign_claim` is "an optimization only" and answers first while
+    label == project (phase 1); it is stubbed out here so the gate inside
+    `_resolve_token_ref` is proven on its own -- the boundary P40d's composed
+    labels will lean on. A NULL-owner project is admin-only.
+    """
+    monkeypatch.setattr(deploy_mod, "reject_foreign_claim", AsyncMock())
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project(owner))
+    mgr = _secret_manager({PRJ_FILE: {"GH": "a-secret"}})
+    clone = _fake_clone()
+    resp = _post(
+        _client(q, tmp_path, secret_manager=mgr), monkeypatch, clone, token_ref="${secrets.GH}"
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["code"] == "deploy.git_token_scope"
+    assert "a-secret" not in resp.text
+    mgr.load.assert_not_called()
+    clone.assert_not_awaited()
+
+
+def test_a_shared_ref_inside_a_foreign_project_never_reads_the_project_override(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(deploy_mod, "reject_foreign_claim", AsyncMock())
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-other"))
+    mgr = _secret_manager({PRJ_FILE: {"GH": "a-secret"}, "_shared": {"GH": "sh-value"}})
+    clone = _fake_clone()
+    resp = _post(
+        _client(q, tmp_path, secret_manager=mgr),
+        monkeypatch,
+        clone,
+        token_ref="${secrets.shared.GH}",
+    )
+    assert resp.status_code == 201, resp.text
+    assert clone.await_args.kwargs["token"] == "sh-value"
+    assert [c.args[0] for c in mgr.load.call_args_list] == ["_shared"]
+
+
+def test_admin_reads_a_null_owner_project_scope(tmp_path, monkeypatch):
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project(None))
+    mgr = _secret_manager({PRJ_FILE: {"GH": "prj-value"}})
+    clone = _fake_clone()
+    resp = _post(
+        _client(q, tmp_path, secret_manager=mgr),
+        monkeypatch,
+        clone,
+        raw=LEGACY,
+        token_ref="${secrets.GH}",
+    )
+    assert resp.status_code == 201, resp.text
+    assert clone.await_args.kwargs["token"] == "prj-value"
+
+
+def test_owned_redeploy_merges_the_rows_project_under_the_service_scope(tmp_path, monkeypatch):
+    """Row project by id (never by name); the service scope wins a shared key (D-P40-9)."""
+    row = _existing().model_copy(update={"project_id": PRJ_ID})
+    q = _queries(row)
+    q.get_project = AsyncMock(return_value=_project("tok-sub"))
+    mgr = _secret_manager({PRJ_FILE: {"GH": "prj", "ONLY_PRJ": "p"}, "demo": {"GH": "svc"}})
+    clone = _fake_clone()
+    client = _client(q, tmp_path, secret_manager=mgr)
+    resp = _post(client, monkeypatch, clone, token_ref="${secrets.GH}")
+    assert resp.status_code == 201, resp.text
+    assert clone.await_args.kwargs["token"] == "svc"
+    resp = _post(client, monkeypatch, clone, token_ref="${secrets.ONLY_PRJ}")
+    assert resp.status_code == 201, resp.text
+    assert clone.await_args.kwargs["token"] == "p"
+    q.get_project.assert_awaited_with(PRJ_ID)
+    q.get_project_by_name.assert_not_awaited()
+
+
+def test_owned_redeploy_of_a_row_in_a_foreign_project_skips_the_project_scope(
+    tmp_path, monkeypatch
+):
+    """Row ownership proves the service scope only; the project scope is judged on its own."""
+    row = _existing().model_copy(update={"project_id": PRJ_ID})
+    q = _queries(row)
+    q.get_project = AsyncMock(return_value=_project("tok-other"))
+    mgr = _secret_manager({PRJ_FILE: {"GH": "a-secret"}, "demo": {}})
+    clone = _fake_clone()
+    resp = _post(
+        _client(q, tmp_path, secret_manager=mgr), monkeypatch, clone, token_ref="${secrets.GH}"
+    )
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "deploy.git_token_unresolved"
+    assert [c.args[0] for c in mgr.load.call_args_list] == ["demo"]
+    clone.assert_not_awaited()
+
+
+def test_vars_token_ref_is_stored_and_audited_as_the_secrets_form(tmp_path, monkeypatch):
+    q = _queries(_existing())
+    mgr = _secret_manager({"demo": {"GH": "svc-value"}})
+    clone = _fake_clone()
+    resp = _post(
+        _client(q, tmp_path, with_audit=True, secret_manager=mgr),
+        monkeypatch,
+        clone,
+        token_ref="${vars.GH}",
+    )
+    assert resp.status_code == 201, resp.text
+    assert clone.await_args.kwargs["token"] == "svc-value"
+    cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
+    assert cfg["source"]["token_ref"] == "${secrets.GH}"
+    assert "${vars." not in json.dumps([c.kwargs for c in q.insert_audit_log.await_args_list])
+
+
+def test_vars_shared_token_ref_resolves_the_shared_scope(tmp_path, monkeypatch):
+    q = _queries()
+    mgr = _secret_manager({"_shared": {"GH": "sh-value"}})
+    clone = _fake_clone()
+    resp = _post(
+        _client(q, tmp_path, secret_manager=mgr),
+        monkeypatch,
+        clone,
+        token_ref="${vars.shared.GH}",
+    )
+    assert resp.status_code == 201, resp.text
+    assert clone.await_args.kwargs["token"] == "sh-value"

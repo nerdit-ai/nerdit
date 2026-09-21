@@ -21,7 +21,7 @@ from nerdit.daemon.idempotency import IdempotencyMiddleware
 from nerdit.daemon.middleware import ScopedTokenAuthMiddleware
 from nerdit.daemon.routes.secrets import router as secrets_router
 from nerdit.db.database import Database
-from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, TokenRole
+from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, Project, SecretClaim, TokenRole
 from nerdit.db.queries import Queries
 
 LEGACY = "legacy-global"
@@ -70,6 +70,23 @@ def _queries(service: Job | None = None) -> AsyncMock:
     # By default the target service exists and is owned by the submitter (tok-sub)
     # so ownership-agnostic tests exercise the happy path.
     q.get_service_by_name = AsyncMock(return_value=service if service is not None else _service())
+    # Dict-backed `secret_claims` (P39): mint is INSERT OR IGNORE, so a second
+    # mint on a taken name loses.
+    claims: dict[str, SecretClaim] = {}
+    q.claims = claims
+
+    async def _mint(name: str, token_id: str | None, *, admin: bool = False) -> bool:
+        if name in claims:
+            return False
+        claims[name] = SecretClaim(service_name=name, token_id=token_id)
+        return True
+
+    q.get_secret_claim = AsyncMock(side_effect=lambda name: claims.get(name))
+    # (P40b) No `projects` row for any name unless a test plants one: a bare
+    # AsyncMock would return a truthy MagicMock and read as a foreign project.
+    q.get_project_by_name = AsyncMock(return_value=None)
+    q.mint_secret_claim = AsyncMock(side_effect=_mint)
+    q.delete_secret_claim = AsyncMock(side_effect=lambda name: claims.pop(name, None) is not None)
     return q
 
 
@@ -310,29 +327,291 @@ def test_null_owner_service_is_admin_only(tmp_path):
     )
 
 
-def _queries_no_service() -> AsyncMock:
+def _queries_no_service(claim: str | None = None, *, claimed: bool = False) -> AsyncMock:
+    """No row for any name; optionally a pre-existing claim by token `claim`."""
     q = _queries()
     q.get_service_by_name = AsyncMock(return_value=None)
+    if claimed:
+        q.claims["ghost"] = SecretClaim(service_name="ghost", token_id=claim)
     return q
 
 
-def test_set_on_nonexistent_service_404(tmp_path):
-    # Cannot squat secrets on a not-yet-created service name.
-    c = _client(tmp_path, _queries_no_service())
-    resp = c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(SUB_RAW))
+# --- rowless names: the D-P39-2 table ------------------------------------------
+
+
+def test_set_on_rowless_name_mints_a_claim_and_returns_names(tmp_path):
+    q = _queries_no_service()
+    c = _client(tmp_path, q, with_audit=True)
+    resp = c.post("/secrets/ghost", json={"values": {"A": "s3cr3t"}}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"service": "ghost", "keys": ["A"]}
+    assert "s3cr3t" not in resp.text
+    assert q.claims["ghost"].token_id == "tok-sub"
+    logged = json.dumps(q.insert_audit_log.call_args.kwargs)
+    assert "s3cr3t" not in logged
+    assert json.loads(q.insert_audit_log.call_args.kwargs["params_redacted"])["claimed"] is True
+    # The claimant may read and delete; a later write merges without re-minting.
+    assert c.get("/secrets/ghost", headers=_auth(SUB_RAW)).json()["keys"] == ["A"]
+    resp = c.post("/secrets/ghost", json={"values": {"B": "2"}}, headers=_auth(SUB_RAW))
+    assert resp.json()["keys"] == ["A", "B"]
+    assert "claimed" not in json.loads(q.insert_audit_log.call_args.kwargs["params_redacted"])
+
+
+def test_claim_by_another_token_is_the_same_403_as_a_foreign_row(tmp_path):
+    q = _queries_no_service("tok-sub", claimed=True)
+    c = _client(tmp_path, q)
+    # Same envelope as require_owner_or_admin: no "claimed, not deployed" oracle.
+    expected = (
+        _client(tmp_path, _queries(_service("tok-sub")))
+        .post("/secrets/demo", json={"values": {"A": "1"}}, headers=_auth(OTHER_RAW))
+        .json()
+    )
+    for resp in (
+        c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(OTHER_RAW)),
+        c.get("/secrets/ghost", headers=_auth(OTHER_RAW)),
+        c.delete("/secrets/ghost", headers=_auth(OTHER_RAW)),
+        c.delete("/secrets/ghost/A", headers=_auth(OTHER_RAW)),
+    ):
+        assert resp.status_code == 403
+        assert resp.json()["code"] == "forbidden"
+        assert resp.json()["message"] == expected["message"]
+        assert resp.json()["hint"] == expected["hint"]
+    assert not SecretManager(tmp_path / "secrets").exists("ghost")
+
+
+def test_null_token_claim_is_admin_only(tmp_path):
+    q = _queries_no_service(None, claimed=True)
+    c = _client(tmp_path, q)
+    assert c.get("/secrets/ghost", headers=_auth(SUB_RAW)).status_code == 403
+    assert c.get("/secrets/ghost", headers=_auth(ADMIN_RAW)).status_code == 200
+
+
+def test_admin_bypasses_a_foreign_claim(tmp_path):
+    q = _queries_no_service("tok-sub", claimed=True)
+    c = _client(tmp_path, q)
+    resp = c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(ADMIN_RAW))
+    assert resp.status_code == 200
+    assert q.claims["ghost"].token_id == "tok-sub"  # the claim is not re-pointed
+    assert c.get("/secrets/ghost", headers=_auth(ADMIN_RAW)).json()["keys"] == ["A"]
+
+
+def test_read_or_delete_on_rowless_unclaimed_name_404_for_non_admin(tmp_path):
+    q = _queries_no_service()
+    c = _client(tmp_path, q)
+    resp = c.get("/secrets/ghost", headers=_auth(SUB_RAW))
     assert resp.status_code == 404
     assert resp.json()["code"] == "not_found"
-
-
-def test_list_on_nonexistent_service_404(tmp_path):
-    c = _client(tmp_path, _queries_no_service())
-    assert c.get("/secrets/ghost", headers=_auth(SUB_RAW)).status_code == 404
-
-
-def test_delete_on_nonexistent_service_404(tmp_path):
-    c = _client(tmp_path, _queries_no_service())
+    assert "nerdit secrets set ghost" in resp.json()["hint"]
     assert c.delete("/secrets/ghost", headers=_auth(SUB_RAW)).status_code == 404
     assert c.delete("/secrets/ghost/A", headers=_auth(SUB_RAW)).status_code == 404
+    assert q.mint_secret_claim.await_count == 0
+
+
+def test_admin_read_and_delete_on_rowless_unclaimed_name(tmp_path):
+    """An admin removes an orphan file nobody claims (the D-P39-2 'admin only' cell)."""
+    SecretManager(tmp_path / "secrets").set("ghost", {"A": "1"})
+    q = _queries_no_service()
+    c = _client(tmp_path, q)
+    assert c.get("/secrets/ghost", headers=_auth(ADMIN_RAW)).json()["keys"] == ["A"]
+    resp = c.delete("/secrets/ghost", headers=_auth(ADMIN_RAW))
+    assert resp.json() == {"service": "ghost", "deleted": True}
+    assert not SecretManager(tmp_path / "secrets").exists("ghost")
+
+
+def test_orphan_file_409_for_non_admin_admin_claims_it(tmp_path):
+    """A pre-P39 leftover file is never adopted by a stranger's write."""
+    SecretManager(tmp_path / "secrets").set("ghost", {"OLD": "prev-owner-value"})
+    q = _queries_no_service()
+    c = _client(tmp_path, q)
+    resp = c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "secret.orphaned_scope"
+    assert "nerdit secrets rm ghost" in resp.json()["hint"]
+    assert "prev-owner-value" not in resp.text
+    assert q.claims == {}
+    # A read still 404s: the file's presence is no oracle for a non-admin.
+    assert c.get("/secrets/ghost", headers=_auth(SUB_RAW)).status_code == 404
+    resp = c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(ADMIN_RAW))
+    assert resp.status_code == 200
+    assert resp.json()["keys"] == ["A", "OLD"]
+    assert q.claims["ghost"].token_id == "tok-admin"
+
+
+def test_legacy_json_orphan_counts_as_a_file(tmp_path):
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    (secrets_dir / "ghost.json").write_text('{"OLD": "v"}', encoding="utf-8")
+    c = _client(tmp_path, _queries_no_service())
+    resp = c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "secret.orphaned_scope"
+
+
+def test_delete_all_drops_the_claim_single_key_delete_keeps_it(tmp_path):
+    q = _queries_no_service()
+    c = _client(tmp_path, q)
+    c.post("/secrets/ghost", json={"values": {"A": "1", "B": "2"}}, headers=_auth(SUB_RAW))
+    assert c.delete("/secrets/ghost/A", headers=_auth(SUB_RAW)).status_code == 200
+    assert "ghost" in q.claims
+    resp = c.delete("/secrets/ghost", headers=_auth(SUB_RAW))
+    assert resp.json() == {"service": "ghost", "deleted": True}
+    assert "ghost" not in q.claims
+    # Nothing left: the name is free again for anyone.
+    assert c.get("/secrets/ghost", headers=_auth(OTHER_RAW)).status_code == 404
+
+
+def _losing_mint(q: AsyncMock, winner: str | None) -> None:
+    """The mint loses to a claim `winner` minted after the route's claim read."""
+
+    async def _mint(name: str, token_id: str | None, *, admin: bool = False) -> bool:
+        q.claims[name] = SecretClaim(service_name=name, token_id=winner)
+        return False
+
+    q.mint_secret_claim = AsyncMock(side_effect=_mint)
+
+
+def test_lost_mint_race_to_a_foreign_claim_is_403(tmp_path):
+    q = _queries_no_service()
+    _losing_mint(q, "tok-other")
+    c = _client(tmp_path, q)
+    resp = c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 403
+    assert resp.json()["code"] == "forbidden"
+    assert not SecretManager(tmp_path / "secrets").exists("ghost")
+    assert q.claims["ghost"].token_id == "tok-other"
+
+
+def test_lost_mint_race_to_own_claim_still_writes(tmp_path):
+    """Two same-token sets in flight: the loser merges instead of being refused."""
+    q = _queries_no_service()
+    _losing_mint(q, "tok-sub")
+    c = _client(tmp_path, q, with_audit=True)
+    resp = c.post("/secrets/ghost", json={"values": {"B": "2"}}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"service": "ghost", "keys": ["B"]}
+    assert "claimed" not in json.loads(q.insert_audit_log.call_args.kwargs["params_redacted"])
+
+
+def test_lost_mint_race_to_a_vanished_claim_is_403(tmp_path):
+    """Nothing landed on the re-read (claim minted and deleted again): fail closed."""
+    q = _queries_no_service()
+    q.mint_secret_claim = AsyncMock(return_value=False)
+    c = _client(tmp_path, q)
+    resp = c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 403
+    assert not SecretManager(tmp_path / "secrets").exists("ghost")
+
+
+def _project(owner: str | None) -> Project:
+    return Project(id="prj_aaaaaaaaaaaaaaaa", name="ghost", submitted_by_token=owner)
+
+
+@pytest.mark.parametrize("owner", ["tok-other", None])
+def test_lost_mint_to_a_foreign_project_is_the_claim_403_with_no_oracle(tmp_path, owner):
+    """(P40b / D-P40-5 rule 2) The mint's `projects` predicate refused the claim;
+    `_landed_is_callers` re-judges the project and answers the claim envelope --
+    a stranger cannot tell "project reserved" from "claimed". A NULL-owner project
+    is foreign to every non-admin. Nothing minted, nothing written."""
+    q = _queries_no_service()
+    q.mint_secret_claim = AsyncMock(return_value=False)
+    q.get_project_by_name = AsyncMock(return_value=_project(owner))
+    c = _client(tmp_path, q)
+    resp = c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 403
+    assert resp.json()["code"] == "forbidden"
+    assert "project" not in resp.text.lower()
+    assert not SecretManager(tmp_path / "secrets").exists("ghost")
+    assert q.claims == {}
+    q.mint_secret_claim.assert_awaited_once_with("ghost", "tok-sub", admin=False)
+
+
+def test_admin_mint_passes_admin_and_bypasses_a_foreign_project(tmp_path):
+    q = _queries_no_service()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-other"))
+    c = _client(tmp_path, q)
+    resp = c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(ADMIN_RAW))
+    assert resp.status_code == 200, resp.text
+    q.mint_secret_claim.assert_awaited_once_with("ghost", "tok-admin", admin=True)
+    assert q.claims["ghost"].token_id == "tok-admin"
+
+
+def test_row_landing_between_the_row_read_and_the_mint_is_403_for_a_stranger(tmp_path):
+    """A fresh deploy committing after the unlocked row read: the mint refuses the
+    row and the loser is judged against it, never written into its scope."""
+    q = _queries_no_service()
+    q.get_service_by_name = AsyncMock(side_effect=[None, _service("tok-other")])
+    q.mint_secret_claim = AsyncMock(return_value=False)  # the row guard in the query
+    c = _client(tmp_path, q)
+    resp = c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 403
+    assert resp.json()["code"] == "forbidden"
+    assert not SecretManager(tmp_path / "secrets").exists("ghost")
+    assert q.claims == {}
+
+
+def test_row_landing_between_the_row_read_and_the_mint_writes_for_its_owner(tmp_path):
+    q = _queries_no_service()
+    row = _service("tok-sub")
+    # Third read: (P40c) the flag demotion maps the label to its project.
+    q.get_service_by_name = AsyncMock(side_effect=[None, row, row])
+    q.mint_secret_claim = AsyncMock(return_value=False)
+    c = _client(tmp_path, q)
+    resp = c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 200, resp.text
+    assert q.claims == {}
+
+
+def test_stale_claim_read_over_a_same_token_file_is_not_an_orphan(tmp_path):
+    """The claim read predates a same-token winner that already wrote the file."""
+    q = _queries_no_service()
+    q.claims["ghost"] = SecretClaim(service_name="ghost", token_id="tok-sub")
+    q.get_secret_claim = AsyncMock(side_effect=[None, q.claims["ghost"]])
+    SecretManager(tmp_path / "secrets").set("ghost", {"A": "1"})
+    c = _client(tmp_path, q)
+    resp = c.post("/secrets/ghost", json={"values": {"B": "2"}}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["keys"] == ["A", "B"]
+    assert q.mint_secret_claim.await_count == 0
+
+
+def test_bad_item_never_mints_a_claim(tmp_path):
+    q = _queries_no_service()
+    c = _client(tmp_path, q)
+    resp = c.post("/secrets/ghost", json={"values": {"1bad": "v"}}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 422
+    assert q.claims == {}
+
+
+def test_out_of_scope_rowless_name_403_with_no_oracle(tmp_path):
+    scoped = ApiToken(
+        id="tok-scoped",
+        name="sc",
+        role=TokenRole.submitter,
+        token_hash=hash_token("scoped-raw"),
+        scope_services=["other-app"],
+    )
+    q = _queries_no_service()
+    tokens = {**_TOKENS, scoped.token_hash: scoped}
+    q.get_api_token_by_hash = AsyncMock(side_effect=lambda h: tokens.get(h))
+    c = _client(tmp_path, q)
+    for resp in (
+        c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth("scoped-raw")),
+        c.get("/secrets/ghost", headers=_auth("scoped-raw")),
+        c.delete("/secrets/ghost", headers=_auth("scoped-raw")),
+    ):
+        assert resp.status_code == 403
+        assert resp.json()["code"] == "forbidden"
+    q.get_service_by_name.assert_not_awaited()
+    q.get_secret_claim.assert_not_awaited()
+    assert q.claims == {}
+
+
+def test_readonly_still_403_on_rowless_name(tmp_path):
+    q = _queries_no_service()
+    c = _client(tmp_path, q)
+    resp = c.post("/secrets/ghost", json={"values": {"A": "1"}}, headers=_auth(RO_RAW))
+    assert resp.status_code == 403
+    assert q.claims == {}
 
 
 # --- POST /secrets/rotate-key (P8) --------------------------------------------

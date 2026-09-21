@@ -14,6 +14,8 @@ from typing import Any
 
 import httpx
 
+from nerdit.cli.client import QualifiedNameError
+
 # Stable error codes derived from HTTP status for responses that lack a daemon
 # envelope (e.g. an upstream proxy or a non-Nerdit error page).
 _CODE_BY_STATUS: dict[int, str] = {
@@ -107,6 +109,10 @@ async def _call(coro: Awaitable[Any]) -> Any:
     """
     try:
         return await coro
+    except QualifiedNameError as exc:
+        # (D-P40-6) `NerditClient.wire_name` runs inside the awaited client
+        # method, before any request; its message is value-free.
+        return _bad_request(str(exc))
     except httpx.HTTPStatusError as exc:
         response = exc.response
         body: dict[str, Any] = {}

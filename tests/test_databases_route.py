@@ -48,7 +48,7 @@ from nerdit.daemon.routes import databases as databases_routes
 from nerdit.daemon.routes.databases import router as databases_router
 from nerdit.db.database import Database
 from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, TokenRole
-from nerdit.db.queries import Queries, ServiceNameTaken
+from nerdit.db.queries import Queries, ServiceNameClaimed, ServiceNameTaken
 
 LEGACY = "legacy-global"
 ADMIN_RAW = "admin-raw"
@@ -99,7 +99,8 @@ def _queries() -> AsyncMock:
     q.insert_audit_log = AsyncMock()
     q.touch_api_token = AsyncMock()
     q.get_service_endpoint = AsyncMock(return_value=None)
-    q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
+    q.reserve_service_for_token = AsyncMock(side_effect=lambda job, **kw: job)
+    q.get_secret_claim = AsyncMock(return_value=None)
     q.list_services = AsyncMock(return_value=([], None))
     return q
 
@@ -184,6 +185,71 @@ async def test_create_defaults_to_postgres_name_prefix(tmp_path):
     sm = app.state.secret_manager
     assert sm.list_keys("pg") == ["POSTGRES_PASSWORD"]
     assert _HEX64.fullmatch(sm.load("pg")["POSTGRES_PASSWORD"])
+
+
+@pytest.mark.asyncio
+async def test_create_reserves_and_mints_under_the_same_custody_lock(tmp_path, monkeypatch):
+    q = _queries()
+    app = _make_app(q, tmp_path)
+    lock = databases_routes.variable_write_lock(app)
+    manager = app.state.secret_manager
+    real_set = manager.set
+
+    async def reserve(job, **kwargs):
+        assert lock.locked(), "deletion must not overtake a reserved row's credential mint"
+        return job
+
+    def store(service, values):
+        assert lock.locked()
+        return real_set(service, values)
+
+    q.reserve_service_for_token.side_effect = reserve
+    monkeypatch.setattr(manager, "set", store)
+    async with _client(app) as client:
+        resp = await client.post("/databases", json={}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 201
+    assert manager.list_keys("pg") == ["POSTGRES_PASSWORD"]
+    assert not lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_create_holds_custody_until_credential_write_settles(tmp_path, monkeypatch):
+    import threading
+
+    from fastapi import Request
+
+    from nerdit.daemon.auth import Principal
+    from nerdit.db.models import DatabaseCreateRequest
+
+    app = _make_app(_queries(), tmp_path)
+    request = Request({"type": "http", "app": app, "headers": []})
+    request.state.principal = Principal(token_id="tok-sub", name="s", role=TokenRole.submitter)
+    lock = databases_routes.variable_write_lock(app)
+    manager = app.state.secret_manager
+    real_set = manager.set
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def store(service, values):
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(5), "test did not release credential worker"
+        return real_set(service, values)
+
+    monkeypatch.setattr(manager, "set", store)
+    task = asyncio.create_task(databases_routes.create_database(request, DatabaseCreateRequest()))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0)  # deliver cancellation while the file worker is blocked
+        assert lock.locked(), "cancellation must not release custody before the file write"
+        assert not task.done()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert not lock.locked()
+    assert manager.list_keys("pg") == ["POSTGRES_PASSWORD"]
 
 
 @pytest.mark.asyncio
@@ -1953,3 +2019,15 @@ async def test_dump_idempotent_replay_returns_the_same_basename_without_a_second
         assert len(list((tmp_path / "data" / "backups").glob("nerdit-dump-*.tar.gz"))) == 1
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_create_claimed_name_returns_409(tmp_path):
+    """P39: a foreign secret claim on the name refuses the create."""
+    q = _queries()
+    q.reserve_service_for_token = AsyncMock(side_effect=ServiceNameClaimed("pg"))
+    async with _client(_make_app(q, tmp_path)) as client:
+        resp = await client.post("/databases", json={}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "service.name_claimed"
+    assert q.reserve_service_for_token.await_args.kwargs == {"admin": False}

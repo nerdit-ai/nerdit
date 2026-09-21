@@ -44,8 +44,14 @@ from nerdit.core.link.identity import (
 from nerdit.core.link.manager import LinkManager
 from nerdit.core.models import ModelController, OllamaBackend, VllmBackend
 from nerdit.core.proxy import ProxyManager
-from nerdit.core.secrets import SHARED_SCOPE, SecretDecryptError, SecretManager
+from nerdit.core.secrets import (
+    SHARED_SCOPE,
+    InvalidServiceName,
+    SecretDecryptError,
+    SecretManager,
+)
 from nerdit.core.services import ServiceController
+from nerdit.core.variables import load_scoped
 from nerdit.core.workload import WorkloadManager
 from nerdit.db.models import GpuVendor
 
@@ -242,26 +248,29 @@ async def build_secret_manager(
 
 def build_edge_auth_resolver(
     secret_manager: SecretManager,
-) -> Callable[[str, str], str | None]:
+) -> Callable[[str, str | None, str], str | None]:
     """Build a single-reference resolver without exposing secret-store enumeration.
 
-    Use the shared secretref precedence for local/shared references. Any failure
+    Use the shared secretref precedence for local/shared references; the local
+    map is the merged project < service reader over the ROW's `project_id`
+    (D-P40-9 -- the proxy materializes only owner-declared config). Any failure
     returns None, causing the proxy to withhold the route. Plaintext stays local;
     never log, audit, persist or return it elsewhere.
     """
 
-    def resolve(service_name: str, ref: str) -> str | None:
+    def resolve(service_name: str, project_id: str | None, ref: str) -> str | None:
         try:
             return resolve_secret_ref(
                 ref,
-                secret_manager.load(service_name),
+                load_scoped(secret_manager, service_name, project_id)[0],
                 secret_manager.load(SHARED_SCOPE),
                 label="deploy.edge_auth",
                 field="password",
             )
-        except (BindingNotReady, SecretDecryptError, OSError):
+        except (BindingNotReady, SecretDecryptError, InvalidServiceName, OSError):
             # `BindingNotReady` is the ordinary "not set (yet)" signal; the
-            # other two are a corrupted/unreadable store. All three mean the
+            # others are a corrupted/unreadable store or a malformed project id
+            # (`InvalidServiceName`). All of them mean the
             # same thing here — the handler cannot be materialized — and the
             # exception messages (which name keys and paths) stay unlogged.
             return None

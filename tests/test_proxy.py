@@ -2720,6 +2720,7 @@ def before_shape(mgr) -> str:
 # be materialized must take the route AWAY (D-P25-8) rather than serve it open.
 
 PW = "s3cr3t-pw"
+PRJ = "prj_" + "a" * 16
 PW_REF = "${secrets.APP_PW}"
 # bcrypt output is salted per call and therefore never byte-stable, so the
 # route-object goldens pin a deterministic stand-in and assert STRUCTURE +
@@ -2770,7 +2771,7 @@ def _auth_handler(user: str = "alice", pw_hash: str = GOLDEN_HASH) -> dict:
 
 
 class FakeSecrets:
-    """A resolver stand-in: ``(service_name, ref) -> plaintext | None``.
+    """A resolver stand-in: ``(service_name, project_id, ref) -> plaintext | None``.
 
     A CALLABLE is all the proxy is given (D-P25-8) — it can resolve the one
     reference a row declares and cannot enumerate anything.
@@ -2779,9 +2780,11 @@ class FakeSecrets:
     def __init__(self, values: dict[str, str] | None = None):
         self.values = dict(values or {})
         self.calls: list[tuple[str, str]] = []
+        self.project_ids: list[str | None] = []
 
-    def __call__(self, service_name: str, ref: str) -> str | None:
+    def __call__(self, service_name: str, project_id: str | None, ref: str) -> str | None:
         self.calls.append((service_name, ref))
+        self.project_ids.append(project_id)
         return self.values.get(service_name)
 
 
@@ -3290,7 +3293,7 @@ async def test_an_unwired_resolver_fails_closed(queries, hash_calls):
 async def test_a_raising_resolver_fails_closed(queries, hash_calls):
     """Injected code that blows up must not abort the tick — or open the route."""
 
-    def boom(service_name, ref):
+    def boom(service_name, project_id, ref):
         raise RuntimeError("secret store on fire")
 
     fake = FakeCaddy()
@@ -3325,6 +3328,21 @@ async def test_the_resolver_receives_the_service_and_the_ref_verbatim(queries, h
     await _seed_protected(queries, "alpha", ref="${secrets.shared.APP_PW}")
     await mgr.reconcile()
     assert secrets.calls == [("alpha", "${secrets.shared.APP_PW}")]
+
+
+async def test_reconcile_and_register_hand_the_resolver_the_rows_project_id(queries, hash_calls):
+    """(P40c) The desired entries and the inline fast-path carry `jobs.project_id`."""
+    fake = FakeCaddy()
+    secrets = FakeSecrets({"alpha": PW})
+    mgr = _protected_proxy(queries, fake, secrets)
+    await _seed_protected(queries, "alpha")
+    row = await queries.get_service_by_name("alpha")
+    assert row.project_id is not None, "a kind=service row always carries its project (P40a)"
+    await mgr.reconcile()
+    await mgr.register(
+        "alpha", 8111, edge_auth={"user": "alice", "password": PW_REF}, project_id="prj_x"
+    )
+    assert secrets.project_ids == [row.project_id, "prj_x"]
 
 
 async def test_no_plaintext_ever_reaches_the_emitted_route_object(queries, hash_calls):
@@ -3611,14 +3629,54 @@ async def test_the_edge_auth_resolver_walks_the_p8_precedence(tmp_path):
     secrets.set(SHARED_SCOPE, {"SHARED_PW": "shared-value", "ONLY_SHARED": "x"})
     resolve = build_edge_auth_resolver(secrets)
 
-    assert resolve("alpha", "${secrets.APP_PW}") == "per-service"
-    assert resolve("alpha", "${secrets.shared.SHARED_PW}") == "shared-value"
+    assert resolve("alpha", None, "${secrets.APP_PW}") == "per-service"
+    assert resolve("alpha", None, "${secrets.shared.SHARED_PW}") == "shared-value"
     # An unset key is the ordinary fail-closed signal.
-    assert resolve("alpha", "${secrets.MISSING}") is None
+    assert resolve("alpha", None, "${secrets.MISSING}") is None
     # An UNSCOPED ref never falls back to a same-named shared key (P8 precedence).
-    assert resolve("alpha", "${secrets.ONLY_SHARED}") is None
+    assert resolve("alpha", None, "${secrets.ONLY_SHARED}") is None
     # A service with no store at all resolves to nothing, never raises.
-    assert resolve("ghost", "${secrets.APP_PW}") is None
+    assert resolve("ghost", None, "${secrets.APP_PW}") is None
+
+
+async def test_the_edge_auth_resolver_reads_the_project_scope_under_the_service(tmp_path):
+    """(P40c / D-P40-9) project < service < nothing else; no project id, no project read."""
+    from nerdit.core.secrets import SHARED_SCOPE, SecretManager, project_storage_name
+    from nerdit.daemon.bootstrap import build_edge_auth_resolver
+
+    secrets = SecretManager(tmp_path / "secrets")
+    secrets.set(project_storage_name(PRJ), {"APP_PW": "project-value", "BOTH": "project"})
+    secrets.set("alpha", {"BOTH": "service"})
+    secrets.set(SHARED_SCOPE, {"APP_PW": "shared-value"})
+    resolve = build_edge_auth_resolver(secrets)
+
+    assert resolve("alpha", PRJ, "${secrets.APP_PW}") == "project-value"
+    assert resolve("alpha", PRJ, "${secrets.BOTH}") == "service"
+    # A project-scope key shadows the shared scope, like a service-scope one.
+    assert resolve("alpha", PRJ, "${secrets.shared.APP_PW}") == "project-value"
+    # A row with no project (model/database/legacy) never reads a project file.
+    assert resolve("alpha", None, "${secrets.APP_PW}") is None
+    # A malformed id fails closed instead of raising into the reconcile tick.
+    assert resolve("alpha", "../x", "${secrets.APP_PW}") is None
+
+
+async def test_edge_auth_materializes_through_a_project_scope_ref(queries, hash_calls, tmp_path):
+    """(P40c) End to end: row -> desired entry -> real resolver -> project file -> handler."""
+    from nerdit.core.secrets import SecretManager, project_storage_name
+    from nerdit.daemon.bootstrap import build_edge_auth_resolver
+
+    secrets = SecretManager(tmp_path / "secrets")
+    fake = FakeCaddy()
+    mgr = _protected_proxy(queries, fake, build_edge_auth_resolver(secrets))
+    job = await _seed_protected(queries, "alpha")
+    await mgr.reconcile()
+    assert fake.routes == [], "unset everywhere: withheld, never open"
+
+    secrets.set(project_storage_name(job.project_id), {"APP_PW": PW})
+    await mgr.reconcile()
+    assert [r["@id"] for r in fake.routes] == ["nerdit-route-alpha"]
+    assert _live_auth(fake.routes[0]) is not None
+    assert PW not in json.dumps(fake.routes)
 
 
 async def test_the_edge_auth_resolver_turns_an_unreadable_store_into_none(tmp_path):
@@ -3629,7 +3687,7 @@ async def test_the_edge_auth_resolver_turns_an_unreadable_store_into_none(tmp_pa
     secrets = SecretManager(tmp_path / "secrets")
     secrets.set("alpha", {"APP_PW": "per-service"})
     (tmp_path / "secrets" / "alpha.enc").write_bytes(b"not a valid envelope")
-    assert build_edge_auth_resolver(secrets)("alpha", "${secrets.APP_PW}") is None
+    assert build_edge_auth_resolver(secrets)("alpha", None, "${secrets.APP_PW}") is None
 
 
 # --- 10. (P26 WP1) custom domains: a second route per service ----------------

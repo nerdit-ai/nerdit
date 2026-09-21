@@ -946,7 +946,11 @@ def test_fresh_deploy_stamps_source_and_revision(tmp_path):
     q = _queries(None)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
+    q.reserve_service_for_token = AsyncMock(side_effect=lambda job, **kw: job)
+    q.get_secret_claim = AsyncMock(return_value=None)
+    # (P40b) No `projects` row unless a test plants one: a bare AsyncMock would
+    # return a truthy MagicMock and read as a foreign project.
+    q.get_project_by_name = AsyncMock(return_value=None)
     client = _deploy_client(q, tmp_path)
     r = _deploy(client)
     assert r.status_code == 201
@@ -1301,6 +1305,30 @@ def test_db_section_external_needs_no_row():
     assert r.status_code == 200, r.text
     new_cfg = json.loads(q.update_app_config.await_args.args[1])
     assert new_cfg["db"]["cache"]["provider"] == "external"
+
+
+def test_the_vars_alias_is_stored_as_a_secrets_ref_on_both_binding_sections():
+    """D-P40-9: the merged body is persisted raw, so this ingress rewrites the alias itself."""
+    q = _queries_db(_app_job(), None)
+    ai = {"provider": "api", "model": "m", "base_url": "https://x.example/v1"}
+    r = _put(_client(q), section="ai", body={"cheap": {**ai, "api_key": "${vars.shared.K}"}})
+    assert r.status_code == 200, r.text
+    new_cfg = json.loads(q.update_app_config.await_args.args[1])
+    assert new_cfg["ai"]["cheap"]["api_key"] == "${secrets.shared.K}"
+    r = _put(
+        _client(q),
+        section="db",
+        body={"cache": {"provider": "external", "url": "redis://h/0", "password": "${vars.P}"}},
+    )
+    assert r.status_code == 200, r.text
+    new_cfg = json.loads(q.update_app_config.await_args.args[1])
+    assert new_cfg["db"]["cache"]["password"] == "${secrets.P}"
+    # A re-PUT of the alias over its stored form is a no-op, not a change.
+    stored = _app_job(config_extra={"ai": {"cheap": {**ai, "api_key": "${secrets.K}"}}})
+    q = _queries_db(stored, None)
+    r = _put(_client(q), section="ai", body={"cheap": {**ai, "api_key": "${vars.K}"}})
+    assert r.status_code == 200, r.text
+    q.update_app_config.assert_not_awaited()
 
 
 def test_db_section_null_deletes_binding():

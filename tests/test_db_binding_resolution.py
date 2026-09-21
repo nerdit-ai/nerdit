@@ -22,7 +22,7 @@ from nerdit.core.data.binding import (
     resolve_db_bindings,
 )
 from nerdit.core.models.binding import BindingNotReady, inject_env_key_names
-from nerdit.core.secrets import SecretManager
+from nerdit.core.secrets import SecretManager, project_storage_name
 from nerdit.core.services import ServiceController
 from nerdit.db.models import Job, JobKind, JobStatus
 
@@ -308,10 +308,18 @@ class _FakeData:
 
 
 async def test_injected_database_url_beats_user_secret(queries, tmp_path):
-    """Decision #4 extended: a user secret named DATABASE_URL must not win."""
+    """Decision #4 extended: a DATABASE_URL in either variable scope must not win (D-P40-9)."""
     mgr = SecretManager(tmp_path / "secrets")
     mgr.set("pg", {"POSTGRES_PASSWORD": PW})
     mgr.set("app", {"DATABASE_URL": "postgresql://user-should-lose@nowhere/x"})
+    project_id = "prj_" + "a" * 16
+    mgr.set(
+        project_storage_name(project_id),
+        {
+            "DATABASE_URL": "postgresql://project-should-lose@nowhere/x",
+            "NERDIT_DB_DEFAULT_URL": "x",
+        },
+    )
     await _serve_db(queries)
     endpoint = await queries.get_service_endpoint("pg")
 
@@ -330,6 +338,7 @@ async def test_injected_database_url_beats_user_secret(queries, tmp_path):
         name="app",
         kind=JobKind.service,
         service_name="app",
+        project_id=project_id,
         gpu_count=0,
         status=JobStatus.building,
         desired_state="running",

@@ -100,13 +100,30 @@ function redeployable(svc: Service): boolean {
   return type === "git" || type === "workspace";
 }
 
-function tabPath(name: string, key: TabKey): string {
-  const base = `/projects/${encodeURIComponent(name)}`;
-  return key === "overview" ? base : `${base}/${key}`;
+function tabPath(basePath: string, key: TabKey): string {
+  return key === "overview" ? basePath : `${basePath}/${key}`;
 }
 
-export default function ProjectDetail() {
-  const { name = "", tab } = useParams();
+/**
+ * (P40e) The page is mounted by `ProjectPage`'s route components, which resolve
+ * the URL to a service LABEL through the API (never by parsing one):
+ * `/projects/:name` for the single-service project and the pre-P40 daemon,
+ * `/projects/:name/services/:service` inside a multi-service project.
+ */
+export interface ProjectDetailProps {
+  /** The service's wire identity (D-P40-6) — every API call here uses it. */
+  label: string;
+  /** Where this page's tabs live; the overview tab IS this path. */
+  basePath: string;
+  /** The project page, when the daemon has one; absent on a pre-P40 daemon. */
+  projectPath?: string;
+  /** True under `/services/:service`: a way back up, and delete returns there. */
+  nested?: boolean;
+}
+
+export default function ProjectDetail({ label, basePath, projectPath, nested }: ProjectDetailProps) {
+  const { tab } = useParams();
+  const name = label;
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -146,7 +163,7 @@ export default function ProjectDetail() {
   }, [notFound, navigate]);
   useEffect(() => {
     if (svc && svc.kind !== "service") {
-      navigate(kindHomePath(svc.kind, svc.name), { replace: true });
+      navigate(kindHomePath(svc), { replace: true });
     }
   }, [svc, navigate]);
 
@@ -154,8 +171,8 @@ export default function ProjectDetail() {
   // bookmark lands on the content it asked for instead of a silent Overview.
   const legacy = tab ? LEGACY_TABS[tab] : undefined;
   useEffect(() => {
-    if (legacy) navigate(tabPath(name, legacy), { replace: true });
-  }, [legacy, name, navigate]);
+    if (legacy) navigate(tabPath(basePath, legacy), { replace: true });
+  }, [legacy, basePath, navigate]);
 
   // The ⌘K palette redeploy quick action hands off via router state. It routes
   // through the SAME source-aware handler as the header Deploy button — a git
@@ -265,7 +282,7 @@ export default function ProjectDetail() {
         onSuccess: () => {
           setConfirmDelete(false);
           toast("success", `App ${svc!.name} deleted`);
-          navigate("/");
+          navigate(nested && projectPath ? projectPath : "/");
         }
       }
     );
@@ -294,8 +311,17 @@ export default function ProjectDetail() {
 
   return (
     <div className="mx-auto max-w-content space-y-6">
+      {nested && projectPath && (
+        <Link
+          to={projectPath}
+          className="text-13 text-muted-foreground hover:text-foreground"
+          data-testid="app-project-link"
+        >
+          ← {svc.project ?? "Project"}
+        </Link>
+      )}
       <PageHeader
-        title={svc.name}
+        title={nested ? (svc.service ?? svc.name) : svc.name}
         subtitle={
           <Badge
             tone={serviceStatusTone(svc.status)}
@@ -329,7 +355,7 @@ export default function ProjectDetail() {
           return (
             <Link
               key={t.key}
-              to={tabPath(name, t.key)}
+              to={tabPath(basePath, t.key)}
               aria-current={active ? "page" : undefined}
               className={`-mb-px border-b-2 px-1 py-2 text-14 ${
                 active
@@ -348,6 +374,7 @@ export default function ProjectDetail() {
           svc={svc}
           project={project}
           name={name}
+          managePath={tabPath(basePath, "manage")}
           canConfigure={canConfigure}
           showProgress={progress === null}
           isAdmin={isAdmin}
@@ -357,7 +384,13 @@ export default function ProjectDetail() {
       )}
       {activeTab === "logs" && <ServiceLogsPanel ident={svc.name} status={svc.status} />}
       {activeTab === "manage" && (
-        <ManageTab svc={svc} name={name} canConfigure={canConfigure} onConfigure={() => setConfigureOpen(true)} />
+        <ManageTab
+          svc={svc}
+          name={name}
+          projectPath={nested ? undefined : projectPath}
+          canConfigure={canConfigure}
+          onConfigure={() => setConfigureOpen(true)}
+        />
       )}
 
       <Confirm
@@ -520,6 +553,7 @@ function OverviewTab({
   svc,
   project,
   name,
+  managePath,
   canConfigure,
   showProgress,
   isAdmin,
@@ -529,6 +563,7 @@ function OverviewTab({
   svc: Service;
   project: Project;
   name: string;
+  managePath: string;
   canConfigure: boolean;
   showProgress: boolean;
   isAdmin: boolean | undefined;
@@ -572,7 +607,7 @@ function OverviewTab({
         {project.resources.length === 0 ? (
           <p className="px-4 py-3 text-13 text-subtle-foreground">
             No models or databases bound.{" "}
-            <Link to={tabPath(name, "manage")} className="text-primary hover:underline">
+            <Link to={managePath} className="text-primary hover:underline">
               Wire one from Manage.
             </Link>
           </p>
@@ -656,11 +691,13 @@ function ActivityFeed({ name }: { name: string }) {
 function ManageTab({
   svc,
   name,
+  projectPath,
   canConfigure,
   onConfigure
 }: {
   svc: Service;
   name: string;
+  projectPath?: string;
   canConfigure: boolean;
   onConfigure: () => void;
 }) {
@@ -686,6 +723,20 @@ function ManageTab({
           <SecretsPanel service={svc.name} canWrite={canConfigure} />
         </div>
       </Panel>
+
+      {/* (P40e) A single-service project keeps this page as its home; the
+          project-level sections (variables, addresses, delete) are one link away. */}
+      {projectPath && (
+        <Panel title="Project">
+          <p className="px-4 py-3 text-13 text-muted-foreground">
+            Variables shared by every service of <Mono>{svc.project ?? svc.name}</Mono>, its
+            addresses and the project itself.{" "}
+            <Link to={projectPath} className="text-primary hover:underline" data-testid="app-project-link">
+              Open the project
+            </Link>
+          </p>
+        </Panel>
+      )}
 
       <Panel title="AI resources">
         <div className="space-y-3 px-4 py-3">

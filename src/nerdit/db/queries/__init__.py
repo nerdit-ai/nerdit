@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from ._base import PortRangeExhausted, ServiceNameTaken, _serialized
+from ._base import (
+    PortRangeExhausted,
+    ProjectExists,
+    ProjectOwned,
+    ServiceNameClaimed,
+    ServiceNameTaken,
+    _serialized,
+)
 from .audit import AuditQueries
 from .domains import DomainQueries
 from .endpoints import EndpointQueries
@@ -10,13 +17,23 @@ from .events import EventQueries
 from .gpus import GpuQueries
 from .idempotency import IdempotencyQueries
 from .logs import LogQueries
+from .projects import ProjectQueries
+from .secret_claims import SecretClaimQueries
 from .service_config import ServiceConfigQueries
 from .services import ServiceQueries
 from .shares import ShareQueries
 from .tokens import TokenQueries
 from .workloads import WorkloadQueries
 
-__all__ = ["PortRangeExhausted", "Queries", "ServiceNameTaken", "_serialized"]
+__all__ = [
+    "PortRangeExhausted",
+    "ProjectExists",
+    "ProjectOwned",
+    "Queries",
+    "ServiceNameClaimed",
+    "ServiceNameTaken",
+    "_serialized",
+]
 
 
 class Queries(
@@ -32,6 +49,8 @@ class Queries(
     ServiceConfigQueries,
     ShareQueries,
     DomainQueries,
+    SecretClaimQueries,
+    ProjectQueries,
 ):
     """Async query interface shared by routes and scheduling.
 

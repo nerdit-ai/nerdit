@@ -145,6 +145,9 @@ def _service_response(
     return ServiceResponse(
         id=job.id,
         name=job.service_name or job.name or job.id,
+        project=job.project,
+        project_id=job.project_id,
+        service=job.service,
         status=job.status,
         desired_state=job.desired_state,
         kind=job.kind,

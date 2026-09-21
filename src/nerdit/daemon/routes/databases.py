@@ -69,6 +69,7 @@ from nerdit.daemon.schemas.databases import (
     DatabaseRestoreRequest,
     DatabaseRestoreResponse,
 )
+from nerdit.daemon.secret_scope import demote_flags, variable_write_lock
 from nerdit.daemon.service_purge import _dep_entry, _iter_db_dependents
 from nerdit.daemon.views.service import _not_found, _resolve_service
 from nerdit.db.models import (
@@ -220,49 +221,57 @@ async def create_database(request: Request, body: DatabaseCreateRequest) -> Data
         config=config,
     )
 
-    # The row-write is the ownership-authorization point (the P11.5
-    # template-secrets precedent): mint the credential only AFTER it succeeds so
-    # a name clash never leaves an orphaned secret.
-    job = await reserve_or_conflict(
-        queries,
-        job,
-        service_name=service_name,
-        name_taken_hint="Check `nerdit db list`, or pass a different --name.",
-    )
-
-    # Mint the credential (the security-review core, D-B).
-    #
-    # This value is minted server-side and stored write-only under the backend's
-    # image-native env name so the ordinary per-service secret scope delivers it
-    # at launch (decided point (b)). It is NEVER returned by any response body,
-    # audit row, log line, diagnose payload, or dry-run diff — names only. If
-    # this action ever begins riding a value on a response body, it MUST be added
-    # to NO_BODY_CACHE_ACTIONS (daemon/idempotency.py) so idempotent replays
-    # never re-serve the plaintext credential (the LOCAL_MODEL_API_KEY trap,
-    # core/models/binding.py, retargeted).
-    password = secrets.token_hex(32)
-    try:
-        # SecretManager.set takes the rotation RLock, which a rotate_key worker
-        # thread can hold for a full re-encrypt; run it off the event loop so an
-        # in-flight rotation cannot stall the whole daemon (§2 WP2).
-        await asyncio.to_thread(
-            secret_manager.set, service_name, {backend.minted_secret_key: password}
+    # Hold custody from reservation until the credential worker settles: deletion
+    # must neither orphan this write nor let it overwrite a replacement owner.
+    async with variable_write_lock(request.app):
+        # The row-write is the ownership-authorization point (the P11.5
+        # template-secrets precedent): mint the credential only AFTER it succeeds so
+        # a name clash never leaves an orphaned secret.
+        job = await reserve_or_conflict(
+            request,
+            queries,
+            job,
+            service_name=service_name,
+            name_taken_hint="Check `nerdit db list`, or pass a different --name.",
         )
-    except Exception as exc:  # noqa: BLE001 — surface as an actionable structured error
-        # The row already exists but has no usable credential: it will never
-        # reach db_ready. No compensating row rollback (the P11.5 posture) — the
-        # operator sets the secret and restarts, or deletes and recreates.
-        logger.warning("Failed to mint credential for database %s: %s", service_name, exc)
-        raise NerditError(
-            500,
-            "db.credential_mint_failed",
-            "The database was created but its credential could not be stored.",
-            hint=(
-                f"Set it manually (nerdit secrets set {service_name} "
-                f"{backend.minted_secret_key}=...) and restart the database, "
-                "or delete and recreate it."
-            ),
-        ) from exc
+
+        # Mint the credential (the security-review core, D-B).
+        #
+        # This value is minted server-side and stored write-only under the backend's
+        # image-native env name so the ordinary per-service secret scope delivers it
+        # at launch (decided point (b)). It is NEVER returned by any response body,
+        # audit row, log line, diagnose payload, or dry-run diff — names only. If
+        # this action ever begins riding a value on a response body, it MUST be added
+        # to NO_BODY_CACHE_ACTIONS (daemon/idempotency.py) so idempotent replays
+        # never re-serve the plaintext credential (the LOCAL_MODEL_API_KEY trap,
+        # core/models/binding.py, retargeted).
+        password = secrets.token_hex(32)
+        try:
+            # SecretManager.set takes the rotation RLock, which a rotate_key worker
+            # thread can hold for a full re-encrypt; run it off the event loop so an
+            # in-flight rotation cannot stall the whole daemon (§2 WP2).
+            # Flag first, then file, under the variables lock (D-P40-1): a plain
+            # flag pre-set on this key name through the variables API must never
+            # make the minted credential listable.
+            await demote_flags(request, service_name, [backend.minted_secret_key])
+            await settled_to_thread(
+                secret_manager.set, service_name, {backend.minted_secret_key: password}
+            )
+        except Exception as exc:  # noqa: BLE001 — surface as an actionable structured error
+            # The row already exists but has no usable credential: it will never
+            # reach db_ready. No compensating row rollback (the P11.5 posture) — the
+            # operator sets the secret and restarts, or deletes and recreates.
+            logger.warning("Failed to mint credential for database %s: %s", service_name, exc)
+            raise NerditError(
+                500,
+                "db.credential_mint_failed",
+                "The database was created but its credential could not be stored.",
+                hint=(
+                    f"Set it manually (nerdit secrets set {service_name} "
+                    f"{backend.minted_secret_key}=...) and restart the database, "
+                    "or delete and recreate it."
+                ),
+            ) from exc
     await _audit_credential_minted(request, service_name, [backend.minted_secret_key])
 
     return await _database_response(request, job)
@@ -680,7 +689,7 @@ async def create_database_dump(
     # its owner column.
     require_owner_or_admin(request, job)
     service_name = job.service_name or name
-    require_service_scope(request, service_name)
+    require_service_scope(request, service_name, project=job.project)
 
     backend = _dump_preflight(request, name, job, timeout_s=body.timeout_s)
     audit["engine"] = backend.name
@@ -844,7 +853,7 @@ async def list_database_dumps(request: Request, name: str) -> DatabaseDumpListRe
         raise _not_found(name)
     require_owner_or_admin(request, job)
     service_name = job.service_name or name
-    require_service_scope(request, service_name)
+    require_service_scope(request, service_name, project=job.project)
     if job.kind is not JobKind.database:
         raise _dump_not_a_database(name, job.kind)
 

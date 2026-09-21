@@ -3,7 +3,9 @@
 Reads list names only; values are injected at container launch, never returned.
 Writes require scope/role authorization, idempotency and redacted auditing.
 Shared scope maps to _shared storage: only admins write it, any authenticated
-principal may read names. Key rotation is admin-only and audits counts only.
+principal may read names. A rowless name is authorized through its claim
+(`daemon/secret_scope.py`): the first write reserves it for the caller until a
+deploy consumes it. Key rotation is admin-only and audits counts only.
 Mounted under /api only.
 """
 
@@ -15,28 +17,24 @@ import logging
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from nerdit.core.secrets import (
-    SHARED_SCOPE,
-    InvalidSecretKey,
-    InvalidSecretValue,
-    InvalidServiceName,
-    SecretDecryptError,
-    SecretRotationInProgress,
-)
+from nerdit.core.secrets import SecretDecryptError, SecretRotationInProgress
 from nerdit.daemon.audit import audit_params
-from nerdit.daemon.auth import require_owner_or_admin, require_role, require_service_scope
+from nerdit.daemon.auth import require_role
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.schemas._base import StrictRequestModel
+from nerdit.daemon.secret_scope import (
+    authorize_secret_scope,
+    secret_call,
+    secret_manager,
+    set_secret_values,
+    storage_name,
+    variable_write_lock,
+)
 from nerdit.db.models import TokenRole
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-# User-facing name of the shared (global) secrets scope. Routes translate
-# it to the internal storage name (`SHARED_SCOPE`); a service can never take
-# this name (`service.reserved_name` on create/deploy).
-_SHARED_PUBLIC = "shared"
 
 
 class SecretSetRequest(StrictRequestModel):
@@ -66,93 +64,6 @@ class RotateKeyResponse(BaseModel):
     services_rewritten: int
 
 
-def _manager(request: Request):
-    mgr = getattr(request.app.state, "secret_manager", None)
-    if mgr is None:  # pragma: no cover - always wired in the daemon
-        raise NerditError(500, "internal", "Secret manager is not configured.")
-    return mgr
-
-
-def _call(fn, *args):
-    """Run a SecretManager operation, mapping its errors to the envelope.
-
-    Every CRUD handler reaches `load()` internally (set/delete merge the
-    existing file), so a corrupt or wrong-key `.enc` can surface anywhere —
-    the structured 500 keeps the kid-bearing restore hint reaching the caller
-    instead of a bare Starlette 500. Messages are hygienic by construction
-    (paths, service names and kids only).
-    """
-    try:
-        return fn(*args)
-    except InvalidServiceName as exc:
-        raise NerditError(422, "secret.invalid_service", str(exc)) from exc
-    except InvalidSecretKey as exc:
-        raise NerditError(
-            422,
-            "secret.invalid_key",
-            str(exc),
-            hint="Key names are env-var names: letters, digits and '_', not starting with a digit.",
-        ) from exc
-    except InvalidSecretValue as exc:
-        raise NerditError(
-            422,
-            "secret.invalid_value",
-            str(exc),
-            hint="Values may not contain NUL or control characters (tab/newline/CR are allowed).",
-        ) from exc
-    except SecretDecryptError as exc:
-        raise NerditError(500, "secret.decrypt_failed", str(exc)) from exc
-
-
-def _storage_name(service: str) -> str:
-    """Translate the user-facing `shared` scope to its internal storage name."""
-    return SHARED_SCOPE if service == _SHARED_PUBLIC else service
-
-
-def _guard_name(service: str) -> None:
-    from nerdit.core.secrets import _DNS_LABEL_RE
-
-    if not _DNS_LABEL_RE.match(service):
-        raise NerditError(
-            422,
-            "secret.invalid_service",
-            f"Invalid service name '{service}'.",
-            hint="Service names are DNS labels (lowercase, digits, '-').",
-        )
-
-
-async def _authorize_service(request: Request, service: str, *, write: bool) -> None:
-    """Authorize secret access, checking scope before service lookup to prevent oracles.
-
-    Service secrets require an existing row and owner/admin, including names-only
-    reads. Shared scope skips row lookup: admins write, any authenticated caller
-    reads names. Refuse all shared operations if a legacy service owns that name;
-    never reinterpret its secrets as shared storage.
-    """
-    if service == _SHARED_PUBLIC:
-        if getattr(request.app.state, "shared_scope_blocked", False):
-            raise NerditError(
-                409,
-                "secret.shared_unavailable",
-                "A service named 'shared' predates the reserved shared scope; "
-                "shared-scope secrets are disabled.",
-                hint="Rename or delete that service, then restart the daemon.",
-            )
-        if write:
-            require_role(request, TokenRole.admin)
-        return
-    require_service_scope(request, service)
-    existing = await request.app.state.queries.get_service_by_name(service)
-    if existing is None:
-        raise NerditError(
-            404,
-            "not_found",
-            f"No service '{service}'.",
-            hint="Deploy the service first, then set its secrets.",
-        )
-    require_owner_or_admin(request, existing)
-
-
 # Registered BEFORE the parameterized routes so the literal path wins over
 # `POST /secrets/{service}` (its audit rule likewise sits above `secret.set`).
 @router.post(
@@ -178,7 +89,7 @@ async def rotate_secrets_key(request: Request) -> RotateKeyResponse:
             hint="Rename or delete that service, then restart the daemon.",
         )
     try:
-        count = await asyncio.to_thread(_manager(request).rotate_key)
+        count = await asyncio.to_thread(secret_manager(request).rotate_key)
     except SecretRotationInProgress as exc:
         raise NerditError(
             409,
@@ -198,18 +109,19 @@ async def rotate_secrets_key(request: Request) -> RotateKeyResponse:
 async def set_secrets(
     request: Request, service: str, body: SecretSetRequest
 ) -> SecretNamesResponse:
-    """Set/merge secrets for a service. Returns the resulting key names only."""
+    """Set/merge secrets for a service. Returns the resulting key names only.
+
+    A name with no row is reserved for the caller's token until deployed.
+    """
     require_role(request, TokenRole.submitter, TokenRole.admin)
     # Audit the *names* only — never the values (defense-in-depth on top of the
     # middleware's env/secret redaction).
     request.state.audit_params = audit_params(
         {"service": service, "keys": sorted(body.values.keys())}
     )
-    _guard_name(service)
-    await _authorize_service(request, service, write=True)
     if not body.values:
         raise NerditError(400, "secret.empty", "No secret values provided.")
-    keys = _call(_manager(request).set, _storage_name(service), body.values)
+    keys = await set_secret_values(request, service, body.values)
     return SecretNamesResponse(service=service, keys=keys)
 
 
@@ -222,10 +134,9 @@ async def list_secret_names(request: Request, service: str) -> SecretNamesRespon
     Intentionally no coarse role gate: the read is scoped to the service's
     owning token (or an admin) via the ownership check below.
     """
-    _guard_name(service)
-    await _authorize_service(request, service, write=False)
+    await authorize_secret_scope(request, service, write=False)
     return SecretNamesResponse(
-        service=service, keys=_call(_manager(request).list_keys, _storage_name(service))
+        service=service, keys=secret_call(secret_manager(request).list_keys, storage_name(service))
     )
 
 
@@ -234,19 +145,25 @@ async def delete_secret_key(request: Request, service: str, key: str):
     """Delete a single secret key from a service."""
     require_role(request, TokenRole.submitter, TokenRole.admin)
     request.state.audit_params = audit_params({"service": service, "key": key})
-    _guard_name(service)
-    await _authorize_service(request, service, write=True)
-    if not _call(_manager(request).delete_key, _storage_name(service), key):
+    async with variable_write_lock(request.app):  # verdict and delete are one section
+        await authorize_secret_scope(request, service, write=True)
+        existed = secret_call(secret_manager(request).delete_key, storage_name(service), key)
+    if not existed:
         raise NerditError(404, "not_found", f"No secret '{key}' for service '{service}'.")
     return {"service": service, "deleted": key}
 
 
 @router.delete("/secrets/{service}", status_code=200, operation_id="delete_service_secrets")
 async def delete_all_secrets(request: Request, service: str):
-    """Delete all secrets for a service (removes the whole file)."""
+    """Delete all secrets for a service (removes the whole file and its claim)."""
     require_role(request, TokenRole.submitter, TokenRole.admin)
     request.state.audit_params = audit_params({"service": service})
-    _guard_name(service)
-    await _authorize_service(request, service, write=True)
-    existed = _call(_manager(request).delete, _storage_name(service))
+    # Under the writers' lock: releasing the claim ends an owner epoch, and a
+    # write parked on the lock must re-authorize AFTER it, never land across it.
+    async with variable_write_lock(request.app):
+        await authorize_secret_scope(request, service, write=True)
+        existed = secret_call(secret_manager(request).delete, storage_name(service))
+        # The claim reserves the name only while secrets exist for it; a
+        # single-key delete keeps both.
+        await request.app.state.queries.delete_secret_claim(service)
     return {"service": service, "deleted": existed}

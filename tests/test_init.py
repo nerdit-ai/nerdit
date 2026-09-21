@@ -271,6 +271,7 @@ class TestInitScaffoldsNoDeadConfig:
         config_text, token = init._generate_default_config()
         assert token
         parsed = tomllib.loads(config_text)
+        assert parsed["proxy"] == {"enabled": True, "mdns": True, "https_port": 8443}
 
         assert "scheduler" not in parsed
         assert "mount_workdir" not in parsed["containers"]
@@ -469,7 +470,9 @@ class TestInstallerAuthToken:
     local caller as admin. The installer closes that; these pin the contract.
     """
 
-    def test_writes_only_the_auth_token(self, tmp_path):
+    def test_fresh_config_enables_https_and_mdns(self, tmp_path):
+        import tomllib
+
         from nerdit.cli.commands.init import _write_installer_auth_config
 
         assert _write_installer_auth_config(tmp_path) == "written"
@@ -478,6 +481,21 @@ class TestInstallerAuthToken:
         assert "auth_token" in text
         # Never the default template's bind-all host: the docs promise loopback.
         assert "0.0.0.0" not in text
+        assert tomllib.loads(text)["proxy"] == {"enabled": True, "mdns": True, "https_port": 8443}
+
+    def test_existing_config_keeps_proxy_opt_out(self, tmp_path):
+        import tomllib
+
+        from nerdit.cli.commands.init import _write_installer_auth_config
+
+        path = tmp_path / "config.toml"
+        path.write_text("[proxy]\nenabled = false\nmdns = false\nhttps_port = 9443\n")
+        assert _write_installer_auth_config(tmp_path) == "written"
+        assert tomllib.loads(path.read_text())["proxy"] == {
+            "enabled": False,
+            "mdns": False,
+            "https_port": 9443,
+        }
 
     def test_is_idempotent_and_never_rotates(self, tmp_path):
         from nerdit.cli.commands.init import _write_installer_auth_config

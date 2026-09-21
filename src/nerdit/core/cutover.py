@@ -626,6 +626,7 @@ class CutoverManager:
             name,
             green_port,
             edge_auth=parse_job_config(job).get("edge_auth"),
+            project_id=job.project_id,
             with_domains=True,
             # (Codex round 1, P2 #3831777105) The SAME snapshot `caddy_ids`
             # was derived from, never a second read: `register` used to

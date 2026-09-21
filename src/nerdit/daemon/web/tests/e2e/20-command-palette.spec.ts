@@ -1,10 +1,12 @@
 import { expect, test } from "@playwright/test";
-import { loginAsToken, mockApi, SAMPLE_SERVICES } from "./fixtures";
+import { loginAsToken, mockApi, SAMPLE_SERVICES, SAMPLE_SERVICES_WITH_ASSO } from "./fixtures";
 
 // Command palette: ⌘K jumps to any app and carries per-app quick actions (logs,
 // redeploy), on top of the static nav rows. Apps come from
 // GET /services?limit=200 (kind=service only). The app detail route is still
-// /projects/:name (W4 moves it); the nav word is "Apps".
+// /projects/:name (W4 moves it); the nav word is "Apps". (P40e) The palette
+// still jumps by service LABEL (scope guard); a label inside a multi-service
+// project resolves to its nested page through the row's project/service fields.
 
 test("⌘K jumps to an app page", async ({ page }) => {
   await mockApi(page);
@@ -55,6 +57,46 @@ test("⌘K redeploy quick action takes the app's own deploy path, cleared on rel
   await page.reload();
   await expect(page.getByRole("heading", { name: "my-app" })).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("⌘K on a multi-service project's service lands on its nested page, tab and all", async ({
+  page
+}) => {
+  await mockApi(page, { services: SAMPLE_SERVICES_WITH_ASSO });
+  await loginAsToken(page);
+
+  await page.keyboard.press("Control+k");
+  await page.getByPlaceholder("Jump to…").fill("api--asso logs");
+  await page.getByRole("option", { name: /logs/ }).first().click();
+  await expect(page).toHaveURL("/projects/asso/services/api/logs");
+  await expect(page.getByRole("heading", { name: "api", level: 1 })).toBeVisible();
+
+  // The home service's label IS the project name: its quick action still means
+  // the SERVICE, not the project page.
+  await page.keyboard.press("Control+k");
+  await page.getByPlaceholder("Jump to…").fill("asso logs");
+  await page.getByRole("option", { name: /^asso\s*logs$/ }).click();
+  await expect(page).toHaveURL("/projects/asso/services/web/logs");
+  await expect(page.getByRole("heading", { name: "web", level: 1 })).toBeVisible();
+});
+
+test("⌘K redeploy survives the label redirect into a multi-service project", async ({ page }) => {
+  await mockApi(page, { services: SAMPLE_SERVICES_WITH_ASSO });
+  await loginAsToken(page);
+
+  for (const [label, url] of [
+    ["api--asso", "/projects/asso/services/api"],
+    ["asso", "/projects/asso/services/web"]
+  ]) {
+    await page.keyboard.press("Control+k");
+    await page.getByPlaceholder("Jump to…").fill(`${label} redeploy`);
+    await page.getByRole("option", { name: new RegExp(`^${label}\\s*redeploy$`) }).click();
+    await expect(page).toHaveURL(url);
+    // Both rows are ZIP-sourced: the source-aware handler opens the upload dialog.
+    await expect(page.getByTestId("deploy-dialog")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("deploy-dialog")).toBeHidden();
+  }
 });
 
 test("⌘K still reaches static nav entries", async ({ page }) => {

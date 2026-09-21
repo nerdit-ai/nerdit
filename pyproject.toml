@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nerdit"
-version = "0.6.3"
+version = "0.6.4"
 description = "The local AI PaaS — deploy and operate apps on your own hardware, with first-class local AI"
 readme = "README.md"
 license = "Apache-2.0"
@@ -70,6 +70,7 @@ dependencies = [
     # ``websockets.asyncio`` API, and matching it keeps close-code and
     # upgrade-rejection semantics identical on both ends of the frozen wire.
     "websockets>=14",
+    "zeroconf>=0.132",
 ]
 
 [project.optional-dependencies]
@@ -89,6 +90,7 @@ docs = [
 mcp = [
     "mcp>=1.9,<2",
 ]
+# Retained for compatibility; mDNS is included in the base installation.
 mdns = [
     "zeroconf>=0.132",
 ]
@@ -204,6 +206,7 @@ extend-immutable-calls = [
 "src/nerdit/daemon/routes/service_diagnose.py" = ["C901", "PLR0912", "PLR0915", "SIM105", "SIM118"] # idiom — _classify_bindings/diagnose_service/_pending_env_key_names's inherent complexity — re-open per-code if a later change reduces any of these below threshold
 "src/nerdit/daemon/deploy_pipeline.py" = ["PLR0912", "PLR0913", "PLR0915"] # idiom — write_redeploy's branch count (kept as ONE function), several phase functions' explicit-arg signatures (incl. write_redeploy/_finalize_deploy), and _finalize_deploy's orchestrator statement count are inherent to this decomposition shape — re-open per-code if a later change reduces any below threshold
 "src/nerdit/daemon/routes/deploy.py" = ["PLR0913"] # idiom — `deploy()`'s 10 FastAPI Form(...) params — the ZIP-upload contract
+"src/nerdit/daemon/routes/projects.py" = ["PLR0913"] # idiom — `apply_project`'s 7 FastAPI params (path + the multipart archive-or-git source + `dry_run`), the `deploy()` precedent — re-open if the source ever becomes one body model
 "src/nerdit/db/queries/_base.py" = ["SIM105"] # idiom — the ``@_serialized`` decorator's own poisoned-transaction rollback is a deliberate try/except-pass (BaseException, not a single-exception suppress: a rollback failure must never mask the original exception) — re-open if a later change reduces this below threshold
 "src/nerdit/db/queries/gpus.py" = ["SIM105"] # idiom — allocate_gpus/release_gpus each carry one deliberate BEGIN-IMMEDIATE rollback try/except-pass — re-open if a later change reduces this below threshold
 "src/nerdit/db/queries/audit.py" = ["PLR0913"] # idiom — insert_audit_log's wide keyword-only signature (10 fields, one per audit_log column) — re-open if a later change reduces this below threshold
@@ -229,6 +232,7 @@ extend-immutable-calls = [
 
 # ── Idiom: src, no scheduled Track B WP ─────────────────────────────────────
 "src/nerdit/cli/client.py" = ["PLR0913"] # idiom — put_app_config/create_service/deploy*/deploy_git/deploy_template mirror the REST payload 1:1
+"src/nerdit/cli/commands/apply.py" = ["PLR0913"] # idiom — apply()/_apply_async() surface every CLI apply option directly
 "src/nerdit/cli/commands/backup.py" = ["PLR0915"] # idiom — _run_restore/_run_volume_restore are linear confirm-then-execute CLI wizards
 "src/nerdit/cli/commands/check_deps.py" = ["PLR0912"] # idiom — _run_install_flow is a per-platform install-command dispatch ladder
 "src/nerdit/cli/commands/config.py" = ["SIM108"] # idiom — the if/else reads clearer than a nested ternary for the ai-vs-plain pair parse

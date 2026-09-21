@@ -26,7 +26,7 @@ from nerdit.core import gitwatch as gitwatch_mod
 from nerdit.core.eventlog import EventRecorder
 from nerdit.core.gitsource import GitSourceError
 from nerdit.core.gitwatch import GitWatchController
-from nerdit.core.secrets import SecretManager
+from nerdit.core.secrets import SecretManager, project_storage_name
 from nerdit.daemon.deploy_pipeline import github_token_absent_error
 from nerdit.daemon.errors import NerditError
 from nerdit.db.models import Job, JobKind, JobStatus
@@ -687,6 +687,25 @@ async def test_recorded_token_is_resolved_without_an_audit_row(queries, tmp_path
     # The value reaches the probe and nothing else.
     assert sentinel not in json.dumps([r.model_dump(mode="json") for r in await _audit(queries)])
     assert sentinel not in json.dumps([e.model_dump(mode="json") for e in await _events(queries)])
+
+
+async def test_recorded_token_resolves_through_the_rows_project_scope(queries, tmp_path, fake_ls):
+    """(P40c) Daemon-driven: the ROW's `project_id`, service scope on top (D-P40-9)."""
+    secrets = SecretManager(tmp_path / "secrets")
+    job = _job(source=_source(token_ref="${secrets.GH_TOKEN}"))
+    await queries.create_job(job)
+    secrets.set(project_storage_name(job.project_id), {"GH_TOKEN": "ghp-project-ZQXJKW"})
+    controller = _controller(queries, tmp_path, secrets=secrets)
+
+    await _tick(controller)
+    assert fake_ls.calls[0]["token"] == "ghp-project-ZQXJKW"
+
+    row = await queries.get_service_by_name("svc-a")
+    secrets.set("svc-a", {"GH_TOKEN": "ghp-service-ZQXJKW"})
+    assert controller._resolve_token(row, "svc-a", "${secrets.GH_TOKEN}") == "ghp-service-ZQXJKW"
+    dump = json.dumps([r.model_dump(mode="json") for r in await _audit(queries)])
+    dump += json.dumps([e.model_dump(mode="json") for e in await _events(queries)])
+    assert "ZQXJKW" not in dump
 
 
 async def test_missing_secret_is_a_credential_poll_failure(queries, tmp_path, fake_ls):

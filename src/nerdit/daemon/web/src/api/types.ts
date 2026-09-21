@@ -154,7 +154,13 @@ export interface ServiceSource {
 /** Mirrors `ServiceResponse` (db/models.py) — services and model rows alike. */
 export interface Service {
   id: string;
+  /** The LABEL — the service's wire identity (D-P40-6). Never parsed for parts. */
   name: string;
+  /** (P40b) The owning project; null on models, databases and pre-P40 rows, absent on an older daemon. */
+  project?: string | null;
+  project_id?: string | null;
+  /** (P40b) Service name inside the project (`web` for a bare project name). */
+  service?: string | null;
   status: JobStatus;
   desired_state: string | null;
   kind: WorkloadKind;
@@ -304,6 +310,90 @@ export interface SecretNames {
 export interface SecretDeleted {
   service: string;
   deleted: string | boolean;
+}
+
+// --- Projects and variables (P40b/c — mirrors `daemon/routes/projects.py`) ---
+
+/** Mirrors `ProjectSummary`: one row of `GET /projects` (and the create body). */
+export interface Project {
+  id: string;
+  name: string;
+  services: Service[];
+  addresses: PublicUrlEntry[];
+}
+
+export interface ProjectListPage {
+  items: Project[];
+  next_cursor: string | null;
+}
+
+/** Mirrors `ProjectResourceView`. `ready: null` = cannot be judged without the caller's secrets. */
+export interface ProjectResourceView {
+  /** LABEL of the service that declares the binding. */
+  service: string;
+  type: string;
+  binding: string;
+  provider: string | null;
+  target: string | null;
+  ready: boolean | null;
+}
+
+/** Mirrors `VariableName`: a name, its scope and the plain flag. Never a value. */
+export interface ProjectVariableName {
+  key: string;
+  /** `project`, or `production/<service>`. */
+  scope: string;
+  plain: boolean;
+}
+
+/** Mirrors `VariableView`: `value` is set for a PLAIN key only, always null for a secret. */
+export interface ProjectVariable extends ProjectVariableName {
+  value?: string | null;
+}
+
+/** Mirrors `ProjectResponse` (`GET /projects/{project}`). */
+export interface ProjectDetail extends Project {
+  resources: ProjectResourceView[];
+  home: { hostname: string | null; node_id: string | null };
+  /** OMITTED (not null) unless the caller owns the project or is an admin (D-P40-15). */
+  variables?: ProjectVariableName[] | null;
+}
+
+export interface VariableList {
+  project: string;
+  scope: string;
+  variables: ProjectVariable[];
+}
+
+/** Mirrors `VariableResolveResponse`: per key, the scope a launch would take it from. */
+export interface VariableResolve {
+  project: string;
+  service: string;
+  variables: ProjectVariableName[];
+}
+
+/** Body of `PUT …/variables`. `secret` defaults to TRUE server-side (D-P40-16). */
+export interface VariableSetRequest {
+  values: Record<string, string>;
+  secret: boolean;
+}
+
+export interface VariableSetResponse {
+  project: string;
+  scope: string;
+  keys: string[];
+  plain: boolean;
+}
+
+export interface VariableDeleted {
+  project: string;
+  scope: string;
+  deleted: string;
+}
+
+export interface ProjectDeleted {
+  name: string;
+  deleted: string[];
 }
 
 /** Multipart payload for `POST /deploy` (field names match the route's Form params). */
@@ -548,6 +638,12 @@ export interface Capabilities {
      * page — gate, never sniff.
      */
     audit_target_filter?: boolean;
+    /** P40b — `/api/projects` exists; absent on older daemons (gate, never sniff). */
+    projects?: boolean;
+    /** P40c — `/api/projects/{project}/variables` exists; absent on older daemons. */
+    variables?: boolean;
+    /** P40d — `POST /api/projects/{project}/apply` exists; absent on older daemons. */
+    project_apply?: boolean;
   };
   /** Admin-only; absent for non-admin callers. */
   paths?: { data_dir: string; db_path: string };

@@ -48,6 +48,8 @@ _EXPECTED_TAGS = {
     # Services: exposure is the surface custom domains (WP1) and ACME (WP2)
     # will join, so a generated client finds all of it under one heading.
     "Exposure",
+    # (P40b / D-P40-10) The project noun, one tag, registered last.
+    "Projects",
 }
 
 
@@ -307,13 +309,43 @@ def test_p25_operation_ids_are_present(schema: dict) -> None:
     Generated clients and token whoami/rotate depend on these IDs. Update the
     count deliberately when adding routes so accidental exposure fails this test.
     Pre-auth uses the existing claim operation; it adds no route. Database
-    dump/list/restore bring the total to 82 operations.
+    dump/list/restore bring the total to 82 operations; the P40b project
+    quartet takes it to 86; the P40c variable quartet to 90; P40d's
+    ``apply_project`` to 91.
     """
     op_ids = {op.get("operationId") for _, _, op in _operations(schema)}
     expected = {"get_self_token", "rotate_self_token"}
     missing = expected - op_ids
     assert not missing, f"P25 operationIds missing from the schema: {sorted(missing)}"
-    assert len(op_ids) == 82
+    assert len(op_ids) == 91
+
+
+def test_p40b_operation_ids_are_present(schema: dict) -> None:
+    """The P40b project quartet keeps its pinned operationIds (D-P40-10).
+
+    ``nerdit projects …`` and the four MCP tools pin to these; all four live
+    under the new ``Projects`` tag, registered last.
+    """
+    op_ids = {op.get("operationId") for _, _, op in _operations(schema)}
+    expected = {"create_project", "list_projects", "get_project", "delete_project"}
+    missing = expected - op_ids
+    assert not missing, f"P40b operationIds missing from the schema: {sorted(missing)}"
+
+
+def test_p40c_operation_ids_are_present(schema: dict) -> None:
+    """The P40c variable quartet keeps its pinned operationIds, under `Projects` (D-P40-10)."""
+    ops = {op.get("operationId"): op for _, _, op in _operations(schema)}
+    expected = {"list_variables", "set_variables", "delete_variable", "resolve_variables"}
+    assert not expected - ops.keys()
+    assert all(ops[op_id]["tags"] == ["Projects"] for op_id in expected)
+
+
+def test_p40d_apply_operation_is_multipart_under_projects(schema: dict) -> None:
+    """`apply_project` sits under `Projects` and takes the archive-or-git multipart form."""
+    op = schema["paths"]["/api/projects/{project}/apply"]["post"]
+    assert op["operationId"] == "apply_project" and op["tags"] == ["Projects"]
+    assert list(op["requestBody"]["content"]) == ["multipart/form-data"]
+    assert [p["name"] for p in op["parameters"]] == ["project", "dry_run"]
 
 
 def test_p37_operation_ids_are_present(schema: dict) -> None:

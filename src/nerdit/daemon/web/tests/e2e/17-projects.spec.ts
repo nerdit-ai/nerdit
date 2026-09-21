@@ -1,11 +1,19 @@
 import { expect, test } from "@playwright/test";
-import { loginAsToken, mockApi } from "./fixtures";
+import {
+  SAMPLE_CAPABILITIES_PRE_P40,
+  SAMPLE_SERVICES,
+  SAMPLE_SERVICES_WITH_ASSO,
+  loginAsToken,
+  mockApi
+} from "./fixtures";
 
-// The apps list (dashboard redesign W3): a table, one row per kind=service row,
-// with the run-state badge from lib/status, the address, and the last-deploy
-// column. The aggregated project status (lib/projects.ts) still reaches the
-// operator as the badge's tooltip. Also carries the public-URL / proxy-off
-// coverage relocated from the retired /services list (05-services.spec.ts).
+// The apps list (dashboard redesign W3): a table, one row per PROJECT (P40e —
+// read from `GET /api/projects`, one bounded read instead of the per-app config
+// fan-out), with the run-state badge from lib/status, the address, and the
+// last-deploy column. The status detail (lib/projects.ts) still reaches the
+// operator as the badge's tooltip. A daemon without `features.projects` keeps
+// the services-derived list. Also carries the public-URL / proxy-off coverage
+// relocated from the retired /services list (05-services.spec.ts).
 
 test("the table renders a row per app with status, address and last deploy", async ({ page }) => {
   await mockApi(page);
@@ -51,6 +59,88 @@ test("a row opens the app detail page", async ({ page }) => {
   await page.getByTestId("app-row-my-app").click();
   await expect(page).toHaveURL("/projects/my-app");
   await expect(page.getByRole("heading", { name: "my-app" })).toBeVisible();
+});
+
+test("the list is one /api/projects read, with no per-app config fan-out", async ({ page }) => {
+  const api = await mockApi(page);
+  const configReads: string[] = [];
+  page.on("request", (r) => {
+    if (r.url().includes("/api/config/apps/")) configReads.push(r.url());
+  });
+  await loginAsToken(page);
+
+  await expect(page.getByTestId("app-row-my-app")).toBeVisible();
+  await expect(page.getByTestId("app-row-worker-api")).toBeVisible();
+  expect(api.projectCalls.some((call) => call.startsWith("GET /api/projects?"))).toBe(true);
+  expect(configReads).toEqual([]);
+});
+
+test("the list walks the project cursor to the last page", async ({ page }) => {
+  const api = await mockApi(page, { services: SAMPLE_SERVICES_WITH_ASSO, projectsPageSize: 1 });
+  await loginAsToken(page);
+
+  for (const name of ["my-app", "worker-api", "asso"]) {
+    await expect(page.getByTestId(`app-row-${name}`)).toBeVisible();
+  }
+  expect(api.projectCalls.filter((call) => call.includes("cursor=")).length).toBeGreaterThanOrEqual(2);
+});
+
+test("a multi-service project is ONE row: its worst service, its home address", async ({ page }) => {
+  await mockApi(page, { services: SAMPLE_SERVICES_WITH_ASSO });
+  await loginAsToken(page);
+
+  const row = page.getByTestId("app-row-asso");
+  await expect(row).toContainText("2 services");
+  // The second service never gets a row of its own, and neither does the model.
+  await expect(page.getByTestId("app-row-api--asso")).toHaveCount(0);
+  await expect(page.getByTestId("app-row-ollama-llama3-1-8b")).toHaveCount(0);
+
+  // `api` is degraded, `web` runs: the project shows the worse of the two and
+  // the tooltip names which service it is — by its `service` field.
+  const tr = page.getByRole("row").filter({ has: row });
+  await expect(tr.getByText("Running · unhealthy")).toBeVisible();
+  await expect(tr.getByTitle(/^api: /)).toBeVisible();
+  // The address is the home service's (`web`), not the degraded one's.
+  await expect(
+    tr.getByRole("link", { name: "https://test-host.nerdit.internal/asso", exact: true })
+  ).toBeVisible();
+
+  await row.click();
+  await expect(page).toHaveURL("/projects/asso");
+  await expect(page.getByTestId("project-page")).toBeVisible();
+});
+
+test("older daemon (no features.projects): today's list, and /api/projects is never called", async ({
+  page
+}) => {
+  // A pre-P40 daemon sends neither the flags nor the row fields.
+  const items = SAMPLE_SERVICES.items.map((row) => {
+    const legacy: Record<string, unknown> = { ...row };
+    for (const field of ["project", "project_id", "service"]) delete legacy[field];
+    return legacy;
+  });
+  const api = await mockApi(page, {
+    capabilities: SAMPLE_CAPABILITIES_PRE_P40,
+    services: { items, next_cursor: null }
+  });
+  await loginAsToken(page);
+
+  await expect(page.getByTestId("app-row-my-app")).toBeVisible();
+  await expect(page.getByTestId("app-row-worker-api")).toBeVisible();
+  // The derived status still reaches the badge tooltip, bindings and all.
+  await expect(page.getByTitle("App running.")).toBeVisible();
+  await expect(page.getByTestId("app-last-deploy-worker-api")).toContainText("Building");
+
+  // The row opens today's app page: three tabs, no project link, no variables.
+  await page.getByTestId("app-row-my-app").click();
+  await expect(page).toHaveURL("/projects/my-app");
+  await expect(page.getByRole("heading", { name: "my-app" })).toBeVisible();
+  await page.goto("/projects/my-app/manage");
+  await expect(page.getByRole("heading", { name: "AI resources" })).toBeVisible();
+  await expect(page.getByTestId("app-project-link")).toHaveCount(0);
+  await expect(page.getByTestId("project-variables")).toHaveCount(0);
+
+  expect(api.projectCalls).toEqual([]);
 });
 
 test("empty list sells the north-star gesture", async ({ page }) => {

@@ -29,7 +29,12 @@ export default function ServiceRedirect() {
       return;
     }
     if (service.data) {
-      navigate(kindHomePath(service.data.kind, service.data.name), { replace: true });
+      // A service goes to its LABEL URL: that route moves on to the project
+      // shape only when the caller can read the project (a label-scoped token cannot).
+      const svc = service.data;
+      const to =
+        svc.kind === "service" ? `/projects/${encodeURIComponent(svc.name)}` : kindHomePath(svc);
+      navigate(to, { replace: true });
     }
   }, [notFound, service.data, navigate]);
 

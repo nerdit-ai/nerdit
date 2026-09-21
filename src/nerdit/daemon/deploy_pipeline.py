@@ -42,6 +42,7 @@ from nerdit.config.project import (
     _DNS_LABEL_RE,
     PROJECT_CONFIG_NAME,
     DeployConfig,
+    is_project_declaration,
     shared_secret_keys,
     shared_secret_keys_for,
 )
@@ -67,7 +68,9 @@ from nerdit.core.gitsource import (
     validate_subdir,
 )
 from nerdit.core.jobconfig import parse_job_config
+from nerdit.core.project_identity import PRODUCTION
 from nerdit.core.secrets import SHARED_SCOPE, SecretDecryptError
+from nerdit.core.variables import load_scoped
 from nerdit.daemon.audit import audit_params, record_shared_referenced
 from nerdit.daemon.auth import (
     Principal,
@@ -76,14 +79,20 @@ from nerdit.daemon.auth import (
     require_owner_or_admin,
 )
 from nerdit.daemon.errors import NerditError
+from nerdit.daemon.secret_scope import (
+    name_claimed_error,
+    name_taken_error,
+    project_owned_by_caller,
+    project_owned_error,
+)
 from nerdit.daemon.views.hosted import load_hosted_context
 from nerdit.daemon.views.service import (
     _cutover_in_progress_error,
     _run_in_progress_error,
     _service_response,
 )
-from nerdit.db.models import Job, JobKind, JobStatus, TokenRole
-from nerdit.db.queries import Queries, ServiceNameTaken
+from nerdit.db.models import Job, JobKind, JobStatus, Project, TokenRole
+from nerdit.db.queries import ProjectOwned, Queries, ServiceNameClaimed, ServiceNameTaken
 from nerdit.utils.ids import generate_id
 
 logger = logging.getLogger(__name__)
@@ -305,6 +314,82 @@ _DEPLOY_SHAPE_HINT = (
     "public_env); "
     "explicit deploy fields override these values."
 )
+
+
+#: (P40d) One declared service handed to `_finalize_deploy` by `apply_project`:
+#: the judged project row (`None` only on a dry run of a project that does not
+#: exist yet -- a dry run creates nothing), the service name inside it, and its
+#: already validated `[services.<svc>]` table. A tuple, not a model (D-P40-12).
+DeclaredService = tuple[Project | None, str, dict]
+
+
+def use_apply_error() -> NerditError:
+    """The 422 a legacy ingress answers to a `[project]` / `[services]` file (D-P40-12)."""
+    return NerditError(
+        422,
+        "deploy.use_apply",
+        f"This {PROJECT_CONFIG_NAME} declares a project ([project] / [services]); "
+        "this route deploys a single [deploy] app.",
+        hint="Run `nerdit apply` (POST /api/projects/{project}/apply) instead.",
+    )
+
+
+def reject_foreign_label(
+    existing: Job | None, declared: DeclaredService | None, label: str
+) -> None:
+    """409 `service.name_taken` when `label`'s row is not the declared project's service.
+
+    A legacy row literally named like a composed label (`api--asso` deployed by
+    hand) belongs to its own implicit project; apply never adopts it. Judged on
+    the ROW's triple, never by parsing the label (D-P40-2). To a project that
+    does not exist yet (a dry run) every row is foreign. No-op for a legacy
+    ingress (`declared is None`).
+    """
+    if declared is None or existing is None:
+        return
+    joined, service, _ = declared
+    if joined is None or existing.project_id != joined.id or existing.service != service:
+        raise name_taken_error(label)
+
+
+def _deploy_section_source(project: dict, declared: DeclaredService | None) -> dict:
+    """The parsed `nerdit.toml` a deploy reads its `[deploy]` defaults from (D-P40-12).
+
+    Here, not per route: every legacy ingress (ZIP, git, workspace, template,
+    recorded-source redeploy) reads the file at this one seam, before any
+    write, and refuses a declaration. For `apply_project` the table the route
+    validated BEFORE this context existed stands in for `[deploy]`; `[ai.*]` /
+    `[db.*]` stay the file's own.
+    """
+    if declared is None:
+        # ponytail: this also refuses `POST /deploy/{name}/redeploy` and the
+        # GitWatch poll of a git-applied service (re-apply is its redeploy);
+        # teach the recorded-source path to pick the row's own table if
+        # push-to-deploy on declared services is wanted.
+        if is_project_declaration(project):
+            raise use_apply_error()
+        return project
+    return {
+        key: value for key, value in project.items() if key not in ("project", "services", "vars")
+    } | {"deploy": declared[2]}
+
+
+def _nested_project_toml(
+    selected: Path, declared: DeclaredService | None
+) -> tuple[dict, tomllib.TOMLDecodeError | UnicodeDecodeError | None]:
+    """The `nerdit.toml` of a `build_settings.subdir` context, as far as it counts.
+
+    (D-P40-12) The declaration is the spec: under `apply_project` a file inside
+    the selected subdir (a leftover from deploying that folder on its own) is
+    not read at all, so it can neither override the validated
+    `[services.<svc>]` table nor shadow the project-wide `[ai.*]` / `[db.*]`.
+    A legacy ingress keeps nested-wins, and its nested file goes through the
+    same `deploy.use_apply` seam as the root one.
+    """
+    if declared is not None:
+        return {}, None
+    nested, error = _read_project_toml(selected)
+    return _deploy_section_source(nested, None), error
 
 
 def reject_non_service_row(existing: Job | None, name: str) -> None:
@@ -1201,8 +1286,13 @@ async def write_fresh(
     source_meta: dict,
     principal: Principal,
     owner_token_id: str | None = None,
+    declared: DeclaredService | None = None,
 ) -> Job:
     """Fresh deploy: assemble a brand-new config blob + reserve the row.
+
+    `declared` (P40d) presets the row's triple `(project, production, service)`
+    so `_stamp_project` leaves it alone and `reserve_service_for_token` judges
+    the project the row JOINS by id; `None` keeps the legacy identity mapping.
 
     `owner_token_id` overrides who the fresh row belongs to. Default `None`
     keeps every existing ingress byte-for-byte (the row is the acting
@@ -1250,8 +1340,18 @@ async def write_fresh(
         submitted_by_token=owner_token_id if owner_token_id is not None else principal.token_id,
         idempotency_key=request.headers.get("Idempotency-Key"),
     )
+    if declared is not None:
+        joined = declared[0]
+        assert joined is not None  # only a dry run carries no row, and it never writes
+        job.project_id, job.environment, job.service = joined.id, PRODUCTION, declared[1]
+        job.project = joined.name  # the create response projects it without a re-read
     try:
-        return await queries.reserve_service_for_token(job)
+        # An admin's bypass covers its OWN row only. A row created for a sidecar
+        # owner is judged as that owner, or an admin deploy would plant a
+        # foreign row inside another token's project and hand it the project's
+        # variables (and the name's claimed secrets).
+        admin = principal.role is TokenRole.admin and owner_token_id in (None, principal.token_id)
+        return await queries.reserve_service_for_token(job, admin=admin)
     except ServiceNameTaken as exc:  # lost a create race
         raise NerditError(
             409,
@@ -1259,6 +1359,10 @@ async def write_fresh(
             f"A service named '{name}' already exists.",
             hint="Delete it first with `nerdit services rm`.",
         ) from exc
+    except ServiceNameClaimed as exc:
+        raise name_claimed_error(name) from exc
+    except ProjectOwned as exc:
+        raise project_owned_error(name) from exc
     except QuotaExceeded as exc:
         raise exc.to_error() from exc
 
@@ -1434,8 +1538,15 @@ async def _finalize_deploy(
     owner_token_id: str | None = None,
     build_settings: dict | None = None,
     dry_run: bool = False,
+    declared: DeclaredService | None = None,
 ) -> dict:
     """Validate a prepared build context and create or update its service row.
+
+    `declared` (P40d) is set by `apply_project` only: the service's validated
+    `[services.<svc>]` table stands in for `[deploy]`, a fresh row is born with
+    the project triple, and a row on the label that is not this project's
+    service is 409 `service.name_taken`. Every other ingress passes `None` and
+    refuses a declaration file (422 `deploy.use_apply`) before any write.
 
     Callers must authorize, validate syntax and reserved names, and set audit
     parameters before preparing the context. Re-read and re-authorize existing
@@ -1463,6 +1574,7 @@ async def _finalize_deploy(
         # A name owned by a live kind=model/database row is not a redeploy
         # target — the create-race security boundary (ingresses are fast paths).
         reject_non_service_row(existing, name)
+        reject_foreign_label(existing, declared, name)
         # Re-authorize on the SAME read the fresh-vs-redeploy branch uses: a
         # name created during the extraction/clone window must not slip onto
         # the redeploy path without an owner check (the caller's pre-ingress
@@ -1477,6 +1589,7 @@ async def _finalize_deploy(
         prev_failure = _failure_detail(existing) if existing is not None else None
 
         project, project_error = _read_project_toml(context_dir)
+        project = _deploy_section_source(project, declared)
         zip_deploy, unknown_deploy_keys = _parse_deploy_defaults(project, name)
         # Legacy explicit start is also a request override; nested membership wins,
         # including null reset. Clients must not promote repository defaults here.
@@ -1489,7 +1602,7 @@ async def _finalize_deploy(
         if selected != context_dir:
             root_settings = zip_deploy.get("build_settings") or {}
             context_dir = selected
-            nested, nested_error = _read_project_toml(context_dir)
+            nested, nested_error = _nested_project_toml(context_dir, declared)
             project_error = project_error or nested_error
             # Preserve root auth, bindings and deployment defaults. The selected
             # app may explicitly replace sections or override deploy keys.
@@ -1508,7 +1621,10 @@ async def _finalize_deploy(
             gpus=gpus,
             start=start,
             health=health,
-            zip_deploy=zip_deploy,
+            # A declared service can never auto-deploy (its recorded-source
+            # redeploy answers `deploy.use_apply`), so converting a legacy git
+            # row must not carry the flag forward and leave GitWatch polling it.
+            zip_deploy=zip_deploy if declared is None else {**zip_deploy, "auto_deploy": False},
             existing=existing,
             prev_cfg=prev_cfg,
         )
@@ -1711,6 +1827,7 @@ async def _finalize_deploy(
                 source_meta=source_meta,
                 principal=principal,
                 owner_token_id=owner_token_id,
+                declared=declared,
             )
 
         # One `service.deploy_started` per generation, at the only
@@ -1872,7 +1989,13 @@ def resolve_github_installation_token(app: Any, repo_url: str) -> str | None:
 
 
 async def _resolve_source_token(
-    request: Request, secrets: Any, name: str, token_ref: str, *, repo_url: str
+    request: Request,
+    secrets: Any,
+    name: str,
+    token_ref: str,
+    *,
+    repo_url: str,
+    project_id: str | None = None,
 ) -> str:
     """Resolve a recorded `token_ref` to its raw value for a re-clone.
 
@@ -1884,9 +2007,14 @@ async def _resolve_source_token(
     The redeploy path always runs AFTER the owner-or-admin gate on an existing
     row, so the per-service scope is provably the caller's — the fresh-deploy
     `service_owned` carve-out in `routes/deploy.py::_resolve_token_ref` has
-    nothing to protect here. Precedence is the launch-path one: per-service
-    scope first, then shared. The raw value lives only as a local — never in
-    audit params, config, logs, argv, or the response.
+    nothing to protect here. Row ownership proves the service scope ONLY: the
+    ROW's project scope is judged on its own (`project_owned_by_caller`, the
+    git route's gate), because a row can sit in a project its owner does not
+    own (the plan §5 rollback bounce: the boot backfill adopts by name) and a
+    caller-driven path must never send another token's project secret to a
+    repo host the caller recorded. Precedence is the launch-path one: service
+    scope over project scope (D-P40-9), then shared. The raw value lives only
+    as a local — never in audit params, config, logs, argv, or the response.
     """
     if token_ref == GITHUB_INSTALLATION_REF:
         token = resolve_github_installation_token(request.app, repo_url)
@@ -1895,13 +2023,19 @@ async def _resolve_source_token(
         return token
     if secrets is None:  # pragma: no cover - always wired in the daemon
         raise NerditError(500, "internal", "Secret manager is not configured.")
+    project = (
+        await request.app.state.queries.get_project(project_id) if project_id is not None else None
+    )
+    project_mine = project_owned_by_caller(request, project)
     try:
         # A grammar miss short-circuits inside the walk before either scope is
         # loaded, so an unusable reference is still reported ahead of any
         # decrypt failure.
         res = walk_secret_ref(
             token_ref,
-            service_env=lambda: secrets.load(name),
+            service_env=lambda: load_scoped(
+                secrets, name, project_id if project_mine else None, include_project=project_mine
+            )[0],
             shared_env=lambda: secrets.load(SHARED_SCOPE),
         )
     except SecretDecryptError as exc:
@@ -2081,7 +2215,12 @@ async def redeploy_from_source(
     token = None
     if token_ref is not None:
         token = await _resolve_source_token(
-            request, secrets, name, str(token_ref), repo_url=repo_url
+            request,
+            secrets,
+            name,
+            str(token_ref),
+            repo_url=repo_url,
+            project_id=fresh.project_id,
         )
 
     dest_dir = Path(settings.daemon.upload_dir).expanduser() / generate_id()

@@ -37,6 +37,7 @@ from nerdit.daemon.audit import audit_params, record_out_of_band
 from nerdit.daemon.auth import current_principal, require_owner_or_admin
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.imagegc import _protected_image_refs, _repo_tags
+from nerdit.daemon.secret_scope import variable_write_lock
 from nerdit.daemon.views.service import (
     _cutover_in_progress_error,
     _not_found,
@@ -359,6 +360,25 @@ async def _purge_secrets(request: Request, job: Job, name: str) -> bool:
         request, job, "service.purge_secrets", {"key": f"services/{name}", "purged": ok}
     )
     return ok
+
+
+def _secret_file_kept(request: Request, name: str) -> bool:
+    """Whether a secret file survives this delete and so needs its claim re-minted (D-P39-6).
+
+    A secrets file kept past the row must stay reachable by its owner and
+    unclaimable by anyone else: without the claim, a stranger's fresh deploy
+    of the same name would launch with the old owner's values injected. The
+    mint itself runs inside `delete_service_checked`'s transaction (a NULL
+    owner mints a NULL claim, admin-only, the same posture as its row); this
+    probe runs under the variable writer lock through row deletion. A probe
+    failure conservatively reserves the name because secrets may survive.
+    """
+    secret_mgr = getattr(request.app.state, "secret_manager", None)
+    try:
+        return secret_mgr is not None and bool(secret_mgr.exists(name))
+    except Exception:  # noqa: BLE001 — best-effort, like every purge step
+        logger.warning("Could not probe the secret file for '%s'; reserving its name", name)
+        return True
 
 
 async def _purge_workspace(request: Request, job: Job, name: str) -> bool:
@@ -934,7 +954,7 @@ async def delete_service(
 
     # For workspace purge, wait for the workspace lock and hold it across row deletion
     # and rmtree. Earlier writes finish before deletion; concurrent writes receive 409;
-    # later writes create a fresh workspace. Lock order is workspace_lock → DB writer;
+    # later writes create a fresh workspace. Lock order is workspace → variables → DB;
     # never acquire a workspace lock inside a DB transaction. ExitStack releases it on
     # all early errors. Read share removal from the delete transaction's rowcount,
     # not a pre-read that could miss a racing share PUT. Emit only the removal fact,
@@ -956,15 +976,35 @@ async def delete_service(
     def _note_domains_removed(names: list[str]) -> None:
         removed_domains.extend(names)
 
+    # The secret file's claim (D-P39-6) is re-minted INSIDE the delete
+    # transaction, never after it: post-commit, a stranger's fresh row could
+    # land before the mint and launch with the old owner's values. Minted even
+    # when `secrets` is being purged: the purge is best-effort, and the claim
+    # is dropped only once the file is confirmed gone.
+    secrets_reclaimed: bool | None = None
+
+    def _note_secrets_reclaimed(minted: bool) -> None:
+        nonlocal secrets_reclaimed
+        secrets_reclaimed = minted
+
     async with contextlib.AsyncExitStack() as stack:
         if "workspace" in purge_set and job.service_name:
             await stack.enter_async_context(workspace_lock(job.service_name))
-        fresh_deps = await queries.delete_service_checked(
-            job.id,
-            checker,
-            on_share_removed=_note_share_removed,
-            on_domains_removed=_note_domains_removed,
-        )
+        # Serialize the file probe and claim mint with first-time secret writes.
+        # Release before the tail, which takes the same lock for secret purge.
+        async with variable_write_lock(request.app):
+            reclaim = (
+                _note_secrets_reclaimed
+                if job.service_name and _secret_file_kept(request, job.service_name)
+                else None
+            )
+            fresh_deps = await queries.delete_service_checked(
+                job.id,
+                checker,
+                on_share_removed=_note_share_removed,
+                on_domains_removed=_note_domains_removed,
+                on_secrets_reclaimed=reclaim,
+            )
         if fresh_deps is None:
             # (P29 review round-2, Codex 3803596881) The row was ALREADY GONE: this
             # request deleted nothing, so it has earned no name-based side effect.
@@ -1060,7 +1100,47 @@ async def delete_service(
             if name:
                 purged = PurgeReport()
                 if "secrets" in purge_set:
-                    purged.secrets = await _purge_secrets(request, job, name)
+                    # Under the writers' lock, like `DELETE /secrets/{name}`, so
+                    # no parked write straddles the release. The row went long
+                    # before this tail: a name that has since gained a row, or a
+                    # claim that is not the one this delete minted for the row's
+                    # owner, is somebody's NEW scope and its file is not ours to
+                    # delete by name. `secrets_reclaimed` is history, not a
+                    # verdict: the owner may have released the name and a
+                    # stranger claimed it since, so the CURRENT claim is judged.
+                    # ponytail: judged by owner, not claim identity — the owner's
+                    # own re-claim inside its delete tail is purged as requested.
+                    async with variable_write_lock(request.app):
+                        # Row and claim in ONE snapshot: a deploy turns a claim
+                        # into a row in one transaction, and two reads could
+                        # miss both.
+                        retaken = await queries.name_retaken(
+                            name, job.submitted_by_token, any_claim=not secrets_reclaimed
+                        )
+                        if retaken:
+                            # Still one `service.purge_secrets` row per requested
+                            # purge: a skip is recorded, never a silence.
+                            purged.secrets = False
+                            await _audit_purge(
+                                request,
+                                job,
+                                "service.purge_secrets",
+                                {
+                                    "key": f"services/{name}",
+                                    "purged": False,
+                                    "reason": "name_retaken",
+                                },
+                            )
+                        else:
+                            purged.secrets = await _purge_secrets(request, job, name)
+                        if purged.secrets and secrets_reclaimed:
+                            # File gone → release the name. A failed purge keeps
+                            # the claim, so the leftover stays the owner's.
+                            await queries.delete_secret_claim(name)
+                elif secrets_reclaimed is not None:
+                    request.state.audit_params = audit_params(
+                        {**request.state.audit_params, "secrets_reclaimed": secrets_reclaimed}
+                    )
                 if "data" in purge_set:
                     if job.kind is JobKind.database:
                         # C2: the data was renamed to a tombstone pre-delete (the delete

@@ -46,7 +46,38 @@ Follow the [getting-started guide](https://docs.nerdit.ai/engine/quickstart)
 for prerequisites, deployment and opening your app. This repository contains
 the source, tests and contributor instructions.
 
-From source:
+### With pip
+
+Prefer a Python package to the shell installer? With **Python 3.11+** and
+Docker installed and running on Linux, macOS, or Windows through WSL2,
+create a dedicated environment. Native Windows is not supported:
+
+```bash
+python3 -m venv ~/.venvs/nerdit
+source ~/.venvs/nerdit/bin/activate
+python -m pip install nerdit
+nerdit init
+nerdit doctor
+```
+
+The PyPI package includes the CLI, daemon and built dashboard. Open
+`http://127.0.0.1:9321/` after initialization. Add MCP support with
+`python -m pip install "nerdit[mcp]"` in the same environment. For LAN mDNS,
+version 0.6.4 includes support in the base package. With 0.6.3, use
+`python -m pip install "nerdit[mdns]"`, or `"nerdit[mcp,mdns]"` for both.
+
+Unlike the signed installer, pip does not bundle Caddy or register a service
+for startup after reboot. `nerdit init` starts a background daemon; run it
+again after a reboot, or manage `nerditd` with your service manager. The
+0.6.4 release enables HTTPS on port 8443 and mDNS in new configurations;
+install Caddy separately for HTTPS with pip. Existing configurations are preserved.
+On 0.6.3 or an existing configuration with the proxy disabled, run
+`nerdit config set proxy enabled=true https_port=8443` and
+`nerdit daemon restart` after installing Caddy.
+See [installation and upgrades](https://docs.nerdit.ai/engine/installation#install-with-pip)
+for lifecycle, networking and update details.
+
+### From source
 
 ```bash
 git clone https://github.com/nerdit-ai/nerdit && cd nerdit
@@ -67,8 +98,11 @@ venv/bin/nerdit init
   env vars in both cases.
 - **Databases**: managed Postgres and Redis, credentials minted for you and
   bound into apps through `[db.*]`.
-- **Secrets**: write-only, encrypted at rest, rotatable, with a shared scope.
-- **Agents**: an MCP server with 49 tools, scoped tokens, idempotent writes,
+- **Projects and variables**: several services in one `nerdit.toml`
+  (`nerdit apply`), with plain or secret variables at project or service
+  scope. Secrets are write-only; every value is encrypted at rest and
+  rotatable, with a machine-wide shared scope.
+- **Agents**: an MCP server with 57 tools, scoped tokens, idempotent writes,
   structured errors and an audit log. A coding agent can deploy, wire and
   diagnose apps without shell access.
 - **Backups** of the control plane, with an offline restore — plus, for a

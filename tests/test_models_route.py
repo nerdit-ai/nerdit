@@ -34,7 +34,7 @@ from nerdit.db.models import (
     JobStatus,
     TokenRole,
 )
-from nerdit.db.queries import Queries, ServiceNameTaken
+from nerdit.db.queries import Queries, ServiceNameClaimed, ServiceNameTaken
 
 LEGACY = "legacy-global"
 
@@ -81,7 +81,8 @@ def _queries() -> AsyncMock:
     q.touch_api_token = AsyncMock()
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
+    q.reserve_service_for_token = AsyncMock(side_effect=lambda job, **kw: job)
+    q.get_secret_claim = AsyncMock(return_value=None)
     q.list_services = AsyncMock(return_value=([], None))
     return q
 
@@ -639,3 +640,15 @@ async def test_list_models_paginates_and_excludes_services():
         }
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_claimed_name_returns_409_envelope():
+    """P39: a foreign secret claim on the derived name refuses the serve."""
+    q = _queries()
+    q.reserve_service_for_token = AsyncMock(side_effect=ServiceNameClaimed("ollama-llama3-1-8b"))
+    async with _client(_make_app(q)) as client:
+        resp = await client.post("/models", json={"model": "llama3.1:8b"}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "service.name_claimed"
+    assert q.reserve_service_for_token.await_args.kwargs == {"admin": False}

@@ -1,5 +1,5 @@
 import type { AppBindings } from "../api/queries";
-import type { Database, Model, Service, WorkloadKind } from "../api/types";
+import type { Database, Model, Service } from "../api/types";
 import {
   apiReadiness,
   dbExternalReadiness,
@@ -44,13 +44,22 @@ export interface Project {
  * The canonical home route for a workload by kind (D8) — shared by
  * `ServiceRedirect` (the kind-aware `/services/:ident` redirect) and
  * `ProjectDetail` (a deep link to a non-service name bounces to its real home).
- * A `service` lands on its project page (by NAME); models and databases land on
- * their inventory pages; anything else falls back to the project grid.
+ * A `service` lands on its project (P40e), read from the row's `project` /
+ * `service` FIELDS and never parsed out of the label: the service whose label
+ * IS the project name lands on `/projects/:project`, any other on its own
+ * `/projects/:project/services/:service`. A row without the fields (an older
+ * daemon) keeps the label path. Models and databases land on their inventory
+ * pages; anything else falls back to the project grid.
  */
-export function kindHomePath(kind: WorkloadKind, name: string): string {
-  switch (kind) {
+export function kindHomePath(
+  svc: Pick<Service, "kind" | "name" | "project" | "service">
+): string {
+  switch (svc.kind) {
     case "service":
-      return `/projects/${encodeURIComponent(name)}`;
+      if (svc.project && svc.service && svc.project !== svc.name) {
+        return `/projects/${encodeURIComponent(svc.project)}/services/${encodeURIComponent(svc.service)}`;
+      }
+      return `/projects/${encodeURIComponent(svc.project ?? svc.name)}`;
     case "model":
       return "/models";
     case "database":

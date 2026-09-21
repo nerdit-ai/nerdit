@@ -54,6 +54,14 @@ _SECRET_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # keep the word `shared`; routes translate.
 SHARED_SCOPE = "_shared"
 
+# Internal storage names above the service scope (D-P40-8), same underscore
+# argument as `_shared`: `_project-<prj_id>` is the project scope, id-keyed so
+# a project rename never re-encrypts (the stem is the AAD); `_env-<prj_id>-<env>`
+# is reserved for phase 3 and admitted so it never needs a second grammar
+# change, but nothing writes it. The id grammar is `mint_project_id`'s.
+_PROJECT_STEM_RE = re.compile(r"_project-prj_[a-z2-7]{16}")
+_ENV_STEM_RE = re.compile(r"_env-prj_[a-z2-7]{16}-(?!.*--)[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?")
+
 # AES-256-GCM envelope constants. The AAD prefix is versioned so a future
 # format change can coexist with v1 files.
 _ENVELOPE_VERSION = 1
@@ -130,6 +138,24 @@ class SecretRotationInProgress(RuntimeError):  # noqa: N818 — public API name
     """
 
 
+def project_storage_name(project_id: str) -> str:
+    """The `SecretManager` name of a project's variable scope (D-P40-8).
+
+    Args:
+        project_id: A `prj_` id from `core.project_identity.mint_project_id`.
+
+    Returns:
+        `_project-<project_id>`; the `.enc` stem and the AES-GCM AAD name.
+
+    Raises:
+        InvalidServiceName: When `project_id` is not a minted project id.
+    """
+    name = f"_project-{project_id}"
+    if not _PROJECT_STEM_RE.fullmatch(name):
+        raise InvalidServiceName(f"Invalid project id: {project_id!r}")
+    return name
+
+
 class SecretManager:
     """Per-service secret env store (write-only over the API, encrypted at rest)."""
 
@@ -166,7 +192,14 @@ class SecretManager:
         return self._key_path.with_name(self._key_path.name + ".new")
 
     def _check_name(self, service: str) -> str:
-        if service != SHARED_SCOPE and not _DNS_LABEL_RE.match(service):
+        # `fullmatch` on the internal stems: they become a filename, and `$`
+        # alone would admit a trailing newline.
+        if (
+            service != SHARED_SCOPE
+            and not _PROJECT_STEM_RE.fullmatch(service)
+            and not _ENV_STEM_RE.fullmatch(service)
+            and not _DNS_LABEL_RE.match(service)
+        ):
             raise InvalidServiceName(f"Invalid service name: {service!r}")
         return service
 
@@ -728,6 +761,13 @@ class SecretManager:
             else:
                 path.unlink(missing_ok=True)
             return True
+
+    def exists(self, service: str) -> bool:
+        """Whether any secrets file (`.enc` or legacy `.json`) is stored for the name.
+
+        A presence probe only: nothing is read or decrypted.
+        """
+        return self._path(service).is_file() or self._legacy_path(service).is_file()
 
     def delete(self, service: str) -> bool:
         """Remove the whole secrets file for a service. Returns True if it existed."""

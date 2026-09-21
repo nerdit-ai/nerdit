@@ -13,6 +13,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from nerdit.config.build import BuildSettings
 from nerdit.config.redaction import redact_url_userinfo
+from nerdit.core.project_identity import (
+    PRODUCTION,
+    PROJECT_NAME_RE,
+    SERVICE_NAME_RE,
+    service_label,
+)
 
 PROJECT_CONFIG_NAME = "nerdit.toml"
 
@@ -49,6 +55,20 @@ AI_BINDING_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 # — ``${secrets.shared.KEY}`` resolves the per-service KEY first (override
 # escape hatch), then the shared store; unscoped refs stay per-service-only.
 SECRET_REF_RE = re.compile(r"^\$\{secrets\.(?:(shared)\.)?([A-Z][A-Z0-9_]*)\}$")
+
+
+def rewrite_vars_ref(value: str | None) -> str | None:
+    """Rewrite the `${vars.…}` alias to its `${secrets.…}` storage form (D-P40-9).
+
+    Applied at every ref ingress BEFORE the `SECRET_REF_RE` check, so the alias
+    is never stored and the frozen grammar (and every `fullmatch` backstop
+    downstream) never learns a second spelling. Anything else passes through
+    untouched for the grammar check to judge.
+    """
+    if value is not None and value.startswith("${vars."):
+        return "${secrets." + value[len("${vars.") :]
+    return value
+
 
 # [db.*] binding name grammar (P15, D-A) — its OWN constant, cloned from
 # AI_BINDING_NAME_RE (never repointed) so the frozen [ai.*] grammar and the new
@@ -195,6 +215,7 @@ class EdgeAuthConfig(BaseModel):
     @field_validator("password")
     @classmethod
     def _check_password_is_secret_ref(cls, value: str) -> str:
+        value = rewrite_vars_ref(value) or ""
         if not SECRET_REF_RE.fullmatch(value):
             # Never echo the rejected value: a literal password is exactly what
             # this rejects, and the message rides the same 422/job_logs/diagnose
@@ -335,6 +356,7 @@ class AiBindingConfig(BaseModel):
     @field_validator("api_key")
     @classmethod
     def _check_api_key_is_secret_ref(cls, value: str | None) -> str | None:
+        value = rewrite_vars_ref(value)
         if value is not None and not SECRET_REF_RE.match(value):
             # Never echo the rejected value: a literal API key is exactly what
             # this rejects, and ``hide_input_in_errors`` does NOT reach a
@@ -426,6 +448,7 @@ class DbBindingConfig(BaseModel):
     @field_validator("password")
     @classmethod
     def _check_password_is_secret_ref(cls, value: str | None) -> str | None:
+        value = rewrite_vars_ref(value)
         if value is not None and not SECRET_REF_RE.match(value):
             # Never echo the rejected value: a literal password is exactly what
             # this rejects, and the message rides the same 422/job_logs/diagnose
@@ -588,6 +611,188 @@ def load_project_config(path: Path | None = None) -> ProjectConfig | None:
         ai=parse_ai_bindings(data["ai"]) if "ai" in data else None,
         db=parse_db_bindings(data["db"]) if "db" in data else None,
     )
+
+
+#: `[vars] required` entries: the key half of the secret-ref grammar (`SECRET_REF_RE`).
+_VAR_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]*")
+
+
+class DeclarationError(ValueError):
+    """A `[project]` declaration refusal carrying the 422 code the apply route answers with.
+
+    Still a `ValueError`, so CLI callers that only want the text treat it like
+    every other `nerdit.toml` error. Messages are value-free: they name tables
+    and keys, never a rejected value.
+
+    Attributes:
+        code: `project.invalid_declaration`, `project.invalid_name`,
+            `project.invalid_service` or `project.label_too_long`.
+    """
+
+    def __init__(self, message: str, code: str = "project.invalid_declaration") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def is_project_declaration(data: dict) -> bool:
+    """Whether a parsed `nerdit.toml` carries `[project]` or `[services]` (D-P40-12).
+
+    The legacy ingresses refuse such a file (`deploy.use_apply`) on presence
+    alone, whatever its shape: a half-written declaration must not deploy as a
+    legacy `[deploy]` app.
+    """
+    return "project" in data or "services" in data
+
+
+def parse_project_declaration(
+    data: dict, *, new_project: bool = True
+) -> tuple[str, dict[str, dict], list[str]]:
+    """Validate a `[project]` / `[services.*]` / `[vars]` declaration (P40d / D-P40-12).
+
+    A function, not a model: each `[services.<svc>]` table is validated as
+    `DeployConfig(**{**table, "name": label})`, the legacy deploy shape, so
+    `DeployConfig.model_fields` stays the one schema. The label comes from
+    `service_label` and is never parsed back (D-P40-2 / D-P40-6). Top-level
+    `[ai.*]` / `[db.*]` go through the shared binding schemas.
+
+    Reserved names (`RESERVED_SERVICE_NAMES`) are a daemon-side judgment and
+    are not checked here.
+
+    Args:
+        data: The parsed `nerdit.toml`.
+        new_project: `True` enforces the D-P40-14 project-name grammar, which
+            binds only where a NEW name enters. The apply route passes `False`
+            for a project that already exists, so a grammar-exempt implicit
+            project (41-63 chars, or carrying `--`) can gain a second service;
+            the name must still be a DNS label.
+
+    Returns:
+        `(name, services, required)`: the project name, each service's raw
+        table keyed by service name (declaration order), and `[vars] required`.
+
+    Raises:
+        DeclarationError: On any refusal; `code` is the 422 code.
+    """
+    if "deploy" in data:
+        raise DeclarationError(
+            f"{PROJECT_CONFIG_NAME} carries both [deploy] and [project]/[services]: "
+            "move the [deploy] keys into a [services.web] table."
+        )
+    project = data.get("project")
+    if not isinstance(project, dict):
+        raise DeclarationError("[project] must be a table with a 'name' key.")
+    if set(project) - {"name"}:
+        raise DeclarationError("[project] takes only the 'name' key.")
+    name = project.get("name")
+    pattern = PROJECT_NAME_RE if new_project else _DNS_LABEL_RE
+    if not isinstance(name, str) or not pattern.fullmatch(name):
+        raise DeclarationError(
+            "Invalid [project] name: a lowercase DNS label of at most 40 characters "
+            "(letters, digits, '-') that never contains '--'.",
+            "project.invalid_name",
+        )
+
+    tables = data.get("services")
+    if not isinstance(tables, dict) or not tables:
+        raise DeclarationError(
+            "[services] must hold at least one [services.<name>] table, e.g. [services.web]."
+        )
+    services: dict[str, dict] = {}
+    for svc, table in tables.items():
+        services[svc] = _service_table(name, svc, table)
+    _check_bindings(data)
+    return name, services, _required_vars(data.get("vars"))
+
+
+def _service_table(project: str, svc: str, table: object) -> dict:
+    """Validate one `[services.<svc>]` table as a `DeployConfig` named by its label."""
+    if not SERVICE_NAME_RE.fullmatch(svc):
+        raise DeclarationError(
+            "Invalid [services.<name>] table name: a lowercase DNS label of at most "
+            "20 characters, no '--'.",
+            "project.invalid_service",
+        )
+    if not isinstance(table, dict):
+        raise DeclarationError(f"[services.{svc}] must be a table.")
+    if "name" in table:
+        # The label is composed, never chosen (D-P40-6): a silent override
+        # would let a file claim a name it does not get.
+        raise DeclarationError(
+            f"[services.{svc}] must not set 'name': the service is named by its table."
+        )
+    if "auto_deploy" in table:
+        # The recorded-source redeploy of a declared service answers
+        # `deploy.use_apply`, so the flag could only ever write failed-redeploy
+        # noise on each push. ponytail: lift with the GitWatch-picks-its-table upgrade.
+        raise DeclarationError(
+            f"[services.{svc}] must not set 'auto_deploy': re-run `nerdit apply` to redeploy."
+        )
+    try:
+        label = service_label(project, PRODUCTION, svc)
+    except ValueError as exc:
+        raise DeclarationError(
+            f"[services.{svc}] has no valid label: the composed '<service>--<project>' "
+            "must be a DNS label of at most 63 characters.",
+            "project.label_too_long",
+        ) from exc
+    try:
+        DeployConfig(**{**table, "name": label})
+    except (ValidationError, TypeError) as exc:
+        # First validator message only, the `deploy.invalid` shape:
+        # `hide_input_in_errors` keeps it value-free, a TypeError (a
+        # non-string key cannot happen in TOML) is not echoed at all.
+        msg = (
+            exc.errors(include_url=False, include_input=False)[0].get("msg", "invalid")
+            if isinstance(exc, ValidationError)
+            else "invalid table"
+        )
+        raise DeclarationError(f"Invalid [services.{svc}] table: {msg}") from exc
+    return dict(table)
+
+
+def _check_bindings(data: dict) -> None:
+    """Run top-level `[ai.*]` / `[db.*]` through the shared schemas; `engine=` gets the hint."""
+    # `describe_project_config_error` is the value-free one-liner for both a
+    # pydantic error and the parsers' own shape errors.
+    try:
+        if "ai" in data:
+            parse_ai_bindings(data["ai"])
+    except ValueError as exc:
+        raise DeclarationError(describe_project_config_error(exc)) from exc
+    try:
+        if "db" in data:
+            parse_db_bindings(data["db"])
+    except ValueError as exc:
+        raw_db = data["db"]
+        declares_engine = isinstance(raw_db, dict) and any(
+            isinstance(table, dict) and "engine" in table for table in raw_db.values()
+        )
+        hint = (
+            " A declaration cannot create a database: run `nerdit db create`, then bind it "
+            'with provider = "managed" and database = "<name>".'
+            if declares_engine
+            else ""
+        )
+        raise DeclarationError(describe_project_config_error(exc) + hint) from exc
+
+
+def _required_vars(section: object) -> list[str]:
+    """Validate `[vars] required`: ref-grammar keys, no duplicates; absent means none."""
+    if section is None:
+        return []
+    if not isinstance(section, dict) or set(section) - {"required"}:
+        raise DeclarationError("[vars] must be a table with only a 'required' key.")
+    required = section.get("required", [])
+    if not isinstance(required, list) or not all(
+        isinstance(key, str) and _VAR_KEY_RE.fullmatch(key) for key in required
+    ):
+        raise DeclarationError(
+            "[vars] required must be a list of variable names "
+            "(uppercase letters, digits and '_', starting with a letter)."
+        )
+    if len(set(required)) != len(required):
+        raise DeclarationError("[vars] required lists a variable name more than once.")
+    return list(required)
 
 
 def describe_project_config_error(exc: ValueError) -> str:

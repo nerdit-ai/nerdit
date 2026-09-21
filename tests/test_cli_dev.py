@@ -434,6 +434,20 @@ def test_not_a_directory_exits_1(tmp_path, monkeypatch):
     assert "Not a directory" in result.output
 
 
+def test_a_declaration_folder_is_refused_up_front(tmp_path, monkeypatch):
+    """(P40d) Every save would answer 422 `deploy.use_apply`; refuse once, send nothing."""
+    fake = _client()
+    _install_loop(monkeypatch, [])
+    (tmp_path / "nerdit.toml").write_text('[project]\nname = "asso"\n\n[services.web]\nport = 1\n')
+
+    with patch("nerdit.cli.client.get_configured_client", return_value=fake):
+        result = runner.invoke(app, ["dev", str(tmp_path)])
+
+    assert result.exit_code == 1
+    assert "nerdit apply" in result.output
+    fake.deploy.assert_not_called()
+
+
 # --- the snapshot itself ------------------------------------------------------
 
 

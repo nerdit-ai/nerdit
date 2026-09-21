@@ -17,8 +17,9 @@ from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import Principal, QuotaExceeded, current_principal, require_role
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.routes.services import reject_reserved_name
+from nerdit.daemon.secret_scope import name_claimed_error, project_owned_error
 from nerdit.db.models import Job, JobKind, JobStatus, TokenRole
-from nerdit.db.queries import ServiceNameTaken
+from nerdit.db.queries import ProjectOwned, ServiceNameClaimed, ServiceNameTaken
 
 __all__ = [
     "authorize_create",
@@ -96,16 +97,19 @@ def new_workload_row(
 
 
 async def reserve_or_conflict(
-    queries: Any, job: Job, *, service_name: str, name_taken_hint: str
+    request: Request, queries: Any, job: Job, *, service_name: str, name_taken_hint: str
 ) -> Job:
     """Reserve the row for the submitting token.
 
     Maps `ServiceNameTaken` to the shared 409 `service.name_taken` code +
-    message (the hint stays per-side) and `QuotaExceeded` to its own error
-    envelope, exactly as both routes did inline.
+    message (the hint stays per-side), `ServiceNameClaimed` to 409
+    `service.name_claimed`, `ProjectOwned` to 409 `project.owned` (P40b), and
+    `QuotaExceeded` to its own error envelope.
     """
     try:
-        return await queries.reserve_service_for_token(job)
+        return await queries.reserve_service_for_token(
+            job, admin=current_principal(request).role is TokenRole.admin
+        )
     except ServiceNameTaken as exc:
         raise NerditError(
             409,
@@ -113,5 +117,9 @@ async def reserve_or_conflict(
             f"A service named '{service_name}' already exists.",
             hint=name_taken_hint,
         ) from exc
+    except ServiceNameClaimed as exc:
+        raise name_claimed_error(service_name) from exc
+    except ProjectOwned as exc:
+        raise project_owned_error(service_name) from exc
     except QuotaExceeded as exc:
         raise exc.to_error() from exc

@@ -24,6 +24,7 @@ from nerdit.core.secrets import (
     SecretDecryptError,
     SecretManager,
     SecretRotationInProgress,
+    project_storage_name,
 )
 from nerdit.core.services import ServiceController
 from nerdit.db.models import Job, JobKind, JobStatus
@@ -727,3 +728,66 @@ def test_has_ciphertexts_true_when_the_store_path_is_not_a_directory(tmp_path):
     store = tmp_path / "secrets"
     store.write_text("not a directory", encoding="utf-8")
     assert SecretManager(store).has_ciphertexts() is True
+
+
+def test_exists_probes_enc_and_legacy_json_without_reading(tmp_path):
+    """P39 orphan probe: presence of either file shape, never a decrypt."""
+    secrets_dir = tmp_path / "secrets"
+    mgr = SecretManager(secrets_dir)
+    assert mgr.exists("demo") is False
+    mgr.set("demo", {"A": "1"})
+    assert mgr.exists("demo") is True
+    assert mgr.delete("demo") is True
+    assert mgr.exists("demo") is False
+    (secrets_dir / "legacy.json").write_text("{not json", encoding="utf-8")
+    assert mgr.exists("legacy") is True  # a malformed legacy file still counts
+    with pytest.raises(InvalidServiceName):
+        mgr.exists("Bad_Name")
+
+
+# --- P40c: project-scope storage names (D-P40-8) --------------------------------
+
+_PRJ = "prj_abcdefghij234567"
+
+
+def test_project_storage_name_is_the_one_composer():
+    assert project_storage_name(_PRJ) == f"_project-{_PRJ}"
+    for bad in ("asso", "prj_short", "prj_ABCDEFGHIJ234567", f"{_PRJ}/../x", f"{_PRJ}\n"):
+        with pytest.raises(InvalidServiceName):
+            project_storage_name(bad)
+
+
+def test_check_name_admits_project_and_reserved_env_stems_only(tmp_path):
+    mgr = SecretManager(tmp_path / "secrets")
+    mgr.set(f"_project-{_PRJ}", {"A": "1"})
+    mgr.set(f"_env-{_PRJ}-staging", {"A": "1"})  # reserved for phase 3, admitted
+    assert (tmp_path / "secrets" / f"_project-{_PRJ}.enc").is_file()
+    for bad in (
+        "_other",
+        "_project-asso",
+        f"_project-{_PRJ}x",
+        f"_project-{_PRJ}\n",
+        f"_env-{_PRJ}",
+        f"_env-{_PRJ}-a--b",
+        f"_env-{_PRJ}-../x",
+        "_shared2",
+    ):
+        with pytest.raises(InvalidServiceName):
+            mgr.set(bad, {"A": "1"})
+
+
+def test_rotation_reencrypts_a_project_file_under_its_stem_aad(tmp_path):
+    mgr = SecretManager(tmp_path / "secrets")
+    name = project_storage_name(_PRJ)
+    mgr.set(name, {"TOKEN": "s3cret"})
+    mgr.set("asso", {"B": "2"})
+    path = tmp_path / "secrets" / f"{name}.enc"
+    before = path.read_text(encoding="utf-8")
+    assert mgr.rotate_key() == 2
+    assert path.read_text(encoding="utf-8") != before
+    assert mgr.load(name) == {"TOKEN": "s3cret"}
+    # The AAD is the stem: the same ciphertext under another project's name must not open.
+    other = tmp_path / "secrets" / "_project-prj_zzzzzzzzzzzzzzzz.enc"
+    other.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(SecretDecryptError):
+        mgr.load(other.stem)

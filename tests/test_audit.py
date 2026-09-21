@@ -82,6 +82,11 @@ def test_action_fallback_is_templated():
     assert target_id is None
 
 
+def test_project_apply_is_a_mapped_action_targeting_the_project():
+    """(P40d / D-P40-10) Mapped, so the idempotency layer never sees a fallback action."""
+    assert derive_action("POST", "/api/projects/asso/apply") == ("project.apply", "project", "asso")
+
+
 def test_removed_batch_routes_have_no_action_rule():
     """The batch HTTP surface is gone; its audit rules went with it (WP2)."""
     for method, path in (
@@ -199,7 +204,11 @@ def _queries() -> AsyncMock:
     q.get_service_by_name = AsyncMock(return_value=None)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
+    q.reserve_service_for_token = AsyncMock(side_effect=lambda job, **kw: job)
+    q.get_secret_claim = AsyncMock(return_value=None)
+    # (P40b) No `projects` row unless a test plants one: a bare AsyncMock would
+    # return a truthy MagicMock and read as a foreign project.
+    q.get_project_by_name = AsyncMock(return_value=None)
     q.set_desired_state = AsyncMock()
     q.list_audit_log = AsyncMock(return_value=([], None))
     return q

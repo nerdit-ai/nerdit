@@ -12,6 +12,8 @@ Covers three things:
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from nerdit.db.database import Database
@@ -301,6 +303,42 @@ async def test_service_name_index_survives_legacy_rebuild():
     indexes = await _index_names(db)
     assert "idx_jobs_service_name" in indexes, "index dropped by the jobs_new DROP TABLE rebuild"
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_rebuild_boots_with_a_job_logs_child_row():
+    """The pre-P1 rebuild must boot on an install that ever ran a job.
+
+    ``PRAGMA foreign_keys=OFF`` is a no-op inside a transaction, and ``_migrate``
+    has already opened Python's implicit one by the time the rebuild runs. So
+    the rebuild commits first; otherwise ``DROP TABLE jobs`` runs its implicit
+    DELETE with FKs on and any child row raises ``IntegrityError`` at boot.
+    """
+    db = Database(":memory:")
+    await db.connect()
+    await db.conn.execute(_LEGACY_JOBS_DDL)
+    await db.conn.execute(
+        "CREATE TABLE job_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "job_id TEXT REFERENCES jobs(id), message TEXT, timestamp TEXT)"
+    )
+    await db.conn.execute(
+        "INSERT INTO jobs (id, name, script_path, gpu_count, status) "
+        "VALUES ('legacyjob005', 'old', 'train.py', 1, 'completed')"
+    )
+    await db.conn.execute("INSERT INTO job_logs (job_id, message) VALUES ('legacyjob005', 'hi')")
+    await db.conn.commit()
+    try:  # close even on failure: a leaked aiosqlite thread hangs the run
+        await db.init_schema()
+
+        cursor = await db.conn.execute(
+            "SELECT j.script_path FROM job_logs l JOIN jobs j ON j.id = l.job_id"
+        )
+        assert [tuple(row) for row in await cursor.fetchall()] == [("train.py",)]
+        # FK enforcement is back on, and nothing dangles.
+        assert (await (await db.conn.execute("PRAGMA foreign_keys")).fetchone())[0] == 1
+        assert await (await db.conn.execute("PRAGMA foreign_key_check")).fetchall() == []
+    finally:
+        await db.close()
 
 
 # A pre-P22 ``idempotency_keys`` table: everything except ``body_hash``.
@@ -837,3 +875,280 @@ async def test_naive_expires_at_column_is_coerced_to_utc(queries):
     assert token.expires_at is not None
     assert token.expires_at.tzinfo is not None
     assert token.expires_at.utcoffset() == UTC.utcoffset(None)
+
+
+# --- P39 secret claims ---
+
+
+@pytest.mark.asyncio
+async def test_secret_claims_table_shape(db):
+    """The D-P39-1 columns, exactly as locked."""
+    cursor = await db.conn.execute("PRAGMA table_info(secret_claims)")
+    cols = {row[1] for row in await cursor.fetchall()}
+    assert cols == {"service_name", "token_id", "created_at"}
+
+
+@pytest.mark.asyncio
+async def test_secret_claims_appear_on_a_legacy_db():
+    """A ``_SCHEMA``-only table is created on every existing install (the ``events`` argument)."""
+    db = Database(":memory:")
+    await db.connect()
+    await db.conn.execute(_LEGACY_JOBS_DDL)
+    await db.conn.commit()
+
+    await db.init_schema()
+    await db.init_schema()  # idempotent: a second boot must not duplicate it
+
+    tables = [name for name in await _table_names(db) if name == "secret_claims"]
+    assert tables == ["secret_claims"]
+    await db.close()
+
+
+# --- P40a project identity (D-P40-3 / D-P40-4 / D-P40-5) ---
+
+
+# The three P40a columns on ``jobs`` (exact set).
+_PROJECT_JOB_COLS = {"project_id", "environment", "service"}
+
+
+# A P39-shaped ``jobs`` table: the 33 columns the frozen ``jobs_new`` literal
+# carries, ``script_path`` already nullable (so no rebuild fires) and none of
+# the P40a columns. This is every install upgrading today.
+_P39_JOBS_DDL = """
+CREATE TABLE jobs (
+    id          TEXT PRIMARY KEY,
+    name        TEXT,
+    script_path TEXT,
+    gpu_count   INTEGER DEFAULT 1,
+    priority    INTEGER DEFAULT 5,
+    status      TEXT DEFAULT 'pending',
+    container_id TEXT,
+    created_at  TEXT DEFAULT (datetime('now')),
+    started_at  TEXT,
+    finished_at TEXT,
+    paused_at   TEXT,
+    exit_code   INTEGER,
+    retries     INTEGER DEFAULT 0,
+    max_retries INTEGER DEFAULT 3,
+    config      TEXT,
+    tags        TEXT,
+    preemptible INTEGER DEFAULT 0,
+    max_runtime_seconds INTEGER,
+    time_window TEXT,
+    error_class TEXT,
+    error_message TEXT,
+    submitted_via TEXT NOT NULL DEFAULT 'cli',
+    template_id TEXT,
+    kind        TEXT NOT NULL DEFAULT 'batch',
+    submitted_by_token TEXT,
+    idempotency_key TEXT,
+    desired_state TEXT,
+    restart_policy TEXT,
+    restart_count INTEGER NOT NULL DEFAULT 0,
+    health_check TEXT,
+    service_name TEXT,
+    last_exit_at TEXT,
+    restart_window_start TEXT
+)
+"""
+
+
+async def _triples(db: Database) -> dict[str, tuple[str | None, str | None, str | None]]:
+    cursor = await db.conn.execute("SELECT id, project_id, environment, service FROM jobs")
+    return {row[0]: (row[1], row[2], row[3]) for row in await cursor.fetchall()}
+
+
+async def _projects(db: Database) -> dict[str, tuple[str, str | None]]:
+    cursor = await db.conn.execute("SELECT name, id, submitted_by_token FROM projects")
+    return {row[0]: (row[1], row[2]) for row in await cursor.fetchall()}
+
+
+@pytest.mark.asyncio
+async def test_fresh_db_has_project_columns_table_and_index(db):
+    """A fresh database carries the triple, the ``projects`` table and the triple index."""
+    assert _PROJECT_JOB_COLS <= await _jobs_columns(db)
+    assert {"projects", "secret_claims"} <= await _table_names(db)
+    cursor = await db.conn.execute("PRAGMA table_info(projects)")
+    assert {row[1] for row in await cursor.fetchall()} == {
+        "id",
+        "name",
+        "submitted_by_token",
+        "created_at",
+    }
+    assert {"idx_jobs_service_name", "idx_jobs_project_service"} <= await _index_names(db)
+
+
+@pytest.mark.asyncio
+async def test_project_service_index_is_partial_unique_on_the_triple(db):
+    """D-P40-3: UNIQUE on ``(project_id, environment, service)`` WHERE project_id IS NOT NULL."""
+    cursor = await db.conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_jobs_project_service'"
+    )
+    ddl = (await cursor.fetchone())[0].replace('"', "")
+    assert "UNIQUE" in ddl
+    assert "jobs(project_id, environment, service)" in ddl
+    assert "WHERE project_id IS NOT NULL" in ddl
+
+
+@pytest.mark.asyncio
+async def test_p39_db_gains_triple_and_one_project_per_service_row():
+    """The upgrade every install makes today: columns added, service rows backfilled.
+
+    Each ``kind=service`` row becomes ``(name, production, web)`` in a
+    ``projects`` row named after it and owned by the row's token; model,
+    database and batch rows keep NULL; the second boot is a no-op with the
+    same ids (find-or-create by name, ``project_id IS NULL`` predicate).
+    """
+    db = Database(":memory:")
+    await db.connect()
+    await db.conn.execute(_P39_JOBS_DDL)
+    await db.conn.executemany(
+        "INSERT INTO jobs (id, kind, service_name, submitted_by_token) VALUES (?, ?, ?, ?)",
+        [
+            ("svc000000001", "service", "api", "tok000000001"),
+            ("svc000000002", "service", "blog", None),
+            ("mdl000000001", "model", "llama", "tok000000001"),
+            ("dbs000000001", "database", "pg", "tok000000001"),
+            ("bat000000001", "batch", None, None),
+            # The P1-P2 window: a service row without a name stays tripleless.
+            ("svc000000003", "service", None, "tok000000001"),
+        ],
+    )
+    await db.conn.commit()
+
+    await db.init_schema()
+
+    assert _PROJECT_JOB_COLS <= await _jobs_columns(db)
+    assert "idx_jobs_project_service" in await _index_names(db)
+    projects = await _projects(db)
+    assert set(projects) == {"api", "blog"}
+    assert projects["api"][1] == "tok000000001"
+    assert projects["blog"][1] is None
+    for _, (project_id, _) in projects.items():
+        assert project_id.startswith("prj_") and len(project_id) == 20
+    triples = await _triples(db)
+    assert triples["svc000000001"] == (projects["api"][0], "production", "web")
+    assert triples["svc000000002"] == (projects["blog"][0], "production", "web")
+    for untripled in ("mdl000000001", "dbs000000001", "bat000000001", "svc000000003"):
+        assert triples[untripled] == (None, None, None)
+
+    await db.init_schema()  # second boot: ids stable, nothing duplicated
+    assert await _projects(db) == projects
+    assert await _triples(db) == triples
+    cols = [row[1] for row in await (await db.conn.execute("PRAGMA table_info(jobs)")).fetchall()]
+    assert all(cols.count(col) == 1 for col in _PROJECT_JOB_COLS)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_adopts_an_existing_project_row_by_name():
+    """Find-or-create: a service row whose project already exists joins it, id unchanged."""
+    db = Database(":memory:")
+    await db.connect()
+    await db.conn.execute(_P39_JOBS_DDL)
+    await db.conn.execute(
+        "INSERT INTO jobs (id, kind, service_name, submitted_by_token) "
+        "VALUES ('svc000000004', 'service', 'api', 'tok000000002')"
+    )
+    await db.conn.commit()
+    await db.conn.executescript(
+        "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, "
+        "submitted_by_token TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')));"
+        "INSERT INTO projects (id, name, submitted_by_token) "
+        "VALUES ('prj_aaaaaaaaaaaaaaaa', 'api', 'tok000000001');"
+    )
+
+    await db.init_schema()
+
+    assert (await _projects(db))["api"] == ("prj_aaaaaaaaaaaaaaaa", "tok000000001")
+    assert (await _triples(db))["svc000000004"] == ("prj_aaaaaaaaaaaaaaaa", "production", "web")
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_project_columns_and_index_survive_legacy_rebuild():
+    """D-P40-4: the P40a block runs AFTER ``_ensure_nullable_script_path``.
+
+    Mirror of ``test_service_name_index_survives_legacy_rebuild``: on a pre-P1
+    database the rebuild ``DROP TABLE``s ``jobs`` from the frozen 33-column
+    literals, so the columns, the ``projects`` table and the triple index must
+    all be there afterwards -- and still exactly once after a second boot.
+    """
+    db = Database(":memory:")
+    await db.connect()
+    await db.conn.execute(_LEGACY_JOBS_DDL)
+    await db.conn.execute(
+        "INSERT INTO jobs (id, name, script_path, gpu_count, status) "
+        "VALUES ('legacyjob004', 'old', 'train.py', 1, 'completed')"
+    )
+    await db.conn.commit()
+
+    await db.init_schema()
+    await db.init_schema()  # idempotent
+
+    cols = [row[1] for row in await (await db.conn.execute("PRAGMA table_info(jobs)")).fetchall()]
+    assert _PROJECT_JOB_COLS <= set(cols)
+    assert all(cols.count(col) == 1 for col in _PROJECT_JOB_COLS)
+    assert "projects" in await _table_names(db)
+    assert {"idx_jobs_service_name", "idx_jobs_project_service"} <= await _index_names(db)
+    # The legacy batch row survived and is untripled.
+    assert (await _triples(db))["legacyjob004"] == (None, None, None)
+    assert await _projects(db) == {}
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_variables_table_appears_on_an_existing_db_with_no_value_column():
+    """A ``_SCHEMA``-only table: an existing install gains it on boot, idempotently."""
+    db = Database(":memory:")
+    await db.connect()
+    await db.conn.execute(_LEGACY_JOBS_DDL)
+    await db.conn.commit()
+
+    await db.init_schema()
+    await db.init_schema()
+
+    assert [n for n in await _table_names(db) if n == "variables"] == ["variables"]
+    cursor = await db.conn.execute("PRAGMA table_info(variables)")
+    info = {row[1]: row for row in await cursor.fetchall()}
+    # D-P40-1: a flag table -- no column may ever hold a value.
+    assert set(info) == {"project_id", "environment", "service", "key", "plain", "updated_at"}
+    assert {name for name, row in info.items() if row[5]} == {
+        "project_id",
+        "environment",
+        "service",
+        "key",
+    }
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_project_row_cascades_its_variable_flags(db):
+    """D-P40-17: the FK removes the flag rows with the ``projects`` row, and only those."""
+    for pid, name in (("prj_aaaaaaaaaaaaaaaa", "asso"), ("prj_bbbbbbbbbbbbbbbb", "blog")):
+        await db.conn.execute("INSERT INTO projects (id, name) VALUES (?, ?)", (pid, name))
+        await db.conn.execute(
+            "INSERT INTO variables (project_id, key, plain) VALUES (?, 'K', 1)", (pid,)
+        )
+        await db.conn.execute(
+            "INSERT INTO variables (project_id, environment, service, key, plain) "
+            "VALUES (?, 'production', 'web', 'K', 0)",
+            (pid,),
+        )
+    await db.conn.commit()
+
+    await db.conn.execute("DELETE FROM projects WHERE name = 'asso'")
+    await db.conn.commit()
+
+    cursor = await db.conn.execute("SELECT DISTINCT project_id FROM variables")
+    assert [r[0] for r in await cursor.fetchall()] == ["prj_bbbbbbbbbbbbbbbb"]
+    # The FK also refuses a flag for a project that does not exist.
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.conn.execute(
+            "INSERT INTO variables (project_id, key, plain) VALUES ('prj_nope', 'K', 1)"
+        )
+    # ...and the CHECK refuses anything but 0/1.
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.conn.execute(
+            "INSERT INTO variables (project_id, key, plain) VALUES ('prj_bbbbbbbbbbbbbbbb', 'Z', 2)"
+        )

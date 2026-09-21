@@ -26,7 +26,7 @@ from nerdit.core.data.backend import PostgresBackend
 from nerdit.core.data.controller import DataController
 from nerdit.core.models.backend import OllamaBackend, VllmBackend
 from nerdit.core.models.controller import ModelController
-from nerdit.core.secrets import SecretManager
+from nerdit.core.secrets import SecretManager, project_storage_name
 from nerdit.daemon.auth import hash_token
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers
 from nerdit.daemon.middleware import ScopedTokenAuthMiddleware
@@ -707,6 +707,36 @@ async def test_missing_secret_binding_yields_set_missing_secret(harness):
     assert body["remediation"]["code"] == "set_missing_secret"
 
 
+async def test_project_scope_secret_satisfies_the_binding_wait(harness):
+    """(P40c) Diagnose judges the same merged project < service map the launch does."""
+    client, queries, secrets = harness
+    cfg = {
+        "image": "nerdit-app/my-app:1",
+        "port": 8000,
+        "ai": {
+            "cheap": {
+                "provider": "api",
+                "model": "gpt-4o-mini",
+                "base_url": "https://api.openai.com/v1",
+                "api_key": "${secrets.OPENAI_KEY}",
+            }
+        },
+        "last_deploy": {
+            "version": 1,
+            "action": "create",
+            "phase": "launching",
+            "started_at": _STARTED,
+        },
+    }
+    job = await _seed_service(queries, config=cfg, status=JobStatus.building)
+    secrets.set(project_storage_name(job.project_id), {"OPENAI_KEY": "sk-project-never-printed"})
+    resp = await client.get("/api/services/my-app/diagnose", headers=_auth(OWNER_RAW))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["remediation"]["code"] != "set_missing_secret"
+    assert resp.json()["bindings"]["waiting"] is False
+    assert "sk-project-never-printed" not in resp.text
+
+
 async def test_unprovisioned_managed_db_binding_is_outcome_readable(harness):
     # (P15 WP4 review R2) An app whose ONLY binding is a managed [db.default]
     # pointing at an unprovisioned database sits in the launch retry loop. Before
@@ -918,15 +948,19 @@ async def test_post_launch_secret_shows_in_pending_not_injected(harness):
             "started_at": _STARTED,
         },
     }
-    await _seed_service(queries, config=cfg, status=JobStatus.running)
+    job = await _seed_service(queries, config=cfg, status=JobStatus.running)
     # A secret added AFTER the launch — visible in pending, absent from injected.
     secrets.set("my-app", {"ADDED_AFTER_LAUNCH": "value-not-leaked"})
+    # (P40c) So is a project-scope variable: the next launch merges both scopes.
+    secrets.set(project_storage_name(job.project_id), {"PROJECT_VAR": "value-not-leaked"})
     resp = await client.get("/api/services/my-app/diagnose", headers=_auth(OWNER_RAW))
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["injected_env_keys_source"] == "launch"
     assert "ADDED_AFTER_LAUNCH" not in body["injected_env_keys"]
     assert "ADDED_AFTER_LAUNCH" in body["pending_env_keys"]
+    assert "PROJECT_VAR" in body["pending_env_keys"]
+    assert "value-not-leaked" not in resp.text
 
 
 async def test_serialized_body_never_leaks_a_secret_value(harness):
@@ -1465,6 +1499,18 @@ async def test_edge_auth_secret_present_falls_through_to_the_existing_codes(harn
     secrets.set("my-app", {"APP_PW": "s3cr3t-never-printed"})
     cfg = {**_EDGE_AUTH_CFG, "edge_auth": {"user": "ops", "password": "${secrets.APP_PW}"}}
     await _seed_service(queries, config=cfg, status=JobStatus.running)
+    resp = await client.get("/api/services/my-app/diagnose", headers=_auth(OWNER_RAW))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["remediation"]["code"] == "none"
+    assert "s3cr3t-never-printed" not in resp.text
+
+
+async def test_edge_auth_secret_in_the_project_scope_resolves(harness):
+    """(P40c) The edge-auth probe reads the row's project scope, like the proxy resolver."""
+    client, queries, secrets = harness
+    cfg = {**_EDGE_AUTH_CFG, "edge_auth": {"user": "ops", "password": "${secrets.APP_PW}"}}
+    job = await _seed_service(queries, config=cfg, status=JobStatus.running)
+    secrets.set(project_storage_name(job.project_id), {"APP_PW": "s3cr3t-never-printed"})
     resp = await client.get("/api/services/my-app/diagnose", headers=_auth(OWNER_RAW))
     assert resp.status_code == 200, resp.text
     assert resp.json()["remediation"]["code"] == "none"

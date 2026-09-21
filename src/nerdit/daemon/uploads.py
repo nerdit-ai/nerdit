@@ -121,3 +121,63 @@ async def extract_upload(
         return upload_dir
     finally:
         tmp.close()
+
+
+#: Cap on one archive member read into memory by `read_upload_member`.
+_MEMBER_MAX_BYTES = 1 * 1024 * 1024
+
+
+def _read_member(tmp: IO[bytes], member: str) -> bytes | None:
+    tmp.seek(0)
+    if not zipfile.is_zipfile(tmp):
+        raise NerditError(
+            400, "deploy.invalid_zip", "The uploaded file is not a valid ZIP archive."
+        )
+    tmp.seek(0)
+    try:
+        with zipfile.ZipFile(tmp, "r") as zf:
+            try:
+                info = zf.getinfo(member)
+            except KeyError:
+                return None
+            if info.file_size > _MEMBER_MAX_BYTES:
+                raise NerditError(
+                    413,
+                    "payload_too_large",
+                    f"'{member}' is larger than {_MEMBER_MAX_BYTES} bytes.",
+                )
+            return zf.read(info)
+    except zipfile.BadZipFile:
+        raise NerditError(400, "deploy.invalid_zip", "The ZIP archive is corrupted.") from None
+
+
+async def read_upload_member(archive: UploadFile, member: str, *, max_bytes: int) -> bytes | None:
+    """Read one root member out of an uploaded ZIP without extracting anything.
+
+    `apply_project` reads the declaration this way so every refusal lands
+    before the first build context exists (D-P40-12). The multipart parser has
+    already spooled the upload, so this only seeks; the archive is rewound for
+    the `extract_upload` calls that follow.
+
+    Args:
+        archive: The spooled multipart upload.
+        member: The member's path inside the archive, e.g. `nerdit.toml`.
+        max_bytes: The upload cap `extract_upload` enforces; refused here too
+            so an oversized archive costs no extraction.
+
+    Returns:
+        The member's bytes (at most 1 MiB), or `None` when the archive has none.
+
+    Raises:
+        NerditError: 400 `deploy.invalid_zip`, 413 `payload_too_large`.
+    """
+    if archive.size is not None and archive.size > max_bytes:
+        raise NerditError(
+            413,
+            "payload_too_large",
+            f"Archive too large ({archive.size} bytes); the limit is {max_bytes} bytes.",
+        )
+    try:
+        return await asyncio.to_thread(_read_member, archive.file, member)
+    finally:
+        await archive.seek(0)

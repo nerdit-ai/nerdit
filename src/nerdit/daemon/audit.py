@@ -43,6 +43,10 @@ _ID_COLLECTIONS = {
     "secrets",
     "deploy",
     "app-templates",
+    # (P40b) `/projects/<name>` — the D-P40-10 collection.
+    "projects",
+    # (P40c) `/projects/<name>/variables/<key>`.
+    "variables",
 }
 
 # Explicit route → (action, target_type, id-group) map. Ordered; first match
@@ -186,6 +190,26 @@ _ROUTE_RULES: list[tuple[str, re.Pattern[str], str, str | None, int | None]] = [
     # route stamps the target (see `_TARGET_STAMP_ALLOWED` below).
     ("POST", re.compile(r"^/license$"), "license.install", "license", None),
     ("DELETE", re.compile(r"^/license$"), "license.remove", "license", None),
+    # (P40b / D-P40-10) The project pair. The create's name rides the body, so
+    # the route stamps it (see `_TARGET_STAMP_ALLOWED`); the delete's rides
+    # the path. Bodies carry names only — no `NO_BODY_HASH_ACTIONS` entry.
+    ("POST", re.compile(r"^/projects$"), "project.create", "project", None),
+    ("DELETE", re.compile(r"^/projects/([^/]+)$"), "project.delete", "project", 1),
+    # (P40d / D-P40-10) The declaration apply. Multipart, so never body-hashed
+    # (the `deploy.create` treatment); `token_ref` is a reference name, so no
+    # `NO_BODY_HASH_ACTIONS` entry. Params are hand-built by the route.
+    ("POST", re.compile(r"^/projects/([^/]+)/apply$"), "project.apply", "project", 1),
+    # (P40c / D-P40-10) The variable pair; the target is the project. The set's
+    # body is a value map, so `variable.set` is in `NO_BODY_HASH_ACTIONS` and
+    # the route hand-builds its params (names only, never `environment`).
+    ("PUT", re.compile(r"^/projects/([^/]+)/variables$"), "variable.set", "project", 1),
+    (
+        "DELETE",
+        re.compile(r"^/projects/([^/]+)/variables/([^/]+)$"),
+        "variable.unset",
+        "project",
+        1,
+    ),
 ]
 
 # Actions whose target the route may stamp via `request.state.audit_target`
@@ -225,6 +249,9 @@ _TARGET_STAMP_ALLOWED: dict[str, str] = {
     # out of the path, so the route stamps it.
     "license.install": "license",
     "license.remove": "license",
+    # (P40b) The project name lives in the create body (the `model.serve`
+    # shape), so the route stamps it.
+    "project.create": "project",
 }
 
 # Redaction denylist — any key whose lowercase name is here is masked. Secret
@@ -246,6 +273,10 @@ _REDACT_KEYS = {
     "password",
     "secret",
     "secrets",
+    # (P40c / D-P40-10) The variable set body is `{values: {K: v}}`. Depth only:
+    # the route hand-builds its params and a value is never a member.
+    "value",
+    "values",
 }
 # Keys whose value is a free-form map of *user-chosen* names → secret-bearing
 # values (e.g. a service's injected `env`). Name-based matching cannot catch

@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from nerdit.config.settings import ServicesSettings
+from nerdit.core.app_build import _sensitive_env_values
 from nerdit.core.models.backend import sanitize_model_name
 from nerdit.core.models.binding import (
     LOCAL_MODEL_API_KEY,
@@ -25,8 +26,8 @@ from nerdit.core.models.binding import (
     resolve_binding,
     resolve_bindings,
 )
-from nerdit.core.secrets import SHARED_SCOPE, SecretManager
-from nerdit.core.services import ServiceController
+from nerdit.core.secrets import SHARED_SCOPE, SecretManager, project_storage_name
+from nerdit.core.services import LaunchEnvNotReady, ServiceController
 from nerdit.daemon.routes.service_diagnose import _ai_env_key_names
 from nerdit.db.models import Job, JobKind, JobStatus
 
@@ -651,3 +652,95 @@ async def test_resolved_launch_env_injected_keys_empty_without_bindings(queries,
 
     assert resolved.injected_keys == set()
     assert resolved.env["PORT"] == "8000"
+
+
+# --- (P40c) the project scope under the service scope (D-P40-9) ---------------
+
+
+async def test_launch_env_merges_project_under_service_under_injected(queries, tmp_path):
+    """cfg.env < project < service < injected bindings < PORT (Invariant #1 holds)."""
+    mgr = SecretManager(tmp_path / "secrets")
+    controller = _controller(queries, _FakeRuntime(), mgr)
+    job = _svc_job("app", ai={"default": API_SPEC})
+    await queries.create_job(job)
+    assert job.project_id is not None
+    mgr.set(
+        project_storage_name(job.project_id),
+        {
+            "OPENAI_KEY": "sk-project",  # the [ai.default] ref resolves from the project scope
+            "OPENAI_BASE_URL": "https://evil.example/v1",  # loses to the injected binding
+            "BOTH": "project",
+            "ONLY_PROJECT": "p",
+            "FROM_CFG": "project-beats-cfg",
+        },
+    )
+    mgr.set("app", {"BOTH": "service"})
+    cfg = json.loads(job.config)
+    cfg["env"] = {"FROM_CFG": "cfg", "CFG_ONLY": "c"}
+
+    resolved = await controller._resolve_launch_env(job, cfg, 8000, cfg["ai"], None)
+
+    env = resolved.env
+    assert env["OPENAI_API_KEY"] == "sk-project"
+    assert env["OPENAI_BASE_URL"] == "https://api.example.com/v1"
+    assert env["BOTH"] == "service"
+    assert env["ONLY_PROJECT"] == "p"
+    assert env["FROM_CFG"] == "project-beats-cfg"
+    assert env["CFG_ONLY"] == "c"
+    assert env["PORT"] == "8000"
+    # The scrub set is the merged map -- the plain/secret flag is never read, so
+    # a plain project value is masked from run/release/crash tails like a secret.
+    assert {"p", "sk-project", "service"} <= _sensitive_env_values(resolved)
+
+
+async def test_a_row_without_a_project_reads_no_project_scope(queries, tmp_path):
+    """Model/database/legacy rows (`project_id` NULL) degrade to service-only."""
+    mgr = SecretManager(tmp_path / "secrets")
+    controller = _controller(queries, _FakeRuntime(), mgr)
+    job = _svc_job("app")
+    await queries.create_job(job)
+    mgr.set(project_storage_name(job.project_id), {"ONLY_PROJECT": "p"})
+    orphan = job.model_copy(update={"project_id": None})
+
+    resolved = await controller._resolve_launch_env(orphan, {"port": 8000}, 8000, None, None)
+
+    assert "ONLY_PROJECT" not in resolved.env
+
+
+async def test_a_project_scope_key_shadows_shared_and_is_reported_overridden(queries, tmp_path):
+    """`unresolved_shared` and `overridden` test the MERGED map: one audit row, no second."""
+    mgr = SecretManager(tmp_path / "secrets")
+    runtime = _FakeRuntime()
+    controller = _controller(queries, runtime, mgr)
+    job = _svc_job("app", ai={"default": SHARED_API_SPEC})
+    await queries.create_job(job)
+    mgr.set(project_storage_name(job.project_id), {"OPENAI_KEY": "sk-project"})
+    # A corrupt shared store must not block the launch: the project-scope
+    # override means `_shared` is never decrypted.
+    mgr.set(SHARED_SCOPE, {"OPENAI_KEY": "sk-shared"})
+    (tmp_path / "secrets" / f"{SHARED_SCOPE}.enc").write_bytes(b"corrupt")
+
+    await controller.reconcile()
+
+    assert (await queries.get_service_by_name("app")).status is JobStatus.running
+    assert runtime.run_configs[-1].env["OPENAI_API_KEY"] == "sk-project"
+    rows = await _shared_resolved_rows(queries)
+    assert len(rows) == 1
+    assert rows[0].params_redacted["keys"] == ["OPENAI_KEY"]
+    assert rows[0].params_redacted["overridden"] == ["OPENAI_KEY"]
+    assert "sk-project" not in json.dumps(rows[0].params_redacted)
+    await controller.shutdown()
+
+
+async def test_an_undecryptable_project_scope_defers_the_launch(queries, tmp_path):
+    mgr = SecretManager(tmp_path / "secrets")
+    controller = _controller(queries, _FakeRuntime(), mgr)
+    job = _svc_job("app")
+    await queries.create_job(job)
+    stem = project_storage_name(job.project_id)
+    mgr.set(stem, {"K": "v"})
+    (tmp_path / "secrets" / f"{stem}.enc").write_bytes(b"corrupt")
+
+    with pytest.raises(LaunchEnvNotReady) as excinfo:
+        await controller._resolve_launch_env(job, {"port": 8000}, 8000, None, None)
+    assert excinfo.value.kind == "secrets"

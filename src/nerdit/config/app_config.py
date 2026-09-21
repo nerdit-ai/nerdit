@@ -267,7 +267,9 @@ async def require_provisioned_databases(  # noqa: ANN001
             )
         if binding.model_dump(exclude_none=True) == prior.get(binding_name):
             continue  # carried forward unchanged — not an authoring act
-        require_service_scope(request, database)
+        # (D-P40-7) A database row carries no project, so this stays label-only in
+        # effect; passing the row's own field keeps every row-in-hand site uniform.
+        require_service_scope(request, database, project=row.project)
         _require_bindable_database(request, binding_name, database, row)
 
 

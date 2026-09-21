@@ -192,6 +192,7 @@ async def serve_model(request: Request, body: ModelServeRequest) -> ModelRespons
     )
 
     job = await reserve_or_conflict(
+        request,
         queries,
         job,
         service_name=service_name,

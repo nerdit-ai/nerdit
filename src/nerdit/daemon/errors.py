@@ -241,7 +241,11 @@ _SECRET_INPUT_FIELDS = frozenset(
         # `SecretSetRequest.values` — the one request body that is credential
         # all the way down. Only that model binds a `values` field from a
         # request; `ConfigView.values` is response-only and never validated.
+        # (P40c) `VariableSetRequest.values` is the second binder, same reason.
         "values",
+        # (P40c / D-P40-10) Singular twin, depth only: no request model binds a
+        # `value` field today, so a future one is masked by default.
+        "value",
         # `WorkspaceWriteRequest.files` — the P29 content ingress. A pydantic
         # 422 (a non-string value, a nested type error) echoes the offending
         # `input`, which here is the caller's own source file. Content never

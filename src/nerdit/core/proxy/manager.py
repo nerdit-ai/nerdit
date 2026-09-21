@@ -153,7 +153,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         audit: bool = True,
         admin: CaddyAdmin | None = None,
         dashboard_upstream: str = f"{DEFAULT_HOST}:{DEFAULT_PORT}",
-        secret_resolver: Callable[[str, str], str | None] | None = None,
+        secret_resolver: Callable[[str, str | None, str], str | None] | None = None,
     ) -> None:
         self._queries = queries
         self._settings = settings
@@ -249,8 +249,8 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         # a line every five seconds.
         self._edge_auth_failed: set[str] = set()
 
-    def set_secret_resolver(self, resolver: Callable[[str, str], str | None]) -> None:
-        """Wire the edge-auth secret resolver after construction (P25 §3.4.5).
+    def set_secret_resolver(self, resolver: Callable[[str, str | None, str], str | None]) -> None:
+        """Wire the edge-auth `(service_name, project_id, ref)` resolver after construction.
 
         The daemon lifespan builds the `ProxyManager` before the
         `SecretManager` (the resolver closes over the latter), so the wiring
@@ -537,9 +537,18 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
     # -- route shaping --------------------------------------------------------
 
     def build_route(
-        self, service_name: str, host_port: int, edge_auth: EdgeAuthSpec | None = None
+        self,
+        service_name: str,
+        host_port: int,
+        edge_auth: EdgeAuthSpec | None = None,
+        *,
+        project_id: str | None = None,
     ) -> RouteSpec:
         """Build a route spec for the service's active upstream and resolved edge auth.
+
+        `project_id` is the ROW's (P40c): the password ref resolves through the
+        merged project < service reader. The proxy materializes only
+        owner-declared config, so there is no ownership question here.
 
         Memoize bcrypt hashes; never fall back to an unprotected route on failure.
         Read paths needing only an ID must use `_route_id` to avoid resolving secrets.
@@ -554,7 +563,9 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
             host_port=host_port,
             route=generate_route(service_name, mode=self._settings.mode),
             caddy_id=_route_id(service_name),
-            auth=None if edge_auth is None else self._resolve_auth(service_name, edge_auth),
+            auth=None
+            if edge_auth is None
+            else self._resolve_auth(service_name, project_id, edge_auth),
             # `mode` enters HERE and is recorded on the spec; from
             # this point the emitter and the drift classifier read the spec's
             # own shape, never the manager's mode. That is what lets a
@@ -611,7 +622,9 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
             for domain in domains
         ]
 
-    def _resolve_auth(self, service_name: str, spec: EdgeAuthSpec) -> EdgeAuthMaterial:
+    def _resolve_auth(
+        self, service_name: str, project_id: str | None, spec: EdgeAuthSpec
+    ) -> EdgeAuthMaterial:
         """Resolve + hash one edge-auth declaration into emittable material.
 
         The plaintext lives in a local for the length of one hash: it is never
@@ -623,7 +636,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         if resolver is None:
             raise EdgeAuthUnresolved(service_name, key)
         try:
-            plaintext = resolver(service_name, spec.password_ref)
+            plaintext = resolver(service_name, project_id, spec.password_ref)
         except Exception as exc:  # noqa: BLE001 — injected code; any failure is "unresolved"
             # The resolver owns its own error translation, so anything reaching
             # here is unexpected — and an unexpected failure must fail CLOSED,
@@ -1022,6 +1035,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         *,
         with_domains: bool = False,
         domains: Sequence[str] | None = None,
+        project_id: str | None = None,
     ) -> None:
         """Refresh routes best-effort, auditing only actual Caddy changes.
 
@@ -1035,13 +1049,16 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
             domains: Optional shared snapshot of domain names. Cutover must write and
                 verify the same set, avoiding races with concurrent domain deletion.
                 None reads the names here.
+            project_id: The row's project, for the merged edge-auth secret read.
         """
         if not self.enabled or not self._available:
             return
         new_dial = f"127.0.0.1:{host_port}"
         try:
             try:
-                spec = self.build_route(service_name, host_port, load_edge_auth(edge_auth))
+                spec = self.build_route(
+                    service_name, host_port, load_edge_auth(edge_auth), project_id=project_id
+                )
             except (EdgeAuthInvalid, EdgeAuthUnresolved) as exc:
                 self._note_edge_auth_failure(service_name, exc)
                 await self.deregister(service_name)
@@ -1277,7 +1294,10 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                 # skip THIS entry without aborting the tick — hence the build
                 # sits in its own try ahead of the write block below.
                 spec = self.build_route(
-                    entry.service_name, entry.host_port, load_edge_auth(entry.edge_auth)
+                    entry.service_name,
+                    entry.host_port,
+                    load_edge_auth(entry.edge_auth),
+                    project_id=entry.project_id,
                 )
             except (EdgeAuthInvalid, EdgeAuthUnresolved) as exc:
                 # Fail closed: NOT added to `desired_ids`, so the prune loop

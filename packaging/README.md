@@ -86,16 +86,10 @@ python3.12 -m venv /tmp/nerdit-build-venv
 # -> dist/nerdit/{nerdit,nerditd,_internal}
 ```
 
-> **The build environment IS the artifact manifest.** PyInstaller ships
-> whatever it can reach from the entry points in the environment it runs in, so
-> a *dev* venv leaks its extras into a customer tarball. Building this repo's
-> `venv/` (which has `[dev]`, `[mcp]` and `[mdns]`) produced a bundle carrying
-> `mcp`, `zeroconf` and — via pydantic's own mypy plugin module — the whole of
-> mypy. **Release builds use a clean environment with `pip install '.[mcp]'` and
-> the pinned PyInstaller build tool**; the spec additionally
-> excludes `pydantic.mypy` / `pydantic.v1.mypy` so the mypy chain cannot come
-> back through the side door. Expect a locally built bundle to be larger than a
-> CI one, and never treat a local build as representative of what ships.
+> **Use a clean build environment.** Dev dependencies can enter the frozen
+> dependency graph. Release builds install `.[mcp]` and the pinned PyInstaller
+> tool; zeroconf is a base dependency. The spec additionally excludes
+> `pydantic.mypy` / `pydantic.v1.mypy` to keep the type checker out of the bundle.
 
 Then fetch the pinned Caddy for your platform (CI does this from `caddy.pin`
 with a checksum gate; by hand, read the version out of the pin file):
@@ -135,7 +129,7 @@ Seven legs, each printing `SMOKE <n> PASS`:
 
 1. extract; `nerdit --version` matches the `VERSION` file, every layout member present
 2. the frozen `nerditd` boots under a scratch `HOME` and answers `/health`
-3. `nerdit doctor` renders its table; the `docker` **and** `proxy` checks are `ok`
+3. `nerdit doctor` renders its table; `docker`, `proxy` and `mdns` are `ok`
    (the proxy check being `ok` is what proves the *bundled* Caddy started)
 4. `nerdit store deploy node-starter` converges to `running`
 5. the app answers **200** on its `public_url` through the bundled Caddy, over
@@ -154,7 +148,7 @@ store clones server-side using the host's git; the bundle does not carry one.
 Network access to `github.com` is needed for leg 4.
 
 Knobs (all optional): `NERDIT_SMOKE_PORT` (9333), `NERDIT_SMOKE_HTTPS_PORT`
-(9443), `NERDIT_SMOKE_APP` (`smoke-app`), `NERDIT_SMOKE_BOOT_TIMEOUT` (60),
+(9443), `NERDIT_SMOKE_ADMIN_PORT` (19333), `NERDIT_SMOKE_APP` (`smoke-app`), `NERDIT_SMOKE_BOOT_TIMEOUT` (60),
 `NERDIT_SMOKE_DEPLOY_BUDGET` (900).
 
 ### Why the smoke sets `DOCKER_CONFIG`
@@ -171,10 +165,9 @@ service-account `HOME` (the D-P30-8 units included) has the same problem.
 
 ## Notes and deliberate exclusions
 
-- **The `mdns` (`zeroconf`) extra is not installed in the release build
-  environment**, so it does not ship. `[proxy].mdns` degrades exactly as it does
-  on a source install without the extra — the advertiser stays off and
-  `doctor` reports `mdns: skipped`.
+- **mDNS (`zeroconf`) ships in every bundle and pip installation.** The spec
+  collects its extension modules and requires its distribution metadata;
+  `smoke.sh` requires the frozen daemon to register a real mDNS advertisement.
 - **The `mcp` extra ships since 0.5.3** (`release.yml` installs `.[mcp]`; the
   spec collects the package). The v1 note that "the MCP server remains
   reachable over `[mcp].http_enabled` without the extra" was wrong: that flag

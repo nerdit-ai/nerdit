@@ -412,7 +412,8 @@ class ProxySettings(BaseModel):
     hostname_override: str | None = None
     caddy_binary: str = DEFAULT_CADDY_BINARY
     # Advertise the daemon's name over mDNS so ``<name>.local`` resolves from
-    # other LAN machines. Opt-in; needs the ``nerdit[mdns]`` extra. Path mode
+    # other LAN machines. Fresh installs enable it; the fallback remains off
+    # for existing configurations without this key. Path mode
     # only — subdomain-mode service names (``<service>.<base>``) are
     # multi-label and standard mDNS resolvers will not answer them.
     mdns: bool = False

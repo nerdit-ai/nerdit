@@ -21,6 +21,15 @@ if TYPE_CHECKING:
     from nerdit.daemon.lifecycle import DaemonLifecycle
 
 
+# Explicit first-install defaults leave existing configurations unchanged.
+# An unprivileged port also works for pip and Linux user-service installations.
+_INITIAL_PROXY_CONFIG = """[proxy]
+enabled = true
+mdns = true
+https_port = 8443
+"""
+
+
 def _generate_default_config() -> tuple[str, str]:
     """Generate default config TOML with a fresh auth token.
 
@@ -45,12 +54,13 @@ default_image = "nerdit-runtime:0.1"
 interval_seconds = 5
 gpu_temp_warning = 80
 gpu_temp_critical = 90
-"""
+
+{_INITIAL_PROXY_CONFIG}"""
     return config, token
 
 
 def _write_installer_auth_config(data_dir: Path) -> str:
-    """Ensure an installer-created daemon has an auth token before first startup.
+    """Initialize a fresh installer config or add its missing authentication token.
 
     Tokenless loopback requests are admin requests, including other local users.
     Preserve existing TOML comments and layout; insert only the token, leaving
@@ -105,7 +115,7 @@ def _write_installer_auth_config(data_dir: Path) -> str:
         data_dir.chmod(0o700)
     except OSError:
         pass
-    body = f'[daemon]\nauth_token = "{generate_auth_token()}"\n'
+    body = f'[daemon]\nauth_token = "{generate_auth_token()}"\n\n{_INITIAL_PROXY_CONFIG}'
     return "written" if _replace_secret_file(config_path, body) else "failed"
 
 
@@ -169,6 +179,21 @@ NERDIT_TOML_TEMPLATE = """\
 # gpus = 0
 # start = "npm start"
 # volumes = ["data:/data"]
+
+# Several services in one project? Replace [deploy] with a declaration and run
+# `nerdit apply`. A file carries [deploy] OR [project]/[services], never both.
+# [project]
+# name = "my-app"
+#
+# [services.web]                       # served as "my-app"
+# port = 8000
+#
+# [services.api]                       # served as "api--my-app"
+# port = 9000
+# build_settings = { subdir = "apps/api" }
+#
+# [vars]
+# required = ["API_KEY"]               # set with `nerdit vars set my-app ...`
 
 # Declare the AI the app needs; Nerdit wires it to a local model or an API.
 # [ai.default]
@@ -247,7 +272,7 @@ def init(
     auth_token_only: bool = typer.Option(
         False,
         "--auth-token-only",
-        help="Write only [daemon].auth_token if absent, then exit (installer use).",
+        help="Initialize fresh config or add a missing auth token, then exit (installer use).",
         hidden=True,
     ),
 ) -> None:

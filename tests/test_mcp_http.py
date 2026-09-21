@@ -575,9 +575,11 @@ def test_readonly_tools_list_succeeds():
     tools = _sse_result(r)["result"]["tools"]
     # (P26 WP-H) 43 → 45 with share_service/unshare_service; (P26 WP1) 45 → 47
     # with add_domain/remove_domain; (P37) 47 → 49 with dump_database/
-    # list_database_dumps; the authoritative ledger pin lives in
+    # list_database_dumps; (P40b) 49 → 53 with the project quartet; (P40c)
+    # 53 → 55 with set_variable/resolve_variables; (P40d) 55 → 57 with
+    # write_project_files/apply_project; the authoritative ledger pin lives in
     # tests/test_mcp.py.
-    assert len(tools) == 49
+    assert len(tools) == 57
 
 
 def test_readonly_write_tool_gets_inner_403(monkeypatch):
@@ -623,7 +625,7 @@ def test_bare_and_slash_paths_both_served():
     # _McpMount serves both directly — no 307 to the slash form, no 404.
     for r in (r_bare, r_slash):
         assert r.status_code == 200
-        assert len(_sse_result(r)["result"]["tools"]) == 49
+        assert len(_sse_result(r)["result"]["tools"]) == 57
 
 
 # --- full-stack: audit + idempotency exemptions -------------------------------

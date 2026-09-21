@@ -48,6 +48,16 @@ _ACTIVE_SERVICE_STATUSES = (
 # max_gpus. Terminal states (completed/failed/cancelled/stopped) stay out.
 _ACTIVE_STATUSES = tuple(dict.fromkeys((*_ACTIVE_JOB_STATUSES, *_ACTIVE_SERVICE_STATUSES)))
 
+#: The one SELECT prefix every ``_row_to_job`` site uses (P40a / D-P40-7): the
+#: project's *name* rides the row so the synchronous auth predicates never
+#: need a lookup. LEFT JOIN because model/database/batch rows have no
+#: project. Callers must qualify ``id`` / ``created_at`` / ``name`` in their
+#: WHERE and ORDER BY (``projects`` has all three) -- ``jobs.id``, not ``id``.
+_JOB_SELECT = (
+    "SELECT jobs.*, projects.name AS project FROM jobs "
+    "LEFT JOIN projects ON projects.id = jobs.project_id"
+)
+
 
 class ServiceNameTaken(Exception):  # noqa: N818 — domain error mapped to a 409 envelope
     """Raised when a service INSERT collides with the unique `service_name` index.
@@ -60,6 +70,41 @@ class ServiceNameTaken(Exception):  # noqa: N818 — domain error mapped to a 40
     def __init__(self, service_name: str | None) -> None:
         super().__init__(f"Service name already in use: {service_name}")
         self.service_name = service_name
+
+
+class ServiceNameClaimed(Exception):  # noqa: N818 — domain error mapped to a 409 envelope
+    """Raised when a fresh-row insert meets a `secret_claims` row owned by another token.
+
+    Surfaced by `Queries.reserve_service_for_token`; routes map it to a
+    `service.name_claimed` 409 (P39 D-P39-3). The message is value-free: it
+    names the service, never the claimant or any secret.
+    """
+
+    def __init__(self, service_name: str | None) -> None:
+        super().__init__(f"Secrets for '{service_name}' were set by another token")
+        self.service_name = service_name
+
+
+class ProjectOwned(Exception):  # noqa: N818 — domain error mapped to a 409 envelope
+    """Raised when a fresh-row insert names a project another token owns (D-P40-5 rule 1).
+
+    Surfaced by `Queries.reserve_service_for_token` for every managed kind;
+    routes map it to a `project.owned` 409. A NULL-owner project is foreign to
+    every non-admin (the `auth._owns` posture). Value-free: names the project,
+    never its owner.
+    """
+
+    def __init__(self, project: str | None) -> None:
+        super().__init__(f"Project '{project}' belongs to another token")
+        self.project = project
+
+
+class ProjectExists(Exception):  # noqa: N818 — domain error mapped to a 409 envelope
+    """Raised by `Queries.create_project` when a `projects` row already carries the name."""
+
+    def __init__(self, project: str) -> None:
+        super().__init__(f"Project '{project}' already exists")
+        self.project = project
 
 
 class PortRangeExhausted(Exception):  # noqa: N818 — domain error mapped to a 503 envelope
@@ -232,4 +277,11 @@ class QueriesBase:
             restart_window_start=(
                 datetime.fromisoformat(window_start_raw) if window_start_raw else None
             ),
+            project_id=r["project_id"],
+            environment=r["environment"],
+            service=r["service"],
+            # Only a ``_JOB_SELECT`` row carries the joined name; raw test rows
+            # (``SELECT * FROM jobs``) do not. ``.keys()`` is load-bearing:
+            # ``in`` on a sqlite3.Row scans values, not column names.
+            project=r["project"] if "project" in r.keys() else None,  # noqa: SIM118
         )

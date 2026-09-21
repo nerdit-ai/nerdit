@@ -63,6 +63,8 @@ DATAS = [
 # ``nerdit``'s own dist-info: importlib.metadata is consulted by a few
 # libraries' plugin machinery; carrying the metadata is cheap insurance.
 DATAS += copy_metadata("nerdit")
+# Fail the build if mDNS is absent from the clean build environment.
+DATAS += copy_metadata("zeroconf")
 try:
     # pydantic v2's plugin loader scans ``importlib.metadata.distributions()``;
     # without its metadata the scan is merely empty, so this is a mitigation,
@@ -91,6 +93,8 @@ HIDDEN_IMPORTS = [
     # [mcp].http_enabled is set), so name it and collect the mcp package.
     "nerdit.mcp.server",
     *collect_submodules("mcp"),
+    # Zeroconf wheels contain extension modules with runtime imports.
+    *collect_submodules("zeroconf"),
 ]
 
 # tkinter is never imported by Nerdit and drags in a large native toolkit.
@@ -107,12 +111,6 @@ EXCLUDES = [
     "pydantic.v1.mypy",
     "mypy",
 ]
-
-# The mDNS extra (zeroconf) is deliberately NOT bundled in v1 — see
-# packaging/README.md. ``[proxy].mdns`` degrades exactly as it does on a source
-# install without the extra. The mcp extra IS bundled since 0.5.3: without it
-# ``[mcp].http_enabled`` refuses to boot, and remote MCP through the cloud
-# forwards to exactly that mount.
 
 _common = dict(
     pathex=[str(SRC)],

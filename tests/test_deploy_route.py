@@ -35,7 +35,8 @@ from nerdit.daemon.deploy_pipeline import _ASYNC_DEPLOY_WHY as _ASYNC_HINT
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers
 from nerdit.daemon.middleware import ScopedTokenAuthMiddleware
 from nerdit.daemon.routes.deploy import router as deploy_router
-from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, TokenRole
+from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, SecretClaim, TokenRole
+from nerdit.db.queries import ServiceNameClaimed
 
 LEGACY = "legacy-global"
 SUB_RAW = "sub-raw"
@@ -95,7 +96,11 @@ def _queries(existing: Job | None = None) -> AsyncMock:
     q.get_model_by_ref = AsyncMock(return_value=None)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
+    q.reserve_service_for_token = AsyncMock(side_effect=lambda job, **kw: job)
+    q.get_secret_claim = AsyncMock(return_value=None)
+    # (P40b) No `projects` row unless a test plants one: a bare AsyncMock would
+    # return a truthy MagicMock and read as a foreign project.
+    q.get_project_by_name = AsyncMock(return_value=None)
     q.update_service_config = AsyncMock()  # app-build revert (unguarded twin)
     # redeploy AND rollback (CAS on max_version + the cutover marker); `True` =
     # committed, the steady state these rigs model.
@@ -3609,3 +3614,58 @@ def test_dry_run_plan_shows_public_env_in_clear(tmp_path):
     assert resp.json()["build"]["public_env"] == {"VITE_API": "https://api.example.com"}
     resp = _dry_post(_client(q, tmp_path), _node_zip())
     assert resp.json()["build"]["public_env"] == {}
+
+
+# --- P39: a name claimed by setting its secrets first -------------------------
+
+
+def _claim(token_id: str | None) -> SecretClaim:
+    return SecretClaim(service_name="demo", token_id=token_id)
+
+
+def test_fresh_deploy_by_the_claimant_consumes_the_claim(tmp_path):
+    """The claimant's deploy reaches the row transaction, which consumes the claim."""
+    q = _queries()
+    q.get_secret_claim = AsyncMock(return_value=_claim("tok-sub"))
+    resp = _post(_client(q, tmp_path), _node_zip())
+    assert resp.status_code == 201, resp.text
+    job = q.reserve_service_for_token.call_args.args[0]
+    assert job.submitted_by_token == "tok-sub"
+    # Non-admin: the query must fail closed on any claim it does not own.
+    assert q.reserve_service_for_token.call_args.kwargs == {"admin": False}
+
+
+def test_fresh_deploy_over_a_foreign_claim_409_before_extract(tmp_path):
+    q = _queries()
+    q.get_secret_claim = AsyncMock(return_value=_claim("tok-other"))
+    resp = _post(_client(q, tmp_path), _node_zip())
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["code"] == "service.name_claimed"
+    assert "nerdit secrets rm demo" in resp.json()["hint"]
+    assert "tok-other" not in resp.text  # the claimant is never named
+    q.reserve_service_for_token.assert_not_called()
+    assert not (tmp_path / "uploads").exists()  # refused before the upload is unpacked
+
+
+def test_admin_deploys_over_a_foreign_claim(tmp_path):
+    q = _queries()
+    q.get_secret_claim = AsyncMock(return_value=_claim("tok-other"))
+    resp = _post(_client(q, tmp_path), _node_zip(), raw=LEGACY)
+    assert resp.status_code == 201, resp.text
+    assert q.reserve_service_for_token.call_args.kwargs == {"admin": True}
+
+
+def test_claim_raced_into_the_transaction_maps_to_409(tmp_path):
+    """The transaction is the boundary: a claim minted after the fast path still refuses."""
+    q = _queries()
+    q.reserve_service_for_token = AsyncMock(side_effect=ServiceNameClaimed("demo"))
+    resp = _post(_client(q, tmp_path), _node_zip())
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "service.name_claimed"
+
+
+def test_redeploy_never_reads_the_claim(tmp_path):
+    q = _queries(_redeploy_existing())
+    resp = _post(_client(q, tmp_path), _node_zip())
+    assert resp.status_code == 201, resp.text
+    q.get_secret_claim.assert_not_awaited()

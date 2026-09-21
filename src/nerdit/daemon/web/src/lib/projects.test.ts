@@ -430,21 +430,39 @@ describe("projectsBoundTo — reverse index (D9)", () => {
 });
 
 describe("kindHomePath", () => {
-  it("routes a service to its project page by name", () => {
-    expect(kindHomePath("service", "my-app")).toBe("/projects/my-app");
+  it("falls back to the label path when the row carries no project field", () => {
+    expect(kindHomePath({ kind: "service", name: "my-app" })).toBe("/projects/my-app");
+    expect(kindHomePath({ kind: "service", name: "my-app", project: null, service: null })).toBe(
+      "/projects/my-app"
+    );
   });
 
   it("URL-encodes the service name", () => {
-    expect(kindHomePath("service", "a b/c")).toBe("/projects/a%20b%2Fc");
+    expect(kindHomePath({ kind: "service", name: "a b/c" })).toBe("/projects/a%20b%2Fc");
+  });
+
+  it("routes the service whose label is the project name to the project route", () => {
+    expect(
+      kindHomePath({ kind: "service", name: "asso", project: "asso", service: "web" })
+    ).toBe("/projects/asso");
+  });
+
+  it("routes any other service of a project by its FIELDS, never the label", () => {
+    // The label deliberately disagrees with the fields: a parser would say `api`/`asso`.
+    expect(
+      kindHomePath({ kind: "service", name: "api--asso", project: "other", service: "worker" })
+    ).toBe("/projects/other/services/worker");
   });
 
   it("routes models and databases to their inventory pages", () => {
-    expect(kindHomePath("model", "ollama-llama3-1-8b")).toBe("/models");
-    expect(kindHomePath("database", "appdb")).toBe("/databases");
+    expect(kindHomePath({ kind: "model", name: "ollama-llama3-1-8b", project: null })).toBe(
+      "/models"
+    );
+    expect(kindHomePath({ kind: "database", name: "appdb" })).toBe("/databases");
   });
 
   it("falls back to the project grid for an unknown kind (batch has no page)", () => {
-    expect(kindHomePath("mystery" as Service["kind"], "x")).toBe("/projects");
-    expect(kindHomePath("batch", "some-job")).toBe("/projects");
+    expect(kindHomePath({ kind: "mystery" as Service["kind"], name: "x" })).toBe("/projects");
+    expect(kindHomePath({ kind: "batch", name: "some-job" })).toBe("/projects");
   });
 });

@@ -5,7 +5,7 @@ import {
   useQuery,
   useQueryClient
 } from "@tanstack/react-query";
-import { api, apiRaw } from "./client";
+import { api, apiRaw, ApiError } from "./client";
 import { capture } from "../lib/analytics";
 import { toastApiError } from "../lib/apiErrors";
 import type {
@@ -31,6 +31,9 @@ import type {
   LogEntry,
   Model,
   ModelListPage,
+  ProjectDeleted,
+  ProjectDetail,
+  ProjectListPage,
   ProxyStatus,
   RouteListPage,
   SecretDeleted,
@@ -43,7 +46,11 @@ import type {
   TemplateDeployRequest,
   TokenCreateRequest,
   TokenCreateResponse,
-  TokenView
+  TokenView,
+  VariableDeleted,
+  VariableList,
+  VariableSetRequest,
+  VariableSetResponse
 } from "./types";
 
 /**
@@ -226,6 +233,8 @@ export function useServiceAction(action: ServiceAction) {
     onSuccess: () => {
       capture("service_action", { action });
       void qc.invalidateQueries({ queryKey: ["services"] });
+      // (P40e) The apps list reads `/projects`; a deleted service must leave it at once.
+      void qc.invalidateQueries({ queryKey: ["projects"] });
       void qc.invalidateQueries({ queryKey: ["models"] });
       // A database row rides the same /services quartet, so its own list is
       // stale after stop/restart/delete too — without this the Databases page
@@ -655,6 +664,132 @@ export function useDeleteSecret(service: string) {
       ),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["secrets", service] });
+    },
+    onError: (err: Error) => toastApiError(err, "Delete failed")
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Projects and variables (P40e — `/api/projects*`, gated on
+// `capabilities.features.projects | variables`). Query keys carry names only,
+// never a value.
+// ---------------------------------------------------------------------------
+
+/** Every in-scope project, walking the cursor like `fetchAllServices` (bounded: 5 × 200). */
+export function useProjects(enabled = true) {
+  return useQuery({
+    queryKey: ["projects"],
+    queryFn: async (): Promise<ProjectListPage> => {
+      const items: ProjectListPage["items"] = [];
+      let cursor: string | null = null;
+      for (let page = 0; page < 5; page++) {
+        const suffix: string = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
+        const data: ProjectListPage = await api(`/projects?limit=200${suffix}`);
+        items.push(...data.items);
+        cursor = data.next_cursor;
+        if (!cursor) break;
+      }
+      return { items, next_cursor: null };
+    },
+    refetchInterval: 5000,
+    enabled
+  });
+}
+
+export function useProject(name: string, enabled = true) {
+  return useQuery({
+    queryKey: ["projects", name],
+    queryFn: () => api<ProjectDetail>(`/projects/${encodeURIComponent(name)}`),
+    // A 403 is this token's scope, which never changes: stop polling it. A 404
+    // keeps polling — another session can create the project any time.
+    refetchInterval: (query) => {
+      const error = query.state.error;
+      return error instanceof ApiError && error.status === 403 ? false : 5000;
+    },
+    enabled: enabled && Boolean(name),
+    // A 404 is an answer (a legacy label deep link resolves through the
+    // service row instead), not something to retry.
+    retry: false
+  });
+}
+
+function variablesPath(project: string, service?: string, key?: string): string {
+  const base = `/projects/${encodeURIComponent(project)}/variables`;
+  const qs = service ? `?service=${encodeURIComponent(service)}` : "";
+  return `${base}${key ? `/${encodeURIComponent(key)}` : ""}${qs}`;
+}
+
+/**
+ * One scope's variables (project scope when `service` is omitted): names, the
+ * plain flag, and the value of a PLAIN key only. Owner or admin (D-P40-15) —
+ * callers enable it only for an owner view, and a 403 is a quiet state the
+ * panel renders as nothing, so it is never retried.
+ */
+export function useVariables(project: string, service?: string, enabled = true) {
+  return useQuery({
+    queryKey: ["projects", project, "variables", service ?? null],
+    queryFn: () => api<VariableList>(variablesPath(project, service)),
+    enabled: enabled && Boolean(project),
+    retry: false
+  });
+}
+
+/**
+ * Set/merge variables in one scope. The argument is a THUNK, read once at
+ * request time: the mutation cache keeps `variables` for as long as the
+ * observer lives, and a closure over the (cleared-on-success) input is the
+ * only thing it may hold — never a secret value. `gcTime: 0` drops the entry
+ * as soon as it is unobserved.
+ */
+export function useSetVariables(project: string, service?: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: () => VariableSetRequest) =>
+      api<VariableSetResponse>(variablesPath(project, service), {
+        method: "PUT",
+        body: JSON.stringify(body()),
+        headers: idempotencyHeaders()
+      }),
+    gcTime: 0,
+    onSuccess: (res) => {
+      // The flag only — variable keys and values never leave the browser.
+      capture("set_variable", { plain: res.plain });
+      void qc.invalidateQueries({ queryKey: ["projects", project] });
+    },
+    onError: (err: Error) => toastApiError(err, "Save failed")
+  });
+}
+
+export function useDeleteVariable(project: string, service?: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (key: string) =>
+      api<VariableDeleted>(variablesPath(project, service, key), {
+        method: "DELETE",
+        headers: idempotencyHeaders()
+      }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["projects", project] });
+    },
+    onError: (err: Error) => toastApiError(err, "Delete failed")
+  });
+}
+
+/** Delete a project: every service through the `/services` cascade, then the row. */
+export function useDeleteProject() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ name, purge }: { name: string; purge?: string }) =>
+      api<ProjectDeleted>(
+        `/projects/${encodeURIComponent(name)}${purge ? `?purge=${encodeURIComponent(purge)}` : ""}`,
+        { method: "DELETE", headers: idempotencyHeaders() }
+      ),
+    // Settled, not success: a 409 `project.delete_incomplete` still removed
+    // some services.
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: ["projects"] });
+      void qc.invalidateQueries({ queryKey: ["services"] });
+      void qc.invalidateQueries({ queryKey: ["cluster"] });
     },
     onError: (err: Error) => toastApiError(err, "Delete failed")
   });

@@ -62,6 +62,11 @@ export const SAMPLE_SERVICES = {
     {
       id: "svc1aaaa0001",
       name: "my-app",
+      // (P40b) The owning project + the service name inside it. A single-service
+      // project's one label IS the project name; the UI reads these, never the label.
+      project: "my-app",
+      project_id: "prj_myapp00000000001",
+      service: "web",
       status: "running",
       desired_state: "running",
       kind: "service",
@@ -109,6 +114,9 @@ export const SAMPLE_SERVICES = {
     {
       id: "svc2bbbb0002",
       name: "worker-api",
+      project: "worker-api",
+      project_id: "prj_workerapi0000002",
+      service: "web",
       status: "running",
       desired_state: "running",
       kind: "service",
@@ -149,6 +157,77 @@ export const SAMPLE_SERVICES = {
         started_at: "2026-07-04T09:05:00+00:00",
         updated_at: "2026-07-04T09:05:10+00:00"
       }
+    }
+  ],
+  next_cursor: null
+};
+
+// (P40e) The multi-service variant: project `asso` = `web` (label `asso`) +
+// `api` (label `api--asso`), plus a model row whose project fields are null.
+// Kept separate (the AMD-inventory precedent) so the default specs' two-row
+// list is unchanged. `/api/projects*` is DERIVED from whichever service page a
+// spec passes, so the two surfaces cannot disagree.
+const ASSO_WEB = {
+  ...SAMPLE_SERVICES.items[0],
+  id: "svc3cccc0003",
+  name: "asso",
+  project: "asso",
+  project_id: "prj_asso000000000003",
+  service: "web",
+  image: "nerdit-app/asso:1",
+  container_id: "ctr-asso",
+  source: { type: "zip" },
+  endpoint: {
+    container_port: 8000,
+    host_port: 38002,
+    protocol: "tcp",
+    route: "/asso",
+    url: "http://127.0.0.1:38002",
+    public_url: "https://test-host.nerdit.internal/asso",
+    public_urls: [
+      {
+        url: "https://test-host.nerdit.internal/asso",
+        kind: "default",
+        state: "ready",
+        access: null
+      }
+    ]
+  },
+  rollback_available: false,
+  build_version: 1,
+  last_deploy: { ...SAMPLE_SERVICES.items[0].last_deploy, version: 1, action: "deploy" }
+};
+
+export const SAMPLE_SERVICES_WITH_ASSO = {
+  items: [
+    ...SAMPLE_SERVICES.items,
+    ASSO_WEB,
+    {
+      ...ASSO_WEB,
+      id: "svc4dddd0004",
+      name: "api--asso",
+      service: "api",
+      status: "degraded",
+      image: "nerdit-app/api--asso:1",
+      container_id: "ctr-asso-api",
+      endpoint: {
+        container_port: 9000,
+        host_port: 38003,
+        protocol: "tcp",
+        route: "/api--asso",
+        url: "http://127.0.0.1:38003",
+        public_url: "https://test-host.nerdit.internal/api--asso",
+        public_urls: []
+      }
+    },
+    {
+      ...SAMPLE_SERVICES.items[0],
+      id: "mdl1cccc0003",
+      name: "ollama-llama3-1-8b",
+      kind: "model",
+      project: null,
+      project_id: null,
+      service: null
     }
   ],
   next_cursor: null
@@ -398,9 +477,18 @@ export const SAMPLE_CAPABILITIES = {
     batch: true,
     secrets_shared_scope: true,
     app_templates: true,
-    audit_target_filter: true
+    audit_target_filter: true,
+    projects: true,
+    variables: true,
+    project_apply: true
   },
   paths: { data_dir: "/home/test/.nerdit", db_path: "/home/test/.nerdit/nerdit.db" }
+};
+
+/** The pre-P40 daemon: no `features.projects|variables|project_apply`, so today's pages render. */
+export const SAMPLE_CAPABILITIES_PRE_P40 = {
+  ...SAMPLE_CAPABILITIES,
+  features: { batch: true, secrets_shared_scope: true, app_templates: true, audit_target_filter: true }
 };
 
 // Mirrors GET /doctor — a warn-tinted mix so cards render every status tone.
@@ -542,6 +630,40 @@ export interface MockOverrides {
   daemonRestartResponse?: { status: number; body: unknown };
   /** Per-service secret key names for GET /api/secrets/:service ("shared" targets the shared scope). Default keeps ["API_KEY"] for every service. */
   secretNames?: Record<string, string[]>;
+  /**
+   * (P40e) False = the caller does not own the projects: `GET /projects/{name}`
+   * OMITS the `variables` section (D-P40-15) and every variables call plus the
+   * project delete answer the one `owner_denial` 403. Default true.
+   */
+  projectOwner?: boolean;
+  /**
+   * `GET …/variables` answers the owner 403 although `get_project` listed names —
+   * ownership moved between the two reads. The page must stay a page.
+   */
+  variablesReadForbidden?: boolean;
+  /**
+   * Seed variables per project name. `scope` is `project` or
+   * `production/<service>`; only a PLAIN entry carries a `value` — the mock,
+   * like the daemon, has nowhere to return a secret value from.
+   */
+  variables?: Record<string, MockVariable[]>;
+  /** Page size of `GET /api/projects` (default: everything in one page), to exercise the cursor walk. */
+  projectsPageSize?: number;
+}
+
+export interface MockVariable {
+  key: string;
+  scope: string;
+  plain: boolean;
+  value?: string;
+}
+
+/** What `mockApi` hands back so a spec can assert on what the page SENT. */
+export interface MockHandle {
+  /** Every `PUT …/variables`, in order: the `service` query param (null = project scope) + the JSON body. */
+  variablePuts: { service: string | null; body: { values?: Record<string, string>; secret?: boolean } }[];
+  /** Every `/api/projects*` request as `METHOD path?query` — the older-daemon fallback asserts it stays empty. */
+  projectCalls: string[];
 }
 
 const TOKEN = "test-token-1234567890abcdef";
@@ -564,7 +686,16 @@ function jsonWithEtag(route: Route, body: { etag?: string | null } & object) {
   });
 }
 
-export async function mockApi(page: Page, overrides: MockOverrides = {}): Promise<void> {
+// The one 403 every owner gate raises (`daemon/auth.py::owner_denial`).
+const OWNER_DENIAL = {
+  code: "forbidden",
+  message: "You do not have permission to act on this job.",
+  hint: "Only the submitting token or an admin may manage this job.",
+  detail: "You do not have permission to act on this job."
+};
+
+export async function mockApi(page: Page, overrides: MockOverrides = {}): Promise<MockHandle> {
+  const handle: MockHandle = { variablePuts: [], projectCalls: [] };
   const gpus = overrides.gpus ?? SAMPLE_GPUS;
   const clusterStats = overrides.clusterStats ?? SAMPLE_CLUSTER_STATS;
 
@@ -634,9 +765,14 @@ export async function mockApi(page: Page, overrides: MockOverrides = {}): Promis
   const auditPage2 = overrides.auditPage2 ?? SAMPLE_AUDIT_PAGE_2;
 
   // Generic: GET /api/services (ServiceListPage).
+  // (P40e) Projects removed through `DELETE /api/projects/{name}` in this page's
+  // lifetime; their rows leave the service list too, like the daemon's cascade.
+  const deletedProjects = new Set<string>();
+  const liveServices = () => services.items.filter((s) => !deletedProjects.has(s.project));
+
   await page.route(/\/api\/services(\?.*)?$/, (route) => {
     if (route.request().method() !== "GET") return route.fallback();
-    return json(route, services);
+    return json(route, { ...services, items: liveServices() });
   });
 
   // GET single service at /api/services/:ident (by name or id) + DELETE.
@@ -674,6 +810,207 @@ export async function mockApi(page: Page, overrides: MockOverrides = {}): Promis
       { id: 1, stream: "system", message: "container started", timestamp: "2026-07-04T10:01:00+00:00" }
     ])
   );
+
+  // --- P40 surface: projects + variables (`daemon/routes/projects.py`) --------
+  // DERIVED from the service page above, grouped by each row's `project` FIELD
+  // (never by parsing a label), so the two surfaces cannot disagree. Same
+  // ordering rule as everywhere here — last registered wins — so the list comes
+  // first and `/variables/resolve` last (it must shadow `/variables/{key}`).
+
+  const owner = overrides.projectOwner ?? true;
+  const variableStore = new Map<string, MockVariable[]>(
+    Object.entries(overrides.variables ?? {}).map(([name, rows]) => [name, [...rows]])
+  );
+  const scopeName = (service: string | null) => (service ? `production/${service}` : "project");
+
+  const projectSummaries = () => {
+    const byName = new Map<string, { id: string; name: string; services: any[]; addresses: any[] }>();
+    for (const svc of liveServices()) {
+      if (svc.kind !== "service" || !svc.project) continue;
+      const entry = byName.get(svc.project) ?? {
+        id: svc.project_id,
+        name: svc.project,
+        services: [],
+        addresses: []
+      };
+      entry.services.push(svc);
+      entry.addresses.push(...(svc.endpoint?.public_urls ?? []));
+      byName.set(svc.project, entry);
+    }
+    return [...byName.values()];
+  };
+  // Mirrors `_resources`: every `[ai.*]`/`[db.*]` binding of a service, read from
+  // the SAME app config its Manage tab gets, judged on the inventory rows only.
+  const isUp = (row: any) => row?.status === "running" || row?.status === "degraded";
+  const projectResources = (label: string) => {
+    const cfg = overrides.appConfigsByName?.[label] ?? overrides.appConfig ?? SAMPLE_APP_CONFIG;
+    const modelItems = (overrides.models ?? SAMPLE_MODELS).items;
+    const dbItems = (overrides.databases ?? SAMPLE_DATABASES).items;
+    const ai = Object.entries<any>(cfg.ai ?? {}).map(([binding, spec]) => ({
+      service: label,
+      type: "ai",
+      binding,
+      provider: spec.provider ?? null,
+      target: (spec.provider === "api" ? spec.base_url : spec.model) ?? null,
+      ready: spec.provider === "ollama" ? isUp(modelItems.find((m) => m.model === spec.model)) : null
+    }));
+    const db = Object.entries<any>(cfg.db ?? {}).map(([binding, spec]) => ({
+      service: label,
+      type: "db",
+      binding,
+      provider: spec.provider ?? null,
+      target: spec.database ?? null,
+      ready: spec.provider === "managed" ? isUp(dbItems.find((d) => d.name === spec.database)) : null
+    }));
+    const byBinding = (a: { binding: string }, b: { binding: string }) =>
+      a.binding.localeCompare(b.binding);
+    return [...ai.sort(byBinding), ...db.sort(byBinding)];
+  };
+  const projectNotFound = (name: string) => ({
+    code: "not_found",
+    message: `No project '${name}'.`,
+    hint: "List projects with `nerdit projects list` to find a valid name.",
+    detail: `No project '${name}'.`
+  });
+  /** `[project name, …rest]` of the path after `/api/projects/`, plus the `service` query param. */
+  const projectRequest = (route: Route) => {
+    const url = new URL(route.request().url());
+    const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    handle.projectCalls.push(`${route.request().method()} ${url.pathname}${url.search}`);
+    return {
+      parts: parts.slice(parts.indexOf("projects") + 1),
+      service: url.searchParams.get("service"),
+      url
+    };
+  };
+
+  // GET /api/projects (ProjectListPage; the cursor is the next index).
+  await page.route(/\/api\/projects(\?.*)?$/, (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    const { url } = projectRequest(route);
+    const all = projectSummaries();
+    const size = overrides.projectsPageSize ?? all.length;
+    const start = Number(url.searchParams.get("cursor") ?? 0);
+    const end = start + size;
+    return json(route, {
+      items: all.slice(start, end),
+      next_cursor: end < all.length ? String(end) : null
+    });
+  });
+
+  // GET /api/projects/{name} (ProjectResponse) + DELETE (ProjectDeletedResponse).
+  await page.route(/\/api\/projects\/[^/?]+(\?.*)?$/, (route) => {
+    const method = route.request().method();
+    const { parts } = projectRequest(route);
+    const name = parts[0];
+    const summary = projectSummaries().find((p) => p.name === name);
+    if (!summary) return json(route, projectNotFound(name), 404);
+    if (method === "DELETE") {
+      if (!owner) return json(route, OWNER_DENIAL, 403);
+      deletedProjects.add(name);
+      variableStore.delete(name);
+      return json(route, { name, deleted: summary.services.map((s) => s.name) });
+    }
+    if (method !== "GET") return route.fallback();
+    return json(route, {
+      ...summary,
+      resources: summary.services.flatMap((svc) => projectResources(svc.name)),
+      home: { hostname: SAMPLE_CLUSTER_INFO.hostname, node_id: null },
+      // D-P40-15: OMITTED, not nulled, for a non-owner. Names only, never a value.
+      ...(owner
+        ? {
+            variables: (variableStore.get(name) ?? []).map(({ key, scope, plain }) => ({
+              key,
+              scope,
+              plain
+            }))
+          }
+        : {})
+    });
+  });
+
+  // POST /api/projects/{name}/apply (ApplyResponse). No page calls it yet; the
+  // mock exists so a future caller meets the real shape, not the catch-all.
+  await page.route(/\/api\/projects\/[^/?]+\/apply(\?.*)?$/, (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    const { parts, url } = projectRequest(route);
+    const dryRun = url.searchParams.get("dry_run") === "true";
+    return json(route, {
+      project: parts[0],
+      status: dryRun ? "planned" : "applied",
+      dry_run: dryRun,
+      services: [],
+      public_urls: [],
+      missing: [],
+      hint: null
+    });
+  });
+
+  // GET/PUT /api/projects/{name}/variables[?service=] — one scope at a time.
+  await page.route(/\/api\/projects\/[^/?]+\/variables(\?.*)?$/, (route) => {
+    const method = route.request().method();
+    const { parts, service } = projectRequest(route);
+    const name = parts[0];
+    const scope = scopeName(service);
+    if (method === "PUT") {
+      const body = (route.request().postDataJSON() ?? {}) as MockHandle["variablePuts"][number]["body"];
+      handle.variablePuts.push({ service, body });
+      if (!owner) return json(route, OWNER_DENIAL, 403);
+      // `secret` defaults to TRUE server-side (D-P40-16).
+      const plain = body.secret === false;
+      const keys = Object.keys(body.values ?? {});
+      const rest = (variableStore.get(name) ?? []).filter(
+        (row) => row.scope !== scope || !keys.includes(row.key)
+      );
+      variableStore.set(name, [
+        ...rest,
+        // A secret's value is dropped on the floor: nothing here can echo it.
+        ...keys.map((key) => ({ key, scope, plain, ...(plain ? { value: body.values![key] } : {}) }))
+      ]);
+      return json(route, { project: name, scope, keys, plain });
+    }
+    if (method !== "GET") return route.fallback();
+    if (!owner || overrides.variablesReadForbidden) return json(route, OWNER_DENIAL, 403);
+    return json(route, {
+      project: name,
+      scope,
+      variables: (variableStore.get(name) ?? [])
+        .filter((row) => row.scope === scope)
+        .sort((a, b) => a.key.localeCompare(b.key))
+        .map(({ key, plain, value }) => ({ key, scope, plain, value: plain ? (value ?? null) : null }))
+    });
+  });
+
+  // DELETE /api/projects/{name}/variables/{key}[?service=].
+  await page.route(/\/api\/projects\/[^/?]+\/variables\/[^/?]+(\?.*)?$/, (route) => {
+    if (route.request().method() !== "DELETE") return route.fallback();
+    const { parts, service } = projectRequest(route);
+    if (!owner) return json(route, OWNER_DENIAL, 403);
+    const [name, , key] = parts;
+    const scope = scopeName(service);
+    variableStore.set(
+      name,
+      (variableStore.get(name) ?? []).filter((row) => row.scope !== scope || row.key !== key)
+    );
+    return json(route, { project: name, scope, deleted: key });
+  });
+
+  // GET /api/projects/{name}/variables/resolve[?service=web] — the winning scope
+  // per key (service beats project), never a value. Registered LAST so the
+  // literal segment is never taken for a key.
+  await page.route(/\/api\/projects\/[^/?]+\/variables\/resolve(\?.*)?$/, (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    const { parts, service } = projectRequest(route);
+    if (!owner) return json(route, OWNER_DENIAL, 403);
+    const target = service ?? "web";
+    const winners = new Map<string, { key: string; scope: string; plain: boolean }>();
+    for (const scope of ["project", scopeName(target)]) {
+      for (const row of variableStore.get(parts[0]) ?? []) {
+        if (row.scope === scope) winners.set(row.key, { key: row.key, scope, plain: row.plain });
+      }
+    }
+    return json(route, { project: parts[0], service: target, variables: [...winners.values()] });
+  });
 
   // GET /api/models (ModelListPage) + POST /api/models (serve).
   await page.route(/\/api\/models(\?.*)?$/, (route) => {
@@ -955,6 +1292,8 @@ export async function mockApi(page: Page, overrides: MockOverrides = {}): Promis
       body: ":\n\n"
     })
   );
+
+  return handle;
 }
 
 export async function loginAsToken(page: Page): Promise<void> {

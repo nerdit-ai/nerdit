@@ -417,6 +417,28 @@ async def test_step_f_call_order_and_phase_machine(queries, tmp_path):
     assert events.types() == ["service.cutover_started", "service.cutover_succeeded"]
 
 
+async def test_the_repoint_hands_the_proxy_the_rows_project_id(queries, tmp_path):
+    """P40c: the repoint rebuilds the whole route, so an edge-auth ref that lives in
+    the project scope only resolves when `register` gets the row's `project_id` —
+    without it the route is withheld mid-cutover and the dial never converges."""
+    controller, _runtime, proxy, _fake, job, _endpoint = await _full_setup(queries, tmp_path)
+    _healthy(controller)
+    seen: list[str | None] = []
+    orig_register = proxy.register
+
+    async def register(name, port, edge_auth=None, **kw):
+        seen.append(kw.get("project_id"))
+        await orig_register(name, port, edge_auth, **kw)
+
+    proxy.register = register
+    await controller.reconcile()
+    await _drain_cutovers(controller)
+
+    row = await queries.get_job(job.id)
+    assert row.project_id is not None
+    assert seen and set(seen) == {row.project_id}
+
+
 async def test_the_green_probes_the_transient_port_not_the_stable_one(queries, tmp_path):
     controller, runtime, _proxy_mgr, _fake, job, endpoint = await _full_setup(queries, tmp_path)
     probed: list[int] = []

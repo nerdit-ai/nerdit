@@ -100,7 +100,6 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from nerdit.core.gitsource import GitSourceInfo  # noqa: E402
-from nerdit.core.secrets import InvalidServiceName  # noqa: E402
 from nerdit.daemon.audit import AuditMiddleware, derive_action  # noqa: E402
 from nerdit.daemon.auth import hash_token  # noqa: E402
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers  # noqa: E402
@@ -114,6 +113,7 @@ from nerdit.db.models import (  # noqa: E402
     Job,
     JobKind,
     JobStatus,
+    SecretClaim,
     TokenRole,
 )
 
@@ -161,7 +161,12 @@ def _queries(existing: Job | None = None) -> AsyncMock:
     q.get_model_by_ref = AsyncMock(return_value=None)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
+    q.reserve_service_for_token = AsyncMock(side_effect=lambda job, **kw: job)
+    q.get_secret_claim = AsyncMock(return_value=None)
+    # (P40b) No `projects` row unless a test plants one: a bare AsyncMock would
+    # return a truthy MagicMock and read as a foreign project.
+    q.get_project_by_name = AsyncMock(return_value=None)
+    q.mint_secret_claim = AsyncMock(return_value=True)
     q.update_service_config = AsyncMock()
     return q
 
@@ -184,6 +189,7 @@ def _make_app(
     mgr = MagicMock()
     mgr.list_keys.return_value = []
     mgr.set.return_value = []
+    mgr.exists.return_value = False  # a truthy MagicMock would read as an orphan file
     app.state.secret_manager = mgr
     if with_audit:
         app.add_middleware(AuditMiddleware, get_queries=lambda: queries, get_event_bus=lambda: None)
@@ -257,6 +263,9 @@ class _FakeSecrets:
 
     def delete_key(self, service: str, key: str) -> bool:
         return self.store.get(service, {}).pop(key, None) is not None
+
+    def exists(self, service: str) -> bool:
+        return service in self.store
 
 
 def _patch_catalog(monkeypatch, template: AppTemplate) -> None:
@@ -424,9 +433,41 @@ def test_t4_satisfied_request_writes_secrets_and_masks_audit(tmp_path, monkeypat
     assert "s3cr3t" not in logged
     params = json.loads(q.insert_audit_log.call_args.kwargs["params_redacted"])
     assert params["secrets"] == "***"
+    # The fresh name was claimed for the caller on this request (D-P39-7).
+    assert params["claimed"] is True
+    q.mint_secret_claim.assert_awaited_once_with("demo", "tok-sub", admin=False)
 
 
-def test_t4_finalize_failure_writes_no_secrets_and_removes_dest(tmp_path, monkeypatch):
+def test_secrets_are_stored_before_the_row_exists(tmp_path, monkeypatch):
+    """D-P39-5 claim-then-deploy: claim mint, then file write, then the row insert."""
+    _patch_catalog(monkeypatch, _synthetic_template())
+    ctx = _node_context(tmp_path)
+    order: list[str] = []
+    q = _queries()
+    q.mint_secret_claim = AsyncMock(side_effect=lambda *a, **k: order.append("claim") or True)
+    q.reserve_service_for_token = AsyncMock(
+        side_effect=lambda job, **kw: order.append("row") or job
+    )
+    app = _make_app(q, tmp_path)
+    app.state.secret_manager.set.side_effect = lambda *a: order.append("file") or ["SERVICE_KEY"]
+
+    async def _clone(*a, **kw):
+        order.append("clone")
+        return GitSourceInfo(commit_sha="a" * 40, resolved_ref="v1.0.0", context_dir=ctx)
+
+    monkeypatch.setattr(app_templates_route, "clone_source", AsyncMock(side_effect=_clone))
+    resp = TestClient(app, raise_server_exceptions=False).post(
+        "/app-templates/synth/deploy",
+        json={"name": "demo", "env": {"API_URL": "u"}, "secrets": {"SERVICE_KEY": "k"}},
+        headers=_auth(SUB_RAW),
+    )
+    assert resp.status_code == 201, resp.text
+    assert order == ["claim", "file", "clone", "row"]
+
+
+def test_t4_finalize_failure_keeps_secrets_in_the_callers_scope_and_removes_dest(
+    tmp_path, monkeypatch
+):
     _patch_catalog(monkeypatch, _synthetic_template())
     _, captured = _patch_clone(monkeypatch, _node_context(tmp_path), create_dest=True)
     q = _queries()
@@ -445,50 +486,29 @@ def test_t4_finalize_failure_writes_no_secrets_and_removes_dest(tmp_path, monkey
         headers=_auth(SUB_RAW),
     )
     assert resp.status_code >= 500
-    # Secrets are written AFTER finalize's row write; a failed FRESH deploy never
-    # reached the write, so the scope has no keys (nothing to clean up).
-    assert mgr.load("demo") == {}
+    # Secrets precede the row (claim-then-deploy): a failed FRESH deploy leaves
+    # the file under the caller's own claim, so a retry merges rather than
+    # re-asks. No foreign scope can be touched: the claim is the caller's.
+    assert mgr.list_keys("demo") == ["SERVICE_KEY"]
+    q.mint_secret_claim.assert_awaited_once_with("demo", "tok-sub", admin=False)
     # _finalize_deploy owns rmtree of the clone root on any failure.
     assert not Path(captured["dest_dir"]).exists()
 
 
-def test_f1_create_race_cannot_write_secrets_into_foreign_scope(tmp_path, monkeypatch):
-    """A create race must not let a losing principal write into another owner's scope.
+def test_f1_create_race_loses_the_claim_insert_before_any_clone(tmp_path, monkeypatch):
+    """A create race is arbitrated by the claim's PRIMARY KEY, before the clone.
 
-    The pre-clone existing-row read sees no row, so nothing gates the clone; a
-    rival principal creates ``demo`` during the clone window. _finalize_deploy
-    re-reads that row and require_owner_or_admin rejects the non-owning submitter
-    BEFORE any secret write, so the victim's value is never touched.
+    The pre-clone reads see neither row nor claim; a rival mints the claim
+    first (`INSERT OR IGNORE` returns False for the loser). The loser is
+    refused with the foreign-row envelope: no file write, no clone, no row —
+    the rival's scope is never touched.
     """
     _patch_catalog(monkeypatch, _synthetic_template())
-    ctx = _node_context(tmp_path)
-    q = _queries()  # get_service_by_name -> None pre-clone
-
-    raced = Job(
-        id="svc-raced",
-        service_name="demo",
-        name="demo",
-        kind=JobKind.service,
-        gpu_count=0,
-        submitted_by_token="someone-else",
-        config=json.dumps({"image": "nerdit-app/demo:1"}),
-    )
-    captured: dict = {}
-
-    async def _racing_clone(
-        repo_url, *, ref, subdir, dest_dir, token, timeout_s, max_bytes, allowed_hosts
-    ):
-        captured["dest_dir"] = dest_dir
-        Path(dest_dir).mkdir(parents=True, exist_ok=True)
-        # Another principal wins the name during the clone window.
-        q.get_service_by_name = AsyncMock(return_value=raced)
-        return GitSourceInfo(commit_sha="a" * 40, resolved_ref=ref or "v1.0.0", context_dir=ctx)
-
-    monkeypatch.setattr(app_templates_route, "clone_source", AsyncMock(side_effect=_racing_clone))
-
+    clone_mock, _ = _patch_clone(monkeypatch, _node_context(tmp_path))
+    q = _queries()
+    q.mint_secret_claim = AsyncMock(return_value=False)
     app = _make_app(q, tmp_path)
-    mgr = _FakeSecrets()
-    mgr.set("demo", {"SERVICE_KEY": "victim-value"})  # pre-seed the victim scope
+    mgr = _FakeSecrets()  # the rival holds the claim, not a file yet
     app.state.secret_manager = mgr
     client = TestClient(app, raise_server_exceptions=False)
     resp = client.post(
@@ -498,32 +518,63 @@ def test_f1_create_race_cannot_write_secrets_into_foreign_scope(tmp_path, monkey
     )
     assert resp.status_code == 403, resp.text
     assert resp.json()["code"] == "forbidden"
-    # The victim's secret was never overwritten — the write never happened.
-    assert mgr.load("demo")["SERVICE_KEY"] == "victim-value"
-    # The clone root was removed by _finalize_deploy on the 403.
-    assert not Path(captured["dest_dir"]).exists()
+    assert "evil" not in resp.text
+    assert mgr.store == {}
+    clone_mock.assert_not_awaited()
+    q.reserve_service_for_token.assert_not_awaited()
 
 
-def test_f1_post_finalize_secret_failure_surfaces_actionable_hint(tmp_path, monkeypatch):
-    """A secret-write failure after the row exists surfaces the partial state."""
+def test_f1_invalid_secret_key_is_422_with_no_clone_and_no_row(tmp_path, monkeypatch):
+    """A bad secret item fails before the claim, the clone and the row."""
     _patch_catalog(monkeypatch, _synthetic_template())
-    _patch_clone(monkeypatch, _node_context(tmp_path))
+    clone_mock, _ = _patch_clone(monkeypatch, _node_context(tmp_path))
     q = _queries()
     app = _make_app(q, tmp_path)
-    mgr = app.state.secret_manager
-    mgr.set.side_effect = InvalidServiceName("bad service name")
     client = TestClient(app, raise_server_exceptions=False)
     resp = client.post(
+        "/app-templates/synth/deploy",
+        json={
+            "name": "demo",
+            "env": {"API_URL": "u"},
+            "secrets": {"SERVICE_KEY": "k", "1BAD": "invalid-key-sentinel"},
+        },
+        headers=_auth(SUB_RAW),
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "secret.invalid_key"
+    assert "invalid-key-sentinel" not in resp.text  # value-free by construction
+    q.mint_secret_claim.assert_not_awaited()
+    app.state.secret_manager.set.assert_not_called()
+    clone_mock.assert_not_awaited()
+    q.reserve_service_for_token.assert_not_awaited()
+
+
+def test_redeploy_merges_into_existing_secrets(tmp_path, monkeypatch):
+    """An existing row is authorized as its owner; no claim is minted, keys merge."""
+    existing = Job(
+        id="svc-1",
+        service_name="demo",
+        name="demo",
+        kind=JobKind.service,
+        gpu_count=0,
+        submitted_by_token="tok-sub",
+        config=json.dumps({"image": "nerdit-app/demo:1"}),
+    )
+    _patch_catalog(monkeypatch, _synthetic_template())
+    _patch_clone(monkeypatch, _node_context(tmp_path))
+    q = _queries(existing)
+    app = _make_app(q, tmp_path)
+    mgr = _FakeSecrets()
+    mgr.set("demo", {"OTHER": "kept"})
+    app.state.secret_manager = mgr
+    resp = TestClient(app, raise_server_exceptions=False).post(
         "/app-templates/synth/deploy",
         json={"name": "demo", "env": {"API_URL": "u"}, "secrets": {"SERVICE_KEY": "k"}},
         headers=_auth(SUB_RAW),
     )
-    assert resp.status_code == 422, resp.text
-    body = resp.json()
-    assert body["code"] == "secret.invalid_service"
-    assert "nerdit secrets set demo" in body["hint"]
-    # The row was created before the secret write failed (partial state surfaced).
-    q.reserve_service_for_token.assert_awaited_once()
+    assert resp.status_code == 201, resp.text
+    assert mgr.load("demo") == {"OTHER": "kept", "SERVICE_KEY": "k"}
+    q.mint_secret_claim.assert_not_awaited()
 
 
 def test_t4_git_disabled_returns_git_disabled(tmp_path, monkeypatch):
@@ -775,4 +826,23 @@ def test_template_build_preview_has_no_row_or_secret_writes(tmp_path, monkeypatc
     assert "template-preview-sentinel" not in response.text
     queries.reserve_service_for_token.assert_not_awaited()
     queries.update_service_config.assert_not_awaited()
+    # Neither a claim nor a file: a preview reserves nothing.
+    queries.mint_secret_claim.assert_not_awaited()
     app.state.secret_manager.set.assert_not_called()
+
+
+def test_foreign_claim_refuses_the_template_deploy_before_the_clone(tmp_path, monkeypatch):
+    """P39 fast path: a name another token reserved never costs a clone."""
+    _patch_catalog(monkeypatch, _synthetic_template())
+    clone_mock, _ = _patch_clone(monkeypatch, _node_context(tmp_path))
+    q = _queries()
+    q.get_secret_claim = AsyncMock(return_value=SecretClaim(service_name="demo", token_id="tok-x"))
+    resp = _client(q, tmp_path).post(
+        "/app-templates/synth/deploy",
+        json={"name": "demo", "env": {"API_URL": "u"}, "secrets": {"SERVICE_KEY": "k"}},
+        headers=_auth(SUB_RAW),
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["code"] == "service.name_claimed"
+    clone_mock.assert_not_awaited()
+    q.reserve_service_for_token.assert_not_awaited()

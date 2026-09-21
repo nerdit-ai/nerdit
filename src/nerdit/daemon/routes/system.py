@@ -89,6 +89,7 @@ from nerdit.daemon.limits import (
 )
 from nerdit.daemon.schemas._base import StrictRequestModel
 from nerdit.daemon.schemas.tokens import seconds_until
+from nerdit.daemon.secret_scope import variable_write_lock
 from nerdit.db.models import BackupResponse, JobKind, TokenRole, VolumeBackupResponse
 from nerdit.db.queries._base import mark_request_side_effect
 from nerdit.utils.disk import du_bytes, resolve_archive_dir, spawn_walk
@@ -498,6 +499,21 @@ async def get_capabilities(request: Request) -> dict[str, Any]:
             # so a capability flag is how an agent tells "predates dumps" from
             # "no such database". The surface exists; dumpability is the route's.
             "database_dumps": True,
+            # (P39) Constant ``True`` on this build: a 404 on `POST /secrets/{name}`
+            # is how a pre-P39 daemon says "deploy first", so the flag is how an
+            # agent tells "predates P39" from "no such service".
+            "secrets_before_deploy": True,
+            # (P40b) Constant ``True`` on this build: an unknown `/projects`
+            # path is a plain 404, so the flag is how an agent tells "predates
+            # the project noun" from "no such project".
+            "projects": True,
+            # (P40c) Constant ``True``: `/projects/{p}/variables` is a plain 404
+            # on a pre-P40c daemon, indistinguishable from "no such project".
+            "variables": True,
+            # (P40d) Constant ``True``: `POST /projects/{p}/apply` is a plain
+            # 404/405 before P40d, and a legacy deploy of a `[project]` file
+            # answers `deploy.use_apply` only from this build on.
+            "project_apply": True,
         },
     }
     if is_admin:
@@ -1861,22 +1877,28 @@ async def create_backup_route(request: Request) -> BackupResponse:
         # letting a same-key retry publish a second archive.
         mark_request_side_effect()
         try:
-            result = await create_backup(
-                db=request.app.state.db,
-                secret_manager=request.app.state.secret_manager,
-                data_dir=data_dir,
-                # Neither the node-link private key nor the product license ever
-                # enters a backup tar, even when an operator-chosen
-                # [link].key_file / [license].file sits inside a captured tree
-                # (P27 WP-C3 item 3 — a tar that can impersonate a node changes
-                # the custody story; P17d D-LIC7 — a license is re-issuable, and
-                # keeping it out keeps customer_id out of a tar that already
-                # demands careful custody for the master key).
-                exclude_paths=(
-                    resolve_key_file(settings.link.key_file, str(data_dir)),
-                    resolve_license_file(settings.license.file, str(data_dir)),
-                ),
-            )
+            # The secrets and DB snapshots are sequenced, never atomic, and
+            # (enc file, variables.plain) is a cross-store pair (D-P40-1): a
+            # secret->plain flip landing between them would restore as an old
+            # secret flagged plain. No variable write runs while a backup stages.
+            # ponytail: held for the whole staging, not just the two snapshots.
+            async with variable_write_lock(request.app):
+                result = await create_backup(
+                    db=request.app.state.db,
+                    secret_manager=request.app.state.secret_manager,
+                    data_dir=data_dir,
+                    # Neither the node-link private key nor the product license ever
+                    # enters a backup tar, even when an operator-chosen
+                    # [link].key_file / [license].file sits inside a captured tree
+                    # (P27 WP-C3 item 3 — a tar that can impersonate a node changes
+                    # the custody story; P17d D-LIC7 — a license is re-issuable, and
+                    # keeping it out keeps customer_id out of a tar that already
+                    # demands careful custody for the master key).
+                    exclude_paths=(
+                        resolve_key_file(settings.link.key_file, str(data_dir)),
+                        resolve_license_file(settings.license.file, str(data_dir)),
+                    ),
+                )
         except SecretRotationInProgress as exc:
             # Reuse the class+code, never str(exc) — its message embeds the
             # absolute staged-key path (D2/M3).

@@ -13,6 +13,7 @@ from urllib.parse import quote
 import httpx
 
 from nerdit.config.defaults import DEFAULT_HOST, DEFAULT_PORT
+from nerdit.core.project_identity import PRODUCTION, parse_qualified, service_label
 
 
 def _decode_sse_data(payload: list[str]) -> dict | None:
@@ -47,6 +48,15 @@ def _http_base_url(host: str, port: int) -> str:
     return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
 
 
+class QualifiedNameError(ValueError):
+    """A malformed qualified service name, refused client-side (D-P40-6).
+
+    Typed so the MCP boundary (`mcp/errors.py::_call`) can turn it into the
+    structured error dict without catching every `ValueError` -- a
+    `json.JSONDecodeError` from a 2xx non-JSON body is one too.
+    """
+
+
 class NerditClient:
     """Async HTTP client wrapping the nerditd REST API."""
 
@@ -76,6 +86,31 @@ class NerditClient:
             resp = await client.request(method, url, **kwargs)
             resp.raise_for_status()
             return resp.json()
+
+    @staticmethod
+    def wire_name(name: str) -> str:
+        """Translate a qualified service name into its wire label (D-P40-6).
+
+        `asso/api` becomes `api--asso` and `asso/web` becomes `asso`, composed by
+        `service_label` and never parsed back. A name without `/` (a label, an
+        id, `shared`) passes through untouched. Production only.
+
+        Raises:
+            QualifiedNameError: On a malformed qualified name; the message is
+                value-free.
+        """
+        if "/" not in name:
+            return name
+        try:
+            project, environment, service = parse_qualified(name)
+            if environment != PRODUCTION:
+                raise ValueError
+            return service_label(project, environment, service)
+        except ValueError:
+            raise QualifiedNameError(
+                "Invalid qualified name: expected <project>/<service> "
+                "(production only) composing a DNS label of at most 63 characters."
+            ) from None
 
     async def health(self) -> dict:
         """Call `GET /health` and return the parsed JSON response."""
@@ -161,7 +196,7 @@ class NerditClient:
     async def get_app_config(self, name: str) -> dict:
         """Read a deployed app's config via `GET /api/config/apps/{name}`."""
         return await self._request_json(
-            "GET", f"{self._base_url}/api/config/apps/{name}", timeout=5.0
+            "GET", f"{self._base_url}/api/config/apps/{self.wire_name(name)}", timeout=5.0
         )
 
     async def put_app_config(
@@ -193,7 +228,7 @@ class NerditClient:
             params["restart"] = "true"
         return await self._request_json(
             "PUT",
-            f"{self._base_url}/api/config/apps/{name}/{section}",
+            f"{self._base_url}/api/config/apps/{self.wire_name(name)}/{section}",
             json=values,
             params=params or None,
             headers=headers,
@@ -388,7 +423,7 @@ class NerditClient:
     async def get_service(self, ident: str) -> dict:
         """Fetch a single service by id or name via `GET /api/services/{ident}`."""
         return await self._request_json(
-            "GET", f"{self._base_url}/api/services/{ident}", timeout=5.0
+            "GET", f"{self._base_url}/api/services/{self.wire_name(ident)}", timeout=5.0
         )
 
     async def get_service_logs(
@@ -443,7 +478,7 @@ class NerditClient:
             params["source"] = source
         async with self._client() as client:
             resp = await client.get(
-                f"{self._base_url}/api/services/{ident}/logs",
+                f"{self._base_url}/api/services/{self.wire_name(ident)}/logs",
                 params=params,
                 timeout=5.0,
             )
@@ -474,7 +509,7 @@ class NerditClient:
             params["version"] = version
         return await self._request_json(
             "GET",
-            f"{self._base_url}/api/services/{ident}/wait",
+            f"{self._base_url}/api/services/{self.wire_name(ident)}/wait",
             params=params,
             timeout=max(1, int(timeout)) + 30,
         )
@@ -487,7 +522,7 @@ class NerditClient:
         """
         return await self._request_json(
             "GET",
-            f"{self._base_url}/api/services/{ident}/diagnose",
+            f"{self._base_url}/api/services/{self.wire_name(ident)}/diagnose",
             params={"log_tail": log_tail},
             timeout=10.0,
         )
@@ -501,7 +536,7 @@ class NerditClient:
         """
         return await self._request_json(
             "GET",
-            f"{self._base_url}/api/services/{ident}/stats",
+            f"{self._base_url}/api/services/{self.wire_name(ident)}/stats",
             timeout=15.0,
         )
 
@@ -840,7 +875,7 @@ class NerditClient:
         caller renders that refusal rather than a made-up "private" default.
         """
         return await self._request_json(
-            "GET", f"{self._base_url}/api/services/{name}/share", timeout=10.0
+            "GET", f"{self._base_url}/api/services/{self.wire_name(name)}/share", timeout=10.0
         )
 
     async def set_share(
@@ -861,7 +896,7 @@ class NerditClient:
             headers["Idempotency-Key"] = idempotency_key
         return await self._request_json(
             "PUT",
-            f"{self._base_url}/api/services/{name}/share",
+            f"{self._base_url}/api/services/{self.wire_name(name)}/share",
             json={"access": access, "consent": consent},
             headers=headers,
             timeout=15.0,
@@ -878,7 +913,7 @@ class NerditClient:
             headers["Idempotency-Key"] = idempotency_key
         return await self._request_json(
             "DELETE",
-            f"{self._base_url}/api/services/{name}/share",
+            f"{self._base_url}/api/services/{self.wire_name(name)}/share",
             headers=headers,
             timeout=15.0,
         )
@@ -886,7 +921,7 @@ class NerditClient:
     async def list_domains(self, name: str) -> dict:
         """List direct domains; a service with none returns HTTP 200 and an empty list."""
         return await self._request_json(
-            "GET", f"{self._base_url}/api/services/{name}/domains", timeout=10.0
+            "GET", f"{self._base_url}/api/services/{self.wire_name(name)}/domains", timeout=10.0
         )
 
     async def add_domain(
@@ -908,7 +943,7 @@ class NerditClient:
             headers["Idempotency-Key"] = idempotency_key
         return await self._request_json(
             "PUT",
-            f"{self._base_url}/api/services/{name}/domains/{_encode_dot_segment(domain)}",
+            f"{self._base_url}/api/services/{self.wire_name(name)}/domains/{_encode_dot_segment(domain)}",
             json={} if acme is None else {"acme": acme},
             headers=headers,
             timeout=15.0,
@@ -928,7 +963,7 @@ class NerditClient:
             headers["Idempotency-Key"] = idempotency_key
         return await self._request_json(
             "DELETE",
-            f"{self._base_url}/api/services/{name}/domains/{_encode_dot_segment(domain)}",
+            f"{self._base_url}/api/services/{self.wire_name(name)}/domains/{_encode_dot_segment(domain)}",
             headers=headers,
             timeout=15.0,
         )
@@ -970,7 +1005,9 @@ class NerditClient:
     async def resolve_service(self, ident: str) -> dict | None:
         """Resolve a service ID or name; return None on 404 and propagate other errors."""
         async with self._client() as client:
-            resp = await client.get(f"{self._base_url}/api/services/{ident}", timeout=5.0)
+            resp = await client.get(
+                f"{self._base_url}/api/services/{self.wire_name(ident)}", timeout=5.0
+            )
             if resp.status_code == 404:
                 return None
             resp.raise_for_status()
@@ -982,7 +1019,10 @@ class NerditClient:
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         return await self._request_json(
-            "POST", f"{self._base_url}/api/services/{ident}/stop", headers=headers, timeout=10.0
+            "POST",
+            f"{self._base_url}/api/services/{self.wire_name(ident)}/stop",
+            headers=headers,
+            timeout=10.0,
         )
 
     async def restart_service(self, ident: str, *, idempotency_key: str | None = None) -> dict:
@@ -991,7 +1031,10 @@ class NerditClient:
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         return await self._request_json(
-            "POST", f"{self._base_url}/api/services/{ident}/restart", headers=headers, timeout=10.0
+            "POST",
+            f"{self._base_url}/api/services/{self.wire_name(ident)}/restart",
+            headers=headers,
+            timeout=10.0,
         )
 
     async def remove_service(
@@ -1015,7 +1058,7 @@ class NerditClient:
             params["force"] = "true"
         return await self._request_json(
             "DELETE",
-            f"{self._base_url}/api/services/{ident}",
+            f"{self._base_url}/api/services/{self.wire_name(ident)}",
             headers=headers,
             params=params,
             timeout=120.0,
@@ -1051,7 +1094,7 @@ class NerditClient:
             headers["Idempotency-Key"] = idempotency_key
         return await self._request_json(
             "POST",
-            f"{self._base_url}/api/services/{ident}/run",
+            f"{self._base_url}/api/services/{self.wire_name(ident)}/run",
             json=payload,
             headers=headers,
             timeout=timeout_s + 30,
@@ -1134,7 +1177,7 @@ class NerditClient:
         """Roll back a deploy via `POST /api/deploy/{name}/rollback`."""
         return await self._request_json(
             "POST",
-            f"{self._base_url}/api/deploy/{name}/rollback",
+            f"{self._base_url}/api/deploy/{self.wire_name(name)}/rollback",
             headers={"Idempotency-Key": idempotency_key},
             timeout=30.0,
         )
@@ -1156,7 +1199,7 @@ class NerditClient:
             headers["Idempotency-Key"] = idempotency_key
         return await self._request_json(
             "POST",
-            f"{self._base_url}/api/deploy/{name}/redeploy",
+            f"{self._base_url}/api/deploy/{self.wire_name(name)}/redeploy",
             params={"dry_run": "true"} if dry_run else None,
             headers=headers,
             timeout=180.0,
@@ -1427,7 +1470,7 @@ class NerditClient:
             headers["Idempotency-Key"] = idempotency_key
         return await self._request_json(
             "POST",
-            f"{self._base_url}/api/secrets/{service}",
+            f"{self._base_url}/api/secrets/{self.wire_name(service)}",
             json={"values": values},
             headers=headers,
             timeout=10.0,
@@ -1436,7 +1479,7 @@ class NerditClient:
     async def list_secrets(self, service: str) -> dict:
         """List secret key names via `GET /api/secrets/{service}` (never values)."""
         return await self._request_json(
-            "GET", f"{self._base_url}/api/secrets/{service}", timeout=5.0
+            "GET", f"{self._base_url}/api/secrets/{self.wire_name(service)}", timeout=5.0
         )
 
     async def delete_secret(
@@ -1448,7 +1491,7 @@ class NerditClient:
             headers["Idempotency-Key"] = idempotency_key
         return await self._request_json(
             "DELETE",
-            f"{self._base_url}/api/secrets/{service}/{key}",
+            f"{self._base_url}/api/secrets/{self.wire_name(service)}/{key}",
             headers=headers,
             timeout=10.0,
         )
@@ -1460,7 +1503,7 @@ class NerditClient:
             headers["Idempotency-Key"] = idempotency_key
         return await self._request_json(
             "DELETE",
-            f"{self._base_url}/api/secrets/{service}",
+            f"{self._base_url}/api/secrets/{self.wire_name(service)}",
             headers=headers,
             timeout=10.0,
         )
@@ -1479,6 +1522,182 @@ class NerditClient:
             f"{self._base_url}/api/secrets/rotate-key",
             headers=headers,
             timeout=30.0,
+        )
+
+    # --- Projects (P40b) --------------------------------------------------------
+    #
+    # ``/projects`` is mounted under ``/api`` only. A project is the grouping a
+    # service row points at; its row outlives its services and reserves the name
+    # for the creating token (D-P40-5). Wire identity stays the label (D-P40-6).
+
+    async def list_projects(self, limit: int = 50, cursor: str | None = None) -> dict:
+        """List projects via `GET /api/projects` → a `ProjectListPage` dict."""
+        params: dict[str, str | int] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request_json(
+            "GET", f"{self._base_url}/api/projects", params=params, timeout=10.0
+        )
+
+    async def create_project(self, name: str, *, idempotency_key: str | None = None) -> dict:
+        """Create an empty project via `POST /api/projects` → `{id, name, ...}`."""
+        headers: dict[str, str] = {}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        return await self._request_json(
+            "POST",
+            f"{self._base_url}/api/projects",
+            json={"name": name},
+            headers=headers,
+            timeout=10.0,
+        )
+
+    async def get_project(self, name: str) -> dict:
+        """Read one project via `GET /api/projects/{name}` (services, resources, addresses)."""
+        return await self._request_json(
+            "GET", f"{self._base_url}/api/projects/{name}", timeout=10.0
+        )
+
+    async def delete_project(
+        self, name: str, *, purge: str = "secrets", idempotency_key: str | None = None
+    ) -> dict:
+        """Delete a project and every service in it via `DELETE /api/projects/{name}`.
+
+        `purge` is the CSV applied to each service (the `remove_service` set plus
+        `workspace`). Allow 120 seconds per the cascade: containers, dirs, images.
+        """
+        headers: dict[str, str] = {}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        return await self._request_json(
+            "DELETE",
+            f"{self._base_url}/api/projects/{name}",
+            headers=headers,
+            params={"purge": purge},
+            timeout=120.0,
+        )
+
+    async def apply_project(
+        self,
+        project: str,
+        *,
+        zip_bytes: bytes | None = None,
+        repo_url: str | None = None,
+        ref: str | None = None,
+        token_ref: str | None = None,
+        workspace: bool = False,
+        dry_run: bool = False,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        """Apply a declaration via `POST /api/projects/{project}/apply` (D-P40-12).
+
+        Send exactly one source: `zip_bytes` (the folder holding `nerdit.toml`),
+        `repo_url` (+ `ref`, `token_ref`, a reference name, never a token) or
+        `workspace` (the daemon snapshots the caller's workspace of that name).
+        A dry run stays keyless; a real apply mints a missing key, like `deploy`.
+        """
+        from uuid import uuid4
+
+        if not dry_run and not idempotency_key:
+            idempotency_key = uuid4().hex
+        data = {
+            key: value
+            for key, value in (
+                ("repo_url", repo_url),
+                ("ref", ref),
+                ("token_ref", token_ref),
+                ("workspace", "true" if workspace else None),
+            )
+            if value
+        }
+        files = (
+            {"archive": ("project.zip", zip_bytes, "application/zip")}
+            if zip_bytes is not None
+            else None
+        )
+        async with self._client() as client:
+            resp = await client.post(
+                f"{self._base_url}/api/projects/{project}/apply",
+                files=files,
+                data=data or None,
+                params={"dry_run": "true"} if dry_run else None,
+                headers={"Idempotency-Key": idempotency_key} if idempotency_key else {},
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    # --- Variables (P40c) -------------------------------------------------------
+    #
+    # One store, one flag (D-P40-1). `service=None` is the project scope; no
+    # parameter is ever named `environment` (D-P40-11). The machine scope is
+    # NOT reachable here: it stays `set_secrets("shared", …)`.
+
+    async def list_variables(self, project: str, *, service: str | None = None) -> dict:
+        """List one scope's variables via `GET /api/projects/{project}/variables`.
+
+        A plain key carries its value (owner or admin only); a secret one never does.
+        """
+        return await self._request_json(
+            "GET",
+            f"{self._base_url}/api/projects/{project}/variables",
+            params={"service": service} if service else None,
+            timeout=10.0,
+        )
+
+    async def resolve_variables(self, project: str, *, service: str | None = None) -> dict:
+        """Per key, the winning scope via `GET …/variables/resolve` (never a value)."""
+        return await self._request_json(
+            "GET",
+            f"{self._base_url}/api/projects/{project}/variables/resolve",
+            params={"service": service} if service else None,
+            timeout=10.0,
+        )
+
+    async def set_variables(
+        self,
+        project: str,
+        values: dict[str, str],
+        *,
+        secret: bool = True,
+        service: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        """Set/merge variables via `PUT /api/projects/{project}/variables` → key names only.
+
+        `secret` defaults to True like the route (D-P40-16): a caller that
+        forgets the flag writes write-only.
+        """
+        headers: dict[str, str] = {}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        return await self._request_json(
+            "PUT",
+            f"{self._base_url}/api/projects/{project}/variables",
+            json={"values": values, "secret": secret},
+            params={"service": service} if service else None,
+            headers=headers,
+            timeout=10.0,
+        )
+
+    async def delete_variable(
+        self,
+        project: str,
+        key: str,
+        *,
+        service: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        """Delete one key via `DELETE /api/projects/{project}/variables/{key}`."""
+        headers: dict[str, str] = {}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        return await self._request_json(
+            "DELETE",
+            f"{self._base_url}/api/projects/{project}/variables/{key}",
+            params={"service": service} if service else None,
+            headers=headers,
+            timeout=10.0,
         )
 
     # --- Models (P5) -----------------------------------------------------------

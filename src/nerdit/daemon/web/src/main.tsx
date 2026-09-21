@@ -9,7 +9,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Settings } from "./pages/Settings";
 import { Login } from "./pages/Login";
 import Projects from "./pages/Projects";
-import ProjectDetail from "./pages/ProjectDetail";
+import ProjectRoute, { ServiceRoute } from "./pages/ProjectPage";
 import ServiceRedirect from "./pages/ServiceRedirect";
 import Models from "./pages/Models";
 import Databases from "./pages/Databases";
@@ -54,7 +54,11 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <Projects /> },
       { path: "projects", element: <Navigate to="/" replace /> },
-      { path: "projects/:name/:tab?", element: <ProjectDetail /> },
+      // (P40e) A service of a multi-service project; a single-service project,
+      // a legacy label deep link and the project page all resolve under the
+      // second row (`pages/ProjectPage.tsx`).
+      { path: "projects/:name/services/:service/:tab?", element: <ServiceRoute /> },
+      { path: "projects/:name/:tab?", element: <ProjectRoute /> },
       { path: "services", element: <Navigate to="/" replace /> },
       { path: "services/:ident", element: <ServiceRedirect /> },
       { path: "store", element: <Navigate to="/" replace /> },

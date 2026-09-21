@@ -75,6 +75,9 @@ _DRY_RUN_ROUTES: list[tuple[str, re.Pattern[str]]] = [
     # the caller's Idempotency-Key and poisons the later real deploy.
     ("POST", re.compile(r"^/workspaces/[^/]+/deploy$")),
     ("POST", re.compile(r"^/app-templates/[^/]+/deploy$")),
+    # (P40d) A dry-run apply writes nothing (D-P40-12), so it must not burn the
+    # key the real apply will carry.
+    ("POST", re.compile(r"^/projects/[^/]+/apply$")),
     ("POST", re.compile(r"^/config/daemon/apply$")),
     ("PUT", re.compile(r"^/config/daemon/[^/]+$")),
     ("PUT", re.compile(r"^/config/apps/[^/]+/[^/]+$")),
@@ -147,6 +150,7 @@ NO_BODY_CACHE_ACTIONS = {
 # Link-claim responses are safe to cache; license responses contain customer IDs.
 NO_BODY_HASH_ACTIONS = {
     "secret.set",
+    "variable.set",  # (P40c) the same value map one noun up; its response is names only
     "template.deploy",
     "service.run",
     "service.create",

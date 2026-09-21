@@ -122,6 +122,24 @@ class ServiceResponse(BaseModel):
 
     id: str = Field(description="Unique 12-character row identifier")
     name: str = Field(description="Stable service name (identity)")
+    # (P40b) The project triple beside the untouched label — the stated
+    # deviation from plan §2: the dashboard route
+    # `/projects/:name/services/:service` needs the parts, and a qualified
+    # string would only move the parsing to the client (D-P40-6).
+    project: str | None = Field(
+        default=None,
+        description=(
+            "Name of the project this service belongs to (P40b); null for models, "
+            "databases and rows predating the project columns"
+        ),
+    )
+    project_id: str | None = Field(
+        default=None, description="The owning project's id (`prj_…`); null when `project` is"
+    )
+    service: str | None = Field(
+        default=None,
+        description="Service name within the project ('web' for a bare project name)",
+    )
     status: JobStatus = Field(description="Current lifecycle state")
     desired_state: str | None = Field(
         default=None, description="Reconciler target ('running' | 'stopped')"

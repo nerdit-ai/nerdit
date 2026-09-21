@@ -93,7 +93,8 @@ def _queries(existing: Job | None) -> AsyncMock:
     q.get_model_by_ref = AsyncMock(return_value=None)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
+    q.reserve_service_for_token = AsyncMock(side_effect=lambda job, **kw: job)
+    q.get_secret_claim = AsyncMock(return_value=None)
     q.update_service_config = AsyncMock()  # rollback / app-build revert
     q.update_service_config_guarded = AsyncMock()  # redeploy (CAS on max_version)
     return q
@@ -438,6 +439,44 @@ def test_recorded_token_ref_is_resolved_and_carried_forward(tmp_path, fake_clone
     # token never reaches the persisted blob.
     assert cfg["source"]["token_ref"] == "${secrets.GH_TOKEN}"
     assert "ghp-live" not in json.dumps(cfg)
+
+
+def test_recorded_token_ref_resolves_through_the_rows_project_scope(tmp_path, fake_clone):
+    """(P40c) The redeploy reads project < service over the ROW's `project_id`."""
+    prj = "prj_" + "a" * 16
+    source = {**_GIT_SOURCE, "token_ref": "${secrets.GH_TOKEN}"}
+    row = _git_row(source=source).model_copy(update={"project_id": prj})
+    store = {f"_project-{prj}": {"GH_TOKEN": "ghp-project"}}
+    q = _queries(row)
+    q.get_project = AsyncMock(return_value=SimpleNamespace(id=prj, submitted_by_token="tok-sub"))
+    client = _client(q, tmp_path, secret_manager=_secret_manager(store))
+    resp = _post(client)
+    assert resp.status_code == 201, resp.text
+    assert fake_clone.calls[-1]["token"] == "ghp-project"
+    assert "ghp-project" not in resp.text
+
+    store["demo"] = {"GH_TOKEN": "ghp-service"}
+    assert _post(client).status_code == 201
+    assert fake_clone.calls[-1]["token"] == "ghp-service"
+
+
+def test_an_owned_row_in_a_foreign_project_never_resolves_the_project_scope(tmp_path, fake_clone):
+    """Row ownership proves the service scope only (plan §5 bounce: a row stamped into
+    another token's project): that project's secret must not reach the caller's repo host."""
+    prj = "prj_" + "a" * 16
+    source = {**_GIT_SOURCE, "token_ref": "${secrets.GH_TOKEN}"}
+    row = _git_row(source=source).model_copy(update={"project_id": prj})
+    store = {f"_project-{prj}": {"GH_TOKEN": "ghp-foreign"}}
+    q = _queries(row)
+    q.get_project = AsyncMock(return_value=SimpleNamespace(id=prj, submitted_by_token="tok-other"))
+    client = _client(q, tmp_path, secret_manager=_secret_manager(store))
+    resp = _post(client)  # tok-sub owns the row, tok-other owns the project
+    assert (resp.status_code, resp.json()["code"]) == (409, "deploy.no_source_credential")
+    assert fake_clone.calls == []
+    assert "ghp-foreign" not in resp.text
+    # An admin is never gated.
+    assert _post(client, LEGACY).status_code == 201
+    assert fake_clone.calls[-1]["token"] == "ghp-foreign"
 
 
 def test_private_repo_without_a_recorded_token_ref_is_409(tmp_path, monkeypatch):

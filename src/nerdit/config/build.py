@@ -82,7 +82,13 @@ class BuildSettings(BaseModel):
             raise ValueError(
                 "Build commands must be non-empty single lines of at most 4096 characters."
             )
-        if "${secrets." in value or "${github." in value or _CREDENTIAL.search(value):
+        # `${vars.` is the D-P40-9 alias of `${secrets.`: same refusal.
+        if (
+            "${secrets." in value
+            or "${vars." in value
+            or "${github." in value
+            or _CREDENTIAL.search(value)
+        ):
             raise ValueError("Build credentials and secret references are unsupported.")
         return value
 
@@ -142,7 +148,7 @@ class BuildSettings(BaseModel):
                 raise ValueError(
                     "public_env values must be single lines of at most 4096 characters."
                 )
-            if "${secrets." in item or "${github." in item:
+            if "${secrets." in item or "${vars." in item or "${github." in item:
                 raise ValueError(
                     "public_env values are embedded in public build output; secret references "
                     "are not allowed."

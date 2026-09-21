@@ -96,7 +96,10 @@ from nerdit.db.rows import (  # noqa: F401
     IdempotencyRecord,
     Job,
     LogEntry,
+    Project,
+    SecretClaim,
     ServiceDomain,
     ServiceEndpoint,
     ServiceShare,
+    VariableFlag,
 )

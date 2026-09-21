@@ -4,6 +4,115 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.6.4 (2026-09-21)
+
+Deploy a web frontend, API and worker as one project, with shared variables,
+secrets ready before the first deploy, and a dashboard that brings them together.
+
+### Installation
+
+- **Install with pip as an alternative to the shell installer.** The installation
+  guide now covers `pip install nerdit` in a dedicated Python 3.11+ environment,
+  optional MCP and mDNS support, upgrades and removal. The package includes the dashboard;
+  Caddy and startup after reboot are configured separately for pip installs.
+- **LAN discovery is included.** `zeroconf` ships in both the base Python package
+  and signed bundles. Fresh installations enable HTTPS on port 8443 and mDNS
+  for the machine’s `.local` name. Existing configuration is preserved;
+  mDNS requires a multicast-capable LAN, and HTTPS uses the local CA.
+
+### Projects and deployment
+
+- **Declare several services in one `nerdit.toml`.** Add a `[project]` section
+  and a `[services.<name>]` table for each service, then run
+  `nerdit apply --dry-run` to validate the plan or `nerdit apply --wait` to
+  deploy it. Apply works from a local folder or Git repository; agents can use
+  the `write_project_files` and `apply_project` MCP tools with their workspace.
+- **Manage the project as a whole.** Use `nerdit projects list|create|show|delete`
+  to inspect services, addresses and referenced models and databases, or remove
+  the project and its services. Service commands accept `project/service`, for
+  example `nerdit logs my-app/api`.
+- **Existing apps become projects automatically.** Their service names and
+  addresses stay unchanged, and the existing single-app deployment workflow
+  remains available.
+
+### Variables and secrets
+
+- **Share configuration across services or override it per service.**
+  `nerdit vars set|unset|list|resolve` manages plain and secret variables at
+  project or service scope. Both are encrypted at rest; secret values are
+  never returned by the variable APIs. `resolve` shows which scope supplies
+  each key without exposing its value.
+- **Provide secrets before the first deploy.** Set project variables or use
+  `nerdit secrets set` before a service exists. Required variables declared in
+  `[vars] required` are checked before deployment: if any are missing, apply
+  lists their names and the command to set them, then exits without deploying.
+  Use `--secret --prompt KEY` to enter a secret without putting it in shell
+  history or command-line arguments. Existing `nerdit secrets` commands remain
+  supported.
+
+### Dashboard
+
+- **One project, one place to look.** The Apps list groups services by project.
+  The project page shows service status, addresses, referenced models and
+  databases, and a variable editor for owners and admins. Individual service
+  pages and existing links remain available.
+- **More reliable editing.** Temporary network errors offer a retry instead
+  of sending you to another page. Background refreshes preserve drafts;
+  switching projects clears unsaved secret inputs.
+
+### Security and reliability
+
+- Retained secrets stay associated with their owner when a service is deleted,
+  even during concurrent writes or database creation. A later deployment by
+  another owner cannot inherit them, and a delayed purge cannot delete a new
+  owner's secrets.
+- Variable reads remain safe during concurrent changes between plain and
+  secret values. Workspace deployments enforce the workspace owner's project
+  and secret permissions, including when initiated by an admin.
+- `nerdit apply --wait` tracks the deployment it started for each service and
+  reports when another deployment supersedes it.
+
+### API and agent compatibility
+
+`GET /api/capabilities` exposes `features.projects`, `features.variables`,
+`features.project_apply` and `features.secrets_before_deploy` for feature detection.
+
+| Surface | HTTP endpoints | MCP tools |
+| --- | --- | --- |
+| Projects | `GET /api/projects`, `POST /api/projects`, `GET /api/projects/{project}`, `DELETE /api/projects/{project}` | `create_project`, `list_projects`, `get_project`, `delete_project` |
+| Variables | `GET /api/projects/{project}/variables`, `PUT /api/projects/{project}/variables`, `GET /api/projects/{project}/variables/resolve`, `DELETE /api/projects/{project}/variables/{key}` | `set_variable`, `resolve_variables` |
+| Apply | `POST /api/projects/{project}/apply` | `write_project_files`, `apply_project` |
+
+- Apply accepts `workspace=true` for the caller's workspace or `repo_url` for
+  Git. Missing required variables return `waiting_for_variables` (CLI exit 4).
+  Partial failures return `project.apply_incomplete`; single-app deployment
+  endpoints reject declarations with HTTP 422 `deploy.use_apply`.
+  `--wait` tracks the applied `build_version`.
+- Ownership conflicts use HTTP 409 `project.owned`, `service.name_claimed`
+  or `secret.orphaned_scope`. Incomplete project deletion returns HTTP 409
+  `project.delete_incomplete`.
+- API/MCP variable writes default to secret. Launch precedence is
+  `[deploy].env` < project < service < injected bindings. `${vars.KEY}` and
+  `${vars.shared.KEY}` references work in `[ai.*].api_key`, `[db.*].password`,
+  `[deploy.edge_auth].password` and Git `token_ref`; daemon notification targets
+  continue to use `${secrets.shared.…}`. `nerdit vars set --machine` retains
+  the `nerdit secrets set --shared` behavior.
+
+### Behavior to know before upgrading
+
+- A project remains after its last service is removed and keeps its name
+  reserved. Use `nerdit projects delete <name>` to remove the project itself;
+  retained secrets can also keep a service name reserved.
+- Apply deploys services sequentially, with **no project-wide rollback**. If a
+  service fails, earlier services stay deployed. Fix the failure and apply
+  again; services already applied are redeployed too. Removing a service from
+  `nerdit.toml` does not delete it: use `nerdit services rm <project>/<service>`.
+- Declared services are updated by running `nerdit apply` again. Push-to-deploy
+  (`auto_deploy`) is not supported for them and is disabled when apply converts
+  an existing Git-deployed service.
+- Projects currently use the production environment only; staging and preview
+  environments are not included in this release.
+
 ## 0.6.3 (2026-09-17)
 
 A security and correctness hardening release, drawn from two focused audits over the agent/MCP surface and the daemon. No new features and nothing breaking — upgrading is drop-in. Highlights:

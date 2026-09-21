@@ -776,11 +776,11 @@ sed -e "s|__NERDITD__|$NERDITD_PATH|g" \
 chmod 644 "$UNIT_DST"
 
 # --------------------------------------------------------------------------
-# 10b. Mint the daemon auth token — BEFORE the unit is first started.
+# 10b. Initialize fresh config and auth token BEFORE the unit starts.
 #      A tokenless daemon attaches the LOCAL *admin* principal to every
 #      loopback request, so on a multi-user box every user on it is admin.
-#      Idempotent (`--auth-token-only` never overwrites an existing
-#      config.toml) and fresh-install only: minting one under an existing node
+#      Existing config settings are preserved; fresh configs enable HTTPS
+#      on :8443 and mDNS. Fresh-install only: minting a token under an existing node
 #      would break whatever already talks to it unauthenticated.
 #
 #      It MUST run as the unit user. The daemon's data dir is $HOME of that
@@ -817,7 +817,7 @@ if [ "$MODE" != system ] && [ "$OS" != macos ]; then
 	# Presenting the one scalar command as covering "both ports" left a node
 	# with ACME on still trying to bind :80, i.e. exactly the respawn loop this
 	# note exists to prevent.
-	say "note: a per-user install cannot bind :80 or :443. If you enable the URL layer, run 'sudo setcap cap_net_bind_service=+ep $CURRENT_LINK/caddy' after every update -- one setcap covers both ports."
+	say "note: new installs use HTTPS :8443; a per-user install cannot bind :80 or :443. To use those ports, run 'sudo setcap cap_net_bind_service=+ep $CURRENT_LINK/caddy' after every update -- one setcap covers both ports."
 	say "      to move the ports above 1023 instead: '$SHIM config set proxy https_port=8443' for HTTPS, and for the ACME HTTP-01 listener a [proxy.acme] block with http_port applied via '$SHIM config apply <file.toml>' (config set is scalar-only and cannot address that sub-table). Public certificates still need :80 reachable from the internet, so a moved http_port needs something forwarding :80 to it."
 fi
 

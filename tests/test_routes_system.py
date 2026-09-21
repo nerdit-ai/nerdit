@@ -228,6 +228,16 @@ def test_capabilities_admin_has_paths_and_admin_addr():
     # predates dumps" from "no such database" (both are a plain 404), so the
     # capability has to be readable rather than discoverable.
     assert body["features"]["database_dumps"] is True
+    # (P39) Constant true on this build: a pre-P39 daemon answers a set on a
+    # rowless name with a plain 404, so the capability has to be readable.
+    assert body["features"]["secrets_before_deploy"] is True
+    # (P40b) Constant true on this build: `/api/projects` is a plain 404 on a
+    # pre-P40b daemon, so the capability has to be readable.
+    assert body["features"]["projects"] is True
+    # (P40c) Constant true: the variables routes are a plain 404 before P40c.
+    assert body["features"]["variables"] is True
+    # (P40d) Constant true: the apply route does not exist before P40d.
+    assert body["features"]["project_apply"] is True
 
 
 def test_capabilities_projects_the_container_sandbox():

@@ -101,6 +101,81 @@
       "type": "object"
     }
   },
+  "apply_project": {
+    "description": "Apply a project's declaration: deploy every ``[services.<name>]`` of its ``nerdit.toml``.\n\nThe loop: ``get_project`` (read) \u2192 ``apply_project(dry_run=true)`` \u2192\nif ``status`` is ``waiting_for_variables``, do NOT invent or request\nthe values in chat: ask the human to run ``nerdit vars set <project>\n--secret --prompt KEY`` for each name in ``missing``, then dry-run\nagain \u2192 ``apply_project`` \u2192 ``wait_for_service`` once per ``label`` in\n``services`` \u2192 ``diagnose_service`` on any that failed.\n\nThe response lists ``services`` in declaration order, each with its\n``label`` (the name every other tool takes: ``web`` is the project\nname, any other service ``<service>--<project>``), ``action``\n(``fresh``/``redeploy``) and, on a dry run, its ``plan`` (env key names\nonly, values never); ``public_urls`` carries every advertised address.\n``waiting_for_variables`` deploys nothing and returns names only.\nAsynchronous like every deploy: ``applied`` means accepted, not healthy.\n\nEvery refusal lands before the first build, and a dry run creates\nnothing and mints no idempotency key. A project another token owns is\n409 ``project.owned``. There is NO rollback across services: a failure\non one is ``project.apply_incomplete``, whose ``services`` lists the\nones already applied and ``failed`` the one that was not \u2014 fix it and\napply again (done services redeploy, the rest are retried). A\n``[deploy]``-only ``nerdit.toml`` is not a declaration: use\n``deploy_app`` / ``deploy_git`` for it (they answer 422\n``deploy.use_apply`` on a declaration).\n\nSANDBOX: by DEFAULT containers run with all Linux capabilities dropped\n(``cap_drop=[\"ALL\"]``) and no-new-privileges \u2014 both are operator settings\n(``[containers].drop_all_caps`` / ``[containers].no_new_privileges``), so\nread the live profile in ``capabilities.sandbox`` rather than assuming: an\noperator may have relaxed it. Under that default, an image whose entrypoint\ndoes root work \u2014 ``chown``/``chmod`` of its own runtime dirs, dropping\nprivileges via ``setuid``/``setgid``, writing ``/var/run`` \u2014 dies before\nyour app ever starts. Stock ``nginx`` is the classic trap. Use a non-root\nimage and a non-root ``USER`` that owns the files it writes: for a static\nsite, ``nginxinc/nginx-unprivileged`` (listens on **8080**, so set\n``port=8080``) or any tiny static server. A crash from this reports\nremediation code ``image_needs_privileges`` in ``diagnose_service``. PORT\nCONTRACT: the container MUST listen on the declared ``port`` (the tool\nargument, else ``nerdit.toml`` ``[deploy].port``, else **8000**) \u2014 that is\nthe only port the daemon publishes and health-checks, so listening anywhere\nelse fails the health probe with a healthy-looking container. A port below\n1024 is NOT the reason a root entrypoint is needed: every container runs on\nthe docker bridge in its own network namespace (never host networking),\nwhere Docker sets ``net.ipv4.ip_unprivileged_port_start=0``, so binding 80\nneeds no capability and no root \u2014 the chown/setuid work does.\n",
+    "inputSchema": {
+      "properties": {
+        "dry_run": {
+          "default": false,
+          "description": "true = validate and return the plan (what would change) with zero writes; nothing is built, deployed or audited as a change.",
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
+          "title": "Idempotency Key"
+        },
+        "project": {
+          "description": "Project to apply; must equal ``[project].name`` in the source's ``nerdit.toml`` (422 ``project.name_mismatch`` otherwise). It need not exist yet: a real apply creates it for your token.",
+          "title": "Project",
+          "type": "string"
+        },
+        "ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Git branch or tag to clone; only with ``repo_url``.",
+          "title": "Ref"
+        },
+        "repo_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "https Git URL whose root ``nerdit.toml`` is the declaration. Omit to apply the project's workspace (what ``write_project_files`` wrote).",
+          "title": "Repo Url"
+        },
+        "token_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Private-repo credential as a REFERENCE, never a token: ``${vars.KEY}``, ``${secrets.shared.KEY}`` or ``${github.installation}``; only with ``repo_url``.",
+          "title": "Token Ref"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "title": "apply_projectArguments",
+      "type": "object"
+    }
+  },
   "capabilities": {
     "description": "Describe this daemon: version, caller role/quotas, URL grammar, backends.\n\nRole-aware, pure in-memory read \u2014 call it first to learn what the\ndaemon can do (buildpacks, model backends, proxy mode and public-URL\nshape, deploy limits, git allowlist, feature flags) instead of probing\nendpoints. Admin callers additionally receive ``proxy.admin_addr`` and\nthe ``paths`` block.\n",
     "inputSchema": {
@@ -162,6 +237,72 @@
         }
       },
       "title": "create_databaseArguments",
+      "type": "object"
+    }
+  },
+  "create_project": {
+    "description": "Create an empty project, reserving its name for your token.\n\nA project groups one app's services, the models and databases they\nreference, and their public addresses. The name is reserved for the\ntoken that created it: another token's deploy, ``serve_model`` or\n``create_database`` of that name is refused with 409 ``project.owned``\n(an admin bypasses), and the project remains after ``remove_service``\nuntil ``delete_project`` releases it. You rarely need this before a\ndeploy \u2014 every deployed app already becomes a project of its own name \u2014\nbut it lets you hold a name ahead of the first deploy. A name another\ntoken already reserved through ``set_secret`` is 409\n``service.name_claimed``; a name in use is 409 ``project.exists``.\n",
+    "inputSchema": {
+      "properties": {
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "description": "New project name: a lowercase DNS label of at most 40 characters (letters, digits, '-'), never containing '--'; reserved platform names are refused with 422.",
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "create_projectArguments",
+      "type": "object"
+    }
+  },
+  "delete_project": {
+    "description": "Delete a project: every service in it, then the row, releasing the name.\n\nServices go one by one through the same cascade as ``remove_service``\n(owner-or-admin each; a dependency guard or an in-flight run refuses a\nservice exactly as there). The project row goes last and only when\nevery service went: a refusal leaves the project in place with 409\n``project.delete_incomplete`` listing ``deleted`` and ``failed``, and\nre-running after the fix is idempotent. Owner or admin only.\n",
+    "inputSchema": {
+      "properties": {
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
+          "title": "Idempotency Key"
+        },
+        "name": {
+          "description": "Name of an existing project. Every deployed app already belongs to a project of its own name, so an app name is a valid project name.",
+          "title": "Name",
+          "type": "string"
+        },
+        "purge": {
+          "default": "secrets",
+          "description": "CSV of durable state to destroy alongside EVERY service in the project: ``secrets``, ``data``, ``images``, ``workspace``. Default ``secrets``; an empty string purges nothing; an unknown token is a 422 ``service.invalid_purge``.",
+          "title": "Purge",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "delete_projectArguments",
       "type": "object"
     }
   },
@@ -1100,6 +1241,23 @@
       "type": "object"
     }
   },
+  "get_project": {
+    "description": "The one-call picture of a project: read this before you deploy or diagnose.\n\nReturns the project's services with their state, last deploy and\nendpoint; the models and databases they reference with a readiness\nflag (``null`` when readiness cannot be judged without a secret); every\npublic address under ``addresses``; and ``home``, the node it lives on\n(always this node today). A name outside your scope is 403; an unknown\nname is 404. Secret values never appear here.\n",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "Name of an existing project. Every deployed app already belongs to a project of its own name, so an app name is a valid project name.",
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "get_projectArguments",
+      "type": "object"
+    }
+  },
   "get_service": {
     "description": "Get one service.",
     "inputSchema": {
@@ -1237,6 +1395,41 @@
       "type": "object"
     }
   },
+  "list_projects": {
+    "description": "List the projects this token can see, bounded to ``limit`` per page.\n\nEach entry carries the project's services (state, endpoint) and every\nadvertised address. A scoped token sees only the projects its scope\nnames. Cursor-paginated; use ``get_project`` for the full picture of one.\n",
+    "inputSchema": {
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Opaque paging cursor from the previous page's response; omit for page 1.",
+          "title": "Cursor"
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Projects per page; omit for 50. Clamped to 200, the daemon's own page cap.",
+          "title": "Limit"
+        }
+      },
+      "title": "list_projectsArguments",
+      "type": "object"
+    }
+  },
   "list_routes": {
     "description": "List the DB-authoritative route inventory, annotated with live Caddy state.\n\nModels appear with ``route: null`` (loopback-only by design); each row\ncarries its live-table annotation.\n",
     "inputSchema": {
@@ -1270,7 +1463,7 @@
     "inputSchema": {
       "properties": {
         "service": {
-          "description": "Existing service (app, model or database) whose secret key names to read, or ``shared`` for the global scope, whose names any authenticated principal may read.",
+          "description": "Service (app, model or database) whose secret key names to read, or ``shared`` for the global scope, whose names any authenticated principal may read.",
           "title": "Service",
           "type": "string"
         }
@@ -1457,7 +1650,7 @@
           "title": "Key"
         },
         "service": {
-          "description": "Existing service (app, model or database) whose secrets this call modifies, or ``shared`` for the global scope \u2014 writing that one is admin-only, and a service reads a shared key only where a ``${secrets.shared.KEY}`` reference is honoured (``[ai.*].api_key``, ``[db.*].password``, ``[deploy].edge_auth.password``, a git ``token_ref``), never through ``env``, whose values stay literal.",
+          "description": "Service (app, model or database) whose secrets this call modifies \u2014 need not exist yet: a set on an undeployed name reserves it for this token until deployed \u2014 or ``shared`` for the global scope: admin-only to write, read by a service only where a ``${secrets.shared.KEY}`` reference is honoured (``ai``/``db``/``edge_auth`` refs, a git ``token_ref``), never through ``env``, which stays literal.",
           "title": "Service",
           "type": "string"
         }
@@ -1508,6 +1701,36 @@
         "name"
       ],
       "title": "remove_serviceArguments",
+      "type": "object"
+    }
+  },
+  "resolve_variables": {
+    "description": "What a launch would see: per key, the winning scope and whether it is plain. No values.\n\nThe loop is \"the agent asks, the human supplies\". Call this before a\ndeploy to see which keys the service will receive (``scope`` is\n``project`` or ``production/<service>``). When a key the app needs is\nmissing, do NOT invent or request the value in chat: ask the human to\nrun ``nerdit vars set <project> --secret --prompt KEY``, then call this\nagain to confirm the key is present. A secret value is never returned by\nany tool. Owner or admin only; a name outside your scope is 403.\n",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Name of an existing project. Every deployed app already belongs to a project of its own name, so an app name is a valid project name.",
+          "title": "Project",
+          "type": "string"
+        },
+        "service": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Service inside the project whose launch to resolve for; omit for ``web``, the service of a single-app project.",
+          "title": "Service"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "title": "resolve_variablesArguments",
       "type": "object"
     }
   },
@@ -2050,7 +2273,7 @@
     }
   },
   "set_secret": {
-    "description": "Set/merge write-only secrets for a service; returns key names only.\n\nWARNING: the values you pass here transit this agent's transcript in\nplaintext; for high-value shared keys (broadly-scoped API keys,\ncredentials shared across every app) prefer ``nerdit secrets set --shared`` from the CLI\ninstead of routing them through an agent. The leak-free path for any\nvalue: a human runs ``nerdit secrets set <service> --prompt KEY``\n(hidden input) and you only ever name ``KEY``; it is injected at\nlaunch, overriding an ``env`` key of the same name.\n",
+    "description": "Set/merge write-only secrets for a service; returns key names only.\n\nWARNING: the values you pass here transit this agent's transcript in\nplaintext; for high-value shared keys (broadly-scoped API keys,\ncredentials shared across every app) prefer ``nerdit secrets set --shared`` from the CLI\ninstead of routing them through an agent. The leak-free path for any\nvalue: a human runs ``nerdit secrets set <service> --prompt KEY``\n(hidden input) and you only ever name ``KEY``; it is injected at\nlaunch, overriding an ``env`` key of the same name. You may set secrets\nbefore the service exists; the name is then reserved for your token\nuntil you deploy it (another token's deploy of that name gets 409\n``service.name_claimed``).\n",
     "inputSchema": {
       "properties": {
         "idempotency_key": {
@@ -2067,7 +2290,7 @@
           "title": "Idempotency Key"
         },
         "service": {
-          "description": "Existing service (app, model or database) whose secrets this call modifies, or ``shared`` for the global scope \u2014 writing that one is admin-only, and a service reads a shared key only where a ``${secrets.shared.KEY}`` reference is honoured (``[ai.*].api_key``, ``[db.*].password``, ``[deploy].edge_auth.password``, a git ``token_ref``), never through ``env``, whose values stay literal.",
+          "description": "Service (app, model or database) whose secrets this call modifies \u2014 need not exist yet: a set on an undeployed name reserves it for this token until deployed \u2014 or ``shared`` for the global scope: admin-only to write, read by a service only where a ``${secrets.shared.KEY}`` reference is honoured (``ai``/``db``/``edge_auth`` refs, a git ``token_ref``), never through ``env``, which stays literal.",
           "title": "Service",
           "type": "string"
         },
@@ -2085,6 +2308,71 @@
         "values"
       ],
       "title": "set_secretArguments",
+      "type": "object"
+    }
+  },
+  "set_variable": {
+    "description": "Set/merge a project's variables; write-only unless ``secret=false``. Returns names only.\n\nWARNING: the values you pass here transit this agent's transcript in\nplaintext, whether ``secret`` is omitted, ``true`` or ``false``. For any\ncredential, do not pass the value at all: ask the human to run\n``nerdit vars set <project> --secret --prompt KEY`` (hidden input) and\nonly ever name ``KEY`` yourself. Use this tool for values that are fine\nto appear in a transcript (a log level, a feature flag, a public URL).\n\nA variable reaches a service's environment at launch. Precedence, lowest\nto highest: the manifest ``env`` table, the project scope, the service\nscope, then platform-injected bindings (``OPENAI_BASE_URL``,\n``DATABASE_URL``\u2026), which a variable can never override. Setting a key\nagain flips its plain/secret flag in that scope. Only the project's owner\nor an admin may write (another token gets 403).\nA running service picks the change up on its next restart or redeploy.\nThe machine-wide scope is not reachable here: use ``set_secret`` with\n``shared``.\n",
+    "inputSchema": {
+      "properties": {
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
+          "title": "Idempotency Key"
+        },
+        "project": {
+          "description": "Project whose variables this call modifies. It need not exist yet: a set on an unknown name creates the project for your token.",
+          "title": "Project",
+          "type": "string"
+        },
+        "secret": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Omit (or ``true``) for a write-only SECRET: no API, tool or dashboard ever returns the value again. ``false`` is the explicit PLAIN write: the project's owner or an admin can read the value back. When unsure, omit it.",
+          "title": "Secret"
+        },
+        "service": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Service inside the project (``web`` for a single-app project) to set the key for that service only; omit for the project scope, shared by every service of the project. On a key set in both, the service scope wins.",
+          "title": "Service"
+        },
+        "values": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "KEY \u2192 value pairs merged into the scope: a listed key is overwritten, an unlisted one kept. Key names are env-var identifiers (``[A-Za-z_][A-Za-z0-9_]*``); a value may be multi-line but may contain no NUL and no control character other than tab/newline/CR. An empty map is refused.",
+          "title": "Values",
+          "type": "object"
+        }
+      },
+      "required": [
+        "project",
+        "values"
+      ],
+      "title": "set_variableArguments",
       "type": "object"
     }
   },
@@ -2320,6 +2608,61 @@
         "files"
       ],
       "title": "write_app_filesArguments",
+      "type": "object"
+    }
+  },
+  "write_project_files": {
+    "description": "Write a project's source tree (its ``nerdit.toml`` included), then ``apply_project``.\n\nExactly ``write_app_files`` on the workspace named after the project:\nsame all-or-nothing batch, same text-only rule, same caps, and\n``list_app_files`` / ``read_app_file`` read it back under the project\nname. One tree holds EVERY service; a service built from a subfolder\nsays so with ``build_settings.subdir``. The root ``nerdit.toml`` is the\ndeclaration::\n\n    [project]\n    name = \"asso\"\n\n    [services.web]\n    port = 3000\n\n    [services.api]\n    port = 8000\n    build_settings = { subdir = \"apps/api\" }\n\n    [vars]\n    required = [\"API_KEY\"]\n\n``[services.<name>]`` takes the ``[deploy]`` keys except ``name``: the\nservice ``web`` is served under the project name (``asso``), any other\nunder ``<service>--<project>`` (``api--asso``), and that label is the\nname every other tool takes. ``[ai.*]`` / ``[db.*]`` bindings stay\ntop-level tables shared by every service; a declaration cannot create\na database (``create_database`` first, then bind it). WARNING: file\ncontents you pass here transit this agent's transcript in plaintext;\nnever write secrets into project files.\n",
+    "inputSchema": {
+      "properties": {
+        "delete": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Workspace-relative paths to remove, applied with the writes in the same all-or-nothing batch. Omit (null) to delete nothing; a path that does not exist is a no-op; a path may not be in both ``files`` and ``delete``.",
+          "title": "Delete"
+        },
+        "files": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Workspace-relative path -> that file's full UTF-8 text; a write replaces the file whole. Paths are relative with no ``..``; ``.git``, ``node_modules``, ``__pycache__``, ``.venv``, ``data/`` and ``*.pyc`` are refused, and ``.env`` / ``.env.*`` by name. Text only (NUL or non-UTF-8 is refused). Caps: 256 KiB per file, 10 MiB and 500 files per workspace.",
+          "title": "Files",
+          "type": "object"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
+          "title": "Idempotency Key"
+        },
+        "project": {
+          "description": "Project name: the ONE source tree of the project, a workspace of the same name. A new name creates the workspace; an existing one is edited in place. It must equal ``[project].name`` in the tree's ``nerdit.toml``.",
+          "title": "Project",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "files"
+      ],
+      "title": "write_project_filesArguments",
       "type": "object"
     }
   }

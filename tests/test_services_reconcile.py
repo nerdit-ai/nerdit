@@ -162,14 +162,23 @@ class FakeProxy:
         # service — the real manager parses/resolves it; here it is recorded so
         # the wiring is assertable without a secret store.
         self.edge_auth: dict[str, object] = {}
+        self.project_ids: dict[str, str | None] = {}
 
     @property
     def enabled(self) -> bool:
         return self._enabled
 
-    async def register(self, service_name: str, host_port: int, edge_auth: object = None) -> None:
+    async def register(
+        self,
+        service_name: str,
+        host_port: int,
+        edge_auth: object = None,
+        project_id: str | None = None,
+    ) -> None:
         self.registered[service_name] = host_port
         self.edge_auth[service_name] = edge_auth
+        # (P40c) The launch fast-path hands the row's project to the resolver.
+        self.project_ids[service_name] = project_id
 
     async def deregister(self, service_name: str) -> None:
         self.deregistered.append(service_name)
@@ -943,6 +952,8 @@ async def test_proxy_registers_on_running_and_persists_route(queries):
     await controller.reconcile()  # building → running
 
     assert proxy.registered.get("svc") is not None
+    row = await queries.get_service_by_name("svc")
+    assert row.project_id is not None and proxy.project_ids["svc"] == row.project_id
     ep = await queries.get_service_endpoint("svc")
     assert ep.route == "/svc"  # persisted projection (path mode)
 

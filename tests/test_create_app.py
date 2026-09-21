@@ -23,7 +23,7 @@ from nerdit.daemon.middleware import ScopedTokenAuthMiddleware
 
 # The router-inclusion order from server.py's ``api_router`` tag table,
 # collapsed to unique consecutive tags. Mirrors test_openapi.py's
-# ``_EXPECTED_TAGS`` set: 19 routers share 18 distinct tags because
+# ``_EXPECTED_TAGS`` set: 20 routers share 19 distinct tags because
 # ``config_router`` and ``app_config_router`` are adjacent and both "Config".
 _EXPECTED_TAG_ORDER = [
     "Health",
@@ -47,6 +47,8 @@ _EXPECTED_TAG_ORDER = [
     "Link",
     # (P26 WP-H) The hosted-share trio, registered last on its own tag.
     "Exposure",
+    # (P40b / D-P40-10) The project noun, now the last router.
+    "Projects",
 ]
 
 # The pinned {operation_id: (path, sorted methods)} table under /api.
@@ -142,6 +144,18 @@ _EXPECTED_OPERATIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     # ``:path`` so a pasted URL reaches the validator (422 not_bare), not a 404.
     "add_domain": ("/api/services/{name}/domains/{domain:path}", ("PUT",)),
     "remove_domain": ("/api/services/{name}/domains/{domain:path}", ("DELETE",)),
+    # (P40b) The project quartet, tag Projects, `/api` only.
+    "list_projects": ("/api/projects", ("GET",)),
+    "create_project": ("/api/projects", ("POST",)),
+    "get_project": ("/api/projects/{project}", ("GET",)),
+    "delete_project": ("/api/projects/{project}", ("DELETE",)),
+    # (P40c) The variable quartet, same tag, same router.
+    "resolve_variables": ("/api/projects/{project}/variables/resolve", ("GET",)),
+    "list_variables": ("/api/projects/{project}/variables", ("GET",)),
+    "set_variables": ("/api/projects/{project}/variables", ("PUT",)),
+    "delete_variable": ("/api/projects/{project}/variables/{key}", ("DELETE",)),
+    # (P40d) The declaration apply, same tag, same router.
+    "apply_project": ("/api/projects/{project}/apply", ("POST",)),
 }
 
 
@@ -180,8 +194,8 @@ def _api_routes(built_app) -> list[tuple[str, APIRoute]]:
 
 
 def test_api_router_and_tag_table(app):
-    """The /api operationId set is exact, and the 19-router tag order survives
-    (collapsed to 18 unique consecutive tags — see _EXPECTED_TAG_ORDER)."""
+    """The /api operationId set is exact, and the 20-router tag order survives
+    (collapsed to 19 unique consecutive tags — see _EXPECTED_TAG_ORDER)."""
     routes = _api_routes(app)
     ids = [r.operation_id for _, r in routes]
     # 79 = the Track B 57 + the P25 self-token pair (get_self_token,
@@ -203,8 +217,10 @@ def test_api_router_and_tag_table(app):
     #
     # P37's managed-database dump trio (create_database_dump,
     # list_database_dumps, restore_database_dump — all under the existing
-    # Databases tag) takes it to 82.
-    assert len(ids) == len(set(ids)) == 82, "operation_id set drifted from 82"
+    # Databases tag) takes it to 82; the P40b project quartet (list_projects,
+    # create_project, get_project, delete_project, tag Projects) to 86; the
+    # P40c variable quartet (same tag) to 90; P40d's apply_project to 91.
+    assert len(ids) == len(set(ids)) == 91, "operation_id set drifted from 91"
 
     found = {r.operation_id: (path, tuple(sorted(r.methods))) for path, r in routes}
     assert found == _EXPECTED_OPERATIONS

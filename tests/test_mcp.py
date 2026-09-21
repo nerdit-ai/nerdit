@@ -27,6 +27,7 @@ import pytest
 from nerdit.cli.client import NerditClient
 from nerdit.mcp import server
 from nerdit.mcp.tools import exposure as exposure_tools
+from nerdit.mcp.tools import projects as projects_tools
 from nerdit.mcp.tools import services as services_tools
 from nerdit.mcp.tools import workspaces as workspaces_tools
 
@@ -94,6 +95,19 @@ async def test_call_passes_success_through():
         return {"ok": True}
 
     assert await server._call(coro()) == {"ok": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["asso/", "a/b/c/d", "asso/staging/api", "asso/" + "x" * 70])
+async def test_call_maps_a_malformed_qualified_name_to_the_error_dict(bad):
+    """(D-P40-6) `wire_name` raises client-side; the tool still answers the dict."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request may be sent")
+
+    result = await services_tools._get_service_impl(_client(handler), bad)
+    assert result["error"]["code"] == "bad_request" and result["error"]["status"] is None
+    assert bad not in result["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -1299,6 +1313,246 @@ async def test_rm_secret_impl_respects_explicit_key():
     assert seen["idem"] == "fixed-del"
 
 
+# --- project impls (P40b) ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_project_impl_posts_name_and_mints_key():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        seen["idem"] = request.headers.get("idempotency-key")
+        return httpx.Response(201, json={"id": "prj_x", "name": "asso"})
+
+    result = await projects_tools._create_project_impl(_client(handler), "asso")
+    assert result["id"] == "prj_x"
+    assert (seen["method"], seen["path"]) == ("POST", "/api/projects")
+    assert seen["body"] == {"name": "asso"}
+    uuid.UUID(seen["idem"])  # minted when absent, like every write tool
+
+
+@pytest.mark.asyncio
+async def test_list_projects_impl_clamps_limit_server_side():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["query"] = dict(request.url.params)
+        return httpx.Response(200, json={"items": [], "next_cursor": None})
+
+    await projects_tools._list_projects_impl(_client(handler), limit=9999, cursor="c1")
+    assert seen["path"] == "/api/projects"
+    assert seen["query"] == {"limit": "200", "cursor": "c1"}
+
+
+@pytest.mark.asyncio
+async def test_get_project_impl_targets_name():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/projects/asso"
+        return httpx.Response(200, json={"id": "prj_x", "name": "asso", "services": []})
+
+    result = await projects_tools._get_project_impl(_client(handler), "asso")
+    assert result["name"] == "asso"
+
+
+@pytest.mark.asyncio
+async def test_delete_project_impl_sends_purge_and_respects_explicit_key():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["query"] = dict(request.url.params)
+        seen["idem"] = request.headers.get("idempotency-key")
+        return httpx.Response(200, json={"name": "asso", "deleted": ["asso"]})
+
+    await projects_tools._delete_project_impl(
+        _client(handler), "asso", purge="secrets,data", idempotency_key="fixed-prj"
+    )
+    assert (seen["method"], seen["path"]) == ("DELETE", "/api/projects/asso")
+    assert seen["query"] == {"purge": "secrets,data"}
+    assert seen["idem"] == "fixed-prj"
+
+
+@pytest.mark.asyncio
+async def test_project_impls_surface_daemon_envelope():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={"code": "project.owned", "message": "Project 'asso' belongs to another token."},
+        )
+
+    result = await projects_tools._create_project_impl(_client(handler), "asso")
+    assert result["error"]["code"] == "project.owned"
+
+
+# --- variable impls (P40c) ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secret", "sent"),
+    [(None, True), (True, True), (False, False)],
+    ids=["omitted", "true", "false"],
+)
+async def test_set_variable_impl_omitted_secret_is_write_only(secret, sent):
+    # D-P40-16: only an explicit False is a plain write; a forgotten flag is secret.
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["query"] = dict(request.url.params)
+        seen["body"] = json.loads(request.content)
+        seen["idem"] = request.headers.get("idempotency-key")
+        return httpx.Response(
+            200, json={"project": "asso", "scope": "project", "keys": ["K"], "plain": not sent}
+        )
+
+    result = await projects_tools._set_variable_impl(
+        _client(handler), "asso", {"K": "the-value"}, secret=secret
+    )
+    assert (seen["method"], seen["path"]) == ("PUT", "/api/projects/asso/variables")
+    assert seen["query"] == {}  # project scope; never an `environment` (D-P40-11)
+    assert seen["body"] == {"values": {"K": "the-value"}, "secret": sent}
+    uuid.UUID(seen["idem"])
+    assert "the-value" not in json.dumps(result)  # the result never echoes a value
+
+
+@pytest.mark.asyncio
+async def test_set_variable_impl_targets_service_scope():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["query"] = dict(request.url.params)
+        seen["idem"] = request.headers.get("idempotency-key")
+        return httpx.Response(200, json={"keys": ["K"]})
+
+    await projects_tools._set_variable_impl(
+        _client(handler), "asso", {"K": "v"}, service="web", idempotency_key="fixed-var"
+    )
+    assert seen["query"] == {"service": "web"}
+    assert seen["idem"] == "fixed-var"
+
+
+@pytest.mark.asyncio
+async def test_resolve_variables_impl_reads_resolve_route():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["query"] = dict(request.url.params)
+        return httpx.Response(200, json={"project": "asso", "service": "api", "variables": []})
+
+    await projects_tools._resolve_variables_impl(_client(handler), "asso", service="api")
+    assert (seen["method"], seen["path"]) == ("GET", "/api/projects/asso/variables/resolve")
+    assert seen["query"] == {"service": "api"}
+
+
+def test_set_variable_docstring_carries_transcript_warning():
+    # D-P40-16: the WARNING covers BOTH branches, and names the leak-free path.
+    doc = projects_tools.set_variable.__doc__ or ""
+    assert "WARNING" in doc and "transcript" in doc
+    assert "--secret --prompt KEY" in doc
+    assert "--secret --prompt KEY" in (projects_tools.resolve_variables.__doc__ or "")
+
+
+# --- declaration impls (P40d) -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_apply_project_impl_asks_the_daemon_for_the_workspace_when_no_repo():
+    # The daemon snapshots the workspace under its lock; the tool reads no file
+    # and packs nothing (a client-side pack could capture a half-written tree).
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert not request.url.path.startswith("/api/workspaces/")
+        seen["method"], seen["path"] = request.method, request.url.path
+        seen["query"] = dict(request.url.params)
+        seen["idem"] = request.headers.get("idempotency-key")
+        seen["body"] = request.content
+        return httpx.Response(200, json={"project": "asso", "status": "applied"})
+
+    result = await projects_tools._apply_project_impl(_client(handler), "asso")
+    assert result["status"] == "applied"
+    assert (seen["method"], seen["path"]) == ("POST", "/api/projects/asso/apply")
+    assert seen["query"] == {}
+    uuid.UUID(seen["idem"])
+    assert seen["body"] == b"workspace=true"
+
+
+@pytest.mark.asyncio
+async def test_apply_project_impl_git_dry_run_is_keyless_and_never_reads_the_workspace():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert not request.url.path.startswith("/api/workspaces/")
+        seen["query"] = dict(request.url.params)
+        seen["idem"] = request.headers.get("idempotency-key")
+        seen["body"] = request.content.decode()
+        return httpx.Response(200, json={"status": "waiting_for_variables", "missing": ["K"]})
+
+    result = await projects_tools._apply_project_impl(
+        _client(handler),
+        "asso",
+        repo_url="https://github.com/o/r",
+        ref="main",
+        token_ref="${vars.GH}",
+        dry_run=True,
+    )
+    assert result["missing"] == ["K"]
+    assert seen["query"] == {"dry_run": "true"}
+    assert seen["idem"] is None  # a dry run mints no key (the deploy_app precedent)
+    assert "repo_url" in seen["body"] and "token_ref" in seen["body"]
+
+
+@pytest.mark.asyncio
+async def test_apply_project_impl_surfaces_a_foreign_project_without_key_names():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"code": "project.owned", "message": "owned"})
+
+    result = await projects_tools._apply_project_impl(
+        _client(handler), "asso", repo_url="https://github.com/o/r"
+    )
+    assert result["error"]["code"] == "project.owned"
+    assert "missing" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_write_project_files_is_write_app_files_on_the_project_workspace(monkeypatch):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"], seen["path"] = request.method, request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"written": 1})
+
+    monkeypatch.setattr(projects_tools, "_request_client", lambda: _client(handler))
+    await projects_tools.write_project_files("asso", {"nerdit.toml": "x"})
+    assert (seen["method"], seen["path"]) == ("PUT", "/api/workspaces/asso/files")
+    assert seen["body"]["files"] == {"nerdit.toml": "x"}
+
+
+def test_apply_project_docstring_teaches_the_loop():
+    doc = " ".join((projects_tools.apply_project.__doc__ or "").split())
+    for needle in (
+        "get_project",
+        "dry_run=true",
+        "waiting_for_variables",
+        "nerdit vars set <project> --secret --prompt KEY",
+        "wait_for_service",
+        "diagnose_service",
+    ):
+        assert needle in doc, needle
+    assert "environment" not in doc  # D-P40-11
+
+
 # --- audit + config impls (P6) -----------------------------------------------
 
 
@@ -2086,13 +2340,25 @@ async def test_build_server_registers_all_tools():
         "remove_domain",
         "dump_database",
         "list_database_dumps",
+        "create_project",
+        "list_projects",
+        "get_project",
+        "delete_project",
+        "set_variable",
+        "resolve_variables",
+        "write_project_files",
+        "apply_project",
     }
     # The tool set is a public contract for external agents: pin the count so a
     # tool cannot be added or dropped without an explicit CHANGELOG decision.
     # (P26 WP-H) 43 → 45 with the hosted-share pair; (P26 WP1) 45 → 47 with the
     # custom-domain pair; (P37) 47 → 49 with the managed-database dump pair —
-    # and deliberately NOT a restore tool (D-P37-12).
-    assert len(names) == 49
+    # and deliberately NOT a restore tool (D-P37-12); (P40b) 49 → 53 with the
+    # project quartet (create/list/get/delete_project, D-P40-10); (P40c) 53 → 55
+    # with set_variable/resolve_variables — deliberately no list/unset tool: a
+    # plain value is read by its owner through the CLI/REST, not an agent;
+    # (P40d) 55 → 57 with write_project_files/apply_project (the declaration).
+    assert len(names) == 57
 
 
 _MCP_TOOLS_GOLDEN_PATH = Path(__file__).parent / "data" / "mcp_tools_golden.json"
@@ -2279,7 +2545,7 @@ async def test_deploy_tool_descriptions_name_both_proxy_modes():
 
 # --- (P33) the shared sandbox sentence on every content-bearing deploy tool ---
 
-_SANDBOX_DOC_TOOLS = ("deploy", "deploy_git", "deploy_app", "write_app_files")
+_SANDBOX_DOC_TOOLS = ("deploy", "deploy_git", "deploy_app", "write_app_files", "apply_project")
 
 
 @pytest.mark.asyncio

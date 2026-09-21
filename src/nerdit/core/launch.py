@@ -537,6 +537,7 @@ async def settle_started(
             job.service_name,
             endpoint.host_port,
             edge_auth=parse_job_config(job).get("edge_auth"),
+            project_id=job.project_id,
         )
     logger.info(
         "Service %s running in container %s on host port %d",

@@ -40,6 +40,7 @@ from nerdit.core.gitsource import (
 )
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.core.secrets import SHARED_SCOPE, SecretDecryptError, SecretManager
+from nerdit.core.variables import load_scoped
 
 if TYPE_CHECKING:
     from nerdit.core.eventlog import EventRecorder
@@ -523,10 +524,13 @@ class GitWatchController:
 
     # --- credentials ----------------------------------------------------------
 
-    def _resolve_token(self, name: str, token_ref: str) -> str | None:
+    def _resolve_token(self, job: Job, name: str, token_ref: str) -> str | None:
         """Resolve a recorded `token_ref`, quietly (D-BP-3 — no audit row).
 
-        Same precedence as the request-bound resolver (per-service scope, then
+        Same precedence as the request-bound resolver (the service scope over
+        the ROW's project scope -- D-P40-9; the row was admitted under D-P40-5
+        rule 1, so a daemon-driven poll has no ownership question, bar the
+        rollback bounce the plan's section 5 leaves open -- then
         the shared scope only when the reference names it), minus the
         `secret.shared_referenced` row: a poll repeats every minute and is not
         an access event. `None` means "no such stored secret" — the caller
@@ -535,7 +539,7 @@ class GitWatchController:
         """
         res = walk_secret_ref(
             token_ref,
-            service_env=lambda: self._secrets.load(name),
+            service_env=lambda: load_scoped(self._secrets, name, job.project_id)[0],
             shared_env=lambda: self._secrets.load(SHARED_SCOPE),
         )
         return res.value
@@ -564,7 +568,7 @@ class GitWatchController:
                 return None, False
             return token, True
         try:
-            token = self._resolve_token(name, str(token_ref))
+            token = self._resolve_token(job, name, str(token_ref))
         except SecretDecryptError:
             await self._poll_failed(job, name, "secret.decrypt_failed")
             return None, False

@@ -100,6 +100,7 @@ from nerdit.core.runtime.protocol import (
 )
 from nerdit.core.sandbox import enforce_mount_allowlist, resolve_role
 from nerdit.core.secrets import SHARED_SCOPE, SecretDecryptError, SecretManager
+from nerdit.core.variables import load_scoped
 from nerdit.core.volumes import VolumeSpecError, create_dump_staging_dir, service_volumes
 from nerdit.db.enums import ErrorClass, GpuVendor, JobKind, JobStatus, LogStream, TokenRole
 from nerdit.db.queries import Queries
@@ -2381,7 +2382,8 @@ class ServiceController:
         """Acquire the full launch env or raise `LaunchEnvNotReady`.
 
         Pure of audit side effects (P14 WP-0 C2.1): the caller owns the wait-log
-        and shared-resolved audit. Loads per-service secrets ONCE, lazily
+        and shared-resolved audit. Loads the scoped variables (project < service,
+        D-P40-9) ONCE, lazily
         loads the shared scope only when a `${secrets.shared.KEY}` ref is
         actually unresolved, resolves `[ai.*]` then `[db.*]`
         bindings, and merges the container env (config env ⊕ secrets ⊕ injected
@@ -2391,13 +2393,17 @@ class ServiceController:
         actually produced — for `run_once`'s protected-key overlay. Purely
         additive: `_launch`'s behaviour is unchanged.
         """
-        # Per-service secrets, loaded ONCE — shared between binding
-        # resolution and the container env. A decrypt failure is
-        # NON-terminal: raise, the admin restores the key/file, launch converges.
+        # Scoped variables (project < service, D-P40-9), loaded ONCE — shared
+        # between binding resolution and the container env. The project scope
+        # is the ROW's `project_id`: the row was admitted under D-P40-5 rule 1,
+        # so a daemon-driven launch has no ownership question (bar the rollback
+        # bounce the plan's §5 leaves open: the boot backfill adopts by name).
+        # A decrypt failure is NON-terminal: raise, the admin restores the
+        # key/file, launch converges.
         secret_env: dict[str, str] = {}
         if self._secrets is not None and job.service_name:
             try:
-                secret_env = self._secrets.load(job.service_name)
+                secret_env, _ = load_scoped(self._secrets, job.service_name, job.project_id)
             except SecretDecryptError as exc:
                 raise LaunchEnvNotReady("secrets", f"Secrets unavailable: {exc}") from exc
 
@@ -2410,7 +2416,7 @@ class ServiceController:
             # LAZY shared load: _shared is read only when a spec carries a
             # ${secrets.shared.KEY} ref, so one corrupt shared file blocks only
             # the services that reference it — never the whole node. A ref whose
-            # KEY is already a per-service override resolves from secret_env first
+            # KEY is already a service- or project-scope override resolves from secret_env first
             # (the documented escape hatch), so it does NOT force a shared
             # decrypt: a fully-overridden service must launch even when _shared is
             # corrupt/unreadable. Shared refs come from BOTH kinds — the
@@ -2778,8 +2784,9 @@ class ServiceController:
     ) -> None:
         """Audit which shared keys a launch resolved, as `secret.shared_resolved`.
 
-        `overridden` is the subset shadowed by a same-named per-service secret
-        (the precedence escape hatch) — the row fires even when EVERY ref was
+        `overridden` is the subset shadowed by a same-named service- or
+        project-scope variable (the precedence escape hatch; `secret_env` is the
+        merged map, D-P40-9) — the row fires even when EVERY ref was
         overridden, since it is the admin's only bypass signal. Deduped like
         `_binding_wait_msgs`: a crash-looping service re-audits only when the
         `(keys, overridden)` tuple actually changes. Key *names* only.

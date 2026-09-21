@@ -53,6 +53,19 @@ def _resolve_service(service: Optional[str], shared: bool) -> str:
     return service
 
 
+def prompt_values(keys: list[str]) -> dict[str, str]:
+    """Read one value per key without echo; the value never touches argv.
+
+    Key names are validated before the first prompt so a typo costs no typing.
+    Shared with `nerdit vars set --secret --prompt` (P40c).
+
+    Raises:
+        ValueError: A key is not a valid secret name.
+    """
+    validate_secret_items(dict.fromkeys(keys, ""))
+    return {key: typer.prompt(f"Value for {key}", hide_input=True) for key in keys}
+
+
 @secrets_app.command("set")
 def secrets_set(
     service: Optional[str] = typer.Argument(None, help="Service name"),
@@ -67,7 +80,11 @@ def secrets_set(
         ),
     ] = None,
 ) -> None:
-    """Set/merge secrets for a service (values are write-only)."""
+    """Set/merge secrets for a service (values are write-only).
+
+    On a name that is not deployed yet, the name is reserved for your token
+    until you deploy it.
+    """
     pairs = list(pairs or [])
     # Click cannot know `secrets set --shared KEY=VAL` has no positional
     # service: the first pair lands in `service`. Redistribute it before
@@ -81,9 +98,7 @@ def secrets_set(
         raise typer.Exit(1)
     try:
         values = parse_env_pairs(pairs)
-        validate_secret_items(dict.fromkeys(prompt_keys or [], ""))
-        for key in prompt_keys or []:
-            values[key] = typer.prompt(f"Value for {key}", hide_input=True)
+        values.update(prompt_values(prompt_keys or []))
     except ValueError as exc:
         console.print(f"[red]{_plain(exc)}[/red]")
         raise typer.Exit(1) from exc

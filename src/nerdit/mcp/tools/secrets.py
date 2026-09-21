@@ -18,19 +18,19 @@ from nerdit.mcp.transport import _request_client
 _SecretsScopeWrite = Annotated[
     str,
     Field(
-        description="Existing service (app, model or database) whose secrets this call "
-        "modifies, or ``shared`` for the global scope — writing that one is admin-only, "
-        "and a service reads a shared key only where a ``${secrets.shared.KEY}`` "
-        "reference is honoured (``[ai.*].api_key``, ``[db.*].password``, "
-        "``[deploy].edge_auth.password``, a git ``token_ref``), never through ``env``, "
-        "whose values stay literal."
+        description="Service (app, model or database) whose secrets this call modifies — "
+        "need not exist yet: a set on an undeployed name reserves it for this token until "
+        "deployed — or ``shared`` for the global scope: admin-only to write, read by a "
+        "service only where a ``${secrets.shared.KEY}`` reference is honoured "
+        "(``ai``/``db``/``edge_auth`` refs, a git ``token_ref``), never through ``env``, "
+        "which stays literal."
     ),
 ]
 _SecretsScopeRead = Annotated[
     str,
     Field(
-        description="Existing service (app, model or database) whose secret key names to "
-        "read, or ``shared`` for the global scope, whose names any authenticated principal "
+        description="Service (app, model or database) whose secret key names to read, "
+        "or ``shared`` for the global scope, whose names any authenticated principal "
         "may read."
     ),
 ]
@@ -100,7 +100,10 @@ async def set_secret(
         instead of routing them through an agent. The leak-free path for any
         value: a human runs ``nerdit secrets set <service> --prompt KEY``
         (hidden input) and you only ever name ``KEY``; it is injected at
-        launch, overriding an ``env`` key of the same name.
+        launch, overriding an ``env`` key of the same name. You may set secrets
+        before the service exists; the name is then reserved for your token
+        until you deploy it (another token's deploy of that name gets 409
+        ``service.name_claimed``).
         """
         return await _set_secret_impl(
             _request_client(), service, values, idempotency_key=idempotency_key

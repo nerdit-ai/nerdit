@@ -12,7 +12,12 @@ import pytest
 
 from nerdit.daemon.auth import QuotaExceeded, hash_token
 from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, TokenRole
-from nerdit.db.queries import PortRangeExhausted, ServiceNameTaken
+from nerdit.db.queries import (
+    PortRangeExhausted,
+    ProjectOwned,
+    ServiceNameClaimed,
+    ServiceNameTaken,
+)
 
 
 def _service_job(
@@ -202,9 +207,249 @@ async def test_service_quota_gpus_zero_ok_under_zero_gpu_cap(queries):
 
 
 async def test_service_name_taken(queries):
-    await queries.reserve_service_for_token(_service_job("dup"))
+    # Same token: the project judgment (P40b) passes and the label index refuses.
+    await queries.reserve_service_for_token(_service_job("dup", token="tok-a"))
     with pytest.raises(ServiceNameTaken):
-        await queries.reserve_service_for_token(_service_job("dup"))
+        await queries.reserve_service_for_token(_service_job("dup", token="tok-a"))
+
+
+# --- P39 secret claims --------------------------------------------------------
+
+
+async def test_mint_secret_claim_is_idempotent(queries):
+    assert await queries.mint_secret_claim("pre", "tok-a") is True
+    assert await queries.mint_secret_claim("pre", "tok-b") is False
+    claim = await queries.get_secret_claim("pre")
+    assert claim is not None and claim.token_id == "tok-a"
+
+
+async def test_reserve_consumes_own_claim(queries):
+    await queries.mint_secret_claim("pre", "tok-a")
+    await queries.reserve_service_for_token(_service_job("pre", token="tok-a"))
+    assert await queries.get_service_by_name("pre") is not None
+    assert await queries.get_secret_claim("pre") is None
+
+
+async def test_reserve_refuses_foreign_claim_and_leaves_no_row(queries):
+    await queries.mint_secret_claim("pre", "tok-a")
+    with pytest.raises(ServiceNameClaimed):
+        await queries.reserve_service_for_token(_service_job("pre", token="tok-b"))
+    assert await queries.get_service_by_name("pre") is None
+    claim = await queries.get_secret_claim("pre")
+    assert claim is not None and claim.token_id == "tok-a"
+
+
+async def test_reserve_admin_consumes_foreign_claim(queries):
+    await queries.mint_secret_claim("pre", "tok-a")
+    await queries.reserve_service_for_token(_service_job("pre", token="tok-b"), admin=True)
+    assert await queries.get_service_by_name("pre") is not None
+    assert await queries.get_secret_claim("pre") is None
+
+
+async def test_null_token_claim_is_admin_only(queries):
+    """A NULL claimant is foreign to every non-admin, even a tokenless one."""
+    await queries.mint_secret_claim("pre", None)
+    with pytest.raises(ServiceNameClaimed):
+        await queries.reserve_service_for_token(_service_job("pre", token=None))
+    with pytest.raises(ServiceNameClaimed):
+        await queries.reserve_service_for_token(_service_job("pre", token="tok-b"))
+    assert await queries.get_service_by_name("pre") is None
+    await queries.reserve_service_for_token(_service_job("pre", token=None), admin=True)
+    assert await queries.get_service_by_name("pre") is not None
+    assert await queries.get_secret_claim("pre") is None
+
+
+async def test_mint_refuses_a_name_with_a_row(queries):
+    """A mint racing a fresh deploy loses to the row, in the same statement."""
+    await queries.reserve_service_for_token(_service_job("x", token="tok-a"))
+    assert await queries.mint_secret_claim("x", "tok-b") is False
+    assert await queries.get_secret_claim("x") is None
+
+
+async def test_delete_keeping_secrets_reclaims_inside_the_transaction(queries):
+    """No window between the row delete and the owner's claim (D-P39-6)."""
+    job = await queries.reserve_service_for_token(_service_job("x", token="tok-a"))
+    seen: list[bool] = []
+    assert await queries.delete_service_checked(job.id, on_secrets_reclaimed=seen.append) == []
+    assert seen == [True]
+    with pytest.raises(ServiceNameClaimed):
+        await queries.reserve_service_for_token(_service_job("x", token="tok-b"))
+    await queries.reserve_service_for_token(_service_job("x", token="tok-a"))
+    assert await queries.get_secret_claim("x") is None
+
+
+async def test_delete_without_the_seam_leaves_no_claim(queries):
+    job = await queries.reserve_service_for_token(_service_job("x", token="tok-a"))
+    assert await queries.delete_service_checked(job.id) == []
+    assert await queries.get_secret_claim("x") is None
+    # No claim -- but the project outlives the row (P40b) and still refuses a stranger.
+    with pytest.raises(ProjectOwned):
+        await queries.reserve_service_for_token(_service_job("x", token="tok-b"))
+    await queries.reserve_service_for_token(_service_job("x", token="tok-a"))
+
+
+async def test_delete_secret_claim_reports_presence(queries):
+    await queries.mint_secret_claim("pre", "tok-a")
+    assert await queries.delete_secret_claim("pre") is True
+    assert await queries.delete_secret_claim("pre") is False
+    assert await queries.get_secret_claim("pre") is None
+
+
+# --- P40a project identity (D-P40-3 / D-P40-5) ---------------------------------
+
+
+async def _project_rows(queries) -> dict[str, tuple[str, str | None]]:
+    cursor = await queries._db.conn.execute("SELECT name, id, submitted_by_token FROM projects")
+    return {r[0]: (r[1], r[2]) for r in await cursor.fetchall()}
+
+
+async def test_create_job_stamps_the_legacy_triple_and_creates_the_project(queries):
+    """Both insert paths stamp: ``create_job`` (the fixture path) gives a fresh service
+    ``(name, production, web)`` and a ``projects`` row owned by its token.
+    """
+    job = await queries.create_job(_service_job("asso", token="tok-a"))
+    assert job.project_id is not None and job.project_id.startswith("prj_")
+    assert (job.environment, job.service) == ("production", "web")
+    projects = await _project_rows(queries)
+    assert projects == {"asso": (job.project_id, "tok-a")}
+    fetched = await queries.get_service_by_name("asso")
+    assert fetched is not None
+    assert (fetched.project_id, fetched.environment, fetched.service) == (
+        job.project_id,
+        "production",
+        "web",
+    )
+    assert fetched.project == "asso"  # the LEFT JOIN name (D-P40-7)
+    # Every _JOB_SELECT site carries it.
+    assert (await queries.get_job(job.id)).project == "asso"
+    assert [j.project for j in await queries.list_jobs()] == ["asso"]
+    assert [j.project for j in (await queries.list_services())[0]] == ["asso"]
+    assert [j.project for j in await queries.get_reconcilable_services()] == ["asso"]
+
+
+async def test_reserve_stamps_and_finds_an_existing_project(queries):
+    """``reserve_service_for_token`` stamps inside its BEGIN IMMEDIATE and adopts a
+    ``projects`` row that already carries the name (id stable, owner unchanged).
+    """
+    fresh = await queries.reserve_service_for_token(_service_job("fresh", token="tok-a"))
+    assert fresh.project_id is not None and fresh.project_id.startswith("prj_")
+    # `project` is filled on the in-memory row too (P40b): the create routes
+    # project the returned row straight back without a re-read.
+    assert (fresh.environment, fresh.service, fresh.project) == ("production", "web", "fresh")
+    # A pre-existing row (the P40b shape: a project that outlives its services),
+    # adopted by its owner's deploy.
+    await queries._db.conn.execute(
+        "INSERT INTO projects (id, name, submitted_by_token) VALUES (?, ?, ?)",
+        ("prj_aaaaaaaaaaaaaaaa", "asso", "tok-a"),
+    )
+    await queries._db.conn.commit()
+    second = await queries.reserve_service_for_token(_service_job("asso", token="tok-a"))
+    assert second.project_id == "prj_aaaaaaaaaaaaaaaa"
+    assert (await _project_rows(queries))["asso"] == ("prj_aaaaaaaaaaaaaaaa", "tok-a")
+    assert (await queries.get_project("prj_aaaaaaaaaaaaaaaa")).name == "asso"
+    assert (await queries.get_project_by_name("asso")).submitted_by_token == "tok-a"
+    assert [p.name for p in (await queries.page_projects())[0]] == ["asso", "fresh"]
+    assert await queries.get_project("prj_nope") is None
+
+
+async def test_model_and_database_rows_are_not_stamped(queries):
+    await queries.create_job(Job(name="llm", kind=JobKind.model, service_name="llm", gpu_count=0))
+    await queries.create_job(Job(name="pg", kind=JobKind.database, service_name="pg", gpu_count=0))
+    for name in ("llm", "pg"):
+        row = await queries.get_service_by_name(name)
+        assert (row.project_id, row.environment, row.service, row.project) == (
+            None,
+            None,
+            None,
+            None,
+        )
+    assert await _project_rows(queries) == {}
+
+
+async def test_duplicate_id_still_raises_the_bare_integrity_error(queries):
+    """The PK error names ``jobs.id`` -- neither ``service_name`` nor ``jobs.project_id``
+    (D-P40-3) -- and the fresh ``projects`` row rolls back with the failed INSERT.
+    """
+    import sqlite3
+
+    await queries.reserve_service_for_token(_service_job("a", id="dup000000001"))
+    with pytest.raises(sqlite3.IntegrityError) as exc:
+        await queries.reserve_service_for_token(_service_job("b", id="dup000000001"))
+    assert not isinstance(exc.value, ServiceNameTaken)
+    assert "jobs.id" in str(exc.value)
+    assert set(await _project_rows(queries)) == {"a"}  # no orphan "b"
+    with pytest.raises(sqlite3.IntegrityError):
+        await queries.create_job(_service_job("c", id="dup000000001"))
+    assert set(await _project_rows(queries)) == {"a"}  # the create_job path too
+
+
+async def test_triple_collision_raises_service_name_taken(queries):
+    """A row carrying another row's triple under a different label hits
+    ``idx_jobs_project_service`` alone -- still a name collision (D-P40-3).
+    """
+    first = await queries.reserve_service_for_token(_service_job("a"))
+    with pytest.raises(ServiceNameTaken):
+        # admin: (P40d) a preset project_id is judged, and a tokenless project is
+        # NULL-owned, foreign to every non-admin; this test is about the index.
+        await queries.reserve_service_for_token(
+            _service_job("b", project_id=first.project_id, environment="production", service="web"),
+            admin=True,
+        )
+    assert await queries.get_service_by_name("b") is None
+
+
+async def test_service_name_taken_after_the_projects_insert_rolls_it_back(queries):
+    """A fresh ``projects`` row minted for a label that then collides is rolled back
+    with the transaction -- no orphan project outlives a refused insert.
+    """
+    first = await queries.reserve_service_for_token(_service_job("a"))
+    # A row labelled "b" whose project is "a": no project named "b" exists yet.
+    await queries.reserve_service_for_token(
+        _service_job("b", project_id=first.project_id, environment="production", service="api"),
+        admin=True,  # (P40d) preset project_id is judged; the tokenless project is NULL-owned
+    )
+    assert set(await _project_rows(queries)) == {"a"}
+    with pytest.raises(ServiceNameTaken):
+        await queries.reserve_service_for_token(_service_job("b"))
+    assert set(await _project_rows(queries)) == {"a"}
+
+
+async def test_delete_of_the_last_service_no_longer_prunes_the_project(queries):
+    """(P40b) The P40a prune is gone: the project outlives its services and keeps
+    the name for its owner; `delete_project_checked` releases it."""
+    job = await queries.reserve_service_for_token(_service_job("asso", token="tok-a"))
+    assert await queries.delete_service_checked(job.id) == []
+    assert await _project_rows(queries) == {"asso": (job.project_id, "tok-a")}
+    with pytest.raises(ProjectOwned):
+        await queries.reserve_service_for_token(_service_job("asso", token="tok-b"))
+    again = await queries.reserve_service_for_token(_service_job("asso", token="tok-a"))
+    assert again.project_id == job.project_id  # adopted, id stable
+
+
+async def test_delete_of_a_model_does_not_touch_projects(queries):
+    await queries.reserve_service_for_token(_service_job("asso", token="tok-a"))
+    model = await queries.create_job(
+        Job(name="llm", kind=JobKind.model, service_name="llm", gpu_count=0)
+    )
+    assert await queries.delete_service_checked(model.id) == []
+    assert set(await _project_rows(queries)) == {"asso"}
+
+
+async def test_delete_without_secrets_purge_re_mints_the_claim_and_keeps_the_project(queries):
+    """The D-P39-6 re-mint is untouched by P40b; the project stays beside the claim."""
+    job = await queries.reserve_service_for_token(_service_job("asso", token="tok-a"))
+    seen: list[bool] = []
+    assert await queries.delete_service_checked(job.id, on_secrets_reclaimed=seen.append) == []
+    assert seen == [True]
+    claim = await queries.get_secret_claim("asso")
+    assert claim is not None and claim.token_id == "tok-a"
+    assert await _project_rows(queries) == {"asso": (job.project_id, "tok-a")}
+    # The claim is judged first (D-P40-5 ordering), then the project.
+    with pytest.raises(ServiceNameClaimed):
+        await queries.reserve_service_for_token(_service_job("asso", token="tok-b"))
+    again = await queries.reserve_service_for_token(_service_job("asso", token="tok-a"))
+    assert again.project_id == job.project_id
+    assert await queries.get_secret_claim("asso") is None
 
 
 # --- port allocator -----------------------------------------------------------

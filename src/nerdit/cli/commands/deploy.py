@@ -345,6 +345,25 @@ async def _deploy_async(
         console.print(f"[red]Not a directory:[/red] {directory}")
         raise typer.Exit(1)
 
+    # (P40d) A folder whose nerdit.toml declares [project]/[services] is applied,
+    # not deployed: the legacy ingress would refuse it (422 `deploy.use_apply`).
+    from nerdit.cli.commands.apply import _apply_async, read_declaration
+
+    # `--rollback --name <label>` passes through: it is an image swap of one
+    # service and never reads the folder.
+    if read_declaration(directory) is not None and not (rollback and name):
+        legacy_flags = (name, port, gpus, start, health, vendor, build_settings)
+        if rollback or env or unset_env or any(flag is not None for flag in legacy_flags):
+            console.print(
+                "[red]This folder is a project declaration:[/red] per-service settings live "
+                "in its [services.<name>] tables. Run `nerdit apply`, or roll one service "
+                "back with `nerdit deploy --rollback --name <project>/<service>`."
+            )
+            raise typer.Exit(1)
+        console.print("[dim]nerdit.toml declares a project: running `nerdit apply`.[/dim]")
+        await _apply_async(path, dry_run=dry_run, wait=wait, wait_timeout=wait_timeout)
+        return
+
     # Locate nerdit.toml from the app directory, then read [deploy].
     config_path = find_project_config(directory)
     try:

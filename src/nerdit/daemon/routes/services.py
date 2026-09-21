@@ -31,6 +31,11 @@ from nerdit.daemon.routes.service_logs_stream import router as logs_stream_route
 from nerdit.daemon.routes.service_run import router as run_router
 from nerdit.daemon.routes.service_stats import router as stats_router
 from nerdit.daemon.routes.service_wait import router as wait_router
+from nerdit.daemon.secret_scope import (
+    name_claimed_error,
+    project_owned_error,
+    reject_foreign_claim,
+)
 from nerdit.daemon.service_purge import router as purge_router
 from nerdit.daemon.views.hosted import load_hosted_context
 from nerdit.daemon.views.service import (
@@ -49,7 +54,7 @@ from nerdit.db.models import (
     ServiceResponse,
     TokenRole,
 )
-from nerdit.db.queries import ServiceNameTaken
+from nerdit.db.queries import ProjectOwned, ServiceNameClaimed, ServiceNameTaken
 from nerdit.utils.disk import du_bytes, spawn_walk
 
 logger = logging.getLogger(__name__)
@@ -143,6 +148,9 @@ async def create_service(request: Request, body: ServiceCreateRequest) -> Servic
     # check runs before the image probe and long before the row write.
     require_service_scope(request, body.name)
     queries = request.app.state.queries
+    # Fast path for a name another token reserved by setting its secrets
+    # (P39); `reserve_service_for_token` re-checks inside its transaction.
+    await reject_foreign_claim(request, body.name)
 
     # SANDBOX-1: script_path bind-mounts a host directory; a non-admin token has
     # no daemon-managed upload path for it in P2 (services are register-only over
@@ -182,7 +190,7 @@ async def create_service(request: Request, body: ServiceCreateRequest) -> Servic
     )
 
     try:
-        job = await queries.reserve_service_for_token(job)
+        job = await queries.reserve_service_for_token(job, admin=principal.role is TokenRole.admin)
     except ServiceNameTaken as exc:
         raise NerditError(
             409,
@@ -190,6 +198,10 @@ async def create_service(request: Request, body: ServiceCreateRequest) -> Servic
             f"A service named '{body.name}' already exists.",
             hint="Choose a different name, or delete the existing service first.",
         ) from exc
+    except ServiceNameClaimed as exc:
+        raise name_claimed_error(body.name) from exc
+    except ProjectOwned as exc:
+        raise project_owned_error(body.name) from exc
     except QuotaExceeded as exc:
         raise exc.to_error() from exc
 

@@ -40,6 +40,7 @@ from nerdit.daemon.schemas.workspaces import (
     WorkspaceWriteRequest,
     WorkspaceWriteResponse,
 )
+from nerdit.daemon.secret_scope import judge_project
 from nerdit.daemon.uploads import extract_upload
 from nerdit.db.models import Job, TokenRole
 from nerdit.utils.ids import generate_id
@@ -128,6 +129,49 @@ def _check_row_owner(
         )
 
 
+async def snapshot_own_workspace(request: Request, name: str) -> bytes:
+    """The caller's OWN workspace zipped under its lock: the `apply_project` source.
+
+    One lock covers the owner decision and the snapshot, so the archive is a
+    tree that existed (the `deploy_workspace` contract). The caller has already
+    judged scope on `name`.
+    """
+    try:
+        core_workspaces.validate_workspace_name(name)
+    except WorkspaceError as exc:
+        raise _to_nerdit(exc) from exc
+    lock = core_workspaces.workspace_lock(name)
+    if lock.locked():
+        raise _lock_busy(name)
+    async with lock:
+        try:
+            meta = core_workspaces.read_meta(_data_dir(request), name)
+        except WorkspaceError as exc:
+            raise _to_nerdit(exc) from exc
+        if meta is None:
+            raise _not_found(name)
+        principal = _require_workspace_owner(request, name, meta)
+        # ponytail: an apply creates the project and its rows for the CALLER, so
+        # an admin applying somebody else's workspace would own what it builds
+        # (or plant their code in a project of its own choosing). Refused; the
+        # upgrade is `owner_token_id` plumbing through project creation and
+        # `_finalize_deploy`, judged as the sidecar owner like `_write_fresh`.
+        # `None == None` is the tokenless local install (every sidecar there has
+        # a NULL owner): do not harden it with an `is not None` guard.
+        if meta.get("owner_token_id") != principal.token_id:
+            raise NerditError(
+                403,
+                "forbidden",
+                f"Only the token that owns workspace '{name}' may apply it.",
+                hint="Apply it with the owner's token, or download it and apply it as an archive.",
+            )
+        try:
+            tree = core_workspaces.tree_root(_data_dir(request), name)
+            return await core_workspaces.settled_to_thread(core_workspaces.zip_workspace, tree)
+        except WorkspaceError as exc:
+            raise _to_nerdit(exc) from exc
+
+
 @router.put("/workspaces/{name}/files", status_code=200, operation_id="write_workspace_files")
 async def write_workspace_files(
     request: Request, name: str, body: WorkspaceWriteRequest
@@ -185,6 +229,11 @@ async def write_workspace_files(
             principal = current_principal(request)
             if existing is not None:
                 require_owner_or_admin(request, existing)
+            else:
+                # (D-P40-5) A rowless name may still be someone's project (they
+                # set variables first, or removed the last service): claiming
+                # its workspace would only produce a tree nobody may deploy.
+                await judge_project(request, name)
         try:
             # `settled_to_thread`, never a bare `to_thread`: a client
             # disconnect (or the shutdown cancel) must not free the lock with

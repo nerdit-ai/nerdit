@@ -31,10 +31,11 @@ set -eu
 # --- knobs (defaults keep clear of a real daemon on 9321/443) ---------------
 PORT=${NERDIT_SMOKE_PORT:-9333}
 HTTPS_PORT=${NERDIT_SMOKE_HTTPS_PORT:-9443}
+ADMIN_PORT=${NERDIT_SMOKE_ADMIN_PORT:-19333}
 APP=${NERDIT_SMOKE_APP:-smoke-app}
 TEMPLATE=node-starter
-INSTANCE=nerdit-smoke
-HOSTNAME_OVERRIDE=localhost
+INSTANCE=nerdit-smoke-$$
+HOSTNAME_OVERRIDE=nerdit-smoke-$$.local
 BOOT_TIMEOUT=${NERDIT_SMOKE_BOOT_TIMEOUT:-60}
 DEPLOY_BUDGET=${NERDIT_SMOKE_DEPLOY_BUDGET:-900}
 API="http://127.0.0.1:$PORT"
@@ -167,8 +168,7 @@ pass 1
 SMOKE_HOME=$(mktemp -d "${TMPDIR:-/tmp}/nerdit-smoke-home.XXXXXX") || fail 2 "mktemp failed"
 mkdir -p "$SMOKE_HOME/.nerdit"
 
-# The proxy is opt-in in the product and stays that way on a real install; the
-# smoke turns it on explicitly because legs 5/6 serve through it. `caddy_binary`
+# Explicit settings keep the smoke independent of product defaults. `caddy_binary`
 # points at the BUNDLED binary (D-P30-5) so this leg proves the bundle, not
 # whatever caddy happens to sit on PATH. `instance_id` scopes container
 # ownership so the smoke's sweeps never touch another daemon's containers.
@@ -188,10 +188,16 @@ http_enabled = true
 
 [proxy]
 enabled = true
+mdns = true
 https_port = $HTTPS_PORT
+admin_addr = "127.0.0.1:$ADMIN_PORT"
 hostname_override = "$HOSTNAME_OVERRIDE"
 caddy_binary = "$BUNDLE/caddy"
 EOF
+
+if curl -fsS -m 3 "http://127.0.0.1:$ADMIN_PORT/config/" >/dev/null 2>&1; then
+    fail 2 "Caddy already listens on $ADMIN_PORT — pick another NERDIT_SMOKE_ADMIN_PORT"
+fi
 
 if curl -fsk -m 3 "$API/health" >/dev/null 2>&1; then
     fail 2 "something already listens on $API — pick another NERDIT_SMOKE_PORT"
@@ -264,6 +270,12 @@ case "$DOCTOR_JSON" in
     *'"name":"proxy","status":"ok"'*) ;;
     *) fail 3 "the bundled caddy did not come up: $DOCTOR_JSON" ;;
 esac
+# A successful registration exercises the bundled zeroconf extension modules;
+# version output alone cannot detect a missing or incomplete mDNS dependency.
+case "$DOCTOR_JSON" in
+    *'"name":"mdns","status":"ok"'*) ;;
+    *) fail 3 "the frozen daemon did not register mDNS: $DOCTOR_JSON" ;;
+esac
 # `$SMOKE_HOME` is mktemp'd for this run and leg 4 is the first thing that could
 # store a secret, so this data dir has no key file and no ciphertext: the row
 # must be exactly `skipped`. Asserted positively, not merely "not fail", so it
@@ -321,10 +333,12 @@ grep -q 'BEGIN CERTIFICATE' "$CA_PEM" || fail 5 "/proxy/ca did not return a PEM 
 
 # Caddy provisions the leaf on first use; give it a few seconds rather than
 # racing it. --cacert (never -k): trusting the CA is the point of the leg.
+# Connect directly to loopback while retaining the advertised TLS hostname;
+# platform DNS caches must not decide whether the packaging smoke passes.
 CODE=
 _i=0
 while [ "$_i" -lt 30 ]; do
-    CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 15 --cacert "$CA_PEM" "$PUBLIC_URL" || printf '000')
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 15 --cacert "$CA_PEM" --connect-to "::127.0.0.1:" "$PUBLIC_URL" || printf '000')
     [ "$CODE" = 200 ] && break
     _i=$((_i + 1))
     sleep 2
@@ -369,7 +383,7 @@ STATUS=$(api "/api/services/$APP" | json_str status)
 CODE=
 _i=0
 while [ "$_i" -lt 30 ]; do
-    CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 15 --cacert "$CA_PEM" "$PUBLIC_URL" || printf '000')
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 15 --cacert "$CA_PEM" --connect-to "::127.0.0.1:" "$PUBLIC_URL" || printf '000')
     [ "$CODE" = 200 ] && break
     _i=$((_i + 1))
     sleep 2

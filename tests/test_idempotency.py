@@ -636,6 +636,17 @@ async def test_dry_run_key_is_not_claimed_and_does_not_poison_real_request(dry_r
         await db.close()
 
 
+def test_a_dry_run_apply_bypasses_the_key_and_a_multipart_apply_is_never_hashed():
+    """(P40d) `apply_project` declares `dry_run`, so its key must not be burnt by a plan;
+    its body is multipart, so it gets the `deploy.create` treatment (no hash, no
+    `NO_BODY_HASH_ACTIONS` entry -- `token_ref` is a reference name)."""
+    from nerdit.daemon.idempotency import NO_BODY_HASH_ACTIONS, _honors_dry_run
+
+    assert _honors_dry_run("POST", "/api/projects/asso/apply")
+    assert not _honors_dry_run("POST", "/api/projects/asso/variables")
+    assert "project.apply" not in NO_BODY_HASH_ACTIONS
+
+
 @pytest.mark.asyncio
 async def test_dry_run_on_non_dry_run_route_still_claims_key():
     """``?dry_run=true`` on a route that does NOT declare a ``dry_run`` arg (e.g.
@@ -1307,6 +1318,21 @@ def test_no_body_hash_actions_match_the_real_routes():
     assert derive_action("POST", "/services/demo/run")[0] == "service.run"
     assert derive_action("POST", "/link/claim")[0] == "link.created"
     assert derive_action("POST", "/api/license")[0] == "license.install"
+    # (P40b) Both project mutations are mapped (so their bodies ARE digested —
+    # they carry names only) and deliberately NOT exempt.
+    assert derive_action("POST", "/api/projects")[0] == "project.create"
+    assert derive_action("DELETE", "/api/projects/asso") == ("project.delete", "project", "asso")
+    assert "project.create" not in NO_BODY_HASH_ACTIONS
+    # (P40c / D-P40-10) The variable set body is a value map — exempt like
+    # `secret.set`, under both mounts; the unset carries a key name only.
+    assert derive_action("PUT", "/projects/asso/variables") == ("variable.set", "project", "asso")
+    assert derive_action("PUT", "/api/projects/asso/variables")[0] == "variable.set"
+    assert derive_action("DELETE", "/api/projects/asso/variables/KEY") == (
+        "variable.unset",
+        "project",
+        "asso",
+    )
+    assert "variable.unset" not in NO_BODY_HASH_ACTIONS
     assert sorted(NO_BODY_HASH_ACTIONS) == [
         "license.install",
         "link.created",
@@ -1314,6 +1340,7 @@ def test_no_body_hash_actions_match_the_real_routes():
         "service.create",
         "service.run",
         "template.deploy",
+        "variable.set",
     ]
     # rotate-key carries no secret VALUE (its literal rule sits above the
     # generic one), so it is deliberately NOT exempt.

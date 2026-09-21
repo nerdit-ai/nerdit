@@ -52,10 +52,11 @@ from nerdit.db.models import (
     Job,
     JobKind,
     JobStatus,
+    SecretClaim,
     ServiceEndpoint,
     TokenRole,
 )
-from nerdit.db.queries import ServiceNameTaken
+from nerdit.db.queries import ServiceNameClaimed, ServiceNameTaken
 
 LEGACY = "legacy-global"
 
@@ -106,6 +107,7 @@ def _queries(service: Job | None = None) -> AsyncMock:
     # Read/resolve
     q.get_job = AsyncMock(return_value=service)
     q.get_service_by_name = AsyncMock(return_value=None)
+    q.name_retaken = AsyncMock(return_value=False)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
     # (P26 D-P26-14) The ONE batched hosted-share read every service
@@ -113,7 +115,11 @@ def _queries(service: Job | None = None) -> AsyncMock:
     # ``default`` entry (or nothing) exactly as it did pre-P26.
     q.list_service_shares = AsyncMock(return_value={})
     # Writes
-    q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
+    q.reserve_service_for_token = AsyncMock(side_effect=lambda job, **kw: job)
+    q.get_secret_claim = AsyncMock(return_value=None)
+    # (P40b) No `projects` row unless a test plants one: a bare AsyncMock would
+    # return a truthy MagicMock and read as a foreign project.
+    q.get_project_by_name = AsyncMock(return_value=None)
     q.set_desired_state = AsyncMock()
     q.bump_restart_count = AsyncMock()
     q.release_gpus = AsyncMock()
@@ -3169,3 +3175,34 @@ def test_manageable_has_no_default_so_a_future_call_site_cannot_omit_it():
             gpu_count=0,
             created_at=datetime(2026, 1, 1, tzinfo=UTC),
         )
+
+
+# --- P39: a name claimed by setting its secrets first -------------------------
+
+
+def test_create_over_a_foreign_claim_409_before_reserve():
+    q = _queries()
+    q.get_secret_claim = AsyncMock(return_value=SecretClaim(service_name="demo", token_id="tok-x"))
+    resp = _client(q).post("/services", json=_body(), headers=_auth(SUB_RAW))
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "service.name_claimed"
+    assert "tok-x" not in resp.text
+    q.reserve_service_for_token.assert_not_awaited()
+
+
+def test_create_passes_admin_flag_to_the_reserve():
+    q = _queries()
+    q.get_secret_claim = AsyncMock(return_value=SecretClaim(service_name="demo", token_id="tok-x"))
+    assert _client(q).post("/services", json=_body(), headers=_auth(ADMIN_RAW)).status_code == 201
+    assert q.reserve_service_for_token.await_args.kwargs == {"admin": True}
+    q = _queries()
+    assert _client(q).post("/services", json=_body(), headers=_auth(SUB_RAW)).status_code == 201
+    assert q.reserve_service_for_token.await_args.kwargs == {"admin": False}
+
+
+def test_create_claim_raced_into_the_transaction_returns_409():
+    q = _queries()
+    q.reserve_service_for_token = AsyncMock(side_effect=ServiceNameClaimed("demo"))
+    resp = _client(q).post("/services", json=_body(), headers=_auth(SUB_RAW))
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "service.name_claimed"

@@ -17,7 +17,7 @@ from nerdit.db.models import (
     JobStatus,
 )
 
-from ._base import QueriesBase, _decode_cursor, _encode_cursor, _serialized
+from ._base import _JOB_SELECT, QueriesBase, _decode_cursor, _encode_cursor, _serialized
 
 
 def _parse_config_blob(raw: str | None) -> dict:
@@ -54,7 +54,7 @@ class ServiceQueries(QueriesBase):
         `stopped` service to run again, or a running one to stop).
         """
         cursor = await self._db.conn.execute(
-            f"SELECT * FROM jobs WHERE {MANAGED_KINDS_SQL} "
+            f"{_JOB_SELECT} WHERE {MANAGED_KINDS_SQL} "
             "AND (status NOT IN ('completed', 'cancelled', 'stopped', 'failed') "
             "OR desired_state != status)"
         )
@@ -72,7 +72,8 @@ class ServiceQueries(QueriesBase):
         cursor = await self._db.conn.execute(
             "SELECT j.service_name AS service_name, "
             "COALESCE(e.active_host_port, e.host_port) AS host_port, "
-            "j.status AS status, e.route AS route, j.config AS config FROM jobs j "
+            "j.status AS status, e.route AS route, j.config AS config, "
+            "j.project_id AS project_id FROM jobs j "
             "JOIN service_endpoints e ON e.service_name = j.service_name "
             "WHERE j.kind = 'service' "
             "AND j.status IN ('running', 'degraded', 'restarting')"
@@ -84,6 +85,7 @@ class ServiceQueries(QueriesBase):
                 host_port=r["host_port"],
                 status=r["status"],
                 route=r["route"],
+                project_id=r["project_id"],
                 edge_auth=_row_edge_auth(r["service_name"], r["config"]),
             )
             for r in rows
@@ -104,7 +106,7 @@ class ServiceQueries(QueriesBase):
     async def get_service_by_name(self, service_name: str) -> Job | None:
         """Fetch the single service row owning `service_name`, or `None`."""
         cursor = await self._db.conn.execute(
-            "SELECT * FROM jobs WHERE service_name = ?", (service_name,)
+            f"{_JOB_SELECT} WHERE service_name = ?", (service_name,)
         )
         row = await cursor.fetchone()
         if row is None:
@@ -124,7 +126,7 @@ class ServiceQueries(QueriesBase):
             JobStatus.failed,
         }
         cursor_obj = await self._db.conn.execute(
-            "SELECT * FROM jobs WHERE kind = ? ORDER BY created_at DESC, id DESC",
+            f"{_JOB_SELECT} WHERE kind = ? ORDER BY jobs.created_at DESC, jobs.id DESC",
             (kind.value,),
         )
         rows = await cursor_obj.fetchall()
@@ -207,10 +209,10 @@ class ServiceQueries(QueriesBase):
             params.append(status.value)
         if cursor:
             cursor_ts, cursor_id = _decode_cursor(cursor)
-            clauses.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            clauses.append("(jobs.created_at < ? OR (jobs.created_at = ? AND jobs.id < ?))")
             params.extend([cursor_ts.isoformat(), cursor_ts.isoformat(), cursor_id])
         where = " WHERE " + " AND ".join(clauses)
-        sql = f"SELECT * FROM jobs{where} ORDER BY created_at DESC, id DESC LIMIT ?"
+        sql = f"{_JOB_SELECT}{where} ORDER BY jobs.created_at DESC, jobs.id DESC LIMIT ?"
         params.append(limit + 1)
         cursor_obj = await self._db.conn.execute(sql, params)
         rows = list(await cursor_obj.fetchall())
@@ -285,6 +287,7 @@ class ServiceQueries(QueriesBase):
         *,
         on_share_removed: Callable[[bool], None] | None = None,
         on_domains_removed: Callable[[list[str]], None] | None = None,
+        on_secrets_reclaimed: Callable[[bool], None] | None = None,
     ) -> list[dict[str, str | None]] | None:
         """Atomically check dependents and delete a managed service, model or database.
 
@@ -299,6 +302,11 @@ class ServiceQueries(QueriesBase):
                 was deleted, determined inside the transaction for accurate events.
             on_domains_removed: Called once after successful commit with sorted removed
                 domain names, including domains added before this transaction acquired its lock.
+            on_secrets_reclaimed: When given, re-mint the name's secret claim for the
+                row's owner in this transaction (D-P39-6) and report after commit
+                whether it was minted. Inside the transaction because a stranger's
+                fresh row landing between the commit and a later mint would launch
+                with the kept secret file.
 
         Returns:
             None if absent (no name-keyed purge is authorized), an empty list after
@@ -308,10 +316,12 @@ class ServiceQueries(QueriesBase):
         await self._db.conn.execute("BEGIN IMMEDIATE")
         try:
             cursor = await self._db.conn.execute(
-                f"SELECT 1 FROM jobs WHERE id = ? AND {MANAGED_KINDS_SQL}",
+                f"SELECT service_name, submitted_by_token FROM jobs "
+                f"WHERE id = ? AND {MANAGED_KINDS_SQL}",
                 (job_id,),
             )
-            if await cursor.fetchone() is None:
+            target = await cursor.fetchone()
+            if target is None:
                 await self._db.conn.execute("ROLLBACK")
                 return None
             if find_dependents is not None:
@@ -366,11 +376,24 @@ class ServiceQueries(QueriesBase):
                 (job_id,),
             )
             await self._db.conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+            secrets_reclaimed = False
+            if on_secrets_reclaimed is not None and target["service_name"] is not None:
+                claim_cursor = await self._db.conn.execute(
+                    "INSERT OR IGNORE INTO secret_claims (service_name, token_id) VALUES (?, ?)",
+                    (target["service_name"], target["submitted_by_token"]),
+                )
+                secrets_reclaimed = (claim_cursor.rowcount or 0) > 0
+            # (P40b / D-P40-5) No project prune here any more: a project outlives
+            # its services and keeps reserving its name for the owner token
+            # (the D-P39-6 posture one scope up); `delete_project_checked`
+            # releases it on request.
             await self._db.conn.commit()
             if on_share_removed is not None:
                 on_share_removed(share_removed)
             if on_domains_removed is not None:
                 on_domains_removed(removed_domains)
+            if on_secrets_reclaimed is not None:
+                on_secrets_reclaimed(secrets_reclaimed)
             return []
         except BaseException:
             with contextlib.suppress(Exception):

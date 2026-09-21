@@ -19,6 +19,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
@@ -660,16 +661,20 @@ def _svc(owner="tok-admin", **over) -> Job:
 
 def _queries(job, *, workloads):  # noqa: ANN001
     q = AsyncMock()
+    # A bare AsyncMock would read as a foreign project on a first workspace write.
+    q.get_project_by_name = AsyncMock(return_value=None)
     q.get_api_token_by_hash = AsyncMock(side_effect=lambda h: _TOKENS.get(h))
     q.touch_api_token = AsyncMock()
     q.insert_audit_log = AsyncMock()
     q.get_job = AsyncMock(return_value=job)
     q.get_service_by_name = AsyncMock(return_value=None)
+    q.name_retaken = AsyncMock(return_value=False)
     q.set_desired_state = AsyncMock()
     q.release_gpus = AsyncMock()
     q.release_service_endpoint = AsyncMock()
     q.delete_service_checked = AsyncMock(return_value=[])
     q.list_workload_configs = AsyncMock(return_value=list(workloads))
+    q.mint_secret_claim = AsyncMock(return_value=True)
     return q
 
 
@@ -1476,3 +1481,245 @@ async def test_cancelled_delete_still_runs_the_post_commit_purge(tmp_path):
     assert not (tmp_path / "workspaces" / "a").exists()
     assert not core_workspaces.workspace_lock("a").locked()
     core_workspaces._WORKSPACE_LOCKS.clear()
+
+
+# --- P39 D-P39-6: a delete that keeps the secrets re-mints the claim ------------
+
+
+def _reclaim_seam(q) -> object:  # noqa: ANN001
+    return q.delete_service_checked.await_args.kwargs["on_secrets_reclaimed"]
+
+
+def test_delete_keeping_secrets_reclaims_the_name_for_the_owner(tmp_path):
+    """The surviving file stays reachable by its owner and unclaimable by others:
+    the claim is minted inside the delete transaction, never after the commit."""
+    q = _queries(_svc(owner="tok-sub"), workloads=[])
+
+    async def _delete(job_id, checker, *, on_secrets_reclaimed, **_kw):  # noqa: ANN001, ANN202
+        on_secrets_reclaimed(True)
+        return []
+
+    q.delete_service_checked = AsyncMock(side_effect=_delete)
+    app = _app(runtime=FakeRuntime([]), queries=q, data_dir=tmp_path)
+    app.state.secret_manager.exists = MagicMock(return_value=True)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    resp = client.delete("/services/svc-a?purge=images", headers=_auth())
+    assert resp.status_code == 200, resp.text
+    assert _reclaim_seam(q) is not None
+    q.mint_secret_claim.assert_not_awaited()  # no post-commit mint
+    app.state.secret_manager.delete.assert_not_called()
+    assert _purge_audit_params(q, "service.delete")["secrets_reclaimed"] is True
+
+
+def _reclaiming_delete(q) -> None:  # noqa: ANN001
+    async def _delete(job_id, checker, *, on_secrets_reclaimed, **_kw):  # noqa: ANN001, ANN202
+        on_secrets_reclaimed(True)
+        return []
+
+    q.delete_service_checked = AsyncMock(side_effect=_delete)
+
+
+def test_delete_purging_secrets_releases_the_claim_once_the_file_is_gone(tmp_path):
+    """The claim is minted in the transaction regardless, and dropped only after
+    the best-effort purge confirms the file is gone (security review 2026-09-17)."""
+    q = _queries(_svc(owner="tok-sub"), workloads=[])
+    _reclaiming_delete(q)
+    app = _app(runtime=FakeRuntime([]), queries=q, data_dir=tmp_path)
+    app.state.secret_manager.exists = MagicMock(return_value=True)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    resp = client.delete("/services/svc-a", headers=_auth())  # default: secrets
+    assert resp.status_code == 200, resp.text
+    assert _reclaim_seam(q) is not None
+    app.state.secret_manager.delete.assert_called()
+    q.delete_secret_claim.assert_awaited_once_with("a")
+    assert "secrets_reclaimed" not in _purge_audit_params(q, "service.delete")
+
+
+def test_failed_secrets_purge_keeps_the_claim_for_the_owner(tmp_path):
+    """A leftover the purge could not remove must stay the owner's, never a
+    stranger's fresh deploy's."""
+    q = _queries(_svc(owner="tok-sub"), workloads=[])
+    _reclaiming_delete(q)
+    app = _app(runtime=FakeRuntime([]), queries=q, data_dir=tmp_path)
+    app.state.secret_manager.exists = MagicMock(return_value=True)
+    app.state.secret_manager.delete = MagicMock(side_effect=OSError("disk"))
+    client = TestClient(app, raise_server_exceptions=False)
+
+    resp = client.delete("/services/svc-a", headers=_auth())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["purged"]["secrets"] is False
+    q.delete_secret_claim.assert_not_awaited()
+
+
+def test_delete_keeping_secrets_with_no_file_mints_nothing(tmp_path):
+    """No file, nothing to protect: the name must not be blocked for others."""
+    q = _queries(_svc(owner="tok-sub"), workloads=[])
+    app = _app(runtime=FakeRuntime([]), queries=q, data_dir=tmp_path)
+    app.state.secret_manager.exists = MagicMock(return_value=False)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    assert client.delete("/services/svc-a?purge=images", headers=_auth()).status_code == 200
+    assert _reclaim_seam(q) is None
+    assert "secrets_reclaimed" not in _purge_audit_params(q, "service.delete")
+
+
+def test_reclaim_probe_failure_keeps_the_name_reserved(tmp_path):
+    q = _queries(_svc(owner="tok-sub"), workloads=[])
+    _reclaiming_delete(q)
+    app = _app(runtime=FakeRuntime([]), queries=q, data_dir=tmp_path)
+    app.state.secret_manager.exists = MagicMock(side_effect=OSError("probe"))
+    client = TestClient(app, raise_server_exceptions=False)
+
+    resp = client.delete("/services/svc-a?purge=images", headers=_auth())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deleted"] is True
+    assert _reclaim_seam(q) is not None
+    assert _purge_audit_params(q, "service.delete")["secrets_reclaimed"] is True
+
+
+def test_secrets_purge_spares_a_name_retaken_during_the_delete_tail(tmp_path):
+    # The row went before the tail: a claim this delete did not mint means a
+    # stranger set secrets on the freed name, and their file is not ours to purge.
+    q = _queries(_db_svc(), workloads=[])
+    q.name_retaken = AsyncMock(return_value=True)
+    runtime = FakeRuntime([])
+    app = _app(runtime=runtime, queries=q, data_dir=tmp_path)
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.delete("/services/db-a?purge=data", headers=_auth())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["purged"]["secrets"] is False
+    # A skip is audited like any purge step, with its reason.
+    rows = [
+        c
+        for c in q.insert_audit_log.await_args_list
+        if c.kwargs.get("action") == "service.purge_secrets"
+    ]
+    assert len(rows) == 1
+    assert json.loads(rows[0].kwargs["params_redacted"]) == {
+        "key": "services/pg",
+        "purged": False,
+        "reason": "name_retaken",
+    }
+
+
+async def test_a_stale_purge_tail_spares_a_claim_that_changed_hands(tmp_path):
+    # The delete minted a claim for A, but that is history: during the tail's
+    # proxy await A releases the name and B claims it. The purge must judge the
+    # CURRENT claim, not remember the mint. Real SQLite and SecretManager.
+    from fastapi import Request
+
+    from nerdit.core.secrets import SecretManager
+    from nerdit.daemon.auth import Principal
+    from nerdit.daemon.routes.secrets import delete_all_secrets
+    from nerdit.daemon.secret_scope import set_secret_values
+    from nerdit.db.database import Database
+    from nerdit.db.queries import Queries
+
+    db = Database(":memory:")
+    await db.connect()
+    await db.init_schema()
+    queries = Queries(db)
+    try:
+        app = _app(runtime=FakeRuntime([]), queries=queries, data_dir=tmp_path)
+        app.state.secret_manager = SecretManager(tmp_path)
+        callers = {}
+        for tid in ("a", "b"):
+            await queries.create_api_token(
+                ApiToken(id=tid, name=tid, role=TokenRole.submitter, token_hash=hash_token(tid))
+            )
+            callers[tid] = Request({"type": "http", "app": app, "headers": []})
+            callers[tid].state.principal = Principal(
+                token_id=tid, name=tid, role=TokenRole.submitter
+            )
+        a, b = callers["a"], callers["b"]
+        job = _svc(owner="a", kind=JobKind.model, config='{"model": "synthetic"}')
+        await queries.create_job(job)
+        await set_secret_values(a, "a", {"OLD": "a-value"})
+
+        async def proxy_gap(name):
+            await delete_all_secrets(a, name)
+            await set_secret_values(b, name, {"NEW": "b-value"})
+
+        app.state.proxy_manager = SimpleNamespace(deregister=proxy_gap)
+        result = await services_mod.delete_service(a, job.id, purge="secrets", force=False)
+
+        assert result.purged.secrets is False
+        assert (await queries.get_secret_claim("a")).token_id == "b"
+        assert app.state.secret_manager.load("a") == {"NEW": "b-value"}
+    finally:
+        await db.close()
+
+
+async def test_first_secret_write_racing_delete_keeps_its_owners_claim(tmp_path, monkeypatch):
+    from fastapi import Request
+
+    from nerdit.core.secrets import SecretManager
+    from nerdit.daemon import secret_scope
+    from nerdit.daemon.auth import Principal
+    from nerdit.db.database import Database
+    from nerdit.db.queries import Queries, ServiceNameClaimed
+
+    authorized, finish_write, delete_waiting = (asyncio.Event() for _ in range(3))
+
+    class ObservedLock(asyncio.Lock):
+        async def acquire(self):
+            if self.locked():
+                delete_waiting.set()
+            return await super().acquire()
+
+    original = secret_scope.demote_flags
+
+    async def parked_write(*args):
+        authorized.set()
+        await finish_write.wait()
+        await original(*args)
+
+    monkeypatch.setattr(secret_scope, "demote_flags", parked_write)
+    db = Database(":memory:")
+    await db.connect()
+    await db.init_schema()
+    tasks = []
+    try:
+        queries = Queries(db)
+        app = _app(runtime=FakeRuntime([]), queries=queries, data_dir=tmp_path)
+        app.state.secret_manager = SecretManager(tmp_path)
+        app.state.variable_write_lock = ObservedLock()
+        for tid in ("a", "b"):
+            await queries.create_api_token(
+                ApiToken(id=tid, name=tid, role=TokenRole.submitter, token_hash=hash_token(tid))
+            )
+        request = Request({"type": "http", "app": app, "headers": []})
+        request.state.principal = Principal(token_id="a", name="a", role=TokenRole.submitter)
+        job = _svc(owner="a", service_name="api--example")
+        await queries.create_job(job)
+        writer = asyncio.create_task(
+            secret_scope.set_secret_values(request, job.service_name, {"PRIVATE": "synthetic"})
+        )
+        tasks.append(writer)
+        await asyncio.wait_for(authorized.wait(), 2)
+        deleter = asyncio.create_task(
+            services_mod.delete_service(request, job.id, purge="", force=False)
+        )
+        waiting = asyncio.create_task(delete_waiting.wait())
+        tasks.extend((deleter, waiting))
+        # Fixed code waits on the writer; old code completes deletion first.
+        done, _ = await asyncio.wait(
+            (deleter, waiting), timeout=2, return_when=asyncio.FIRST_COMPLETED
+        )
+        assert done, "delete never reached the custody boundary"
+        finish_write.set()
+        await asyncio.wait_for(asyncio.gather(writer, deleter), 2)
+        assert (await queries.get_secret_claim(job.service_name)).token_id == "a"
+        assert app.state.secret_manager.load(job.service_name) == {"PRIVATE": "synthetic"}
+        replacement = _svc(owner="b", id="replacement", service_name=job.service_name)
+        with pytest.raises(ServiceNameClaimed):
+            await queries.reserve_service_for_token(replacement)
+    finally:
+        finish_write.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await db.close()

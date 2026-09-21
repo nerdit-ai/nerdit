@@ -72,7 +72,12 @@ function normalizePath(pathname: string): string {
   if (pathname.startsWith("/services/")) return "/services/:ident";
   if (pathname.startsWith("/projects/")) {
     // Keep the (five-value) tab segment, drop the project name.
-    const tab = pathname.split("/").filter(Boolean)[2];
+    const parts = pathname.split("/").filter(Boolean);
+    // (P40e) `/projects/:name/services/:service/:tab?` — the service name drops too.
+    if (parts[2] === "services") {
+      return `/projects/:name/services/:service${parts[4] ? `/${parts[4]}` : ""}`;
+    }
+    const tab = parts[2];
     return tab ? `/projects/:name/${tab}` : "/projects/:name";
   }
   return pathname;

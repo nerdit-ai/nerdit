@@ -32,7 +32,7 @@ from typing import TypeGuard
 from fastapi import APIRouter, Body, Query, Request, Response
 
 from nerdit.config.app_config import validate_app_config
-from nerdit.config.project import shared_secret_keys, shared_secret_keys_for
+from nerdit.config.project import rewrite_vars_ref, shared_secret_keys, shared_secret_keys_for
 from nerdit.config.redaction import REDACTED, redact_section
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.daemon.audit import audit_params, record_shared_referenced
@@ -190,8 +190,14 @@ async def _graft_build_tier_keys(queries: Queries, job_id: str, new_cfg: dict) -
 
 
 async def _get_app(request: Request, name: str) -> Job:
-    """Resolve *name* to a `kind=service` row or raise a structured 404."""
+    """Judge scope, then resolve *name* to a `kind=service` row or a structured 404.
+
+    (D-P40-7) The row is read first so its project can widen the scope; the
+    scope verdict still precedes every row-shaped answer, so an out-of-scope
+    caller gets the identical 403 with or without a row.
+    """
     job = await request.app.state.queries.get_service_by_name(name)
+    require_service_scope(request, name, project=job.project if job else None)
     if job is not None and job.kind is JobKind.model:
         raise NerditError(
             404,
@@ -311,7 +317,6 @@ async def get_app_config(request: Request, response: Response, name: str) -> App
     require_role(request, TokenRole.readonly, TokenRole.submitter, TokenRole.admin)
     # (P25 D-P25-3 leg b) The GET carries no owner gate by design, so scope is
     # the only per-service boundary here; a pure name check needs no row.
-    require_service_scope(request, name)
     job = await _get_app(request, name)
     view = _build_view(job)
     response.headers["ETag"] = view.etag or ""
@@ -411,6 +416,18 @@ def _merge_deploy(job: Job, cfg: dict, body: dict) -> tuple[dict, list[str]]:
     return effective, changed
 
 
+def _stored_spec(spec: dict, field: str) -> dict:
+    """`spec` as persisted: the `${vars.…}` alias in `field` rewritten (D-P40-9).
+
+    The merged dict is stored raw (validation only rewrites its own throwaway
+    model), so this ingress rewrites too - before the change diff, so a re-PUT
+    of the alias compares equal. A stored alias would also fail a pre-P40c
+    daemon's re-parse at launch after a rollback.
+    """
+    value = spec.get(field)
+    return {**spec, field: rewrite_vars_ref(value)} if isinstance(value, str) else spec
+
+
 def _merge_ai(cfg: dict, body: dict) -> tuple[dict, list[str]]:
     """Merge an `ai` PUT body at *binding* granularity (`null` deletes)."""
     current = dict(cfg.get("ai") or {})
@@ -427,6 +444,7 @@ def _merge_ai(cfg: dict, body: dict) -> tuple[dict, list[str]]:
                 "config.invalid",
                 f"[ai.{bname}] must be a table (or null to delete the binding).",
             )
+        spec = _stored_spec(spec, "api_key")
         if merged.get(bname) != spec:
             changed.append(bname)
         merged[bname] = spec
@@ -455,6 +473,7 @@ def _merge_db(cfg: dict, body: dict) -> tuple[dict, list[str]]:
                 "config.invalid",
                 f"[db.{bname}] must be a table (or null to delete the binding).",
             )
+        spec = _stored_spec(spec, "password")
         if merged.get(bname) != spec:
             changed.append(bname)
         merged[bname] = spec
@@ -477,9 +496,9 @@ async def put_app_config_section(
 ) -> AppConfigWriteResponse:
     """Validate and (unless `dry_run`) persist one app config section."""
     require_role(request, TokenRole.submitter, TokenRole.admin)
-    # (P25 D-P25-3 leg b) Explicit path-name check beside the row-level owner
-    # gate further down; the path name is authoritative for the target row.
-    require_service_scope(request, name)
+    # (P25 D-P25-3 leg b / D-P40-7) Scope is judged inside `_get_app`, on the path
+    # name or the row's project, beside the row-level owner gate further down.
+    job = await _get_app(request, name)
     # Names, never submitted values: this stamp is what the AuditMiddleware
     # records on every early exit (422 config.invalid, 409 config.stale, dry
     # run). `audit_params` masks by leaf name, which misses a credential
@@ -500,7 +519,6 @@ async def put_app_config_section(
         )
 
     queries = request.app.state.queries
-    job = await _get_app(request, name)
     require_owner_or_admin(request, job)
     cfg = parse_job_config(job)
 

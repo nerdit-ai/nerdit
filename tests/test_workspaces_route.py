@@ -38,7 +38,8 @@ from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers
 from nerdit.daemon.idempotency import IdempotencyMiddleware
 from nerdit.daemon.middleware import ScopedTokenAuthMiddleware
 from nerdit.daemon.routes.workspaces import router as workspaces_router
-from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, TokenRole
+from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, Project, TokenRole
+from nerdit.db.queries import ServiceNameClaimed
 
 LEGACY = "legacy-global"
 SUB_RAW = "sub-raw"
@@ -86,7 +87,11 @@ def _queries(existing: Job | None = None) -> AsyncMock:
     q.get_service_by_name = AsyncMock(return_value=existing)
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
-    q.reserve_service_for_token = AsyncMock(side_effect=lambda job: job)
+    q.reserve_service_for_token = AsyncMock(side_effect=lambda job, **kw: job)
+    q.get_secret_claim = AsyncMock(return_value=None)
+    # (P40b) No `projects` row unless a test plants one: a bare AsyncMock would
+    # return a truthy MagicMock and read as a foreign project.
+    q.get_project_by_name = AsyncMock(return_value=None)
     q.update_service_config = AsyncMock()
     return q
 
@@ -807,7 +812,7 @@ def test_quota_is_charged_to_the_workspace_owner(tmp_path):
     q = _queries()
     charged: list[str | None] = []
 
-    async def _reserve(job):
+    async def _reserve(job, **_kw):
         charged.append(job.submitted_by_token)
         raise QuotaExceeded("max_concurrent_jobs", limit=1, current=1)
 
@@ -1204,3 +1209,55 @@ def test_workspace_deploy_response_carries_summary_and_hints(tmp_path, monkeypat
         "public_url": None,
     }
     assert body["hints"] == ["a hint"]
+
+
+# --- P39: the claim is matched against the sidecar owner ----------------------
+
+
+def test_admin_fresh_deploy_of_a_submitter_workspace_is_judged_as_the_owner(tmp_path):
+    """The row goes to the sidecar owner AND is judged as that owner: an admin
+    deploying S's workspace must not plant S's row in another token's project
+    (or over another token's claim), where it would launch with their variables."""
+    q = _queries()
+    client = _client(q, tmp_path)
+    assert _write_app(client).status_code == 200  # S owns the workspace
+
+    resp = client.post("/workspaces/demo/deploy", json={}, headers=_auth(ADMIN_RAW))
+    assert resp.status_code == 201, resp.text
+    job = q.reserve_service_for_token.call_args.args[0]
+    assert job.submitted_by_token == "tok-sub"
+    assert q.reserve_service_for_token.call_args.kwargs == {"admin": False}
+
+
+def test_admin_fresh_deploy_of_its_own_workspace_keeps_the_bypass(tmp_path):
+    q = _queries()
+    client = _client(q, tmp_path)
+    assert _write_app(client, raw=ADMIN_RAW).status_code == 200
+
+    resp = client.post("/workspaces/demo/deploy", json={}, headers=_auth(ADMIN_RAW))
+    assert resp.status_code == 201, resp.text
+    assert q.reserve_service_for_token.call_args.kwargs == {"admin": True}
+
+
+def test_first_write_onto_a_foreign_rowless_project_is_refused(tmp_path):
+    """A project with no rows yet (variables set first) still belongs to its owner."""
+    q = _queries()
+    q.get_project_by_name = AsyncMock(
+        return_value=Project(id="prj_" + "a" * 16, name="demo", submitted_by_token="tok-other")
+    )
+    client = _client(q, tmp_path)
+    assert _write_app(client).status_code == 403
+    assert _write_app(client, raw=ADMIN_RAW).status_code == 200
+
+
+def test_workspace_deploy_over_a_foreign_claim_409(tmp_path):
+    """The transaction refuses a claim the sidecar owner does not hold."""
+    q = _queries()
+    q.reserve_service_for_token = AsyncMock(side_effect=ServiceNameClaimed("demo"))
+    client = _client(q, tmp_path)
+    assert _write_app(client).status_code == 200
+
+    resp = client.post("/workspaces/demo/deploy", json={}, headers=_auth(SUB_RAW))
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["code"] == "service.name_claimed"
+    assert q.reserve_service_for_token.call_args.kwargs == {"admin": False}

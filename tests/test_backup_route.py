@@ -112,6 +112,23 @@ def test_backup_submitter_forbidden(tmp_path, monkeypatch):
     assert client.post("/api/system/backup", headers=_SUBMITTER).status_code == 403
 
 
+def test_backup_stages_under_the_variable_write_lock(tmp_path, monkeypatch):
+    """No plain/secret flip may land between the secrets and DB snapshots (P40c D-P40-1)."""
+    from nerdit.daemon.secret_scope import variable_write_lock
+
+    client = _app(role=TokenRole.admin, data_dir=tmp_path)
+    held: list[bool] = []
+
+    async def _staged(**kwargs):  # noqa: ANN003
+        held.append(variable_write_lock(client.app).locked())
+        return _result()
+
+    monkeypatch.setattr(system_routes, "create_backup", _staged)
+    assert client.post("/api/system/backup", headers=_ADMIN).status_code == 200
+    assert held == [True]
+    assert not variable_write_lock(client.app).locked()
+
+
 def test_backup_concurrent_409(tmp_path, monkeypatch):
     monkeypatch.setattr(system_routes._backup_lock, "locked", lambda: True)
     monkeypatch.setattr(system_routes, "create_backup", AsyncMock(return_value=_result()))

@@ -3,7 +3,14 @@ import { createElement } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { appConfigWriteRequest, idempotencyHeaders, useRoutes, useSystemGc } from "./queries";
+import {
+  appConfigWriteRequest,
+  idempotencyHeaders,
+  useProjects,
+  useRoutes,
+  useSetVariables,
+  useSystemGc
+} from "./queries";
 import Tokens from "../pages/Tokens";
 
 const UUID_V4 =
@@ -298,5 +305,105 @@ describe("useRoutes (cursor URL build)", () => {
     const { url, keys } = await callRoutes("a+b/c=");
     expect(url).toBe("/api/routes?limit=50&cursor=a%2Bb%2Fc%3D");
     expect(keys).toEqual([["routes", "a+b/c="]]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P40e — projects and variables.
+// ---------------------------------------------------------------------------
+
+describe("useProjects (cursor walk)", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("follows next_cursor, percent-encoded, and returns one merged page", async () => {
+    const pages: Record<string, unknown> = {
+      "/api/projects?limit=200": { items: [{ id: "prj_a", name: "a" }], next_cursor: "a+b=" },
+      "/api/projects?limit=200&cursor=a%2Bb%3D": { items: [{ id: "prj_b", name: "b" }], next_cursor: null }
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => jsonResponse(pages[String(input)]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useProjects(), {
+      wrapper: ({ children }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children)
+    });
+    await vi.waitFor(() => expect(result.current.data).toBeDefined());
+
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual(Object.keys(pages));
+    expect(result.current.data).toEqual({
+      items: [
+        { id: "prj_a", name: "a" },
+        { id: "prj_b", name: "b" }
+      ],
+      next_cursor: null
+    });
+  });
+
+  it("fires nothing while disabled (the older-daemon gate)", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ items: [], next_cursor: null }));
+    vi.stubGlobal("fetch", fetchMock);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderHook(() => useProjects(false), {
+      wrapper: ({ children }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children)
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("useSetVariables (a secret value is held nowhere)", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  const SECRET_VALUE = "var_secret_do_not_persist";
+
+  it("sends the flag and the service scope, and leaves the value in no cache, key or store", async () => {
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      async () =>
+        jsonResponse({ project: "asso", scope: "production/api", keys: ["TOKEN"], plain: false })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } }
+    });
+    const { result } = renderHook(() => useSetVariables("asso", "api"), {
+      wrapper: ({ children }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children)
+    });
+    await act(async () => {
+      await result.current.mutateAsync(() => ({ values: { TOKEN: SECRET_VALUE }, secret: true }));
+    });
+
+    const [url, init] = fetchMock.mock.calls[0];
+    // The value rides the BODY only; the URL carries the scope and nothing else.
+    expect(String(url)).toBe("/api/projects/asso/variables?service=api");
+    expect(init?.method).toBe("PUT");
+    expect(new Headers(init?.headers).get("Idempotency-Key")).toMatch(UUID_V4);
+    expect(JSON.parse(String(init?.body))).toEqual({ values: { TOKEN: SECRET_VALUE }, secret: true });
+
+    // The mutation cache holds a thunk and the names-only response — a
+    // serialized snapshot of everything it keeps never contains the value.
+    const mutations = queryClient
+      .getMutationCache()
+      .getAll()
+      .map((mutation) => JSON.stringify(mutation.state));
+    expect(mutations.some((state) => state.includes(SECRET_VALUE))).toBe(false);
+    const queries = queryClient
+      .getQueryCache()
+      .getAll()
+      .map((query) => JSON.stringify([query.queryKey, query.state.data ?? null]));
+    expect(queries.some((entry) => entry.includes(SECRET_VALUE))).toBe(false);
+    expect(dumpStorage(window.localStorage)).not.toContain(SECRET_VALUE);
+    expect(dumpStorage(window.sessionStorage)).not.toContain(SECRET_VALUE);
   });
 });

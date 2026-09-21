@@ -20,7 +20,7 @@ from nerdit.daemon.errors import NerditError
 from nerdit.db.models import TokenRole
 
 if TYPE_CHECKING:
-    from nerdit.db.models import Job
+    from nerdit.db.models import Job, Project
 
 # Prefix that marks a raw scoped token (distinct from the legacy global token).
 TOKEN_PREFIX = "nrd_"
@@ -54,13 +54,22 @@ class Principal:
         """Whether this principal carries the `admin` role."""
         return self.role == TokenRole.admin
 
-    def in_scope(self, service_name: str) -> bool:
-        """Whether `service_name` falls inside this principal's scope.
+    def in_scope(self, service_name: str, project: str | None = None) -> bool:
+        """Whether `service_name`, or the project its row carries, is in scope.
 
         An unscoped principal (`scope_services is None`) is in scope for
         everything; an empty scope grants nothing (P25 D-P25-3 fail-closed).
+
+        Args:
+            service_name: The label being acted on.
+            project: The project name the ROW (or the request's own project
+                field) carries, D-P40-7. Never derived by parsing a label: a
+                legacy row literally named `api--asso` carries project
+                `api--asso`, so an `asso`-scoped token does not reach it.
         """
-        return self.scope_services is None or service_name in self.scope_services
+        if self.scope_services is None or service_name in self.scope_services:
+            return True
+        return project is not None and project in self.scope_services
 
 
 # (P27 WP-C1) Synthetic tunnel principals carry `token_id = "link:<node_id>"`
@@ -212,11 +221,14 @@ def _owner_or_admin_allows(
     principal: Principal,
     owner_token_id: str | None,
     scope_name: str | None,
+    project: str | None = None,
 ) -> bool:
     """Allow admins, or owners whose row is within their narrowed scope.
 
-    Nameless rows fail a narrowed scope. Do not use Principal.in_scope, which allows
-    scope_name=None; raising and non-raising ownership checks must agree here.
+    Nameless rows fail a narrowed scope, even when their project is in it. Do not
+    call Principal.in_scope with an unchecked name; raising and non-raising
+    ownership checks must agree here. `project` widens the scope only (D-P40-7),
+    never ownership.
     """
     if principal.role == TokenRole.admin:
         return True
@@ -224,7 +236,7 @@ def _owner_or_admin_allows(
         return False
     if principal.scope_services is None:
         return True
-    return scope_name is not None and scope_name in principal.scope_services
+    return scope_name is not None and principal.in_scope(scope_name, project)
 
 
 def _check_owner(
@@ -232,6 +244,7 @@ def _check_owner(
     owner_token_id: str | None,
     scope_name: str | None,
     denial: NerditError,
+    project: str | None = None,
 ) -> Principal:
     """Require admin or non-null ownership plus scope membership.
 
@@ -239,7 +252,7 @@ def _check_owner(
     scope_denial for a matched owner outside scope, otherwise the caller's denial.
     """
     principal = current_principal(request)
-    if _owner_or_admin_allows(principal, owner_token_id, scope_name):
+    if _owner_or_admin_allows(principal, owner_token_id, scope_name, project):
         return principal
     if _owns(principal, owner_token_id):
         raise _scope_denial(principal, scope_name)
@@ -255,6 +268,7 @@ def may_manage_job(request: Request, job: Job) -> bool:
         current_principal(request),
         getattr(job, "submitted_by_token", None),
         getattr(job, "service_name", None),
+        getattr(job, "project", None),
     )
 
 
@@ -271,27 +285,50 @@ def require_owner_or_admin(request: Request, job: Job) -> Principal:
         request,
         getattr(job, "submitted_by_token", None),
         getattr(job, "service_name", None),
-        NerditError(
-            403,
-            "forbidden",
-            "You do not have permission to act on this job.",
-            hint="Only the submitting token or an admin may manage this job.",
-        ),
+        owner_denial(),
+        getattr(job, "project", None),
     )
 
 
-def require_service_scope(request: Request, service_name: str) -> Principal:
+def owner_denial() -> NerditError:
+    """The one 403 every owner gate raises — rows, claims and projects alike.
+
+    One envelope on purpose: a distinct message per subject would be an oracle
+    for "claimed, not deployed" or "project reserved, no row" (P39 / P40b).
+    """
+    return NerditError(
+        403,
+        "forbidden",
+        "You do not have permission to act on this job.",
+        hint="Only the submitting token or an admin may manage this job.",
+    )
+
+
+def require_project_owner_or_admin(request: Request, project: Project) -> Principal:
+    """Ensure the principal owns `project` or is an admin, and that it is in scope.
+
+    The subject is `projects.submitted_by_token` (P40b / D-P40-5), never the
+    acting principal; a NULL owner is admin-only, the `require_owner_or_admin`
+    posture. The scope name is the project name (a label until P40d).
+    """
+    return _check_owner(request, project.submitted_by_token, project.name, owner_denial())
+
+
+def require_service_scope(
+    request: Request, service_name: str, *, project: str | None = None
+) -> Principal:
     """Ensure a scoped token may act on `service_name` (D-P25-3 leg b).
 
     For routes whose target is a NAME, not a Job row (create paths, secrets,
     app-config, template deploys). Admin bypasses; an unscoped token passes;
-    a scoped token must name the service. Composes WITH the role gate, it
-    does not replace it.
+    a scoped token must name the service or, D-P40-7, the `project` the row in
+    hand (or the request's own project field) carries -- never a project
+    parsed out of the label. Composes WITH the role gate, it does not replace it.
     """
     principal = current_principal(request)
     if principal.role == TokenRole.admin:
         return principal
-    if principal.in_scope(service_name):
+    if principal.in_scope(service_name, project):
         return principal
     raise _scope_denial(principal, service_name)
 

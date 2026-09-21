@@ -302,6 +302,19 @@ async def _dev_async(path: str | None, name: str | None, *, wait_timeout: int) -
         console.print(f"[red]Not a directory:[/red] {directory}")
         raise typer.Exit(1)
 
+    # (P40d) Every ingress the watch loop uses answers 422 `deploy.use_apply` to
+    # a declaration, so refuse once here instead of on every save.
+    # ponytail: no watch mode for declared projects; re-applying per save would
+    # rebuild every service -- add a per-subdir apply if this is wanted.
+    from nerdit.cli.commands.apply import read_declaration
+
+    if read_declaration(directory) is not None:
+        console.print(
+            "[red]This folder is a project declaration:[/red] `nerdit dev` watches a "
+            "single [deploy] app. Run `nerdit apply` after a change instead."
+        )
+        raise typer.Exit(1)
+
     # Only load when a file was actually found: `load_project_config(None)`
     # falls back to searching upward from *cwd*, which would read some unrelated
     # project's [deploy] when the watched folder has no nerdit.toml of its own.

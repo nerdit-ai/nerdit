@@ -39,6 +39,7 @@ def main_callback(
 # PLR0915: one deferred import + one registration per verb — the list IS the CLI
 # surface, so it grows one statement per shipped verb by construction.
 def _register_commands() -> None:  # noqa: PLR0915
+    from nerdit.cli.commands.apply import apply  # noqa: F811
     from nerdit.cli.commands.backup import backup, restore  # noqa: F811
     from nerdit.cli.commands.capabilities import capabilities  # noqa: F811
     from nerdit.cli.commands.check_deps import check_deps  # noqa: F811
@@ -59,6 +60,7 @@ def _register_commands() -> None:  # noqa: PLR0915
     from nerdit.cli.commands.logs import logs  # noqa: F811
     from nerdit.cli.commands.mcp import mcp  # noqa: F811
     from nerdit.cli.commands.models import models_app  # noqa: F811
+    from nerdit.cli.commands.projects import projects_app  # noqa: F811
     from nerdit.cli.commands.proxy import proxy_app  # noqa: F811
     from nerdit.cli.commands.routes import routes  # noqa: F811
     from nerdit.cli.commands.secrets import secrets_app  # noqa: F811
@@ -71,11 +73,14 @@ def _register_commands() -> None:  # noqa: PLR0915
     from nerdit.cli.commands.trust import trust, untrust  # noqa: F811
     from nerdit.cli.commands.uninstall import uninstall  # noqa: F811
     from nerdit.cli.commands.update import update  # noqa: F811
+    from nerdit.cli.commands.vars import vars_app  # noqa: F811
 
     app.command(name="check-deps")(check_deps)
     app.command()(init)
     app.command()(serve)
     app.command()(deploy)
+    # (P40d) The declaration verb: every [services.<name>] of a [project].
+    app.command()(apply)
     app.command()(dev)
     app.command()(logs)
     app.command()(connect)
@@ -102,6 +107,12 @@ def _register_commands() -> None:  # noqa: PLR0915
     app.add_typer(config_app, name="config")
     app.add_typer(services_app, name="services")
     app.add_typer(secrets_app, name="secrets")
+    # (P40b) The project noun: list/create/show/delete of the grouping every
+    # deployed service belongs to; the name is reserved for the creating token.
+    app.add_typer(projects_app, name="projects")
+    # (P40c) Variables of a project: plain or secret, project or service scope.
+    # `nerdit secrets` stays an alias surface forever (D-P40-1).
+    app.add_typer(vars_app, name="vars")
     app.add_typer(models_app, name="models")
     app.add_typer(db_app, name="db")
     app.add_typer(store_app, name="store")

@@ -7,9 +7,18 @@ import sqlite3
 from datetime import datetime
 from typing import cast
 
+from nerdit.core.project_identity import DEFAULT_SERVICE, PRODUCTION, mint_project_id
 from nerdit.db.models import ErrorClass, Job, JobKind, JobStatus
 
-from ._base import _ACTIVE_STATUSES, QueriesBase, ServiceNameTaken, _serialized
+from ._base import (
+    _ACTIVE_STATUSES,
+    _JOB_SELECT,
+    ProjectOwned,
+    QueriesBase,
+    ServiceNameClaimed,
+    ServiceNameTaken,
+    _serialized,
+)
 
 
 class WorkloadQueries(QueriesBase):
@@ -17,13 +26,53 @@ class WorkloadQueries(QueriesBase):
 
     # --- Job operations ---
 
+    async def _stamp_project(self, job: Job) -> None:
+        """Give a tripleless service row its project triple before the INSERT (P40a).
+
+        The legacy mapping: ``service_name`` is the project name and the row is
+        ``(project, production, web)`` -- the label rule's identity case
+        (D-P40-2), the same mapping ``_migrate``'s backfill applies. The
+        ``projects`` row is find-or-created by name with the job's token as
+        owner and no judgment (D-P40-5: P40b adds the refusals). A row that
+        arrives with ``project_id`` set (P40d's composed rows) is left alone.
+
+        Runs inside whatever transaction the caller holds: ``BEGIN IMMEDIATE``
+        under ``reserve_service_for_token``, the implicit DML transaction under
+        ``create_job``. Either way a failing jobs INSERT rolls the fresh
+        ``projects`` row back with it, so no orphan can outlive the statement.
+        """
+        # ponytail: stamps the caller's Job in place, so a refused INSERT leaves
+        # a rolled-back id on the object; no caller re-inserts the same Job
+        # today -- return the triple instead if one ever does.
+        if job.kind is not JobKind.service or job.service_name is None or job.project_id:
+            return
+        cursor = await self._db.conn.execute(
+            "SELECT id FROM projects WHERE name = ?", (job.service_name,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            job.project_id = mint_project_id()
+            await self._db.conn.execute(
+                "INSERT INTO projects (id, name, submitted_by_token) VALUES (?, ?, ?)",
+                (job.project_id, job.service_name, job.submitted_by_token),
+            )
+        else:
+            job.project_id = row["id"]
+        job.environment = PRODUCTION
+        job.service = DEFAULT_SERVICE
+        # The in-memory row is what the create routes project straight back
+        # (no re-read), so the JOIN-derived name is filled here too (P40b).
+        job.project = job.service_name
+
     async def _exec_job_insert(self, job: Job) -> None:
         """Execute the `jobs` INSERT for *job* (no commit / transaction control).
 
         Shared by `create_job` (which commits immediately) and
         `reserve_service_for_token` (which runs it inside an open
-        `BEGIN IMMEDIATE` quota transaction).
+        `BEGIN IMMEDIATE` quota transaction). Both stamp the project triple
+        through `_stamp_project` first.
         """
+        await self._stamp_project(job)
         await self._db.conn.execute(
             """INSERT INTO jobs
                (id, name, script_path, gpu_count, status,
@@ -32,8 +81,10 @@ class WorkloadQueries(QueriesBase):
                 error_class, error_message, submitted_via, kind,
                 submitted_by_token, idempotency_key,
                 desired_state, restart_policy, restart_count, health_check,
-                service_name, last_exit_at, restart_window_start)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                service_name, last_exit_at, restart_window_start,
+                project_id, environment, service)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?)""",
             (
                 job.id,
                 job.name,
@@ -59,6 +110,9 @@ class WorkloadQueries(QueriesBase):
                 job.service_name,
                 job.last_exit_at.isoformat() if job.last_exit_at else None,
                 job.restart_window_start.isoformat() if job.restart_window_start else None,
+                job.project_id,
+                job.environment,
+                job.service,
             ),
         )
 
@@ -105,14 +159,36 @@ class WorkloadQueries(QueriesBase):
             raise QuotaExceeded("max_gpus", limit=max_gpus, current=active_gpus)
 
     @_serialized
-    async def reserve_service_for_token(self, job: Job) -> Job:
-        """Check token quotas and insert a workload atomically under BEGIN IMMEDIATE.
+    async def reserve_service_for_token(self, job: Job, *, admin: bool = False) -> Job:
+        """Check token quotas, consume the name's secret claim and insert a workload
+        atomically under BEGIN IMMEDIATE.
 
         Count all active kinds, including transient service states. Legacy/local
         submitted_by_token=None is uncapped. Do not call inside another transaction.
 
+        This transaction is the security boundary for P39 claims: the routes'
+        pre-ingress claim checks are optimizations, and a claim minted between
+        that check and this insert is still honoured here. `admin` bypasses the
+        claim the way it bypasses row ownership; it defaults to `False` so a
+        route that forgets it fails closed. A NULL-token claim (LOCAL/LEGACY_ADMIN
+        claimant, or a claim whose token was revoked) is foreign to every
+        non-admin, so a revoked claimant cannot be impersonated by another
+        tokenless principal.
+
+        The project judgment (P40b / D-P40-5 rule 1) runs after the claim step,
+        under the same lock, for every kind: the row's project name is its
+        label (kind=service: the legacy triple `_stamp_project` resolves;
+        models and databases: the label itself), and a `projects` row of that
+        name owned by another token refuses the insert before `_stamp_project`
+        could adopt it. A NULL-owner project is foreign to every non-admin.
+        A declared service (P40d: `project_id` preset by `apply_project`) is
+        judged on the project it joins, by id, as well; a preset id whose
+        project is gone refuses every caller.
+
         Raises:
             QuotaExceeded: The token's active footprint exceeds a cap.
+            ServiceNameClaimed: Another token set this name's secrets first (D-P39-3).
+            ProjectOwned: Another token owns the project this row would join (D-P40-5).
             ServiceNameTaken: The unique service name collided; the transaction rolls back.
         """
         import sqlite3
@@ -122,10 +198,56 @@ class WorkloadQueries(QueriesBase):
         try:
             if token_id is not None:
                 await self._check_quota_locked(token_id, job.gpu_count, _ACTIVE_STATUSES)
+            cursor = await self._db.conn.execute(
+                "SELECT token_id FROM secret_claims WHERE service_name = ?", (job.service_name,)
+            )
+            claim = await cursor.fetchone()
+            if claim is not None:
+                claimant = claim["token_id"]
+                if not admin and (claimant is None or claimant != token_id):
+                    raise ServiceNameClaimed(job.service_name)
+                await self._db.conn.execute(
+                    "DELETE FROM secret_claims WHERE service_name = ?", (job.service_name,)
+                )
+            # (P40d) A row arriving with `project_id` preset is a declared
+            # service: the project it JOINS is judged by that id, never by
+            # parsing its label (D-P40-2). The project NAMED after the label is
+            # still judged for every row: a composed label `api--asso` must not
+            # squat a foreign implicit project literally named `api--asso`.
+            if job.project_id:
+                cursor = await self._db.conn.execute(
+                    "SELECT submitted_by_token FROM projects WHERE id = ?", (job.project_id,)
+                )
+                joined = await cursor.fetchone()
+                # A project deleted since the route judged it: `jobs.project_id`
+                # carries no FK, so an admin is refused too rather than left
+                # with a row pointing at nothing. Re-applying re-creates it.
+                if joined is None or (
+                    not admin
+                    and (
+                        joined["submitted_by_token"] is None
+                        or joined["submitted_by_token"] != token_id
+                    )
+                ):
+                    raise ProjectOwned(job.service_name)
+            if not admin and job.service_name is not None:
+                cursor = await self._db.conn.execute(
+                    "SELECT submitted_by_token FROM projects WHERE name = ?", (job.service_name,)
+                )
+                project = await cursor.fetchone()
+                if project is not None and (
+                    project["submitted_by_token"] is None
+                    or project["submitted_by_token"] != token_id
+                ):
+                    raise ProjectOwned(job.service_name)
             try:
                 await self._exec_job_insert(job)
             except sqlite3.IntegrityError as exc:
-                if "service_name" in str(exc):
+                # D-P40-3: the label index OR the triple index (SQLite names it
+                # ``jobs.project_id, jobs.environment, jobs.service``) is a
+                # name collision; the PK error ``jobs.id`` matches neither.
+                msg = str(exc)
+                if "service_name" in msg or "jobs.project_id" in msg:
                     raise ServiceNameTaken(job.service_name) from exc
                 raise
             await self._db.conn.execute("COMMIT")
@@ -163,7 +285,7 @@ class WorkloadQueries(QueriesBase):
 
     async def get_job(self, job_id: str) -> Job | None:
         """Fetch a single job by ID, or `None` if not found."""
-        cursor = await self._db.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+        cursor = await self._db.conn.execute(f"{_JOB_SELECT} WHERE jobs.id = ?", (job_id,))
         row = await cursor.fetchone()
         if row is None:
             return None
@@ -186,7 +308,7 @@ class WorkloadQueries(QueriesBase):
             params.append(kind.value)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         cursor = await self._db.conn.execute(
-            f"SELECT * FROM jobs{where} ORDER BY created_at DESC", params
+            f"{_JOB_SELECT}{where} ORDER BY jobs.created_at DESC", params
         )
         rows = await cursor.fetchall()
         return [self._row_to_job(r) for r in rows]

@@ -15,11 +15,13 @@ from nerdit.config.project import (
     AI_BINDING_NAME_RE,
     SECRET_REF_RE,
     AiBindingConfig,
+    DbBindingConfig,
     DeployConfig,
     EdgeAuthConfig,
     ProjectConfig,
     load_project_config,
     parse_ai_bindings,
+    rewrite_vars_ref,
     shared_secret_keys,
 )
 
@@ -44,6 +46,38 @@ def test_secret_ref_groups_are_scope_then_key():
     scoped = SECRET_REF_RE.match("${secrets.shared.OPENAI_KEY}")
     assert scoped is not None
     assert scoped.groups() == ("shared", "OPENAI_KEY")
+
+
+# --- (P40c / D-P40-9) the `${vars.…}` alias is rewritten at ingress -------------
+
+
+@pytest.mark.parametrize(
+    ("alias", "stored"),
+    [
+        ("${vars.OPENAI_KEY}", "${secrets.OPENAI_KEY}"),
+        ("${vars.shared.OPENAI_KEY}", "${secrets.shared.OPENAI_KEY}"),
+    ],
+)
+def test_vars_alias_is_accepted_and_stored_as_the_secrets_form(alias, stored):
+    ai = AiBindingConfig(provider="api", model="m", base_url="https://x.example/v1", api_key=alias)
+    assert ai.api_key == stored
+    assert ai.model_dump(exclude_none=True)["api_key"] == stored
+    db = DbBindingConfig(provider="external", url="postgresql://db.example/app", password=alias)
+    assert db.password == stored
+    edge = EdgeAuthConfig(user="ops", password=alias)
+    assert edge.password == stored
+    assert rewrite_vars_ref(alias) == stored
+
+
+def test_the_alias_rewrite_leaves_everything_else_to_the_frozen_grammar():
+    assert rewrite_vars_ref(None) is None
+    assert rewrite_vars_ref("${secrets.K}") == "${secrets.K}"
+    assert rewrite_vars_ref("sk-literal") == "sk-literal"
+    for bad in ("${vars.lower}", "${vars.other.KEY}", "x${vars.KEY}", "${vars.}"):
+        with pytest.raises(ValidationError) as excinfo:
+            AiBindingConfig(provider="api", model="m", base_url="https://x.example/v1", api_key=bad)
+        assert "api_key" in str(excinfo.value)
+        assert bad not in str(excinfo.value)
 
 
 # --- The north-star two-binding example parses ---------------------------------

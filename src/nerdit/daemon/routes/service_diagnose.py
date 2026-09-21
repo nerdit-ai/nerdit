@@ -36,6 +36,7 @@ from nerdit.core.proxy.edgeauth import (
 )
 from nerdit.core.secrets import SHARED_SCOPE, SecretDecryptError
 from nerdit.core.services import ServiceController
+from nerdit.core.variables import load_scoped
 from nerdit.daemon.auth import require_owner_or_admin
 from nerdit.daemon.limits import _MAX_DIAGNOSE_TAIL
 from nerdit.daemon.remediation import (
@@ -170,7 +171,8 @@ def _pending_env_key_names(request: Request, job: Job, cfg: dict) -> list[str]:
     secret_mgr = getattr(request.app.state, "secret_manager", None)
     if secret_mgr is not None and job.service_name:
         try:
-            pending.update(secret_mgr.list_keys(job.service_name))
+            # The launch assembly's names: both scopes of the merged reader (D-P40-9).
+            pending.update(load_scoped(secret_mgr, job.service_name, job.project_id)[0])
         except SecretDecryptError:
             pass  # names unavailable while the key is missing — omit, don't fail
     # (P15 / D-A) Union the injected env NAMES for every binding kind through the
@@ -282,7 +284,9 @@ async def _classify_bindings(request: Request, job: Job, cfg: dict) -> BindingWa
     secret_decrypt_failed = False
     if secret_mgr is not None and job.service_name:
         try:
-            secret_env = secret_mgr.load(job.service_name)
+            # Diagnose is owner-or-admin gated on an existing row, so the merged
+            # reader takes the ROW's project scope, exactly as the launch does.
+            secret_env, _ = load_scoped(secret_mgr, job.service_name, job.project_id)
         except SecretDecryptError:
             secret_decrypt_failed = True
 
@@ -401,7 +405,7 @@ def _classify_edge_auth(request: Request, job: Job, cfg: dict) -> EdgeAuthWait:
     def _service_scope() -> Mapping[str, str]:
         if secret_mgr is None or not job.service_name:
             return {}
-        return secret_mgr.load(job.service_name)
+        return load_scoped(secret_mgr, job.service_name, job.project_id)[0]
 
     def _shared_scope() -> Mapping[str, str]:
         if secret_mgr is None:
