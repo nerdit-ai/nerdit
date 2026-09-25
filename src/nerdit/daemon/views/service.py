@@ -164,7 +164,6 @@ def _service_response(
         exit_code=job.exit_code,
         error_class=job.error_class,
         error_message=job.error_message,
-        submitted_via=job.submitted_via,
         manageable=may_manage_job(request, job),
         endpoint=_endpoint_view(request, endpoint, hosted=hosted),
         rollback_available=bool(cfg.get("previous_image")),
@@ -172,4 +171,20 @@ def _service_response(
         last_deploy=cfg.get("last_deploy") if isinstance(cfg.get("last_deploy"), dict) else None,
         data_dir_bytes=data_dir_bytes,
         source=source or None,
+    )
+
+
+async def service_view(
+    request: Request,
+    job: Job,
+    *,
+    hosted: HostedContext = EMPTY_HOSTED,
+    data_dir_bytes: int | None = None,
+) -> ServiceResponse:
+    """Read the row's endpoint and GPUs, then project it with `_service_response`."""
+    queries = request.app.state.queries
+    endpoint = await queries.get_service_endpoint(job.service_name or "")
+    gpu_ids = await queries.get_job_gpus(job.id)
+    return _service_response(
+        request, job, gpu_ids, endpoint, data_dir_bytes=data_dir_bytes, hosted=hosted
     )

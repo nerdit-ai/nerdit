@@ -34,8 +34,8 @@ from nerdit.core.link.identity import (
     resolve_key_file,
     sign_node_proof,
     valid_public_reference,
-    verify_node_proof,
 )
+from tests.link_fake_relay import verify_node_proof
 
 #: Pin the vendored helpers were derived from; asserted by the conformance suite.
 PINNED_SHA = "d53507081821d62e99991e2ce9f675e80cdca93e"

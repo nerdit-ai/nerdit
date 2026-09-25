@@ -8,22 +8,28 @@ to avoid per-service queries. Missing app state degrades safely to no exposure.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
 from fastapi import Request
 
-from nerdit.core.link.hosted import hosted_url
+from nerdit.core.link.hosted import (
+    hosted_host,
+    hosted_label_fits,
+    hosted_url,
+    public_address_url,
+)
 from nerdit.core.proxy import _domain_route_id, domain_url_for
 from nerdit.core.proxy.certs import CertStatus
 from nerdit.daemon.schemas.exposure import PublicUrlEntry
-from nerdit.db.rows import ServiceDomain, ServiceShare
+from nerdit.db.rows import ActiveServicePublicAddress, ServiceDomain, ServiceShare
 
-#: The three machine tokens a hosted share can report, shared with
+#: The machine tokens a hosted share can report, shared with
 #: `nerdit.daemon.schemas.exposure.PublicUrlEntry` and `ShareView` so the
 #: projection and the wire contract cannot drift.
-HostedState = Literal["ready", "link_down", "not_entitled"]
+HostedState = Literal["ready", "link_down", "not_entitled", "pending"]
 
 #: The two a custom domain can report (P26 WP1, S-W8). Deliberately NOT a
 #: superset of `HostedState`: a domain is served by this node's own proxy
@@ -60,6 +66,8 @@ class HostedContext:
     #: batched read. Every field below it has a default, so a caller
     #: constructing a pre-WP1 context keyword-wise is unchanged.
     domains: Mapping[str, tuple[ServiceDomain, ...]] = field(default_factory=dict)
+    addresses: Mapping[str, ActiveServicePublicAddress] = field(default_factory=dict)
+    aliases: Mapping[str, str | None] = field(default_factory=dict)
     #: Whether the embedded proxy is up AND serving right now
     #: (`ProxyManager.available`). `False` on a daemon with the URL layer
     #: off, which is exactly when a bound domain cannot answer.
@@ -109,7 +117,7 @@ EMPTY_HOSTED = HostedContext(
 
 
 async def load_hosted_context(request: Request) -> HostedContext:
-    """Load one request snapshot with two table reads and no per-service queries.
+    """Load exposure facts in batched reads, without per-service queries.
 
     Missing queries yields EMPTY_HOSTED; a missing link manager or domains accessor
     produces an unavailable link or empty domain mapping.
@@ -127,6 +135,11 @@ async def load_hosted_context(request: Request) -> HostedContext:
 
     settings = getattr(state, "settings", None)
     link = getattr(settings, "link", None) if settings is not None else None
+    node_id = getattr(link, "node_id", None)
+    address_lister = getattr(queries, "list_service_public_addresses", None)
+    addresses = await address_lister(node_id) if node_id and address_lister else {}
+    alias_lister = getattr(queries, "list_service_hosted_aliases", None)
+    aliases = await alias_lister(node_id) if node_id and alias_lister else {}
     manager = getattr(state, "link_manager", None)
     link_state: str | None = None
     entitled = False
@@ -161,6 +174,8 @@ async def load_hosted_context(request: Request) -> HostedContext:
         link_state=link_state,
         hosted_public_entitled=entitled,
         shares=shares,
+        addresses=addresses,
+        aliases=aliases,
         domains=domains,
         proxy_available=bool(getattr(proxy_manager, "available", False)),
         withheld=frozenset(getattr(proxy_manager, "withheld_services", ()) or ()),
@@ -172,40 +187,41 @@ async def load_hosted_context(request: Request) -> HostedContext:
     )
 
 
-def hosted_state(ctx: HostedContext, share: ServiceShare) -> HostedState:
-    """Classify one share against the live link: `ready`/`link_down`/`not_entitled`.
+def _hosted_url(ctx: HostedContext, service_name: str) -> str | None:
+    address = ctx.addresses.get(service_name)
+    if address is not None and address.active:
+        return public_address_url(address.slug)
+    if ctx.addressable and hosted_label_fits(service_name, ctx.slug or ""):
+        host = hosted_host(service_name, ctx.slug or "", ctx.nodes_base_domain or "")
+        host_hash = hashlib.sha256(host.encode("ascii")).hexdigest()
+        if host_hash in ctx.aliases and ctx.aliases[host_hash] != service_name:
+            return None
+        return hosted_url(service_name, ctx.slug or "", ctx.nodes_base_domain or "")
+    return None
 
-    Order is load-bearing and pinned by test: `not_entitled` outranks
-    `link_down`. An operator who asked for a public share on an unentitled
-    node must be told the thing that will still be true after the tunnel
-    reconnects — reporting `link_down` would send them to debug the wrong
-    layer.
-    """
+
+def hosted_state(ctx: HostedContext, share: ServiceShare) -> HostedState:
+    """Project entitlement, address activation and current link reachability."""
     if share.access == "public" and not ctx.hosted_public_entitled:
         return "not_entitled"
-    if ctx.link_state == "connected" and ctx.addressable:
+    url = _hosted_url(ctx, share.service_name)
+    if url is None and ctx.addressable:
+        return "pending"
+    if ctx.link_state == "connected" and url is not None:
         return "ready"
     return "link_down"
 
 
 def hosted_entry(ctx: HostedContext, service_name: str) -> PublicUrlEntry | None:
-    """The hosted entry for one service, or `None` when it is not shared.
-
-    Presence tracks the ROW, not reachability: an entry appears for every share
-    row, carrying the state that says whether it answers right now. An operator
-    must be able to see that an app is meant to be exposed while the tunnel is
-    down.
-    """
+    """Keep a shared canonical address stable across downtime and access changes."""
     share = ctx.shares.get(service_name)
     if share is None:
         return None
-    url = (
-        hosted_url(service_name, ctx.slug or "", ctx.nodes_base_domain or "")
-        if ctx.addressable
-        else None
-    )
     return PublicUrlEntry(
-        url=url, kind="hosted", state=hosted_state(ctx, share), access=share.access
+        url=_hosted_url(ctx, service_name),
+        kind="hosted",
+        state=hosted_state(ctx, share),
+        access=share.access,
     )
 
 

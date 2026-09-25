@@ -12,6 +12,7 @@ request handling. Shared mux interfaces live here to keep imports acyclic.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -26,6 +27,7 @@ from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from nerdit.core.link.frames import (
+    ERROR_CODE_INTERNAL,
     PROTOCOL_VERSION,
     Downlink,
     ErrorFrame,
@@ -38,6 +40,7 @@ from nerdit.core.link.frames import (
     heartbeat_frame,
     hello_frame,
     parse_downlink,
+    stream_error_frame,
 )
 from nerdit.core.link.identity import NodeIdentity, proof_message
 
@@ -169,12 +172,11 @@ class CloseClass(Enum):
     DISPLACED = "displaced"
 
 
-#: WP-C4 interim seam (plan §7 "WP-C4 — entitlement (thin in v1)"): relay-side
-#: subscription admission is already enforced cloud-side, and the daemon's job
-#: in v1 is to map the resulting refusal to a terminal-with-hint state rather
-#: than to reconnect-loop against a subscription that will not be granted by
-#: retrying. These codes are not in the frozen §4.3 downlink set, so they are
-#: matched tolerantly — an unrecognised code stays an ordinary 4401.
+#: Entitlement is enforced cloud-side; the daemon only maps the resulting
+#: refusal to a terminal-with-hint state rather than reconnect-looping against
+#: an entitlement that retrying will not grant. These codes are not in the
+#: frozen §4.3 downlink set, so they are matched tolerantly — an unrecognised
+#: code stays an ordinary 4401.
 ENTITLEMENT_ERROR_CODES = frozenset({"entitlement_required", "subscription_required"})
 
 _CLOSE_PROTOCOL_UNSUPPORTED = 4400
@@ -331,29 +333,14 @@ async def dial_relay(relay_url: str) -> LinkSocket:
     An `InvalidStatus` becomes `DialRejected` because the pre-accept
     refusal is an HTTP status, not a close frame (spec §5 step 1).
 
-    No `Sec-WebSocket-Protocol` is offered — deliberately, and it is worth
-    stating why, because the WP-C1 checklist reads "with subprotocol
-    `node-link/v1`".
-
-    `node-link/v1` is **not a legal subprotocol token**. RFC 6455 §4.1 defines
-    the header's values as RFC 7230 `token`\\ s, and `/` is a separator, not
-    a token character. `websockets` enforces that grammar on both ends:
-    `validate_subprotocols` raises `ValueError` before a single byte leaves
-    the client, and a server parsing the header answers **HTTP 400**. So the
-    literal reading of the checklist item is not merely unimplementable, it is
-    actively harmful — it turns every dial into either a local crash or a
-    refused upgrade.
-
-    The wire itself never negotiates one either: the relay calls
-    `websocket.accept()` with no subprotocol (`relay/control.py:1022`) and
-    the cloud's own reference daemon offers none. Version negotiation on this
-    link is **in-band**, by the `hello.protocol` field, and its refusal is the
+    No `Sec-WebSocket-Protocol` is offered, deliberately: `node-link/v1` is
+    **not a legal subprotocol token** (RFC 6455 §4.1 takes RFC 7230 tokens,
+    and `/` is a separator). `websockets` raises `ValueError` client-side and
+    a server answers **HTTP 400**, so offering it would break every dial. The
+    relay itself accepts with no subprotocol. Version negotiation is
+    **in-band** via `hello.protocol`; its refusal is the
     `protocol_version_unsupported` error frame plus close 4400 (spec §5 step
-    4, §6) — which is exactly what `LinkConnection.handshake` sends and
-    what `classify_close` maps to
-    `CloseClass.TERMINAL_PROTOCOL`. The checklist's intent — one pinned
-    protocol version, refused loudly rather than guessed at — is therefore
-    honoured where the protocol actually puts it.
+    4, §6), which `classify_close` maps to `CloseClass.TERMINAL_PROTOCOL`.
     """
     url = dial_url(relay_url)
     try:
@@ -365,6 +352,20 @@ async def dial_relay(relay_url: str) -> LinkSocket:
     except InvalidStatus as exc:
         raise DialRejected(exc.response.status_code) from exc
     return _WebSocketLinkSocket(connection)
+
+
+def _open_stream_id(raw: str) -> str | None:
+    """Return the `stream_id` of an invalid `open_stream` frame, if usable."""
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("type") != "open_stream":
+        return None
+    stream_id = payload.get("stream_id")
+    if isinstance(stream_id, str) and 0 < len(stream_id) <= 128:
+        return stream_id
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +565,19 @@ class LinkConnection:
                     # and keeps the connection open. Dropping one bad frame
                     # must not cost a live tunnel and every stream on it.
                     logger.warning("Dropping an invalid downlink frame: %s", exc)
+                    # An `open_stream` with a usable id still gets an answer,
+                    # so the relay-side requester is not left hanging until
+                    # the relay's idle sweep.
+                    stream_id = _open_stream_id(raw)
+                    if stream_id is not None:
+                        await self.send_frame(
+                            stream_error_frame(
+                                stream_id=stream_id,
+                                node_id=self._node_id,
+                                code=ERROR_CODE_INTERNAL,
+                                message="the daemon could not parse the stream",
+                            )
+                        )
                     continue
                 await self._dispatch(frame, handler)
         except LinkClosedError as exc:
@@ -644,7 +658,7 @@ class AppTarget:
     on the transient port, and dialling the reserved one would hand the browser
     the blue generation the daemon has already stopped advertising.
 
-    `host` is the hosted authority `<app>--<slug>.<nodes_base_domain>` the
+    `host` is the validated external authority the
     mux rewrites `Host` to, so the app builds absolute URLs against the name
     the browser typed rather than a loopback port.
     """
@@ -652,6 +666,8 @@ class AppTarget:
     service_name: str
     port: int
     host: str
+    job_id: str | None = None
+    access: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,14 +689,16 @@ class MuxContext:
     #: e.g. `"http://127.0.0.1:9321"` — the daemon's own listener.
     loopback_base_url: str
     http_client_factory: Callable[[], httpx.AsyncClient] | None = None
-    #: `(service_name) -> AppTarget | None` (P26 D-P26-H1/H2), built by
-    #: `bootstrap.build_link_manager` from the share table. `None` — the
-    #: default, and every pre-P26 context — means NO app stream can be served:
+    #: `(service_name, authority, job_id, access) -> AppTarget | None`, built by
+    #: `bootstrap.build_link_manager` from the share table. `None` (the
+    #: default) means NO app stream can be served:
     #: a stream carrying `x-nerdit-app` is answered 404 and is **never**
     #: replayed on loopback. Fail-closed is the whole posture: an unlinked,
     #: unshared or domain-less node must not turn a routing header into a
     #: request against its own control plane.
-    resolve_app: Callable[[str], Awaitable[AppTarget | None]] | None = None
+    resolve_app: (
+        Callable[[str, str | None, str | None, str | None], Awaitable[AppTarget | None]] | None
+    ) = None
     #: Test seam for the SECOND client — the app dial. Same shape as
     #: `http_client_factory`; production builds an `httpx.AsyncClient` with
     #: no `base_url`, because an app stream's authority is per-stream.

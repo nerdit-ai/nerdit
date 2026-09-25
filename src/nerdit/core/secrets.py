@@ -33,12 +33,11 @@ from pathlib import Path
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from nerdit.utils.fs import atomic_write, fsync_dir
+from nerdit.utils.names import DNS_LABEL_RE
+
 logger = logging.getLogger("nerdit.secrets")
 
-# A service name must be a DNS label (same rule as ServiceCreateRequest.name /
-# DeployConfig.name). Enforced here too so a crafted name can never escape the
-# secrets directory via path separators or `..`.
-_DNS_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 # A secret KEY name must be a valid POSIX/env-var identifier so it can be handed
 # to `ContainerConfig.env` at launch. This is stricter than POSIX strictly
@@ -49,7 +48,7 @@ _DNS_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 _SECRET_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # Internal storage name for the shared (global) scope. The leading
-# underscore provably cannot come out of `_DNS_LABEL_RE`, so `_shared.enc`
+# underscore provably cannot come out of `DNS_LABEL_RE`, so `_shared.enc`
 # can never collide with any past or future service file. User-facing surfaces
 # keep the word `shared`; routes translate.
 SHARED_SCOPE = "_shared"
@@ -192,13 +191,14 @@ class SecretManager:
         return self._key_path.with_name(self._key_path.name + ".new")
 
     def _check_name(self, service: str) -> str:
-        # `fullmatch` on the internal stems: they become a filename, and `$`
-        # alone would admit a trailing newline.
+        # A service name must be a DNS label, so a crafted name can never
+        # escape the secrets directory via path separators or `..`. `fullmatch`,
+        # since `$` alone would admit a trailing newline in what becomes a filename.
         if (
             service != SHARED_SCOPE
             and not _PROJECT_STEM_RE.fullmatch(service)
             and not _ENV_STEM_RE.fullmatch(service)
-            and not _DNS_LABEL_RE.match(service)
+            and not DNS_LABEL_RE.fullmatch(service)
         ):
             raise InvalidServiceName(f"Invalid service name: {service!r}")
         return service
@@ -207,7 +207,7 @@ class SecretManager:
         return self._dir / f"{self._check_name(service)}.enc"
 
     def _legacy_path(self, service: str) -> Path:
-        """Pre-P8 plaintext location, honored read-only until re-encrypted."""
+        """Legacy plaintext location, honored read-only until re-encrypted."""
         return self._dir / f"{self._check_name(service)}.json"
 
     def _ensure_dir(self) -> None:
@@ -253,7 +253,7 @@ class SecretManager:
         is the first write). A name ending in `.enc` is the repo-wide marker
         for encrypted material (snapshot, rotation, restore all glob it): the
         `<name>.enc.tmp-<pid>` staging residue does not match, and legacy
-        pre-P8 plaintext `<name>.json` is deliberately excluded — it is
+        plaintext `<name>.json` is deliberately excluded — it is
         recoverable without the key, so it is not material at risk.
 
         **Fail-loud when the store cannot be enumerated.** `Path.glob`
@@ -305,17 +305,14 @@ class SecretManager:
         lost generation race.
         """
         path.parent.mkdir(parents=True, exist_ok=True)
-        target = path.with_name(path.name + ".tmp") if atomic else path
         if atomic:
-            target.unlink(missing_ok=True)
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            atomic_write(path, (key.hex() + "\n").encode("utf-8"))
+            return
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(key.hex() + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        if atomic:
-            os.replace(target, path)
-            self._fsync_dir(path.parent)
 
     def _ensure_key(self) -> bytes:
         """Load the active key, auto-generating it on first use."""
@@ -452,33 +449,12 @@ class SecretManager:
                 f"Secrets file {path.name} decrypted to an invalid payload."
             ) from None
 
-    @staticmethod
-    def _fsync_dir(path: Path) -> None:
-        """fsync a directory so renames inside it survive a power loss."""
-        try:
-            fd = os.open(path, os.O_RDONLY)
-        except OSError:  # pragma: no cover - platforms without directory fds
-            return
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
     def _atomic_write(self, path: Path, payload: str) -> None:
         """Write *payload* to *path* atomically (durably) with 0600 perms."""
         self._ensure_dir()
-        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-        if tmp.exists():
-            tmp.unlink()
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-        self._fsync_dir(path.parent)
+        atomic_write(path, payload.encode("utf-8"))
 
-    # --- migration (P8, boot-safe) ---------------------------------------------
+    # --- migration (boot-safe) ---------------------------------------------
 
     def _migrate_plaintext(self) -> list[str]:
         """Encrypt legacy plaintext `{service}.json` files in place.
@@ -492,7 +468,7 @@ class SecretManager:
         """
         if not self._dir.is_dir():
             return []
-        # Sweep temp orphans first — pre-P8 ones hold plaintext secrets.
+        # Sweep temp orphans first — legacy ones hold plaintext secrets.
         for orphan in sorted(self._dir.glob("*.tmp-*")):
             try:
                 orphan.unlink()
@@ -503,7 +479,7 @@ class SecretManager:
         for legacy in sorted(self._dir.glob("*.json")):
             name = legacy.stem
             try:
-                if name != SHARED_SCOPE and not _DNS_LABEL_RE.match(name):
+                if name != SHARED_SCOPE and not DNS_LABEL_RE.fullmatch(name):
                     raise ValueError("not a valid service name")
                 target = self._dir / f"{name}.enc"
                 if target.is_file():
@@ -611,9 +587,9 @@ class SecretManager:
         key's parent dir *after* so the promote itself sticks.
         """
         if self._dir.is_dir():
-            self._fsync_dir(self._dir)
+            fsync_dir(self._dir)
         os.replace(self._new_key_path, self._key_path)
-        self._fsync_dir(self._key_path.parent)
+        fsync_dir(self._key_path.parent)
 
     def _staged_key_is_unreferenced(self) -> bool:
         """True when every `.enc` file is encrypted under the active key.
@@ -716,7 +692,7 @@ class SecretManager:
         try:
             values = self._parse_strict(legacy.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
-            # Malformed legacy plaintext: keep the pre-P8 degrade-to-{} read
+            # Malformed legacy plaintext: keep the degrade-to-{} read
             # behavior, but never destroy the original by re-encrypting it.
             logger.error("Legacy plaintext secrets file %s is malformed; ignoring it", legacy)
             return {}

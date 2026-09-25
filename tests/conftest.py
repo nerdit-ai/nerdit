@@ -162,9 +162,9 @@ def mock_runtime():
     # fixture has no container to sample (the P13 ``inspect_state`` lesson).
     runtime.stats = AsyncMock(return_value=None)
 
-    # (P20) ``tail``/``max_bytes`` widen the Protocol's bounded-read contract;
+    # (P20) ``tail``/``max_bytes`` (and ``since``) widen the Protocol's bounded-read contract;
     # the fake ignores them (its canned output is already tiny).
-    async def mock_logs(container_id, follow=False, tail=None, max_bytes=None):
+    async def mock_logs(container_id, follow=False, tail=None, max_bytes=None, since=None):
         for line in ["output line 1", "output line 2"]:
             yield line
 

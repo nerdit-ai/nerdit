@@ -41,7 +41,7 @@ from nerdit.core.link.client import (
     dial_url,
 )
 from nerdit.core.link.frames import PROTOCOL_VERSION, StreamDownlink
-from nerdit.core.link.identity import NodeIdentity, proof_message, verify_node_proof
+from nerdit.core.link.identity import NodeIdentity, proof_message
 from tests.link_fake_relay import (
     CLOSE_PROTOCOL_UNSUPPORTED,
     CLOSE_REPLACED,
@@ -52,9 +52,11 @@ from tests.link_fake_relay import (
     FIXTURE_NODE_ID,
     FakeRelay,
     Scenario,
+    Session,
     error_frame,
     load_fixture,
     open_stream_frame,
+    verify_node_proof,
 )
 from tests.node_link_frames import HeartbeatFrame, HelloFrame
 
@@ -582,6 +584,43 @@ async def test_stream_frames_reach_the_handler_and_invalid_ones_do_not_kill_the_
         close = await connection.run(handler)
 
     assert [type(frame).__name__ for frame in handler.seen] == ["OpenStream", "StreamEnd"]
+    assert close.code == 1000
+
+
+async def test_an_invalid_open_stream_is_answered_with_a_stream_error(
+    identity: NodeIdentity,
+) -> None:
+    """A bad `open_stream` with a usable id is refused, not left to the idle sweep."""
+    handler = _NullHandler()
+
+    async def drive(session: Session) -> None:
+        connection = session.connection
+        assert connection is not None
+        await connection.send(json.dumps({"type": "open_tunnel", "stream_id": "s-x"}))
+        bad = open_stream_frame(stream_id="s-bad", token="tok", method="get")
+        await connection.send(json.dumps(bad))
+
+        async def until_stream_error() -> None:
+            while not session.frames("stream_error"):
+                await relay._read(connection, session)
+
+        await asyncio.wait_for(until_stream_error(), 5)
+        valid = open_stream_frame(stream_id="s-ok", token="tok")
+        await connection.send(json.dumps(valid))
+
+    async with FakeRelay(verifier=identity.verifier) as relay:
+        relay.script(Scenario(after_ack=drive, close_with=(1000, "done")))
+        socket = await dial_relay(relay.url)
+        connection = _connection(socket, identity)
+        await connection.handshake(mint_capability(600))
+        close = await connection.run(handler)
+
+    session = relay.sessions[0]
+    errors = session.frames("stream_error")
+    assert [(e["stream_id"], e["code"]) for e in errors] == [("s-bad", "internal_error")]
+    # The unknown-type frame drew no uplink of its own.
+    assert {f["type"] for f in session.uplink} <= {"hello", "heartbeat", "stream_error"}
+    assert [frame.stream_id for frame in handler.seen] == ["s-ok"]
     assert close.code == 1000
 
 

@@ -25,7 +25,7 @@ from fastapi import APIRouter, Query, Request
 from sse_starlette.sse import EventSourceResponse
 
 from nerdit.daemon.errors import NerditError
-from nerdit.daemon.limits import _MAX_SSE_REPLAY, EVENTS_STREAM_CONCURRENCY_MAX
+from nerdit.daemon.limits import EVENTS_STREAM_CONCURRENCY_MAX, MAX_SSE_REPLAY
 from nerdit.daemon.schemas.events import EventPage
 from nerdit.daemon.sse import (
     default_frame,
@@ -44,7 +44,7 @@ router = APIRouter()
 _STREAM_SEMAPHORE = asyncio.Semaphore(EVENTS_STREAM_CONCURRENCY_MAX)
 
 #: Bound on ONE live catch-up read (the hole a dropped subscriber queue left).
-#: Deliberately smaller than `_MAX_SSE_REPLAY`: that bound governs a
+#: Deliberately smaller than `MAX_SSE_REPLAY`: that bound governs a
 #: once-per-connection preamble, this one a read a *single live frame* can
 #: trigger. Comfortably above the bus subscriber queue's own depth, so the
 #: ordinary "slow consumer, full queue" burst is recovered whole; anything
@@ -251,14 +251,14 @@ async def _event_frames(
             nonlocal seen
             if last_id is None or queries is None:
                 return
-            # Check before replay for retention beyond the cursor, more than _MAX_SSE_REPLAY
+            # Check before replay for retention beyond the cursor, more than MAX_SSE_REPLAY
             # rows (limit + 1), or a cursor above the retained maximum. Clamp an oversized
             # cursor or future live rows would all be dropped. Report the existing pruned
             # reason only for nonempty tables. Read min/max in one statement so a retention
             # sweep cannot make the bounds disagree.
             min_id, max_id = await queries.feed_bounds()
-            rows = await queries.replay_events_after(last_id, limit=_MAX_SSE_REPLAY + 1)
-            overflow = len(rows) > _MAX_SSE_REPLAY
+            rows = await queries.replay_events_after(last_id, limit=MAX_SSE_REPLAY + 1)
+            overflow = len(rows) > MAX_SSE_REPLAY
             if last_id > max_id:
                 seen = max_id
             ahead = max_id > 0 and last_id > max_id
@@ -287,7 +287,7 @@ async def _event_frames(
                     reason="pruned" if (pruned or ahead) else "overflow",
                     retained_min_id=retained_min,
                 )
-            for row in rows[:_MAX_SSE_REPLAY]:
+            for row in rows[:MAX_SSE_REPLAY]:
                 seen = row.id
                 yield _row_frame(row)
 

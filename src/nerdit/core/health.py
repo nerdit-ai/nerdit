@@ -39,19 +39,25 @@ def as_int(value: object, default: int) -> int:
         return default
 
 
-async def check_health(host_port: int, path: str, timeout: float) -> int | None:
+async def check_health(
+    host_port: int, path: str, timeout: float, *, client: httpx.AsyncClient | None = None
+) -> int | None:
     """Probe `http://127.0.0.1:host_port{path}` with a strict per-check timeout.
 
     Returns the HTTP status code, or `None` on any connection/timeout error
     (CRIT-5: the timeout bounds the loop cost of a hanging endpoint). Shared by
-    the reconcile health loop and the `/diagnose` fresh probe (F6-PROBE-DUP).
+    the reconcile health loop and the `/diagnose` fresh probe. `client` reuses
+    a caller-owned client; without one a client is built for this call.
     """
     if not path.startswith("/"):
         path = "/" + path
     url = f"http://127.0.0.1:{host_port}{path}"
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(url)
+        if client is not None:
+            resp = await client.get(url, timeout=timeout)
+        else:
+            async with httpx.AsyncClient(timeout=timeout) as own:
+                resp = await own.get(url)
         return resp.status_code
     except Exception:
         return None

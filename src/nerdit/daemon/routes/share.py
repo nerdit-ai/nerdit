@@ -1,6 +1,6 @@
 """Manage hosted shares; the cloud edge controls who can reach them.
 
-Each stream rereads the share row, so unshare takes effect on the next request.
+Every request validates sharing intent; active streams periodically recheck it.
 Sharing requires enabled link configuration, node ID, slug, hosted base domain
 and a tunnel manager; URLs are computed from known metadata, never guessed.
 
@@ -19,7 +19,7 @@ from fastapi import APIRouter, Request
 
 from nerdit.core.eventlog import get_recorder
 from nerdit.core.jobconfig import parse_job_config
-from nerdit.core.link.hosted import MAX_DNS_LABEL, hosted_label, hosted_label_fits
+from nerdit.core.link.hosted import hosted_host, hosted_label_fits
 from nerdit.core.proxy import EdgeAuthInvalid, load_edge_auth
 from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import require_owner_or_admin, require_role
@@ -206,7 +206,7 @@ async def get_share(request: Request, name: str) -> ShareView:
     operation_id="set_share",
 )
 async def set_share(request: Request, name: str, body: ShareRequest) -> ShareView:
-    """Expose a service at https://<name>--<slug>.<nodes_base_domain>/.
+    """Record sharing intent; activation selects the generated canonical address.
 
     Require owner/admin and token scope; re-sharing updates access while preserving
     created_at. Validate identity, kind, link capability and entitlement/consent
@@ -240,19 +240,6 @@ async def set_share(request: Request, name: str, body: ShareRequest) -> ShareVie
     link = request.app.state.settings.link
     manager = _require_addressable(link, getattr(request.app.state, "link_manager", None))
 
-    if not hosted_label_fits(service_name, link.slug):
-        # The LENGTH, never the label itself: the message is what an operator
-        # reads back into a bug report, and the node slug is not something to
-        # scatter through logs and transcripts.
-        raise NerditError(
-            422,
-            "share.name_too_long",
-            f"'{service_name}' plus this node's slug is "
-            f"{len(hosted_label(service_name, link.slug))} characters — a hosted name "
-            f"must fit in one {MAX_DNS_LABEL}-character DNS label.",
-            hint="Redeploy the app under a shorter name.",
-        )
-
     if body.access == "public":
         if not manager.status().hosted_public_entitled:
             raise NerditError(
@@ -279,7 +266,16 @@ async def set_share(request: Request, name: str, body: ShareRequest) -> ShareVie
             )
 
     share = await queries.set_service_share(
-        service_name, body.access, job_id=job.id, preserve_existing=body.preserve_existing
+        service_name,
+        body.access,
+        job_id=job.id,
+        alias_node_id=link.node_id,
+        alias_host=(
+            hosted_host(service_name, link.slug, link.nodes_base_domain)
+            if hosted_label_fits(service_name, link.slug)
+            else None
+        ),
+        preserve_existing=body.preserve_existing,
     )
     if share is None:
         # The service was deleted between this route's resolve and the write
@@ -322,8 +318,8 @@ async def remove_share(request: Request, name: str) -> ShareRemovedView:
     precedent — a delete is its own replay); the middleware still replays one
     when a caller sends it.
 
-    The path closes on the next tunnel stream: the app-stream resolver re-reads
-    this row per stream, so there is nothing to invalidate here.
+    New streams re-read committed intent immediately; active streams recheck
+    it within the mux watchdog interval, including quiet SSE responses.
     """
     require_role(request, TokenRole.submitter, TokenRole.admin)
     request.state.audit_params = audit_params({"service": name})

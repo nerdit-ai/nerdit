@@ -349,6 +349,29 @@ async def test_hmac_signature_verifies_end_to_end(queries, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_signature_v2_binds_timestamp_and_delivery(queries, tmp_path):
+    """V2 signs `<ts>.<delivery>.<body>`; V1 stays the body-only HMAC."""
+    await _seed_events(queries, 1)
+    target = _target(secret_ref="${secrets.shared.HOOK_HMAC}")
+    await queries.set_notification_cursor(target.cursor_id(), 0)
+    secrets = SecretManager(tmp_path / "secrets")
+    secrets.set("_shared", {"HOOK_HMAC": "zqxjkw-ZQXJKW-hmac"})
+
+    recorder = _Recorder(200)
+    await _drain(_dispatcher(queries, tmp_path, recorder.transport, secrets=secrets), target)
+
+    request = recorder.requests[0]
+    key = b"zqxjkw-ZQXJKW-hmac"
+    ts = request.headers["X-Nerdit-Timestamp"]
+    assert ts.isdigit()
+    delivery = request.headers["X-Nerdit-Delivery"]
+    v1 = hmac.new(key, request.content, hashlib.sha256).hexdigest()
+    v2 = hmac.new(key, f"{ts}.{delivery}.".encode() + request.content, hashlib.sha256).hexdigest()
+    assert request.headers["X-Nerdit-Signature"] == f"sha256={v1}"
+    assert request.headers["X-Nerdit-Signature-V2"] == f"sha256={v2}"
+
+
+@pytest.mark.asyncio
 async def test_auth_header_ref_is_sent_and_never_recorded(queries, tmp_path, caplog):
     sentinel = "Bearer zqxjkw-ZQXJKW-9"
     await _seed_events(queries, 1)
@@ -616,6 +639,38 @@ async def test_loop_survives_a_failing_target(queries, tmp_path, monkeypatch):
     await dispatcher.stop()
 
     assert calls == [TARGET_URL]
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_target_does_not_delay_another(queries, tmp_path):
+    """Targets drain concurrently: a hung endpoint never blocks a healthy one."""
+    never = asyncio.Event()
+    fast = _Recorder(200)
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "hang.example":
+            await never.wait()
+        return fast._handler(request)
+
+    hung = NotificationTarget(url="https://hang.example/x")
+    ok = _target()
+    for t in (hung, ok):
+        await queries.set_notification_cursor(t.cursor_id(), 0)
+    await _seed_events(queries, 1)
+
+    dispatcher = _dispatcher(queries, tmp_path, httpx.MockTransport(_handler))
+    dispatcher._settings = NotificationsSettings(
+        enabled=True, targets=[hung, ok], poll_interval_s=300.0, timeout_s=30.0
+    )
+    await dispatcher.start()
+    try:
+        for _ in range(100):
+            if fast.requests:
+                break
+            await asyncio.sleep(0.01)
+        assert [r.url.host for r in fast.requests] == ["hook.example"]
+    finally:
+        await dispatcher.stop()
 
 
 def test_cursor_id_is_canonical_and_url_free():

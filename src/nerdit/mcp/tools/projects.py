@@ -9,8 +9,9 @@ so the three D-P40-5 judgments compose with the P39 secret claim.
 Thin loopback projections of ``GET``/``POST /api/projects`` and
 ``GET``/``DELETE /api/projects/{project}`` (Invariant #3): grammar, reserved
 names, scope, ownership and the delete cascade are all decided by the daemon
-and surface as its structured envelope. Wire identity stays the label
-(D-P40-6); no argument here is ever named ``environment`` (D-P40-11).
+and surface as its structured envelope. Reads, apply and variables also accept
+immutable project IDs; only names may create a project. Workspace file tools
+keep their name identity. No argument is named ``environment`` (D-P40-11).
 
 P40c adds the project's variables: ``set_variable`` (write-only unless
 ``secret=false``, D-P40-16) and ``resolve_variables`` (names and winning
@@ -32,7 +33,16 @@ from pydantic import Field
 
 from nerdit.cli.client import NerditClient
 from nerdit.mcp.errors import _call, _clamp
-from nerdit.mcp.tools._shared import Cursor, DryRun, IdempotencyKey, apply_sandbox_note
+from nerdit.mcp.tools._shared import (
+    DEFAULT_DIAGNOSE_LOG_TAIL,
+    DEFAULT_LOG_TAIL,
+    MAX_DIAGNOSE_LOG_TAIL,
+    MAX_LOG_TAIL,
+    Cursor,
+    DryRun,
+    IdempotencyKey,
+    apply_sandbox_note,
+)
 from nerdit.mcp.tools.workspaces import WorkspaceDeletes, WorkspaceFiles, _write_app_files_impl
 from nerdit.mcp.transport import _request_client
 
@@ -43,8 +53,8 @@ MAX_PROJECT_LIMIT = 200
 _ProjectName = Annotated[
     str,
     Field(
-        description="Name of an existing project. Every deployed app already belongs to "
-        "a project of its own name, so an app name is a valid project name."
+        description="Immutable prj_ ID or name of an existing project. Prefer the ID "
+        "from list_projects: a retired ID never addresses a same-name replacement."
     ),
 ]
 ProjectLimit = Annotated[
@@ -230,8 +240,8 @@ async def set_variable(
         project: Annotated[
             str,
             Field(
-                description="Project whose variables this call modifies. It need not exist "
-                "yet: a set on an unknown name creates the project for your token."
+                description="Immutable prj_ ID or name of the project to modify. An unknown "
+                "name creates it for your token; an unknown or retired ID is refused."
             ),
         ],
         values: Annotated[
@@ -366,9 +376,9 @@ async def apply_project(
         project: Annotated[
             str,
             Field(
-                description="Project to apply; must equal ``[project].name`` in the "
-                "source's ``nerdit.toml`` (422 ``project.name_mismatch`` otherwise). It "
-                "need not exist yet: a real apply creates it for your token."
+                description="Immutable prj_ ID or name of the project to apply. The resolved "
+                "name must equal ``[project].name`` in ``nerdit.toml``. An unknown name "
+                "may be created; an unknown or retired ID is refused."
             ),
         ],
         repo_url: Annotated[
@@ -430,6 +440,59 @@ async def apply_project(
 # fmt: on
 
 
+async def project_logs(  # noqa: PLR0913 - project identity plus bounded log filters
+    project: _ProjectName,
+    service: Annotated[str, Field(description="Service inside the project; omit for web.")] = "web",
+    tail: Annotated[
+        int, Field(description="Newest matching lines; clamped to [1, 1000].")
+    ] = DEFAULT_LOG_TAIL,
+    since_id: Annotated[
+        int, Field(description="Exclusive log cursor; ignored while tail is sent.")
+    ] = 0,
+    grep: Annotated[
+        str | None, Field(description="Literal substring filter; never a regex.")
+    ] = None,
+    since: Annotated[str | None, Field(description="Inclusive ISO-8601 timestamp filter.")] = None,
+    source: Annotated[str, Field(description="Log stream: all, build or runtime.")] = "all",
+) -> Any:
+    """Read bounded logs of one service resolved within an explicit project.
+
+    Prefer the immutable project ID returned by list_projects. Membership is
+    resolved by the daemon; a same-name replacement cannot inherit a retired ID.
+    Existing node grants and local token roles still apply.
+    """
+    return await _call(
+        _request_client().project_logs(
+            project,
+            service=service,
+            tail=_clamp(tail, MAX_LOG_TAIL),
+            since_id=since_id,
+            grep=grep,
+            since=since,
+            source=source,
+        )
+    )
+
+
+async def diagnose_project(
+    project: _ProjectName,
+    service: Annotated[str, Field(description="Service inside the project; omit for web.")] = "web",
+    log_tail: Annotated[
+        int, Field(description="Log lines to bundle; clamped to [1, 200].")
+    ] = DEFAULT_DIAGNOSE_LOG_TAIL,
+) -> Any:
+    """Diagnose one service of an explicit project under the existing owner/admin policy.
+
+    Prefer an immutable project ID. The daemon resolves project membership and
+    reuses diagnose_service's failure bundle; this grants no additional authority.
+    """
+    return await _call(
+        _request_client().diagnose_project(
+            project, service=service, log_tail=_clamp(log_tail, MAX_DIAGNOSE_LOG_TAIL)
+        )
+    )
+
+
 TOOLS = (
     create_project,
     list_projects,
@@ -440,4 +503,6 @@ TOOLS = (
     write_project_files,
     # The shared sandbox sentence is stamped in (see ``tools/deploy.py``).
     apply_sandbox_note(apply_project),
+    project_logs,
+    diagnose_project,
 )

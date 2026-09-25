@@ -11,7 +11,6 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import re
 import shutil
 import tarfile
 from pathlib import Path
@@ -38,15 +37,11 @@ from nerdit.core.backup import (  # noqa: F401 - re-exported for the restore sui
     _within,
 )
 from nerdit.daemon.lifecycle import DaemonLifecycle
+from nerdit.utils.names import DNS_LABEL_RE
 
 #: Test seam — force the manual (non-``data_filter``) extraction fallback so it
 #: is exercised on interpreters that ship ``tarfile.data_filter`` (D7).
 _FORCE_MANUAL = False
-
-#: DNS-label grammar for the manifest ``service`` field (mirrors the service
-#: name grammar) — the volume-restore target is bound to THIS validated field,
-#: never the tar filename (D9).
-_VOLUME_RESTORE_SERVICE_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 # --------------------------------------------------------------------------- #
@@ -449,8 +444,9 @@ def _load_volume_manifest(staging: Path) -> dict:
     version = manifest.get("version") if isinstance(manifest, dict) else None
     if version != 1:
         raise RestoreError(f"unsupported volume backup version: {version!r}")
+    # The restore target is bound to this validated field, never the tar filename (D9).
     service = manifest.get("service")
-    if not isinstance(service, str) or not _VOLUME_RESTORE_SERVICE_RE.fullmatch(service):
+    if not isinstance(service, str) or not DNS_LABEL_RE.fullmatch(service):
         raise RestoreError(f"manifest service is not a valid DNS label: {service!r}")
     return manifest
 

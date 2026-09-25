@@ -95,15 +95,6 @@ CREATE INDEX IF NOT EXISTS idx_job_logs_ts ON job_logs(timestamp);
 -- Same ``_SCHEMA`` safety as ``idx_job_logs_ts``.
 CREATE INDEX IF NOT EXISTS idx_job_logs_job ON job_logs(job_id, id);
 
-CREATE TABLE IF NOT EXISTS file_uploads (
-    id           TEXT PRIMARY KEY,
-    filename     TEXT NOT NULL,
-    path         TEXT NOT NULL,
-    size_bytes   INTEGER NOT NULL,
-    uploaded_at  TEXT DEFAULT (datetime('now')),
-    used_by_jobs TEXT
-);
-
 CREATE TABLE IF NOT EXISTS api_tokens (
     id                  TEXT PRIMARY KEY,
     name                TEXT NOT NULL,
@@ -279,8 +270,28 @@ CREATE TABLE IF NOT EXISTS secret_claims (
 CREATE TABLE IF NOT EXISTS projects (
     id                 TEXT PRIMARY KEY,
     name               TEXT NOT NULL UNIQUE,
+    display_name       TEXT,
     submitted_by_token TEXT,
     created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Cloud-assigned addresses belong to a linked node and one service incarnation.
+-- Sharing is separate: unpublish retains this address, deletion cannot transfer it.
+CREATE TABLE IF NOT EXISTS service_public_addresses (
+    job_id       TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    project_id   TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    node_id      TEXT NOT NULL,
+    service_name TEXT NOT NULL UNIQUE,
+    slug         TEXT NOT NULL UNIQUE,
+    active       INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1))
+);
+
+-- A deleted incarnation leaves a hashed tombstone; legacy names cannot be reused.
+CREATE TABLE IF NOT EXISTS service_hosted_aliases (
+    node_id   TEXT NOT NULL,
+    host_hash TEXT NOT NULL,
+    job_id    TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+    PRIMARY KEY (node_id, host_hash)
 );
 
 -- Variable flags (P40c / D-P40-1): one row per key set through the variables
@@ -354,6 +365,15 @@ class Database:
     async def _migrate(self) -> None:
         """Add columns introduced after the initial schema if missing."""
         assert self._conn is not None
+        project_info = await self._conn.execute("PRAGMA table_info(projects)")
+        if "display_name" not in {row[1] for row in await project_info.fetchall()}:
+            await self._conn.execute("ALTER TABLE projects ADD COLUMN display_name TEXT")
+        address_info = await self._conn.execute("PRAGMA table_info(service_public_addresses)")
+        if "active" not in {row[1] for row in await address_info.fetchall()}:
+            await self._conn.execute(
+                "ALTER TABLE service_public_addresses ADD COLUMN active "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1))"
+            )
         jobs_table_info = await self._get_jobs_table_info()
         existing = {row[1] for row in jobs_table_info}
         migrations = [
@@ -431,18 +451,6 @@ class Database:
                 # edit alone would silently no-op on every existing install (the
                 # P22 WP-B lesson).
                 await self._conn.execute(f"ALTER TABLE api_tokens ADD COLUMN {col} {typedef}")
-        await self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS file_uploads (
-                id           TEXT PRIMARY KEY,
-                filename     TEXT NOT NULL,
-                path         TEXT NOT NULL,
-                size_bytes   INTEGER NOT NULL,
-                uploaded_at  TEXT DEFAULT (datetime('now')),
-                used_by_jobs TEXT
-            )
-            """
-        )
         await self._ensure_nullable_script_path()
         # Created LAST: ``_ensure_nullable_script_path`` does ``DROP TABLE jobs``,
         # so an index declared in ``_SCHEMA`` would be dropped with it. The

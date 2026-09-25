@@ -1,6 +1,6 @@
 """Read curated templates and deploy them through the shared git pipeline.
 
-Template coordinates feed clone_source and _finalize_deploy. Deployment is
+Template coordinates feed clone_into_uploads and _finalize_deploy. Deployment is
 submitter/admin-gated, idempotent and audited with template ID/name, never secret
 values. Secrets go through the one write path (`secret_scope.set_secret_values`)
 before the clone: on a fresh name that mints the caller's claim, so a principal
@@ -10,22 +10,23 @@ or row (P39 D-P39-5). Mounted under /api only with the Store tag.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 from nerdit.config.app_templates import app_templates_by_id, load_app_templates
-from nerdit.core.gitsource import GitSourceError, clone_source, git_source_meta
+from nerdit.core.gitsource import GitSourceError, git_source_meta
 from nerdit.core.secrets import validate_secret_items
 from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import require_owner_or_admin, require_role, require_service_scope
-from nerdit.daemon.deploy_pipeline import _finalize_deploy, reject_non_service_row
+from nerdit.daemon.deploy_pipeline import (
+    _finalize_deploy,
+    clone_into_uploads,
+    reject_non_service_row,
+)
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.routes.services import reject_reserved_name
 from nerdit.daemon.secret_scope import reject_foreign_claim, secret_call, set_secret_values
 from nerdit.db.models import AppTemplate, TemplateDeployRequest, TokenRole
-from nerdit.utils.ids import generate_id
 
 router = APIRouter()
 
@@ -161,18 +162,13 @@ async def deploy_app_template(
         else:
             await set_secret_values(request, body.name, secrets)
 
-    settings = request.app.state.settings
-    dest_dir = Path(settings.daemon.upload_dir).expanduser() / generate_id()
     try:
-        info = await clone_source(
+        info, dest_dir = await clone_into_uploads(
+            request.app.state.settings,
             template.repo_url,
             ref=template.ref,
             subdir=template.subdir,
-            dest_dir=dest_dir,
             token=None,
-            timeout_s=settings.git.clone_timeout_s,
-            max_bytes=settings.git.max_clone_bytes,
-            allowed_hosts=settings.git.allowed_hosts,
         )
     except GitSourceError as exc:
         raise NerditError(exc.status_code, exc.code, exc.message, hint=exc.hint) from exc

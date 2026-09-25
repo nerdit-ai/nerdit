@@ -902,8 +902,9 @@ export async function mockApi(page: Page, overrides: MockOverrides = {}): Promis
   await page.route(/\/api\/projects\/[^/?]+(\?.*)?$/, (route) => {
     const method = route.request().method();
     const { parts } = projectRequest(route);
-    const name = parts[0];
-    const summary = projectSummaries().find((p) => p.name === name);
+    const selector = parts[0];
+    const summary = projectSummaries().find((p) => p.name === selector || p.id === selector);
+    const name = summary?.name ?? selector;
     if (!summary) return json(route, projectNotFound(name), 404);
     if (method === "DELETE") {
       if (!owner) return json(route, OWNER_DENIAL, 403);

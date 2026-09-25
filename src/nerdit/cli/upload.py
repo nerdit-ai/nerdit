@@ -57,21 +57,34 @@ def should_exclude(rel_path: str) -> bool:
     return matches_exclude_pattern(Path(rel_path).parts)
 
 
-def create_dir_zip(directory: str | Path) -> bytes:
+def create_dir_zip(directory: str | Path, skipped_secrets: list[str] | None = None) -> bytes:
     """Create a ZIP archive of a whole directory.
 
     Zips the directory contents recursively for `nerdit deploy`. Arcnames are
-    relative to the directory root and `ZIP_EXCLUDE_PATTERNS` apply.
+    relative to the directory root and `ZIP_EXCLUDE_PATTERNS` apply. Symlinks
+    resolving outside the directory are dropped (they would upload their
+    target), and so are `.env` / `.env.*` files, which would be baked into the
+    image; their relative paths are appended to *skipped_secrets* when given.
     """
+    from nerdit.core.workspaces import is_secret_basename
+
     base_dir = Path(directory).resolve()
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for file in sorted(base_dir.rglob("*")):
-            if not file.is_file():
+            target = file.resolve()
+            if not file.is_file() or not target.is_relative_to(base_dir):
                 continue
             rel = str(file.relative_to(base_dir))
-            if should_exclude(rel):
+            # An in-tree symlink uploads its target's bytes, so the target's
+            # path must pass the same filters as the link's own name.
+            target_rel = str(target.relative_to(base_dir))
+            if should_exclude(rel) or should_exclude(target_rel):
+                continue
+            if is_secret_basename(rel) or is_secret_basename(target_rel):
+                if skipped_secrets is not None:
+                    skipped_secrets.append(rel)
                 continue
             zf.write(file, rel)
 

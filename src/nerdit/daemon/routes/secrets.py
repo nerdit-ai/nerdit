@@ -24,7 +24,7 @@ from nerdit.daemon.errors import NerditError
 from nerdit.daemon.schemas._base import StrictRequestModel
 from nerdit.daemon.secret_scope import (
     authorize_secret_scope,
-    secret_call,
+    secret_io,
     secret_manager,
     set_secret_values,
     storage_name,
@@ -136,7 +136,8 @@ async def list_secret_names(request: Request, service: str) -> SecretNamesRespon
     """
     await authorize_secret_scope(request, service, write=False)
     return SecretNamesResponse(
-        service=service, keys=secret_call(secret_manager(request).list_keys, storage_name(service))
+        service=service,
+        keys=await secret_io(secret_manager(request).list_keys, storage_name(service)),
     )
 
 
@@ -147,7 +148,7 @@ async def delete_secret_key(request: Request, service: str, key: str):
     request.state.audit_params = audit_params({"service": service, "key": key})
     async with variable_write_lock(request.app):  # verdict and delete are one section
         await authorize_secret_scope(request, service, write=True)
-        existed = secret_call(secret_manager(request).delete_key, storage_name(service), key)
+        existed = await secret_io(secret_manager(request).delete_key, storage_name(service), key)
     if not existed:
         raise NerditError(404, "not_found", f"No secret '{key}' for service '{service}'.")
     return {"service": service, "deleted": key}
@@ -162,7 +163,7 @@ async def delete_all_secrets(request: Request, service: str):
     # write parked on the lock must re-authorize AFTER it, never land across it.
     async with variable_write_lock(request.app):
         await authorize_secret_scope(request, service, write=True)
-        existed = secret_call(secret_manager(request).delete, storage_name(service))
+        existed = await secret_io(secret_manager(request).delete, storage_name(service))
         # The claim reserves the name only while secrets exist for it; a
         # single-key delete keeps both.
         await request.app.state.queries.delete_secret_claim(service)

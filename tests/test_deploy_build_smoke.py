@@ -15,9 +15,12 @@ from pathlib import Path
 import pytest
 
 from nerdit.core import builder
+from nerdit.core.node_runtime import DEFAULT_NODE_VERSION
 from nerdit.core.runtime.docker import DockerRuntime
 
 pytestmark = pytest.mark.asyncio
+
+NODE_BASE_IMAGE = f"node:{DEFAULT_NODE_VERSION}-slim"
 
 EXAMPLE_APP = Path(__file__).resolve().parent.parent / "examples" / "ai-app"
 
@@ -37,8 +40,8 @@ async def test_smoke_node_buildpack_builds_real_image(tmp_path):
     runtime = DockerRuntime(client=_docker_client())
 
     # Fast-path gate: never pull node:20-slim inside a smoke test.
-    if not await runtime.image_exists(builder.NODE_BASE_IMAGE):
-        pytest.skip(f"base image {builder.NODE_BASE_IMAGE} not present locally")
+    if not await runtime.image_exists(NODE_BASE_IMAGE):
+        pytest.skip(f"base image {NODE_BASE_IMAGE} not present locally")
 
     # Copy the fixture so the generated Dockerfile.nerdit stays out of the repo.
     context = tmp_path / "app"
@@ -75,8 +78,8 @@ async def test_smoke_cached_rebuild_reuses_install_layer(tmp_path):
     """
     runtime = DockerRuntime(client=_docker_client())
 
-    if not await runtime.image_exists(builder.NODE_BASE_IMAGE):
-        pytest.skip(f"base image {builder.NODE_BASE_IMAGE} not present locally")
+    if not await runtime.image_exists(NODE_BASE_IMAGE):
+        pytest.skip(f"base image {NODE_BASE_IMAGE} not present locally")
 
     context = tmp_path / "app"
     shutil.copytree(EXAMPLE_APP, context)

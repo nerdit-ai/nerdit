@@ -19,7 +19,7 @@ from nerdit.daemon.errors import (
     _envelope,
     register_error_handlers,
 )
-from nerdit.daemon.middleware import BearerAuthMiddleware
+from nerdit.daemon.middleware import ScopedTokenAuthMiddleware
 
 
 class _Body(BaseModel):
@@ -59,7 +59,7 @@ def _make_app(*, auth_token: str | None = None) -> FastAPI:
         return {"ok": True}
 
     if auth_token is not None:
-        app.add_middleware(BearerAuthMiddleware, token=auth_token)
+        app.add_middleware(ScopedTokenAuthMiddleware, token=auth_token)
     app.add_middleware(RequestIdMiddleware)
     return app
 
@@ -166,6 +166,16 @@ def test_request_id_generated_when_absent():
     resp = client.get("/boom/404")
     rid = resp.headers.get("X-Request-Id")
     assert rid
+    assert resp.json()["request_id"] == rid
+
+
+@pytest.mark.parametrize("bad", ["a" * 200, "has space"])
+def test_malformed_request_id_is_replaced_not_echoed(bad):
+    client = TestClient(_make_app(), raise_server_exceptions=False)
+    resp = client.get("/boom/404", headers={"X-Request-Id": bad})
+    rid = resp.headers["X-Request-Id"]
+    assert rid != bad
+    assert len(rid) == 32 and int(rid, 16) >= 0
     assert resp.json()["request_id"] == rid
 
 

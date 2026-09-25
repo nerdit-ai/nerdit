@@ -100,6 +100,7 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from nerdit.core.gitsource import GitSourceInfo  # noqa: E402
+from nerdit.daemon import deploy_pipeline  # noqa: E402
 from nerdit.daemon.audit import AuditMiddleware, derive_action  # noqa: E402
 from nerdit.daemon.auth import hash_token  # noqa: E402
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers  # noqa: E402
@@ -223,7 +224,7 @@ def _node_context(tmp_path, *, toml: str | None = None, dockerfile: bool = False
 
 
 def _patch_clone(monkeypatch, context_dir: Path, *, create_dest=False):
-    """Patch clone_source on the route to return a fixed context dir.
+    """Patch clone_source on the pipeline to return a fixed context dir.
 
     ``create_dest=True`` also materializes the generated ``dest_dir`` so a
     failure-cleanup test can assert it was rmtree'd.
@@ -241,8 +242,8 @@ def _patch_clone(monkeypatch, context_dir: Path, *, create_dest=False):
             commit_sha="a" * 40, resolved_ref=ref or "v1.0.0", context_dir=context_dir
         )
 
-    monkeypatch.setattr(app_templates_route, "clone_source", AsyncMock(side_effect=_fake_clone))
-    return app_templates_route.clone_source, captured
+    monkeypatch.setattr(deploy_pipeline, "clone_source", AsyncMock(side_effect=_fake_clone))
+    return deploy_pipeline.clone_source, captured
 
 
 class _FakeSecrets:
@@ -455,7 +456,7 @@ def test_secrets_are_stored_before_the_row_exists(tmp_path, monkeypatch):
         order.append("clone")
         return GitSourceInfo(commit_sha="a" * 40, resolved_ref="v1.0.0", context_dir=ctx)
 
-    monkeypatch.setattr(app_templates_route, "clone_source", AsyncMock(side_effect=_clone))
+    monkeypatch.setattr(deploy_pipeline, "clone_source", AsyncMock(side_effect=_clone))
     resp = TestClient(app, raise_server_exceptions=False).post(
         "/app-templates/synth/deploy",
         json={"name": "demo", "env": {"API_URL": "u"}, "secrets": {"SERVICE_KEY": "k"}},

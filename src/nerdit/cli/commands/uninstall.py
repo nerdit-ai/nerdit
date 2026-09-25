@@ -811,7 +811,8 @@ def _unsafe_target(label: str, path: Path) -> str | None:
     `[nerdit].data_dir` is an unvalidated `str` (settings.py) mapped verbatim
     from `config.toml` — an empty value expands to `Path('.')` and a relative
     one is CWD-relative, so an unguarded `rmtree` would wipe the working
-    directory. Fail closed on a non-absolute, root, `$HOME` or CWD target.
+    directory. Fail closed on a non-absolute target, a root, `$HOME`, the CWD,
+    or any ancestor of them.
     """
     if not path.is_absolute():
         return f"{label} is not an absolute path ({path!r})"
@@ -833,12 +834,12 @@ def _unsafe_target(label: str, path: Path) -> str | None:
     homes.extend(h for h in (_INVOKING_HOME, _ADOPTED_HOME) if h is not None)
     for home in homes:
         try:
-            if resolved == home.resolve():
-                return f"{label} is a home directory ({resolved})"
+            if home.resolve().is_relative_to(resolved):
+                return f"{label} is a home directory or contains one ({resolved})"
         except OSError:
             continue
-    if resolved == Path.cwd().resolve():
-        return f"{label} resolves to the current directory ({resolved})"
+    if Path.cwd().resolve().is_relative_to(resolved):
+        return f"{label} is or contains the current directory ({resolved})"
 
     # Containment. Once a system unit's home has been adopted, every
     # config-derived target comes from a file an unprivileged principal can
@@ -1148,7 +1149,7 @@ def uninstall(
         service_result = "no service unit manages this install"
 
     # 1. Stop the daemon process itself, whether or not step 0 succeeded (recon
-    #    fact #1: DaemonLifecycle.stop is TERM-only, no wait — we do our own
+    #    fact #1: a bare SIGTERM does not wait — we do our own
     #    TERM → drain → KILL escalation, bounded by ``_DAEMON_DRAIN_S``).
     #    ``_terminate`` is safe on a dead or reused pid: it verifies the command
     #    line first and treats ProcessLookupError as "already gone".

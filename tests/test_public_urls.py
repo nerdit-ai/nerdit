@@ -484,7 +484,7 @@ def _auth() -> dict[str, str]:
 
 def test_services_list_reads_the_share_table_exactly_once_for_three_services():
     """The D-P26-14 budget. Three services on the page, ONE
-    ``list_service_shares`` await and ZERO per-row ``get_service_share`` awaits —
+    ``list_service_shares`` await and no per-row share read —
     the point of loading a request-scoped context in front of sync projections."""
     jobs = [_job(f"app{i}", i) for i in range(3)]
     q = AsyncMock()
@@ -494,7 +494,6 @@ def test_services_list_reads_the_share_table_exactly_once_for_three_services():
     q.get_service_endpoint = AsyncMock(return_value=None)
     q.get_job_gpus = AsyncMock(return_value=[])
     q.list_service_shares = AsyncMock(return_value={})
-    q.get_service_share = AsyncMock(return_value=None)
     q.list_service_domains = AsyncMock(return_value=[])
     q.get_service_domains = AsyncMock(return_value=[])
 
@@ -502,7 +501,6 @@ def test_services_list_reads_the_share_table_exactly_once_for_three_services():
     assert resp.status_code == 200, resp.text
     assert len(resp.json()["items"]) == 3
     assert q.list_service_shares.await_count == 1
-    assert q.get_service_share.await_count == 0
     # (P26 WP1 / S-W1) The second whole-table read, and only ONE of it; the
     # per-service point read is never reached from a list surface.
     assert q.list_service_domains.await_count == 1
@@ -582,7 +580,6 @@ def test_routes_reads_the_share_table_exactly_once_and_projects_it():
             return_value=([_route_endpoint("demo"), _route_endpoint("other")], None)
         ),
         list_service_shares=AsyncMock(return_value={"demo": _share()}),
-        get_service_share=AsyncMock(return_value=None),
         list_service_domains=AsyncMock(return_value=[]),
         get_service_domains=AsyncMock(return_value=[]),
     )
@@ -594,7 +591,6 @@ def test_routes_reads_the_share_table_exactly_once_and_projects_it():
     assert items["demo"]["public_urls"][1]["url"] == HOSTED_URL
     assert [e["kind"] for e in items["other"]["public_urls"]] == ["default"]
     assert q.list_service_shares.await_count == 1
-    assert q.get_service_share.await_count == 0
     assert q.list_service_domains.await_count == 1
     assert q.get_service_domains.await_count == 0
 

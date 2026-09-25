@@ -264,7 +264,6 @@ class QueriesBase:
             config=r["config"],
             error_class=ErrorClass(r["error_class"]) if r["error_class"] else None,
             error_message=r["error_message"],
-            submitted_via=r["submitted_via"] or "cli",
             kind=JobKind(r["kind"]),
             submitted_by_token=r["submitted_by_token"],
             idempotency_key=r["idempotency_key"],

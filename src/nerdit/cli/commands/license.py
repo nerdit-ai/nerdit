@@ -16,7 +16,7 @@ from uuid import uuid4
 
 import typer
 
-from nerdit.cli.display import console, render_client_error
+from nerdit.cli.display import call_or_exit, console, render_client_error
 from nerdit.cli.display import plain as _plain
 
 license_app = typer.Typer(
@@ -222,11 +222,7 @@ async def _remove_async(yes: bool) -> None:
         raise typer.Exit(1)
 
     client = get_configured_client()
-    try:
-        result = await client.remove_license(idempotency_key=uuid4().hex)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    result = await call_or_exit(client.remove_license(idempotency_key=uuid4().hex))
 
     if result.get("removed"):
         console.print("[green]License removed.[/green]")

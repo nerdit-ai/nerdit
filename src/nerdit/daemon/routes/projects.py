@@ -1,28 +1,15 @@
-"""The project noun as an API (P40b): create, list, read and delete projects.
+"""Manage projects, scoped variables and declarative service deployment.
 
-A project is the grouping every ``kind=service`` row points at (P40a). Its row
-outlives its services and reserves the name for the owner token, so the three
-D-P40-5 judgments compose with the P39 claim: a foreign project refuses a
-deploy (409 ``project.owned``), a foreign project refuses a secret claim (the
-row 403), a foreign claim refuses ``create_project`` (409
-``service.name_claimed``). Wire identity stays the label (D-P40-6); no request,
-response or audit field is ever named ``environment`` (D-P40-11). Every message
-here names project and service names only. Mounted under /api only.
-
-P40c adds the variables of a project: one store, one flag (D-P40-1). Every
-value lives in a scope's encrypted file; the only value any body here carries
-is a PLAIN one, to the project's owner or an admin (D-P40-15). No route here
-ever addresses the machine scope (`_shared`).
-
-P40d adds `apply_project`, an orchestrator over the ordinary deploy tail
-(D-P40-12): every refusal lands before the first build context, a dry run
-writes nothing, and a service's label is composed, never parsed back.
+Project ownership and secret claims share the same name boundary. Variable
+values stay encrypted; only plain values are returned to an owner or admin,
+and machine scope is excluded. Apply preflights every service before creating
+build contexts, dry runs write nothing, and service labels are composed rather
+than parsed back.
 """
 
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import shutil
 import tomllib
@@ -30,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Form, Query, Request, UploadFile
+from fastapi import APIRouter, Form, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -39,11 +26,13 @@ from nerdit.config.project import (
     DeclarationError,
     parse_project_declaration,
 )
-from nerdit.core.gitsource import git_source_meta
+from nerdit.config.redaction import redact_url_userinfo
+from nerdit.core.gitsource import GitSourceInfo, git_source_meta
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.core.project_identity import (
     DEFAULT_SERVICE,
     PRODUCTION,
+    PROJECT_ID_RE,
     PROJECT_NAME_RE,
     SERVICE_NAME_RE,
     service_label,
@@ -67,24 +56,29 @@ from nerdit.daemon.deploy_pipeline import (
     reject_non_service_row,
 )
 from nerdit.daemon.errors import NerditError
+from nerdit.daemon.limits import _MAX_LOG_TAIL
+from nerdit.daemon.project_delegation import require_live_project_jobs
 from nerdit.daemon.routes.deploy import (
     _resolve_token_ref,
     clone_for_request,
     validate_git_request,
 )
-from nerdit.daemon.routes.services import reject_reserved_name
+from nerdit.daemon.routes.service_diagnose import diagnose_job
+from nerdit.daemon.routes.services import logs_for_job, reject_reserved_name
 from nerdit.daemon.routes.workspaces import snapshot_own_workspace
 from nerdit.daemon.schemas._base import StrictRequestModel
 from nerdit.daemon.schemas.exposure import PublicUrlEntry
+from nerdit.daemon.schemas.service_diagnose import DiagnoseResponse
 from nerdit.daemon.secret_scope import (
     authorize_secret_scope,
     claim_owned_by_caller,
     create_project_for_caller,
+    lookup_project,
     project_owned_by_caller,
     project_owned_error,
     reject_foreign_claim,
     require_service_in_project,
-    secret_call,
+    secret_io,
     secret_manager,
     service_scope_readable,
     set_project_values,
@@ -93,9 +87,9 @@ from nerdit.daemon.secret_scope import (
 )
 from nerdit.daemon.service_purge import _parse_purge, delete_service
 from nerdit.daemon.uploads import extract_upload, read_upload_member
-from nerdit.daemon.views.hosted import load_hosted_context
-from nerdit.daemon.views.service import _service_response
-from nerdit.db.models import Job, JobKind, JobStatus, Project, ServiceResponse, TokenRole
+from nerdit.daemon.views.hosted import HostedContext, load_hosted_context
+from nerdit.daemon.views.service import service_view
+from nerdit.db.models import Job, JobKind, JobStatus, LogEntry, Project, ServiceResponse, TokenRole
 from nerdit.db.queries import ProjectExists
 from nerdit.utils.ids import generate_id
 
@@ -136,7 +130,8 @@ class ProjectSummary(BaseModel):
     """A project with its services and every advertised address (list + create)."""
 
     id: str = Field(description="`prj_` + 16 base32 chars")
-    name: str = Field(description="The project name")
+    name: str = Field(description="Editable display name; address the project by id")
+    namespace: str = Field(description="Immutable namespace for declarations and legacy selectors")
     services: list[ServiceResponse] = Field(
         default_factory=list, description="The project's service rows, by service name"
     )
@@ -146,7 +141,7 @@ class ProjectSummary(BaseModel):
 
 
 class ProjectHome(BaseModel):
-    """The machine a project lives on — always this node in phase 1 (plan §4)."""
+    """The machine a project lives on — always this node today."""
 
     hostname: str | None = Field(default=None, description="This daemon's hostname")
     node_id: str | None = Field(default=None, description="This node's link id, if linked")
@@ -292,16 +287,13 @@ def _validate_name(name: str) -> None:
         )
 
 
-async def _service_views(request: Request, jobs: list[Job]) -> list[ServiceResponse]:
-    """Project the rows exactly as `GET /services` does, one hosted snapshot per call."""
-    queries = request.app.state.queries
-    hosted = await load_hosted_context(request)
-    views: list[ServiceResponse] = []
-    for job in jobs:
-        endpoint = await queries.get_service_endpoint(job.service_name or "")
-        gpu_ids = await queries.get_job_gpus(job.id)
-        views.append(_service_response(request, job, gpu_ids, endpoint, hosted=hosted))
-    return views
+async def _service_views(
+    request: Request, jobs: list[Job], hosted: HostedContext | None = None
+) -> list[ServiceResponse]:
+    """Project the rows as `GET /services` does, one hosted snapshot unless `hosted` is given."""
+    if hosted is None:
+        hosted = await load_hosted_context(request)
+    return [await service_view(request, job, hosted=hosted) for job in jobs]
 
 
 def _addresses(services: list[ServiceResponse]) -> list[PublicUrlEntry]:
@@ -332,10 +324,15 @@ async def _resources(request: Request, jobs: list[Job]) -> list[ProjectResourceV
             provider = spec.get("provider")
             ready: bool | None = None
             target = spec.get("model")
-            if provider == "ollama" and isinstance(target, str) and principal.in_scope(target):
+            if (
+                principal.project_id is None
+                and provider == "ollama"
+                and isinstance(target, str)
+                and principal.in_scope(target)
+            ):
                 ready = _is_up(await queries.get_model_by_ref(target))
             elif provider == "api":
-                target = spec.get("base_url")
+                target = redact_url_userinfo(spec.get("base_url"))
             out.append(
                 ProjectResourceView(
                     service=label,
@@ -353,7 +350,12 @@ async def _resources(request: Request, jobs: list[Job]) -> list[ProjectResourceV
             provider = spec.get("provider")
             ready = None
             target = spec.get("database")
-            if provider == "managed" and isinstance(target, str) and principal.in_scope(target):
+            if (
+                principal.project_id is None
+                and provider == "managed"
+                and isinstance(target, str)
+                and principal.in_scope(target)
+            ):
                 row = await queries.get_service_by_name(target)
                 ready = row is not None and row.kind is JobKind.database and _is_up(row)
             out.append(
@@ -388,13 +390,20 @@ async def list_projects(
     except ValueError as exc:
         raise NerditError(400, "bad_request", str(exc)) from exc
     items: list[ProjectSummary] = []
+    hosted = await load_hosted_context(request)  # one snapshot for the whole page
     for project in projects:
         # ponytail: one row query per project on the page (≤ 200, in-process
         # SQLite); batch by `project_id IN (...)` if the grid ever feels it.
-        services = await _service_views(request, await queries.list_project_services(project.id))
+        services = await _service_views(
+            request, await queries.list_project_services(project.id), hosted=hosted
+        )
         items.append(
             ProjectSummary(
-                id=project.id, name=project.name, services=services, addresses=_addresses(services)
+                id=project.id,
+                name=project.label,
+                namespace=project.name,
+                services=services,
+                addresses=_addresses(services),
             )
         )
     return ProjectListPage(items=items, next_cursor=next_cursor)
@@ -425,13 +434,12 @@ async def create_project(request: Request, body: ProjectCreateRequest) -> Projec
             f"A project named '{body.name}' already exists.",
             hint="Choose a different name, or `nerdit projects show` the existing one.",
         ) from exc
-    return ProjectSummary(id=project.id, name=project.name)
+    return ProjectSummary(id=project.id, name=project.label, namespace=project.name)
 
 
 async def _lookup(request: Request, name: str) -> Project:
     """Scope first (the 403 for an out-of-scope name), then the row or a 404."""
-    require_service_scope(request, name)
-    project = await request.app.state.queries.get_project_by_name(name)
+    project = await lookup_project(request, name)
     if project is None:
         raise _not_found(name)
     return project
@@ -451,7 +459,8 @@ async def get_project(request: Request, project: str) -> ProjectResponse | JSONR
     manager = getattr(state, "link_manager", None)
     view = ProjectResponse(
         id=row.id,
-        name=row.name,
+        name=row.label,
+        namespace=row.name,
         services=services,
         addresses=_addresses(services),
         resources=await _resources(request, jobs),
@@ -461,12 +470,93 @@ async def get_project(request: Request, project: str) -> ProjectResponse | JSONR
         ),
         variables=await _variable_names(request, row, jobs),
     )
+    await require_live_project_jobs(request, jobs)
     if view.variables is None:
         # D-P40-15: the section is OMITTED for a non-owner, not nulled, and
         # `response_model_exclude_none` would also strip every null a
         # `ServiceResponse` carries on purpose.
         return JSONResponse(view.model_dump(mode="json", exclude={"variables"}))
     return view
+
+
+@router.patch("/projects/{project}", response_model=ProjectSummary, operation_id="rename_project")
+async def rename_project(
+    request: Request, project: str, body: ProjectCreateRequest
+) -> ProjectSummary:
+    """Rename an owned project's display label by ID; namespaces and addresses stay fixed."""
+    require_role(request, TokenRole.submitter, TokenRole.admin)
+    if not PROJECT_ID_RE.fullmatch(project):
+        raise NerditError(422, "project.id_required", "Rename requires an immutable project ID.")
+    row = await _lookup(request, project)
+    require_project_owner_or_admin(request, row)
+    _validate_name(body.name)
+    reject_reserved_name(body.name)
+    request.state.audit_params = audit_params({"project": project, "name": body.name})
+    renamed = await request.app.state.queries.rename_project(row.id, body.name)
+    if renamed is None:
+        raise _not_found(project)
+    services = await _service_views(
+        request, await request.app.state.queries.list_project_services(row.id)
+    )
+    return ProjectSummary(
+        id=row.id,
+        name=renamed.label,
+        namespace=row.name,
+        services=services,
+        addresses=_addresses(services),
+    )
+
+
+async def _project_service(request: Request, project: str, service: str) -> Job:
+    """Resolve membership from stored IDs, never by parsing or guessing a label."""
+    row = await _lookup(request, project)
+    _label(row.name, service)
+    for job in await request.app.state.queries.list_project_services(row.id):
+        if job.kind is JobKind.service and job.environment == PRODUCTION and job.service == service:
+            return job
+    raise NerditError(404, "not_found", f"No service '{service}' in project '{project}'.")
+
+
+@router.get(
+    "/projects/{project}/services/{service}/logs",
+    response_model=list[LogEntry],
+    operation_id="project_logs",
+)
+async def project_logs(
+    request: Request,
+    response: Response,
+    project: str,
+    service: str,
+    since_id: int = Query(0),
+    tail: int | None = Query(None, ge=1, le=_MAX_LOG_TAIL),
+    grep: str | None = Query(None, description="Literal substring filter"),
+    since: str | None = Query(None, description="Inclusive ISO-8601 timestamp"),
+    source: Literal["all", "build", "runtime"] = Query("all"),
+) -> list[LogEntry]:
+    """Read bounded logs for a project's service, addressing the project by ID or name."""
+    job = await _project_service(request, project, service)
+    result = await logs_for_job(
+        request, response, job, since_id=since_id, tail=tail, grep=grep, since=since, source=source
+    )
+    await require_live_project_jobs(request, [job])
+    return result
+
+
+@router.get(
+    "/projects/{project}/services/{service}/diagnose",
+    response_model=DiagnoseResponse,
+    operation_id="diagnose_project",
+)
+async def diagnose_project(
+    request: Request,
+    project: str,
+    service: str,
+    log_tail: int = Query(50, description="Log lines to bundle (clamped to [1, 200])"),
+) -> DiagnoseResponse:
+    """Diagnose one project service under its existing local owner/admin policy."""
+    return await diagnose_job(
+        request, await _project_service(request, project, service), log_tail=log_tail
+    )
 
 
 def _remove_project_file(request: Request, project_id: str) -> None:
@@ -498,25 +588,34 @@ async def _variable_names(
     mgr = getattr(request.app.state, "secret_manager", None)
     if mgr is None or not project_owned_by_caller(request, row):
         return None
-    flags = await request.app.state.queries.list_variable_flags(row.id)
-    plain = {(f.service, f.key) for f in flags if f.plain}
-    # ponytail: a `web` scope set before the first deploy (claim, no row) is not
-    # listed here; `list_variables?service=web` shows it. Add the claim read if
-    # the dashboard needs it.
-    scopes: list[tuple[str, str | None]] = [(project_storage_name(row.id), None)]
-    scopes += [
-        (job.service_name, job.service or DEFAULT_SERVICE)
-        for job in jobs
-        if job.service_name and may_manage_job(request, job)
-    ]
-    try:
-        return [
-            VariableName(key=key, scope=_scope_name(service), plain=(service or "", key) in plain)
-            for storage, service in scopes
-            for key in mgr.list_keys(storage)
+    queries = request.app.state.queries
+    async with variable_write_lock(request.app):
+        current = await queries.get_project(row.id)
+        if current is None or not project_owned_by_caller(request, current):
+            return None
+        flags = await queries.list_variable_flags(row.id)
+        plain = {(f.service, f.key) for f in flags if f.plain}
+        # Recheck immutable job IDs under the deletion/writer lock before
+        # reading label-keyed files. A replacement never inherits the old verdict.
+        original_ids = {job.id for job in jobs}
+        live_jobs = await queries.list_project_services(row.id)
+        # ponytail: rowless pre-deploy web variables stay on list_variables?service=web.
+        scopes: list[tuple[str, str | None]] = [(project_storage_name(row.id), None)]
+        scopes += [
+            (job.service_name, job.service or DEFAULT_SERVICE)
+            for job in live_jobs
+            if job.id in original_ids and job.service_name and may_manage_job(request, job)
         ]
-    except SecretDecryptError:
-        return None
+        try:
+            return [
+                VariableName(
+                    key=key, scope=_scope_name(service), plain=(service or "", key) in plain
+                )
+                for storage, service in scopes
+                for key in mgr.list_keys(storage)
+            ]
+        except SecretDecryptError:
+            return None
 
 
 def _check_new_name(name: str) -> None:
@@ -573,18 +672,24 @@ async def resolve_variables(
     (`load_scoped`), so this cannot drift from what a launch does; the service
     scope joins only when the caller may read it.
     """
-    label = _label(project, service)
-    row = await _owned(request, project)
-    await require_service_in_project(request, row, project, service, label)
-    include_service = await service_scope_readable(request, label)
-    _, winners = secret_call(
-        lambda: load_scoped(secret_manager(request), label, row.id, include_service=include_service)
-    )
-    queries = request.app.state.queries
-    plain = {
-        "project": await plain_keys(queries, row.id),
-        "service": await plain_keys(queries, row.id, service),
-    }
+    if not project.startswith("prj_"):
+        _label(project, service)
+    async with variable_write_lock(request.app):
+        row = await _owned(request, project)
+        project = row.name
+        label = _label(project, service)
+        await require_service_in_project(request, row, project, service, label)
+        include_service = await service_scope_readable(request, label, project=project)
+        _, winners = await secret_io(
+            lambda: load_scoped(
+                secret_manager(request), label, row.id, include_service=include_service
+            )
+        )
+        queries = request.app.state.queries
+        plain = {
+            "project": await plain_keys(queries, row.id),
+            "service": await plain_keys(queries, row.id, service),
+        }
     return VariableResolveResponse(
         project=project,
         service=service,
@@ -614,22 +719,25 @@ async def list_variables(
     Owner or admin (D-P40-15; a NULL-owner project is admin-only); a scoped
     non-owner gets the row 403. A secret value is never returned.
     """
-    label = _label(project, service) if service is not None else None
-    row = await _owned(request, project)
+    if service is not None and not project.startswith("prj_"):
+        _label(project, service)
     # One scope at a time, still through the merged reader (the only caller
     # of `SecretManager.load` outside the store): the other half is excluded.
     mgr = secret_manager(request)
     env: dict[str, str] = {}
-    # Values and flags are ONE snapshot under the writers' lock: a secret->plain
-    # flip landing between the two reads would pair the old secret with the new
-    # plain flag and return it. ponytail: a list waits out a staging backup.
+    # Identity, ownership, values and flags are one snapshot: neither a
+    # replacement nor a secret→plain flip may reuse an earlier verdict.
+    # ponytail: a list waits out a staging backup.
     async with variable_write_lock(request.app):
+        row = await _owned(request, project)
+        project = row.name
+        label = _label(project, service) if service is not None else None
         if label is None or service is None:
-            env, _ = secret_call(lambda: load_scoped(mgr, None, row.id))
+            env, _ = await secret_io(lambda: load_scoped(mgr, None, row.id))
         else:
             await require_service_in_project(request, row, project, service, label)
-            if await service_scope_readable(request, label):
-                env, _ = secret_call(lambda: load_scoped(mgr, label, None))
+            if await service_scope_readable(request, label, project=project):
+                env, _ = await secret_io(lambda: load_scoped(mgr, label, None))
         plain = await plain_keys(request.app.state.queries, row.id, service)
     scope = _scope_name(service)
     return VariableListResponse(
@@ -658,7 +766,7 @@ async def set_variables(
     """Set/merge variables in one scope; returns key names only.
 
     `secret` defaults to true (D-P40-16). A set on an absent project creates
-    it for the caller; a service-scope set on a rowless label mints the P39
+    it for the caller; a service-scope set on a rowless label mints the secrets
     claim. Setting a key flips its flag in that scope. Audited `variable.set`
     with names only.
     """
@@ -679,15 +787,16 @@ async def set_variables(
     if not body.values:
         raise NerditError(400, "variable.empty", "No variable values provided.")
     if service is None:
-        keys = await set_project_values(
+        name, keys = await set_project_values(
             request, project, body.values, plain, check_new_name=_check_new_name
         )
     else:
-        _label(project, service)  # the 422s, before any lookup
-        keys = await set_service_values(
+        name = (await _lookup(request, project)).name if project.startswith("prj_") else project
+        _label(name, service)
+        name, keys = await set_service_values(
             request, project, service, body.values, plain, check_new_name=_check_new_name
         )
-    return VariableSetResponse(project=project, scope=scope, keys=keys, plain=plain)
+    return VariableSetResponse(project=name, scope=scope, keys=keys, plain=plain)
 
 
 @router.delete(
@@ -701,7 +810,7 @@ async def delete_variable(
 ) -> dict[str, str]:
     """Delete one key from a scope's file, and its flag row.
 
-    Owner or admin. Never releases a P39 claim: deleting a whole service scope
+    Owner or admin. Never releases a secrets claim: deleting a whole service scope
     stays `DELETE /secrets/{label}`. Audited `variable.unset`.
     """
     require_role(request, TokenRole.submitter, TokenRole.admin)
@@ -709,16 +818,19 @@ async def delete_variable(
     request.state.audit_params = audit_params(
         {"project": project, "scope": scope, "service": service, "keys": [key]}
     )
-    label = _label(project, service) if service is not None else None
+    if service is not None and not project.startswith("prj_"):
+        _label(project, service)
     async with variable_write_lock(request.app):  # verdict and delete are one section
         row = await _owned(request, project)
+        project = row.name
+        label = _label(project, service) if service is not None else None
         if label is None or service is None:
             storage = project_storage_name(row.id)
         else:
             await require_service_in_project(request, row, project, service, label)
-            await authorize_secret_scope(request, label, write=True)
+            await authorize_secret_scope(request, label, write=True, project=project)
             storage = label
-        existed = secret_call(secret_manager(request).delete_key, storage, key)
+        existed = await secret_io(secret_manager(request).delete_key, storage, key)
         # A stale flag row is harmless (every `/secrets` and variables write
         # re-flags its keys), so the file goes first and the flag follows.
         await request.app.state.queries.delete_variable_flag(row.id, service, key)
@@ -770,15 +882,14 @@ async def delete_project(
             else:
                 deleted.append(label)
         if not failed:
-            remaining = await queries.delete_project_checked(row.id)
-            if remaining is None:
-                raise _not_found(project)
-            if not remaining:
-                # (P40c / D-P40-17) The row is gone and its flag rows went by
-                # FK; nothing can address the id-keyed file any more, so it
-                # goes unconditionally (no purge flag gates it).
-                # Under the writers' lock so a parked write cannot re-create it.
-                async with variable_write_lock(request.app):
+            # Retire the identity under the writers' lock too: a variable write
+            # already authorized on this ID must finish before its name is free.
+            # The service cascade stays outside: each service acquires this lock.
+            async with variable_write_lock(request.app):
+                remaining = await queries.delete_project_checked(row.id)
+                if remaining is None:
+                    raise _not_found(project)
+                if not remaining:
                     _remove_project_file(request, row.id)
             # A row landed between the sweep and the final delete: report it as
             # a refusal like any other so the caller re-runs rather than guesses.
@@ -807,10 +918,10 @@ async def delete_project(
             deleted=deleted,
             failed=failed,
         )
-    return ProjectDeletedResponse(name=project, deleted=deleted)
+    return ProjectDeletedResponse(name=row.name, deleted=deleted)
 
 
-# --- P40d: the declaration apply (D-P40-12) -----------------------------------
+# --- The declaration apply (D-P40-12) -----------------------------------------
 
 
 def _declaration_error(exc: DeclarationError) -> NerditError:
@@ -842,19 +953,13 @@ async def _archive_declaration(request: Request, archive: UploadFile) -> dict:
         raise _invalid_declaration(f"{PROJECT_CONFIG_NAME} is not valid TOML.") from None
 
 
-async def _git_declaration(
-    request: Request, repo_url: str, ref: str | None, token: str | None
-) -> dict:
-    """Read `nerdit.toml` off a throwaway clone; for a git source the clone IS the read."""
-    info, root = await clone_for_request(request, repo_url, ref=ref, subdir=None, token=token)
-    try:
-        data, error = _read_project_toml(info.context_dir)
-    finally:
-        await asyncio.to_thread(shutil.rmtree, root, ignore_errors=True)
+def _tree_declaration(context: Path, missing: str) -> dict:
+    """Read `nerdit.toml` off the apply's master tree; `missing` names the source."""
+    data, error = _read_project_toml(context)
     if error is not None:
         raise _invalid_declaration(f"{PROJECT_CONFIG_NAME} is not valid TOML.")
     if not data:
-        raise _invalid_declaration(f"The repository has no {PROJECT_CONFIG_NAME} at its root.")
+        raise _invalid_declaration(f"The {missing} has no {PROJECT_CONFIG_NAME} at its root.")
     return data
 
 
@@ -862,11 +967,10 @@ async def _judge_apply_project(request: Request, project: str) -> Project | None
     """Scope before any lookup, then the owner gate: 409 `project.owned`, nothing else.
 
     The refusal carries no `missing` list and no key name: a non-owner must
-    never learn which variables a foreign project lacks (the P39 oracle).
+    never learn which variables a foreign project lacks.
     Ownership is judged on `projects.submitted_by_token`, never the actor.
     """
-    require_service_scope(request, project)
-    row = await request.app.state.queries.get_project_by_name(project)
+    row = await lookup_project(request, project)
     if row is not None and not project_owned_by_caller(request, row):
         raise project_owned_error(project)
     return row
@@ -893,7 +997,7 @@ async def _missing_variables(
     Names only: the merged reader is asked for each service's key set and the
     values never leave this frame. The project scope is read because the
     caller passed the owner gate (`include_project`); a service scope only
-    when its row (this project's, manageable by the caller) or its P39 claim
+    when its row (this project's, manageable by the caller) or its secrets claim
     is the caller's, so a foreign label's key names cannot leak through
     `missing`.
     """
@@ -913,7 +1017,7 @@ async def _missing_variables(
                 and existing.service == service
                 and may_manage_job(request, existing)
             )
-        names, _ = secret_call(
+        names, _ = await secret_io(
             lambda label=label, include_service=include_service: load_scoped(
                 mgr,
                 label,
@@ -946,10 +1050,13 @@ async def _preflight_service(request: Request, project: str, declared: DeclaredS
 @dataclass
 class _ApplySource:
     """The one source of an apply: the spooled archive, a git coordinate, or the
-    project's workspace (snapshotted into `archive` once the project is judged).
+    project's workspace.
 
-    `token` is the resolved private-repo credential: a local of the request,
-    never logged, audited, persisted or returned (`repr=False`).
+    `tree` is the disposable master tree of a git or workspace source (the one
+    clone, or the locked workspace copy) that each service's context is copied
+    from; the route removes it. `info` is that clone's provenance. `token` is
+    the resolved private-repo credential: a local of the request, never logged,
+    audited, persisted or returned (`repr=False`).
     """
 
     archive: UploadFile | None
@@ -958,6 +1065,8 @@ class _ApplySource:
     token_ref: str | None
     workspace: bool = False
     token: str | None = field(default=None, repr=False)
+    tree: Path | None = None
+    info: GitSourceInfo | None = None
 
     @property
     def kind(self) -> str:
@@ -995,11 +1104,9 @@ async def _read_declaration(
 ) -> dict:
     """The source's parsed `nerdit.toml`; a git source resolves its token and clones here."""
     if source.workspace:
-        # One locked snapshot serves the declaration read and every service's
-        # context. Provenance stays `zip`: `workspace` on a row means "redeploy
-        # from the workspace named after this LABEL", which no composed label has.
-        snapshot = await snapshot_own_workspace(request, project)
-        source.archive = UploadFile(file=io.BytesIO(snapshot), filename=f"{project}-workspace.zip")
+        # One locked snapshot serves the declaration read and every service's context.
+        source.tree = await snapshot_own_workspace(request, project)
+        return _tree_declaration(source.tree, "workspace")
     if source.archive is not None:
         return await _archive_declaration(request, source.archive)
     assert source.repo_url is not None
@@ -1019,26 +1126,35 @@ async def _read_declaration(
         repo_url=source.repo_url,
         project_id=row.id if row is not None else None,
     )
-    return await _git_declaration(request, source.repo_url, source.ref, source.token)
+    source.info, source.tree = await clone_for_request(
+        request, source.repo_url, ref=source.ref, subdir=None, token=source.token
+    )
+    return _tree_declaration(source.info.context_dir, "repository")
 
 
 async def _service_context(
     request: Request, source: _ApplySource
 ) -> tuple[Path, Path | None, dict]:
     """A fresh, disposable build context: `(context_dir, context_root, source_meta)`."""
-    # ponytail: one extraction/clone per service -- `_finalize_deploy` owns one
-    # context and the builder rmtrees it after the build, so N background builds
-    # cannot share a tree. A shared, refcounted context with one cleanup is the
-    # upgrade (it would also pin every service of a git apply to one commit).
-    if source.repo_url is not None:
-        info, root = await clone_for_request(
-            request, source.repo_url, ref=source.ref, subdir=None, token=source.token
-        )
-        meta = git_source_meta(info, source.repo_url, token_ref=source.token_ref or None)
-        return info.context_dir, root, meta
+    # One clone per apply, so every service builds the same commit; each service
+    # gets its own copy because the builder rmtrees its context after the build.
+    settings = request.app.state.settings.daemon
+    if source.tree is not None:
+        ctx = Path(settings.upload_dir).expanduser() / generate_id()
+        try:
+            await asyncio.to_thread(shutil.copytree, source.tree, ctx, symlinks=True)
+        except BaseException:
+            await asyncio.to_thread(shutil.rmtree, ctx, ignore_errors=True)
+            raise
+        if source.info is None:
+            # Provenance stays `zip`: `workspace` on a row means "redeploy from
+            # the workspace named after this LABEL", which no composed label has.
+            return ctx, None, {"type": "zip"}
+        assert source.repo_url is not None
+        meta = git_source_meta(source.info, source.repo_url, token_ref=source.token_ref or None)
+        return ctx, None, meta
     assert source.archive is not None
     await source.archive.seek(0)
-    settings = request.app.state.settings.daemon
     context = await extract_upload(
         source.archive,
         max_bytes=settings.max_upload_bytes,
@@ -1170,7 +1286,11 @@ async def apply_project(
     source = _validated_source(request, archive, repo_url, ref, token_ref, workspace)
     try:
         row = await _judge_apply_project(request, project)
+        if row is not None:
+            project = row.name
         data = await _read_declaration(request, project, row, source)
+        if row is not None:
+            await _judge_apply_project(request, row.id)
         try:
             # The D-P40-14 grammar binds only where a NEW name enters.
             name, tables, required = parse_project_declaration(data, new_project=row is None)
@@ -1188,6 +1308,8 @@ async def apply_project(
 
         labels = {svc: service_label(project, PRODUCTION, svc) for svc in tables}
         missing = await _missing_variables(request, row, labels, required)
+        if row is not None:
+            await _judge_apply_project(request, row.id)
         if missing:
             return ApplyResponse(
                 project=project,
@@ -1200,8 +1322,17 @@ async def apply_project(
                 ),
             )
         members: list[DeclaredService] = [(row, svc, table) for svc, table in tables.items()]
-        return await _apply_services(request, project, members, source, dry_run=dry_run, done=done)
+        result = await _apply_services(
+            request, project, members, source, dry_run=dry_run, done=done
+        )
+        # Dry runs never reserve rows: recheck the original ID after the last
+        # awaited planning step just as the real deployment checks at reservation.
+        if row is not None:
+            await _judge_apply_project(request, row.id)
+        return result
     finally:
         # `_finalize_deploy` adds masked `ai` / `db` members to the params it
         # finds; the apply row names what was applied, however the request ends.
         request.state.audit_params = params()
+        if source.tree is not None:
+            await asyncio.to_thread(shutil.rmtree, source.tree, ignore_errors=True)

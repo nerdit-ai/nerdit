@@ -1,4 +1,4 @@
-"""Authorize and write a service's secret scope, with or without a row (P39).
+"""Authorize and write a service's secret scope, with or without a row.
 
 A name with no `jobs` row is authorized through its `secret_claims` row: the
 first write mints a claim for the caller, and every later access is judged
@@ -16,7 +16,6 @@ from fastapi import FastAPI, Request
 
 from nerdit.core.project_identity import DEFAULT_SERVICE, PRODUCTION, service_label
 from nerdit.core.secrets import (
-    _DNS_LABEL_RE,
     SHARED_SCOPE,
     InvalidSecretKey,
     InvalidSecretValue,
@@ -26,9 +25,11 @@ from nerdit.core.secrets import (
     project_storage_name,
     validate_secret_items,
 )
+from nerdit.core.workspaces import settled_to_thread
 from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import (
     Principal,
+    _owns,
     current_principal,
     owner_denial,
     require_owner_or_admin,
@@ -37,8 +38,10 @@ from nerdit.daemon.auth import (
     require_service_scope,
 )
 from nerdit.daemon.errors import NerditError
+from nerdit.daemon.project_delegation import delegation_denial, require_project_selector
 from nerdit.db.models import Project, TokenRole
 from nerdit.db.queries import ProjectExists, ServiceNameClaimed, ServiceNameTaken
+from nerdit.utils.names import DNS_LABEL_RE
 
 # User-facing name of the shared (global) secrets scope. Translated to the
 # internal storage name (`SHARED_SCOPE`); a service can never take this name
@@ -101,6 +104,16 @@ def secret_call(fn, *args):
         raise NerditError(500, "secret.decrypt_failed", str(exc)) from exc
 
 
+async def secret_io(fn, *args):
+    """`secret_call` off the loop, settled before the caller's lock releases.
+
+    SecretManager I/O takes an RLock that a key rotation or a backup can hold
+    for minutes; on the loop it would freeze the daemon, and an unsettled
+    worker could still write after `variable_write_lock` is released.
+    """
+    return await settled_to_thread(secret_call, fn, *args)
+
+
 def storage_name(service: str) -> str:
     """Translate the user-facing `shared` scope to its internal storage name."""
     return SHARED_SCOPE if service == _SHARED_PUBLIC else service
@@ -108,7 +121,7 @@ def storage_name(service: str) -> str:
 
 def guard_name(service: str) -> None:
     """422 on a name that is not a DNS label (before any lookup)."""
-    if not _DNS_LABEL_RE.match(service):
+    if not DNS_LABEL_RE.fullmatch(service):
         raise NerditError(
             422,
             "secret.invalid_service",
@@ -133,7 +146,7 @@ def name_claimed_error(name: str) -> NerditError:
 def project_owned_error(name: str) -> NerditError:
     """The 409 a fresh row meets when another token owns the project it would join.
 
-    P40b / D-P40-5 rule 1, the sibling of `name_claimed_error`: value-free, it
+    D-P40-5 rule 1, the sibling of `name_claimed_error`: value-free, it
     names the project and the release command, never the owner.
     """
     return NerditError(
@@ -147,25 +160,13 @@ def project_owned_error(name: str) -> NerditError:
     )
 
 
-def _claim_forbidden() -> NerditError:
-    # The same envelope as `require_owner_or_admin`'s denial: a claim is judged
-    # like a row, and a distinct message would be an oracle for "claimed, not
-    # deployed".
-    return owner_denial()
-
-
-def _claim_is_callers(principal: Principal, token_id: str | None) -> bool:
-    """A NULL claimant is admin-only, like a NULL-owner row."""
-    return token_id is not None and token_id == principal.token_id
-
-
 async def claim_owned_by_caller(request: Request, name: str) -> bool:
     """Whether a claim on `name` exists and belongs to the caller (or the caller is admin)."""
     claim = await request.app.state.queries.get_secret_claim(name)
     if claim is None:
         return False
     principal = current_principal(request)
-    return principal.is_admin or _claim_is_callers(principal, claim.token_id)
+    return principal.is_admin or _owns(principal, claim.token_id)
 
 
 def project_owned_by_caller(request: Request, project: Project | None) -> bool:
@@ -178,40 +179,46 @@ def project_owned_by_caller(request: Request, project: Project | None) -> bool:
     if project is None:
         return False
     principal = current_principal(request)
-    return principal.is_admin or _claim_is_callers(principal, project.submitted_by_token)
+    return (principal.project_id is None or principal.project_id == project.id) and (
+        principal.is_admin or _owns(principal, project.submitted_by_token)
+    )
 
 
 async def reject_foreign_claim(request: Request, name: str) -> None:
     """Pre-ingress fast path: 409 before an upload or clone is spent on a reserved name.
 
-    Judges the P39 claim, then the P40b project NAMED after the label (for a
-    P40d composed label that is a foreign implicit project literally so named,
+    Judges the secrets claim, then the project NAMED after the label (for a
+    composed label that is a foreign implicit project literally so named,
     never the project it joins -- `apply_project` judges that one itself), in
-    the order `reserve_service_for_token` judges them. An
-    optimization only — the reserve transaction re-checks both and is the
-    security boundary.
+    the order `reserve_service_for_token` judges them. An optimization only —
+    the reserve transaction re-checks both and is the security boundary.
     """
     principal = current_principal(request)
     if principal.is_admin:
         return
     queries = request.app.state.queries
     claim = await queries.get_secret_claim(name)
-    if claim is not None and not _claim_is_callers(principal, claim.token_id):
+    if claim is not None and not _owns(principal, claim.token_id):
         raise name_claimed_error(name)
     project = await queries.get_project_by_name(name)
-    if project is not None and not _claim_is_callers(principal, project.submitted_by_token):
+    if project is not None and not _owns(principal, project.submitted_by_token):
         raise project_owned_error(name)
 
 
 async def authorize_secret_scope(
-    request: Request, service: str, *, write: bool, mint: bool = False
+    request: Request,
+    service: str,
+    *,
+    write: bool,
+    mint: bool = False,
+    project: str | None = None,
 ) -> None:
     """Authorize secret access on `service`, checking scope before any lookup.
 
     A row is judged by `require_owner_or_admin`. A rowless name is judged by
     its claim: the caller's (or an admin) passes; another token's is the same
     403 as a foreign row. With no claim, a set (`mint=True`) reserves the name
-    for the caller — unless a pre-P39 orphan file is present, which a non-admin
+    for the caller — unless an orphan secrets file is present, which a non-admin
     may not adopt (409 `secret.orphaned_scope`) — and a read or delete is a
     404 for non-admins. `write` is the mutation gate on `shared`, which skips
     row lookup: admins write, any authenticated caller reads names; refuse all
@@ -230,9 +237,9 @@ async def authorize_secret_scope(
         if write:
             require_role(request, TokenRole.admin)
         return
-    # (D-P40-7) Label-only: scope is judged before any lookup, so there is no row
-    # whose project could widen it (the ceiling is named at `rollback`).
-    require_service_scope(request, service)
+    # `/secrets/{service}` passes no `project` (label-only); the variables
+    # routes pass the project they already judged (D-P40-7).
+    require_service_scope(request, service, project=project)
     queries = request.app.state.queries
     existing = await queries.get_service_by_name(service)
     if existing is not None:
@@ -241,9 +248,11 @@ async def authorize_secret_scope(
     principal = current_principal(request)
     claim = await queries.get_secret_claim(service)
     if claim is not None:
-        if principal.is_admin or _claim_is_callers(principal, claim.token_id):
+        # A NULL claimant is admin-only, like a NULL-owner row; the denial is
+        # the row's envelope, so "claimed, not deployed" is no oracle.
+        if principal.is_admin or _owns(principal, claim.token_id):
             return
-        raise _claim_forbidden()
+        raise owner_denial()
     if not mint:
         if principal.is_admin:
             return
@@ -254,10 +263,10 @@ async def authorize_secret_scope(
             hint=f"Set a secret first with `nerdit secrets set {service} KEY=...`, "
             "or deploy the service.",
         )
-    # A leftover file from a deleted service (pre-P39, or purged without
+    # A leftover file from a deleted service (predating claims, or purged without
     # `secrets`) must not be adopted by a stranger: its values would launch
     # with their fresh deploy.
-    if not principal.is_admin and secret_call(secret_manager(request).exists, service):
+    if not principal.is_admin and await secret_io(secret_manager(request).exists, service):
         # The file may be a concurrent same-token write rather than an orphan:
         # the claim read above can predate its mint.
         if await _landed_is_callers(request, principal, service):
@@ -277,7 +286,7 @@ async def authorize_secret_scope(
         )
         return
     if not principal.is_admin and not await _landed_is_callers(request, principal, service):
-        raise _claim_forbidden()
+        raise owner_denial()
 
 
 async def _landed_is_callers(request: Request, principal: Principal, service: str) -> bool:
@@ -287,8 +296,8 @@ async def _landed_is_callers(request: Request, principal: Principal, service: st
     secrets set`) must merge, not be refused as foreign: a row is judged by
     `require_owner_or_admin`, a claim by the claim rule, and nothing landed
     (the loser of a claim that was deleted again) is `False` — fail closed.
-    A `projects` row of that name owned by another token (P40b / D-P40-5
-    rule 2 — the mint's own predicate refused it) is the same 403 as a foreign
+    A `projects` row of that name owned by another token (D-P40-5 rule 2 —
+    the mint's own predicate refused it) is the same 403 as a foreign
     claim, so a stranger cannot tell "claimed" from "project reserved".
     """
     queries = request.app.state.queries
@@ -297,14 +306,14 @@ async def _landed_is_callers(request: Request, principal: Principal, service: st
         require_owner_or_admin(request, existing)
         return True
     project = await queries.get_project_by_name(service)
-    if project is not None and not _claim_is_callers(principal, project.submitted_by_token):
-        raise _claim_forbidden()
+    if project is not None and not _owns(principal, project.submitted_by_token):
+        raise owner_denial()
     claim = await queries.get_secret_claim(service)
     if claim is None:
         return False
-    if _claim_is_callers(principal, claim.token_id):
+    if _owns(principal, claim.token_id):
         return True
-    raise _claim_forbidden()
+    raise owner_denial()
 
 
 async def set_secret_values(request: Request, service: str, values: dict[str, str]) -> list[str]:
@@ -320,7 +329,7 @@ async def set_secret_values(request: Request, service: str, values: dict[str, st
     async with variable_write_lock(request.app):
         await authorize_secret_scope(request, service, write=True, mint=True)
         await demote_flags(request, service, values)
-        return secret_call(secret_manager(request).set, storage_name(service), values)
+        return await secret_io(secret_manager(request).set, storage_name(service), values)
 
 
 async def demote_flags(request: Request, service: str, keys: Iterable[str]) -> None:
@@ -348,7 +357,7 @@ async def demote_flags(request: Request, service: str, keys: Iterable[str]) -> N
         await queries.upsert_variable_flags(project_id, scope, keys, False)
 
 
-# --- Variables (P40c): the same store one noun up, plus a plain/secret flag ---
+# --- Variables: the same store one noun up, plus a plain/secret flag ---
 
 
 def name_taken_error(name: str) -> NerditError:
@@ -390,11 +399,28 @@ async def judge_project(request: Request, name: str) -> Project | None:
     A foreign project is the one `owner_denial` 403, judged on
     `projects.submitted_by_token` (NULL owner admin-only), never the actor.
     """
-    require_service_scope(request, name)
-    project = await request.app.state.queries.get_project_by_name(name)
+    project = await lookup_project(request, name)
     if project is not None:
         require_project_owner_or_admin(request, project)
     return project
+
+
+async def lookup_project(request: Request, ident: str) -> Project | None:
+    """Resolve a name or immutable ID, preserving name scopes and refusing retired IDs.
+
+    Names may be created by write callers. IDs may only address an existing
+    row: never translate an absent ID into a name or recreate its old name.
+    """
+    require_project_selector(request, ident)
+    queries = request.app.state.queries
+    if ident.startswith("prj_"):
+        project = await queries.get_project(ident)
+        if project is None:
+            raise NerditError(404, "not_found", f"No project '{ident}'.")
+        require_service_scope(request, project.name, display_name=ident)
+        return project
+    require_service_scope(request, ident)
+    return await queries.get_project_by_name(ident)
 
 
 async def _project_for_write(request: Request, name: str, project: Project | None) -> Project:
@@ -433,7 +459,7 @@ async def _write_variables(
     # hold against a concurrent writer of the opposite flag.
     if not plain:
         await queries.upsert_variable_flags(project_id, service, values, False)
-    keys = secret_call(secret_manager(request).set, storage, values)
+    keys = await secret_io(secret_manager(request).set, storage, values)
     if plain:
         await queries.upsert_variable_flags(project_id, service, values, True)
     return keys
@@ -454,11 +480,13 @@ async def require_service_in_project(
     """
     svc = await request.app.state.queries.get_service_by_name(label)
     if label == project and svc is None:
+        if current_principal(request).project_id is not None:
+            raise delegation_denial()
         return
     if svc is None or row is None or svc.project_id != row.id:
         # ponytail: no variables on a composed label before its first deploy
-        # (`demote_flags` could not map a rowless one back to its flags). Kept
-        # in P40d: `apply_project` creates the composed row, after which the
+        # (`demote_flags` could not map a rowless one back to its flags).
+        # `apply_project` creates the composed row, after which the
         # label is addressable; a service that NEEDS a service-scope value at
         # first launch takes it at project scope, or is applied once first.
         # Lifting it means a label -> (project, service) map for rowless labels.
@@ -477,7 +505,7 @@ async def set_project_values(
     plain: bool,
     *,
     check_new_name: Callable[[str], None],
-) -> list[str]:
+) -> tuple[str, list[str]]:
     """Validate, authorize and merge `values` into a project's own scope.
 
     Scope, then the row: its owner or an admin, else the row 403; an absent
@@ -485,13 +513,13 @@ async def set_project_values(
 
     Args:
         request: The caller's request.
-        project: The project name.
+        project: The project name or immutable ID.
         values: `{KEY: value}`; never logged, audited or returned.
         plain: Whether the owner may read the values back.
         check_new_name: Raises the 422 for a name that may not become a project.
 
     Returns:
-        The scope's resulting key names.
+        The canonical project name and the scope's resulting key names.
     """
     secret_call(validate_secret_items, values)
     async with variable_write_lock(request.app):  # verdict and write are one section
@@ -499,9 +527,10 @@ async def set_project_values(
         if row is None:
             check_new_name(project)  # grammar + reserved names bind only where a NEW name enters
         row = await _project_for_write(request, project, row)
-        return await _write_variables(
+        keys = await _write_variables(
             request, row.id, None, project_storage_name(row.id), values, plain
         )
+        return row.name, keys
 
 
 async def set_service_values(
@@ -512,17 +541,17 @@ async def set_service_values(
     plain: bool,
     *,
     check_new_name: Callable[[str], None],
-) -> list[str]:
+) -> tuple[str, list[str]]:
     """Validate, authorize and merge `values` into one service's scope.
 
     The label runs the whole `authorize_secret_scope` chain `POST /secrets`
     runs (guard, scope, row owner, claim, mint, orphan 409), so a rowless label
-    mints the P39 claim. The project is judged FIRST: the claim rule alone
+    mints the claim. The project is judged FIRST: the claim rule alone
     cannot see that a composed label sits inside another token's project.
 
     Args:
         request: The caller's request.
-        project: The project name.
+        project: The project name or immutable ID.
         service: The service name inside the project; the route has already
             proven `service_label(project, production, service)` composes.
         values: `{KEY: value}`; never logged, audited or returned.
@@ -530,21 +559,25 @@ async def set_service_values(
         check_new_name: Raises the 422 for a name that may not become a project.
 
     Returns:
-        The scope's resulting key names.
+        The canonical project name and the scope's resulting key names.
     """
-    label = service_label(project, PRODUCTION, service)
     secret_call(validate_secret_items, values)
     async with variable_write_lock(request.app):  # verdict and write are one section
         row = await judge_project(request, project)
+        project = row.name if row is not None else project
+        label = service_label(project, PRODUCTION, service)
         if row is None:
             check_new_name(project)  # before the mint: a refused name must not leave a claim
         await require_service_in_project(request, row, project, service, label)
-        await authorize_secret_scope(request, label, write=True, mint=True)
+        await authorize_secret_scope(request, label, write=True, mint=True, project=project)
         row = await _project_for_write(request, project, row)
-        return await _write_variables(request, row.id, service, label, values, plain)
+        keys = await _write_variables(request, row.id, service, label, values, plain)
+        return row.name, keys
 
 
-async def service_scope_readable(request: Request, label: str) -> bool:
+async def service_scope_readable(
+    request: Request, label: str, *, project: str | None = None
+) -> bool:
     """Whether the caller may read `label`'s scope: the `/secrets` read rule, quiet on absence.
 
     A foreign row or claim stays the 403; a rowless, unclaimed label (a 404 on
@@ -552,7 +585,7 @@ async def service_scope_readable(request: Request, label: str) -> bool:
     non-admin.
     """
     try:
-        await authorize_secret_scope(request, label, write=False)
+        await authorize_secret_scope(request, label, write=False, project=project)
     except NerditError as exc:
         if exc.status_code == 404:
             return False

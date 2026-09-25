@@ -26,7 +26,6 @@ from nerdit.core.health import (
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.core.models.binding import (
     BindingNotReady,
-    inject_env_key_names,
     resolve_binding,
 )
 from nerdit.core.proxy.edgeauth import (
@@ -37,8 +36,9 @@ from nerdit.core.proxy.edgeauth import (
 from nerdit.core.secrets import SHARED_SCOPE, SecretDecryptError
 from nerdit.core.services import ServiceController
 from nerdit.core.variables import load_scoped
-from nerdit.daemon.auth import require_owner_or_admin
+from nerdit.daemon.auth import current_principal, require_owner_or_admin
 from nerdit.daemon.limits import _MAX_DIAGNOSE_TAIL
+from nerdit.daemon.project_delegation import require_live_project_jobs
 from nerdit.daemon.remediation import (
     AcmeWait,
     BindingWait,
@@ -67,24 +67,6 @@ router = APIRouter()
 
 
 # --- Helpers -----------------------------------------------------------------
-
-
-def _ai_env_key_names(ai_specs: object) -> set[str]:
-    """Env-var NAMES `inject_env` would produce for these `[ai.*]` specs.
-
-    Delegates to `nerdit.core.models.binding.inject_env_key_names` so the
-    key grammar (`NERDIT_AI_<NAME>_URL/_KEY/_MODEL` per binding + the plain
-    `OPENAI_*` triplet for `default`) lives in exactly one place (F7). Reports
-    the injected surface without a resolve that could raise on a not-ready binding.
-
-    The P15 registry drives `_pending_env_key_names` uniformly through
-    `BindingKind.key_names_fn` (the `[ai.*]` entry IS this delegate's callee);
-    this thin wrapper is retained as the named F7 seam the AI-contract freeze
-    tests pin (`tests/test_ai_binding_resolve.py`).
-    """
-    if not isinstance(ai_specs, dict):
-        return set()
-    return inject_env_key_names(ai_specs)
 
 
 def _model_env_key_names(request: Request, job: Job, cfg: dict) -> list[str]:
@@ -480,6 +462,12 @@ async def diagnose_service(
     job = await _resolve_service(queries, ident)
     if job is None:
         raise _not_found(ident)
+    return await diagnose_job(request, job, log_tail=log_tail)
+
+
+async def diagnose_job(request: Request, job: Job, *, log_tail: int = 50) -> DiagnoseResponse:
+    """Diagnose a resolved job, keeping the existing owner gate and log bounds."""
+    queries = request.app.state.queries
     require_owner_or_admin(request, job)
 
     cfg = parse_job_config(job)
@@ -529,7 +517,8 @@ async def diagnose_service(
     probe = await _fresh_health_probe(job, endpoint)
 
     # Fresh, read-only binding resolution.
-    binding_wait = await _classify_bindings(request, job, cfg)
+    delegated = current_principal(request).project_id is not None
+    binding_wait = BindingWait() if delegated else await _classify_bindings(request, job, cfg)
 
     # Injected env keys: persisted (source=launch) with a recompute fallback.
     persisted_keys = cfg.get("last_launch_env_keys")
@@ -562,11 +551,17 @@ async def diagnose_service(
     ]
 
     # The edge-auth outcome the pure classifier cannot compute for itself.
-    edge_auth_wait = _classify_edge_auth(request, job, cfg)
+    edge_auth_wait = EdgeAuthWait() if delegated else _classify_edge_auth(request, job, cfg)
 
     # The certificate outcome, likewise computed here — the classifier
     # is pure and this needs the domain table plus the proxy's storage tree.
     acme_wait = await _classify_acme(request, job)
+
+    # Probes yield while label-keyed variables/domains may be replaced. Never
+    # return their later projection under the deleted job's ownership verdict.
+    if await queries.get_job(job.id) is None:
+        raise _not_found(job.id)
+    await require_live_project_jobs(request, [job])
 
     code, detail = derive_remediation(
         job, cfg, forensics, binding_wait, probe, edge_auth_wait, acme=acme_wait

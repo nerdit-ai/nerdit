@@ -12,10 +12,10 @@ import re
 import typer
 
 from nerdit.cli.display import (
+    call_or_exit,
     console,
     display_token_self,
     display_token_table,
-    render_client_error,
 )
 from nerdit.config.settings import load_settings
 
@@ -106,8 +106,8 @@ async def _create_async(
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        result = await client.create_token(
+    result = await call_or_exit(
+        client.create_token(
             name,
             role=role,
             max_gpus=max_gpus,
@@ -115,9 +115,7 @@ async def _create_async(
             expires_in_s=expires_in_s,
             scope_services=scope_services,
         )
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    )
 
     raw = result.get("token", "")
     console.print(f"[green]Token created:[/green] {result.get('id')} ({result.get('role')})")
@@ -150,11 +148,7 @@ async def _list_async(include_revoked: bool) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        tokens = await client.list_tokens(include_revoked=include_revoked)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    tokens = await call_or_exit(client.list_tokens(include_revoked=include_revoked))
 
     if not tokens:
         console.print("[dim]No tokens.[/dim]")
@@ -172,11 +166,7 @@ async def _whoami_async() -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        token = await client.get_self_token()
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    token = await call_or_exit(client.get_self_token())
 
     display_token_self(token)
 
@@ -211,11 +201,7 @@ async def _rotate_async(extend: bool, expires_in_s: int | None) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        result = await client.rotate_self_token(extend=extend, expires_in_s=expires_in_s)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    result = await call_or_exit(client.rotate_self_token(extend=extend, expires_in_s=expires_in_s))
 
     console.print(f"[green]Token rotated:[/green] {result.get('id')} ({result.get('role')})")
     console.print(result.get("token", ""))
@@ -252,11 +238,7 @@ async def _revoke_async(token_id: str) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        await client.revoke_token(token_id)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    await call_or_exit(client.revoke_token(token_id))
 
     console.print(f"[green]Revoked token {token_id}.[/green]")
 

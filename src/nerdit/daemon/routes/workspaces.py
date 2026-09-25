@@ -4,19 +4,21 @@ meta.json owns the workspace independently of service rows. When a row exists,
 its owner must agree; admins bypass both checks. Filesystem operations live in
 core.workspaces; routes own authorization and audit shaping.
 
-Deploy snapshots the tree under its lock and extracts the ZIP to disposable
-upload space with the usual traversal/zip-bomb guards. Never pass the live tree
-to _finalize_deploy: build cleanup would remove the user's working copy.
+Deploy copies the tree under its lock into disposable upload space. Never pass
+the live tree to _finalize_deploy: build cleanup would remove the user's
+working copy.
 """
 
 from __future__ import annotations
 
-import io
+import asyncio
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Query, Request, UploadFile
+import anyio
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from nerdit.core import workspaces as core_workspaces
@@ -41,7 +43,6 @@ from nerdit.daemon.schemas.workspaces import (
     WorkspaceWriteResponse,
 )
 from nerdit.daemon.secret_scope import judge_project
-from nerdit.daemon.uploads import extract_upload
 from nerdit.db.models import Job, TokenRole
 from nerdit.utils.ids import generate_id
 
@@ -129,12 +130,12 @@ def _check_row_owner(
         )
 
 
-async def snapshot_own_workspace(request: Request, name: str) -> bytes:
-    """The caller's OWN workspace zipped under its lock: the `apply_project` source.
+async def snapshot_own_workspace(request: Request, name: str) -> Path:
+    """The caller's OWN workspace copied under its lock: the `apply_project` source.
 
-    One lock covers the owner decision and the snapshot, so the archive is a
-    tree that existed (the `deploy_workspace` contract). The caller has already
-    judged scope on `name`.
+    One lock covers the owner decision and the copy, so the snapshot is a tree
+    that existed (the `deploy_workspace` contract). Returns a disposable upload
+    dir the caller removes. The caller has already judged scope on `name`.
     """
     try:
         core_workspaces.validate_workspace_name(name)
@@ -165,11 +166,10 @@ async def snapshot_own_workspace(request: Request, name: str) -> bytes:
                 f"Only the token that owns workspace '{name}' may apply it.",
                 hint="Apply it with the owner's token, or download it and apply it as an archive.",
             )
-        try:
-            tree = core_workspaces.tree_root(_data_dir(request), name)
-            return await core_workspaces.settled_to_thread(core_workspaces.zip_workspace, tree)
-        except WorkspaceError as exc:
-            raise _to_nerdit(exc) from exc
+        return await _copy_snapshot(
+            core_workspaces.tree_root(_data_dir(request), name),
+            Path(request.app.state.settings.daemon.upload_dir).expanduser() / generate_id(),
+        )
 
 
 @router.put("/workspaces/{name}/files", status_code=200, operation_id="write_workspace_files")
@@ -198,8 +198,8 @@ async def write_workspace_files(
     # Hand-built params, never the raw body (the license.install precedent):
     # file CONTENT must not reach the audit store even in a rejected request.
     request.state.audit_params = {"files": len(body.files), "deleted": len(body.delete)}
-    # (P25 D-P25-3 leg b) The path name IS the target identity, and a first
-    # write is a name-targeted create — the same gate `POST /deploy` uses.
+    # The path name IS the target identity, and a first write is a
+    # name-targeted create: the same gate `POST /deploy` uses.
     require_service_scope(request, name)
 
     data_dir = _data_dir(request)
@@ -207,7 +207,7 @@ async def write_workspace_files(
 
     lock = core_workspaces.workspace_lock(name)
     if lock.locked():
-        # Fail fast rather than queue behind the snapshot (D-P29-10): the zip is
+        # Fail fast rather than queue behind the snapshot (D-P29-10): the copy is
         # short, and an agent that gets a 409 retries a batch it still holds.
         raise _lock_busy(name)
     async with lock:
@@ -230,7 +230,7 @@ async def write_workspace_files(
             if existing is not None:
                 require_owner_or_admin(request, existing)
             else:
-                # (D-P40-5) A rowless name may still be someone's project (they
+                # A rowless name may still be someone's project (D-P40-5: they
                 # set variables first, or removed the last service): claiming
                 # its workspace would only produce a tree nobody may deploy.
                 await judge_project(request, name)
@@ -239,7 +239,7 @@ async def write_workspace_files(
             # disconnect (or the shutdown cancel) must not free the lock with
             # the batch half-written. The cancelled request's batch therefore
             # LANDS before the lock releases — and since no `@_serialized` DB
-            # writer committed, the P22 machinery deletes the idempotency claim,
+            # writer committed, the idempotency middleware deletes its claim,
             # so a retry re-runs the same batch onto identical content.
             summary = await core_workspaces.settled_to_thread(
                 core_workspaces.write_files,
@@ -253,7 +253,7 @@ async def write_workspace_files(
         except WorkspaceError as exc:
             raise _to_nerdit(exc) from exc
 
-    # Names, hashes and counts — never content (plan §2).
+    # Names, hashes and counts, never content.
     request.state.audit_params = {
         "files": summary["written"],
         "deleted": summary["deleted"],
@@ -294,8 +294,8 @@ async def get_workspace(request: Request, name: str) -> WorkspaceListResponse:
     code (D-P29-9, the named deviation from "reads stay role-only"). Bounded by
     `WORKSPACE_MAX_FILES` by construction, so there is no pagination.
 
-    Authorization and the listing share ONE workspace-lock span (review round-2)
-    so no purge+recreate can slip a foreign generation between them. The read
+    Authorization and the listing share ONE workspace-lock span so no
+    purge+recreate can slip a foreign generation between them. The read
     path **waits** for the lock rather than fail-fast 409-ing: a read is
     sub-second (a bounded stat+hash walk), and the delete's wait posture is the
     precedent. A writer arriving during a read gets the documented 409.
@@ -350,6 +350,24 @@ async def read_workspace_file(request: Request, name: str, path: str) -> PlainTe
     return PlainTextResponse(content, media_type="text/plain; charset=utf-8")
 
 
+async def _copy_snapshot(tree: Path, dest: Path) -> Path:
+    """Copy *tree* into the disposable *dest* while the caller holds the lock.
+
+    NEVER hand `tree` itself to `_finalize_deploy`: it rmtrees its context on
+    any failure and the off-tick builder rmtrees it on success. A failed or
+    cancelled copy removes the partial *dest* before propagating.
+    """
+    try:
+        await core_workspaces.settled_to_thread(core_workspaces.copy_workspace, tree, dest)
+    except BaseException as exc:
+        with anyio.CancelScope(shield=True):
+            await asyncio.to_thread(shutil.rmtree, dest, ignore_errors=True)
+        if isinstance(exc, WorkspaceError):
+            raise _to_nerdit(exc) from exc
+        raise
+    return dest
+
+
 @router.post("/workspaces/{name}/deploy", status_code=201, operation_id="deploy_workspace")
 async def deploy_workspace(
     request: Request,
@@ -361,8 +379,8 @@ async def deploy_workspace(
 ):
     """Snapshot an authorized workspace and deploy through the shared pipeline.
 
-    Authorize and zip under one workspace lock; use a disposable extracted context
-    so cleanup preserves the working tree. Fresh service ownership comes from the
+    Authorize and copy under one workspace lock into a disposable context so
+    cleanup preserves the working tree. Fresh service ownership comes from the
     sidecar, even when an admin acts; redeploy preserves its existing owner. Audit
     attributes the actor separately.
     """
@@ -388,7 +406,7 @@ async def deploy_workspace(
     data_dir = _data_dir(request)
     settings = request.app.state.settings
     queries = request.app.state.queries
-    # (P25 D-P25-3 leg b) Scope before the sidecar gate, mirroring the write.
+    # Scope before the sidecar gate, mirroring the write.
     require_service_scope(request, name)
 
     lock = core_workspaces.workspace_lock(name)
@@ -411,29 +429,13 @@ async def deploy_workspace(
             require_owner_or_admin(request, existing)
         _check_row_owner(principal, existing, meta, name)
 
-        try:
-            tree = core_workspaces.tree_root(data_dir, name)
-            # Read-only, so an abandoned worker is harmless — but it runs under
-            # the lock, and the lock contract is uniform (one grep, no exceptions).
-            zip_bytes = await core_workspaces.settled_to_thread(core_workspaces.zip_workspace, tree)
-        except WorkspaceError as exc:
-            raise _to_nerdit(exc) from exc
-    # The lock covers the owner decision + the snapshot ONLY (D-P29-10) — both
-    # therefore see the same tree state — and never the build: it is off-tick as
-    # ever, and holding the lock across the extraction would block edits for
-    # minutes.
-
-    # NEVER pass `tree` itself: `_finalize_deploy` rmtrees its context on any
-    # failure and the off-tick builder rmtrees it on success. The context must be
-    # disposable, so the snapshot goes through the very extraction the ZIP route
-    # uses (zip-bomb + traversal guards included).
-    upload = UploadFile(file=io.BytesIO(zip_bytes), filename=f"{name}-workspace.zip")
-    context_dir = await extract_upload(
-        upload,
-        max_bytes=settings.daemon.max_upload_bytes,
-        upload_root=Path(settings.daemon.upload_dir).expanduser(),
-        dest_id=generate_id(),
-    )
+        context_dir = await _copy_snapshot(
+            core_workspaces.tree_root(data_dir, name),
+            Path(settings.daemon.upload_dir).expanduser() / generate_id(),
+        )
+    # The lock covers the owner decision + the copy ONLY (D-P29-10) — both
+    # therefore see the same tree state — and never the build, which would
+    # block edits for minutes.
 
     result = await _finalize_deploy(
         request,
@@ -451,11 +453,11 @@ async def deploy_workspace(
         env=opts.env,
         vendor=opts.vendor,
         source_meta={"type": "workspace"},
-        # (review round-1) A FRESH row is born owned by the SIDECAR owner, not
+        # A FRESH row is born owned by the SIDECAR owner, not
         # by whoever pressed deploy: an admin deploying a submitter's workspace
         # would otherwise create an admin-owned row that `_check_row_owner`
         # then 403s the real owner out of — a permanent, admin-only-recoverable
-        # lockout. Same posture the redeploy path already has (quota and
+        # lockout. Same posture as the redeploy path (quota and
         # ownership follow the service OWNER, never the actor). A NULL sidecar
         # owner (an admin-only workspace) falls back to the acting principal.
         owner_token_id=meta.get("owner_token_id"),

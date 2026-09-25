@@ -13,6 +13,7 @@ Production code must not import this module.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
@@ -21,14 +22,34 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
-from nerdit.core.link.identity import proof_message, verify_node_proof
+from nerdit.core.link.identity import ED25519_REFERENCE_PREFIX, proof_message
 from tests.node_link_frames import HelloFrame, parse_outbound
 
 FIXTURES = Path(__file__).parent / "data" / "node_link_v1"
+
+
+def _b64decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def verify_node_proof(reference: str, message: bytes, signature_b64: str) -> bool:
+    """Verify a proof using only the durable public credential reference (the relay's half)."""
+    if not reference.startswith(ED25519_REFERENCE_PREFIX):
+        return False
+    try:
+        public_raw = _b64decode(reference.removeprefix(ED25519_REFERENCE_PREFIX))
+        signature = _b64decode(signature_b64)
+        Ed25519PublicKey.from_public_bytes(public_raw).verify(signature, message)
+    except (InvalidSignature, ValueError):
+        return False
+    return True
+
 
 #: The node id every vendored fixture carries. Tests that compare a produced
 #: frame against a fixture frame must use it, or the comparison differs on that

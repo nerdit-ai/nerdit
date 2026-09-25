@@ -33,8 +33,9 @@ from rich.markup import escape
 from rich.text import Text
 
 from nerdit.cli.commands.daemon import _restart_async as _restart_daemon
-from nerdit.cli.display import console, render_client_error
+from nerdit.cli.display import call_or_exit, console, render_client_error
 from nerdit.cli.display import plain as _plain
+from nerdit.core.remediation_settle import parse_iso
 
 #: (P30 D-P30-10) Production endpoints, applied on the CLAIM path only and only
 #: when the corresponding flag is unset — an explicit ``--api-url`` /
@@ -193,8 +194,7 @@ def _github_line(live: dict) -> str | None:
         (
             parsed
             for inst in installations
-            if isinstance(inst, dict)
-            and (parsed := _parse_stamp(inst.get("expires_at"))) is not None
+            if isinstance(inst, dict) and (parsed := parse_iso(inst.get("expires_at"))) is not None
         ),
         default=None,
     )
@@ -204,16 +204,6 @@ def _github_line(live: dict) -> str | None:
     if remaining <= 0:
         return f"{count} {noun}, expired"
     return f"{count} {noun}, expires in {_duration_phrase(remaining)}"
-
-
-def _parse_stamp(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _duration_phrase(seconds: float) -> str:
@@ -229,12 +219,9 @@ def _older_than_ttl(iso_timestamp: str) -> bool:
     """True when the assertion predates the daemon's 24 h lease window."""
     from nerdit.core.link.manager import ENTITLEMENT_TTL_S
 
-    try:
-        parsed = datetime.fromisoformat(iso_timestamp)
-    except ValueError:
+    parsed = parse_iso(iso_timestamp)
+    if parsed is None:
         return False
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
     return (datetime.now(UTC) - parsed).total_seconds() >= ENTITLEMENT_TTL_S
 
 
@@ -259,12 +246,9 @@ def _age_phrase(iso_timestamp: str) -> str | None:
     Coarse on purpose: the reader wants "recent" vs "stale", and a seconds-
     precise age on a value the cloud re-asserts every few minutes is noise.
     """
-    try:
-        parsed = datetime.fromisoformat(iso_timestamp)
-    except ValueError:
+    parsed = parse_iso(iso_timestamp)
+    if parsed is None:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
     seconds = (datetime.now(UTC) - parsed).total_seconds()
     if seconds < 0:
         # A clock skew between daemon and CLI host; "just now" beats "-3m".
@@ -355,6 +339,13 @@ def link(  # noqa: PLR0913 — one Typer parameter per documented mode/flag of t
     if (device or key_stdin) and code is not None:
         flag = "--device" if device else "--key-stdin"
         raise typer.BadParameter(f"{flag} links without a code — drop the positional argument.")
+    # D-X16-O11: a pre-auth key never goes on argv. The hidden prompt still
+    # accepts one; the value is never interpolated into the error.
+    if code is not None and code.strip().startswith("nk_"):
+        raise typer.BadParameter(
+            "Pre-auth keys never go on argv — pipe the key to 'nerdit link --key-stdin' "
+            "(and treat this one as exposed in shell history)."
+        )
 
     # (P34 D1) The two flag modes are dispatched HERE rather than inside
     # ``_link_async``: they take no positional argument at all, so threading
@@ -1100,11 +1091,7 @@ async def _unlink_async(yes: bool) -> None:
         raise typer.Exit(1)
 
     client = get_configured_client()
-    try:
-        result = await client.unlink_node(idempotency_key=uuid4().hex)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    result = await call_or_exit(client.unlink_node(idempotency_key=uuid4().hex))
 
     pending = int(result.get("pending_wipes") or 0)
     did_anything = (

@@ -37,6 +37,9 @@ from urllib.request import pathname2url
 import aiosqlite
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from nerdit.utils.fs import fsync_dir
+from nerdit.utils.names import DNS_LABEL_RE
+
 from .secrets import SecretRotationInProgress
 from .volumes import dump_staging_root
 
@@ -72,15 +75,6 @@ def _sanitize(exc: BaseException) -> str:
     errno = getattr(exc, "errno", None)
     detail = os.strerror(errno) if errno else "see daemon logs"
     return f"backup staging failed: {type(exc).__name__}: {detail}"
-
-
-def _fsync_dir(path: Path) -> None:
-    """fsync a directory fd so a rename is durable."""
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 async def snapshot_db(db: Database, dest: Path) -> None:
@@ -355,7 +349,7 @@ async def create_backup(
         await asyncio.to_thread(_pack_tar, staging, tmp_tar)
         final = backups / basename
         os.replace(tmp_tar, final)
-        _fsync_dir(backups)
+        fsync_dir(backups)
 
         size_bytes = final.stat().st_size
         return BackupResult(
@@ -666,7 +660,7 @@ def create_volume_backup(
         _pack_volume_tar(service_root, service, entries, manifest, tmp_tar)
         final = backups / basename
         os.replace(tmp_tar, final)
-        _fsync_dir(backups)
+        fsync_dir(backups)
 
         size_bytes = final.stat().st_size
         return VolumeBackupResult(
@@ -813,12 +807,6 @@ DUMP_MANIFEST_NAME = "dump-manifest.json"
 #: daemon read an unbounded "manifest" into memory.
 DUMP_MANIFEST_MAX_BYTES = 64 * 1024
 
-#: DNS-label grammar for the manifest ``service`` field — the same rule the
-#: offline volume restore applies (D9). Provenance only for a dump (the restore
-#: target is the route's path parameter, so a cross-name restore is allowed and
-#: is how a clone is made), but a forged value must still never be a path.
-_DUMP_SERVICE_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
-
 #: The dump member's own name. A plain, dot-free-prefixed basename: it selects
 #: BOTH the tar member and the file the restore writes into the staging dir, so
 #: it must be structurally incapable of naming a path (no ``/``, no ``..``).
@@ -898,7 +886,9 @@ class DumpManifest(BaseModel):
     @field_validator("service")
     @classmethod
     def _check_service(cls, value: str) -> str:
-        if not _DUMP_SERVICE_RE.fullmatch(value):
+        # Provenance only (the restore target is the route's path parameter),
+        # but a forged value must still never be a path (D9).
+        if not DNS_LABEL_RE.fullmatch(value):
             raise ValueError("service is not a valid DNS label")
         return value
 
@@ -949,17 +939,10 @@ def _sha256_nofollow(path: Path) -> tuple[str, int]:
     ``lstat`` and this read (verified live, §0). The size returned is the number
     of bytes actually read, so the manifest can never claim more than we hashed.
     """
-    digest = hashlib.sha256()
-    size = 0
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as fh:
-        while True:
-            chunk = fh.read(_DUMP_CHUNK)
-            if not chunk:
-                break
-            digest.update(chunk)
-            size += len(chunk)
-    return digest.hexdigest(), size
+        digest = hashlib.file_digest(fh, "sha256")
+        return digest.hexdigest(), fh.tell()
 
 
 def _rmtree_staging(staging: Path) -> None:
@@ -1115,7 +1098,7 @@ def create_dump_backup(  # noqa: PLR0913 - the manifest's own fields, all keywor
         final = backups / basename
         os.replace(tmp_tar, final)
         promoted = final
-        _fsync_dir(backups)
+        fsync_dir(backups)
         size_bytes = final.stat().st_size
 
         result = DumpBackupResult(

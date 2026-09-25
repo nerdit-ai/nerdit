@@ -1144,7 +1144,7 @@ _NO_RUN_PAYLOAD = {
 _NO_RUN_OUTPUT = (
     "api  status: running  kind: service\n"
     "  deploy: v4 redeploy → phase healthy\n"
-    "  restarts: 0/3  next retry in: -s\n"
+    "  restarts: 0/3  next retry in: -\n"
     "\n"
     "remediation: none\n"
     "  Nothing to do.\n"
@@ -1421,7 +1421,7 @@ async def test_diagnose_projects_last_dump_for_a_database_row(harness):
     job = await queries.get_service_by_name("pg")
     cfg = json.loads(job.config)
     cfg["last_dump"] = last_dump
-    await queries.set_last_dump(job.id, json.dumps(last_dump))
+    await queries.patch_job_config(job.id, {"last_dump": last_dump})
 
     resp = await client.get("/api/services/pg/diagnose", headers=_auth(OWNER_RAW))
     assert resp.status_code == 200, resp.text

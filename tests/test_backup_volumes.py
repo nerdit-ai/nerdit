@@ -26,8 +26,7 @@ from nerdit.config.settings import NerditSettings
 from nerdit.core.backup import BackupError, _collect_volume_entries, create_volume_backup
 from nerdit.daemon.routes.system import (
     _build_disk_report,
-    _walk_backups,
-    _walk_volume_backups,
+    _walk_tars,
 )
 from nerdit.daemon.server import _prune_backups, _prune_volume_backups
 
@@ -296,9 +295,9 @@ def test_v1_walkers_blind_to_volume_glob(tmp_path):
     assert vol_new.exists()
     assert cp_new.exists()  # control-plane tar untouched by the volume walker
 
-    # The disk walkers count disjoint sets.
-    assert _walk_backups(backups)["count"] == 1  # only the surviving control-plane tar
-    assert _walk_volume_backups(backups)["count"] == 1  # only the surviving volume tar
+    # The disk walkers count disjoint sets: only the surviving tar of each flavour.
+    assert _walk_tars(backups, "nerdit-backup-*.tar.gz")["count"] == 1
+    assert _walk_tars(backups, "nerdit-volumes-*.tar.gz")["count"] == 1
 
 
 # --------------------------------------------------------------------------- #

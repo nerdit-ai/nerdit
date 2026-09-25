@@ -121,7 +121,7 @@ def _make_app(queries: AsyncMock, *, with_audit: bool = False) -> FastAPI:
 
 
 def _client(app: FastAPI) -> AsyncClient:
-    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1")
 
 
 def _auth(raw: str) -> dict:

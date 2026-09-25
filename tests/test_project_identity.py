@@ -6,7 +6,6 @@ import pytest
 
 from nerdit.core.project_identity import (
     DEFAULT_SERVICE,
-    ENV_NAME_RE,
     PRODUCTION,
     PROJECT_NAME_RE,
     SERVICE_NAME_RE,
@@ -31,13 +30,12 @@ def test_project_name_rejects_bad_labels_and_double_dash(name):
     assert PROJECT_NAME_RE.fullmatch(name) is None
 
 
-@pytest.mark.parametrize("regex", [SERVICE_NAME_RE, ENV_NAME_RE])
-def test_service_and_env_names_are_the_same_grammar_capped_at_20(regex):
-    assert regex.fullmatch("web")
-    assert regex.fullmatch("x" * 20)
-    assert regex.fullmatch("x" * 21) is None
-    assert regex.fullmatch("a--b") is None
-    assert regex.fullmatch("Web") is None
+def test_service_name_grammar_capped_at_20():
+    assert SERVICE_NAME_RE.fullmatch("web")
+    assert SERVICE_NAME_RE.fullmatch("x" * 20)
+    assert SERVICE_NAME_RE.fullmatch("x" * 21) is None
+    assert SERVICE_NAME_RE.fullmatch("a--b") is None
+    assert SERVICE_NAME_RE.fullmatch("Web") is None
 
 
 def test_constants():

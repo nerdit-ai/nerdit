@@ -60,6 +60,8 @@ class FakeRuntime:
         self.log_calls: list[tuple[str, bool, int | None, int | None]] = []
         self.log_lines: list[str] = []
         self.log_error: BaseException | None = None
+        # ``since`` of each follow stream opened (log re-adoption resume point).
+        self.follow_since: list[int | None] = []
         # (P20 WP3) label seams: seeded orphan containers per (label, value)
         # pair, and the ids kill() was called with (self.calls stays the
         # coarse "kill" marker existing ordering pins rely on).
@@ -138,8 +140,11 @@ class FakeRuntime:
         follow: bool = False,
         tail: int | None = None,
         max_bytes: int | None = None,
+        since: int | None = None,
     ):
         self.log_calls.append((container_id, follow, tail, max_bytes))
+        if follow:
+            self.follow_since.append(since)
         # (P21) Only the one-shot reads join the ordering marker list: the
         # background follow task races the reconcile tick, so recording it would
         # make every `calls` ordering assertion flaky.
@@ -295,6 +300,42 @@ async def test_backoff_cap_fails_after_three_restarts(queries):
     # PORTS-1: a terminally-failed service releases its host port back to the pool.
     assert await queries.get_service_endpoint("svc") is None
     await controller.shutdown()
+
+
+async def test_budget_exhaustion_settles_status_and_desired_in_one_write(queries, monkeypatch):
+    """Both columns land in one UPDATE, so a crash cannot strand desired=running."""
+    from unittest.mock import AsyncMock
+
+    runtime = FakeRuntime()
+    controller = _controller(queries, runtime, service_max_restarts=0)
+    controller._backoff_seconds = lambda count: 0.0  # type: ignore[assignment]
+    await queries.create_job(_svc("svc"))
+    spy = AsyncMock()
+    monkeypatch.setattr(queries, "set_desired_state", spy)
+
+    for _ in range(10):
+        job = await queries.get_service_by_name("svc")
+        if job.status is JobStatus.failed:
+            break
+        if job.status is JobStatus.running and job.container_id in runtime.live:
+            runtime.live.pop(job.container_id)
+        await controller.reconcile()
+
+    assert job.status is JobStatus.failed
+    assert job.desired_state == "failed"
+    spy.assert_not_awaited()
+    await controller.shutdown()
+
+
+async def test_forget_drops_per_job_reconcile_state(queries):
+    controller = _controller(queries, FakeRuntime())
+    controller._health_failures["j1"] = 2
+    controller._binding_wait_msgs["j1"] = "waiting"
+    controller._shared_resolved_sigs["j1"] = ((), ())
+    controller.forget("j1")
+    assert "j1" not in controller._health_failures
+    assert "j1" not in controller._binding_wait_msgs
+    assert "j1" not in controller._shared_resolved_sigs
 
 
 async def test_oom_crash_classified_and_forensics_persisted(queries):
@@ -560,6 +601,42 @@ async def test_health_failure_degrades_but_keeps_running(queries):
     job = await queries.get_service_by_name("svc")
     assert job.status is JobStatus.running
     assert "c1" in runtime.live
+    await controller.shutdown()
+
+
+async def test_a_ticks_health_probes_run_concurrently(queries):
+    """P2: one slow endpoint must not serialize the tick's other probes."""
+    runtime = FakeRuntime()
+    controller = _controller(queries, runtime)
+    started = datetime.now(UTC) - timedelta(seconds=60)
+    for i, name in enumerate(("a", "b")):
+        runtime.live[f"c{i}"] = datetime.now(UTC)
+        svc = _svc(
+            name,
+            status=JobStatus.running,
+            container_id=f"c{i}",
+            started_at=started,
+            health_check={"path": "/healthz"},
+        )
+        await queries.create_job(svc)
+        await queries.acquire_service_port(name, svc.id, 8000, (9400, 9499))
+
+    in_flight = peak = 0
+
+    async def slow(host_port, path, timeout):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.05)
+        in_flight -= 1
+        return 200
+
+    controller._check_health = slow  # type: ignore[assignment]
+    await controller.reconcile()
+
+    assert peak == 2
+    for name in ("a", "b"):
+        assert (await queries.get_service_by_name(name)).status is JobStatus.running
     await controller.shutdown()
 
 
@@ -918,6 +995,17 @@ async def test_is_port_bindable_sets_so_reuseaddr(monkeypatch):
     with real_socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM) as listener:
         listener.setsockopt(socket_mod.SOL_SOCKET, socket_mod.SO_REUSEADDR, 1)
         listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        busy_port = listener.getsockname()[1]
+        assert ServiceController._is_port_bindable(busy_port) is False
+
+
+async def test_is_port_bindable_sees_a_wildcard_listener():
+    """A foreign listener on 0.0.0.0 makes the port unbindable (BSD SO_REUSEADDR)."""
+    import socket as socket_mod
+
+    with socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM) as listener:
+        listener.bind(("0.0.0.0", 0))
         listener.listen(1)
         busy_port = listener.getsockname()[1]
         assert ServiceController._is_port_bindable(busy_port) is False
@@ -3670,3 +3758,125 @@ async def test_model_launch_without_gpu_passes_no_vram(queries, tmp_path):
     assert captured["max_model_len"] is None
     assert captured["gpu_memory_utilization"] is None
     await controller.shutdown()
+
+
+# --- log follow: resume point + batched writes ------------------------------
+
+
+async def _readopt_follow_since(queries, *, seed_line: bool) -> tuple[int | None, int | None]:
+    runtime = FakeRuntime()
+    runtime.live["c1"] = datetime.now(UTC)
+    controller = _controller(queries, runtime)
+    job = _svc("svc", status=JobStatus.running, container_id="c1")
+    await queries.create_job(job)
+    expected = None
+    if seed_line:
+        await queries.append_log(job.id, "old line", LogStream.stdout)
+        (entry,) = await queries.get_logs(job.id, tail=1)
+        expected = int(entry.timestamp.replace(tzinfo=UTC).timestamp())
+    await controller._reconcile_live(job, [])
+    await asyncio.gather(*controller._log_tasks.values(), return_exceptions=True)
+    await controller.shutdown()
+    return runtime.follow_since[0], expected
+
+
+async def test_readopted_log_stream_resumes_at_newest_persisted_line(queries):
+    """B3: a re-adopted follow resumes at the last stored line, never replays history."""
+    since, expected = await _readopt_follow_since(queries, seed_line=True)
+    assert expected is not None and since == expected
+
+
+async def test_readopted_log_stream_skips_replayed_lines_of_resume_second(queries):
+    """Docker's inclusive `since` replays the resume second; stored lines stay single."""
+    runtime = FakeRuntime()
+    runtime.live["c1"] = datetime.now(UTC)
+    controller = _controller(queries, runtime)
+    job = _svc("svc", status=JobStatus.running, container_id="c1")
+    await queries.create_job(job)
+    # "late" was emitted the second before but flushed into the resume second.
+    await queries.append_logs(job.id, ["old", "late", "a", "b"], LogStream.stdout)
+    await queries._db.conn.execute("UPDATE job_logs SET timestamp = '2026-09-01 12:00:05'")
+    await queries._db.conn.execute(
+        "UPDATE job_logs SET timestamp = '2026-09-01 12:00:04' WHERE message = 'old'"
+    )
+    await queries._db.conn.commit()
+    runtime.log_lines = ["a", "b", "c", "a"]
+    await controller._reconcile_live(job, [])
+    await asyncio.gather(*controller._log_tasks.values(), return_exceptions=True)
+    await controller.shutdown()
+    stored = [e.message for e in await queries.get_logs(job.id)]
+    assert stored == ["old", "late", "a", "b", "c", "a"]
+
+
+async def test_readopted_log_stream_never_drops_new_lines_on_repeats(queries):
+    """A repeated line aligns at its LAST stored match: new lines are kept, never skipped."""
+    runtime = FakeRuntime()
+    runtime.live["c1"] = datetime.now(UTC)
+    controller = _controller(queries, runtime)
+    job = _svc("svc", status=JobStatus.running, container_id="c1")
+    await queries.create_job(job)
+    # Four heartbeats stored in the resume second; Docker replays only the last two.
+    await queries.append_logs(job.id, ["tick"] * 4, LogStream.stdout)
+    await queries._db.conn.execute("UPDATE job_logs SET timestamp = '2026-09-01 12:00:05'")
+    await queries._db.conn.commit()
+    runtime.log_lines = ["tick", "tick", "tick", "done"]
+    await controller._reconcile_live(job, [])
+    await asyncio.gather(*controller._log_tasks.values(), return_exceptions=True)
+    await controller.shutdown()
+    stored = [e.message for e in await queries.get_logs(job.id)]
+    # First-match alignment would have swallowed the new "tick"; last-match keeps it
+    # at the cost of one duplicate.
+    assert stored[-1] == "done"
+    assert stored.count("tick") >= 5
+
+
+async def test_readopted_log_stream_without_history_reads_from_start(queries):
+    since, _ = await _readopt_follow_since(queries, seed_line=False)
+    assert since is None
+
+
+async def test_cancelled_log_collector_flushes_its_pending_batch(queries):
+    """A teardown cancel must persist buffered lines: the container is gone after."""
+    runtime = FakeRuntime()
+    controller = _controller(queries, runtime)
+    job = _svc("svc", status=JobStatus.running, container_id="c1")
+    await queries.create_job(job)
+    streamed = asyncio.Event()
+
+    async def _logs(container_id, follow=False, tail=None, max_bytes=None, since=None):  # noqa: ANN001, ANN202
+        yield "last-words"
+        streamed.set()
+        await asyncio.Event().wait()
+
+    runtime.logs = _logs
+    task = asyncio.create_task(controller._collect_logs(job.id, "c1"))
+    await streamed.wait()
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [e.message for e in await queries.get_logs(job.id)] == ["last-words"]
+
+
+async def test_collect_logs_writes_one_batch(queries, monkeypatch):
+    """B4: a short follow stream lands as one ordered batch, never per line."""
+    runtime = FakeRuntime()
+    runtime.log_lines = [f"l{i}" for i in range(5)]
+    controller = _controller(queries, runtime)
+    job = _svc("svc", status=JobStatus.running, container_id="c1")
+    await queries.create_job(job)
+    batches: list[list[str]] = []
+    real = queries.append_logs
+
+    async def _spy(job_id, messages, stream=LogStream.stdout):  # noqa: ANN001, ANN202
+        batches.append(list(messages))
+        await real(job_id, messages, stream)
+
+    async def _no_single(*a, **k):  # noqa: ANN002, ANN003, ANN202
+        raise AssertionError("per-line append_log used")
+
+    monkeypatch.setattr(queries, "append_logs", _spy)
+    monkeypatch.setattr(queries, "append_log", _no_single)
+    await controller._collect_logs(job.id, "c1")
+    assert batches == [runtime.log_lines]
+    assert [e.message for e in await queries.get_logs(job.id)] == runtime.log_lines

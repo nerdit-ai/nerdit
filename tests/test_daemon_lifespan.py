@@ -578,6 +578,7 @@ class _RecoveryRuntime:
         follow: bool = False,
         tail: int | None = None,
         max_bytes: int | None = None,
+        since: int | None = None,
     ):
         # Only a *follow* stream is unbounded (that is what keeps the live log
         # task tracked). A one-shot tail read — the P21 crash-tail capture — must

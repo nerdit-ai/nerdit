@@ -18,6 +18,7 @@ from rich.table import Table
 from nerdit.cli.commands.deploy import _maybe_wait
 from nerdit.cli.display import (
     _plain,
+    call_or_exit,
     console,
     display_database_table,
     fmt_bytes,
@@ -53,15 +54,13 @@ async def _create_async(backend: str | None, name: str | None, wait: bool, timeo
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        database = await client.create_database(
+    database = await call_or_exit(
+        client.create_database(
             backend=backend,
             name=name,
             idempotency_key=uuid4().hex,
         )
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    )
 
     db_name = database.get("name", "")
     console.print(f"[green]Database provisioning:[/green] {db_name}")
@@ -95,11 +94,7 @@ async def _list_async() -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        page = await client.list_databases()
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    page = await call_or_exit(client.list_databases())
 
     items = page.get("items", [])
     if not items:

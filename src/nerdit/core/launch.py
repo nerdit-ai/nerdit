@@ -64,11 +64,9 @@ _RUN_LINE_MAX_BYTES = 2048
 # The floor is a guard on the platform's own GUESS, so it lives at the set
 # builder (`app_build._sensitive_env_values`), where provenance is still
 # known — NOT at `scrub_secret_values`, which masks whatever it is
-# handed. (PR #96 review F1: applying it at the consumer re-erased the
-# distinction one hop after the builder had made it, so a DECLARED secret
-# shorter than this — the secrets API enforces no minimum length — was
-# published verbatim into `job_logs`, readable by any authenticated
-# principal.)
+# handed. Applied at the consumer, it would let a DECLARED secret shorter
+# than this (the secrets API enforces no minimum length) reach `job_logs`
+# verbatim, readable by any authenticated principal.
 _SCRUB_MIN_VALUE_LEN = 6
 
 
@@ -121,7 +119,7 @@ def plan_gpu_placement(
 ) -> GpuPlacement | None:
     """Pick `gpu_count` GPUs of one vendor from `candidates`, or `None`.
 
-    Pure selection only (P2 placement policy): group the candidates by vendor,
+    Pure selection only: group the candidates by vendor,
     try the requested vendor first (else NVIDIA then AMD), and take the first
     pool with enough capacity. The DB fetch of `candidates` and the
     `allocate_gpus` write (with its `RuntimeError` conflict handling) stay
@@ -226,8 +224,7 @@ class AppContainerSpec(NamedTuple):
     """The service-branch shape inputs to `build_app_container_config`.
 
     Bundled (rather than 8 loose keyword args) to keep this module's ruff
-    `PLR0913` (max-args=6) clean with zero per-file-ignore entry (D-T-4:
-    `core/launch.py` must need none).
+    `PLR0913` (max-args=6) clean with zero per-file-ignore entry.
     """
 
     command: list[str] | None
@@ -246,6 +243,7 @@ class _SandboxProfile(NamedTuple):
 
     memory_limit: str | None
     cpu_limit: float | None
+    pids_limit: int | None
     cap_drop: list[str] | None
     no_new_privileges: bool
     read_only: bool
@@ -256,6 +254,7 @@ def _sandbox_profile(cfg: dict, cs: ContainerSettings) -> _SandboxProfile:
     return _SandboxProfile(
         memory_limit=(cfg.get("memory_limit") or cs.default_memory_limit),
         cpu_limit=cfg.get("cpu_limit") or cs.default_cpu_limit,
+        pids_limit=cs.pids_limit,
         cap_drop=["ALL"] if cs.drop_all_caps else None,
         no_new_privileges=cs.no_new_privileges,
         read_only=cs.read_only_rootfs,
@@ -284,6 +283,7 @@ def build_app_container_config(
         workdir=spec.workdir,
         memory_limit=sandbox.memory_limit,
         cpu_limit=sandbox.cpu_limit,
+        pids_limit=sandbox.pids_limit,
         cap_drop=sandbox.cap_drop,
         no_new_privileges=sandbox.no_new_privileges,
         read_only=sandbox.read_only,
@@ -321,6 +321,7 @@ def build_run_container_config(
         workdir=workdir,
         memory_limit=sandbox.memory_limit,
         cpu_limit=sandbox.cpu_limit,
+        pids_limit=sandbox.pids_limit,
         cap_drop=sandbox.cap_drop,
         no_new_privileges=sandbox.no_new_privileges,
         read_only=sandbox.read_only,
@@ -338,21 +339,14 @@ def apply_platform_overlay(
     container_port: int,
     host_port: int,
 ) -> None:
-    """Apply the platform sandbox overlay on top of a backend-built config.
-
-    Model and database containers get their base shape (image, env, volumes)
-    from their backend, then this overlay hardens them exactly like a plain
-    app service (cap_drop=ALL + no_new_privileges + forced bridge + published
-    port). Before this motion the same 7-line block appeared twice in
-    `_launch`, BYTE-IDENTICAL in the model and database branches (verified
-    by direct diff) — unifying it here is the one deliberate textual change in
-    this PR, and it is zero observable delta.
-    """
-    config.memory_limit = cfg.get("memory_limit") or cs.default_memory_limit
-    config.cpu_limit = cfg.get("cpu_limit") or cs.default_cpu_limit
-    config.cap_drop = ["ALL"] if cs.drop_all_caps else None
-    config.no_new_privileges = cs.no_new_privileges
-    config.read_only = cs.read_only_rootfs
+    """Harden a backend-built model/database config exactly like a plain app service."""
+    sandbox = _sandbox_profile(cfg, cs)
+    config.memory_limit = sandbox.memory_limit
+    config.cpu_limit = sandbox.cpu_limit
+    config.pids_limit = sandbox.pids_limit
+    config.cap_drop = sandbox.cap_drop
+    config.no_new_privileges = sandbox.no_new_privileges
+    config.read_only = sandbox.read_only
     config.network_mode = "bridge"
     config.ports = {container_port: host_port}
 
@@ -364,14 +358,12 @@ def finalize_container_config(
 ) -> None:
     """Merge the daemon-computed named volumes and cap the container's json-file logs.
 
-    (P14 WP-A1) Merge the daemon-computed named volumes onto whatever the
-    branch built (a service's Tier-B workspace mount, or a model's backend
-    weights volume). Empty for a row that declares none, so byte-identical to
-    before there.
+    Named volumes merge onto whatever the branch built (a service's Tier-B
+    workspace mount, or a model's backend weights volume); a row that declares
+    none is left untouched.
 
-    (P14b WP-B2c) Cap the container's json-file logs on disk (service + model
-    kinds) when retention is configured. (F7) An empty
-    `container_log_max_size` is the operator opt-out: set NO log_config at
+    Logs are capped (service + model kinds) when retention is configured. An
+    empty `container_log_max_size` is the operator opt-out: set NO log_config at
     all, so DockerRuntime never forces LogConfig(type="json-file") and the
     container inherits the daemon's configured default driver
     (journald/local/fluentd/…) untouched. The runtime guard is a truthiness
@@ -409,7 +401,7 @@ async def stamp_launching(
             require_version_match=True,
             phase=phase,
         )
-    await sc._stamp_config(
+    await sc._queries.patch_job_config(
         job.id,
         {
             "last_launch_env_keys": sorted((config.env or {}).keys()),
@@ -434,12 +426,12 @@ async def settle_started(
 ) -> None:
     """Post-run settle tail: clear stale flags, flip to `running`, wire it up.
 
-    `model_pulled` is NEVER touched here (D-T-6 asymmetry) — only the model
-    error-message clear and the C5 `db_ready` clear are launch-time clears.
+    `model_pulled` is NEVER touched here — only the model error-message clear
+    and the `db_ready` clear are launch-time clears.
     `is_model`/`is_data` are re-derived from `job`/`sc` (identical to
     the orchestrator's own top-of-`_launch` computation) rather than passed
     in, to keep this module's ruff `PLR0913` (max-args=6) clean with zero
-    per-file-ignore entry (D-T-4).
+    per-file-ignore entry.
     """
     is_model = job.kind is JobKind.model and sc._models is not None
     is_data = job.kind is JobKind.database and sc._data is not None
@@ -471,14 +463,14 @@ async def settle_started(
     # observable to a concurrent proxy reconcile or /routes read. This closes
     # the transient window at the first crash, restart, rollback or non-cutover
     # deploy — but it is deliberately NOT the only backstop: a `degraded` row
-    # stays running and never relaunches, so WP5's crash settle clears the
+    # stays running and never relaunches, so the cutover crash settle clears the
     # column explicitly rather than trusting this one.
     if job.service_name:
         await sc._queries.set_endpoint_active_port(job.service_name, None)
     await sc._queries.update_job_status(
         job.id, JobStatus.running, container_id=container_id, started_at=now
     )
-    # (F11) POST-LAUNCH FK PROBE — the one append site that must NOT simply
+    # POST-LAUNCH FK PROBE — the one append site that must NOT simply
     # swallow. An IntegrityError here IS the deleted-row signal: the DELETE
     # route removed the `jobs` row (cascading `job_logs`) between run() and
     # this write, so the status update above hit zero rows and the fresh
@@ -520,7 +512,7 @@ async def settle_started(
     # URL layer: persist the route projection + best-effort register so
     # the HTTPS URL is live this tick. The proxy reconcile loop is the actual
     # guarantee; this inline call (which never raises) just removes the lag.
-    # kind=model rows are loopback-only (P5, decision #3): they never get a
+    # kind=model rows are loopback-only: they never get a
     # Caddy route and their endpoint route projection stays NULL. kind=database
     # rows share that posture — positive `is service` form so
     # a fourth kind can never leak a route in again.

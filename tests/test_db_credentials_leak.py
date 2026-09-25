@@ -96,7 +96,7 @@ async def _db_env(tmp_path):
 async def test_no_credential_on_response_replay_cache_or_audit(tmp_path):
     app, db, queries = await _db_env(tmp_path)
     try:
-        client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+        client = AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1")
         async with client:
             headers = {"Idempotency-Key": "K-leak"}
             first = await client.post("/databases", json={}, headers=headers)
@@ -140,7 +140,7 @@ async def test_no_credential_in_diagnose_payload(tmp_path):
     """
     app, db, queries = await _db_env(tmp_path)
     try:
-        client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+        client = AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1")
         async with client:
             created = await client.post("/databases", json={})
             assert created.status_code == 201
@@ -176,6 +176,7 @@ class _CapturingRuntime:
         follow: bool = False,
         tail: int | None = None,
         max_bytes: int | None = None,
+        since: int | None = None,
     ):
         return
         yield  # pragma: no cover — empty async generator

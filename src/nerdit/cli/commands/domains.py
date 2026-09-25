@@ -14,7 +14,7 @@ from uuid import uuid4
 import typer
 from rich.table import Table
 
-from nerdit.cli.display import console, render_client_error
+from nerdit.cli.display import call_or_exit, console, render_client_error
 from nerdit.cli.display import plain as _plain
 
 #: Machine ``state`` token → the one-line explanation of why a stored domain is
@@ -95,11 +95,7 @@ async def _list_async(app: str) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        result = await client.list_domains(app)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    result = await call_or_exit(client.list_domains(app))
 
     result = result if isinstance(result, dict) else {}
     rows = result.get("domains") or []
@@ -196,11 +192,7 @@ async def _remove_async(app: str, domain: str) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        result = await client.remove_domain(app, domain, idempotency_key=uuid4().hex)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    result = await call_or_exit(client.remove_domain(app, domain, idempotency_key=uuid4().hex))
 
     result = result if isinstance(result, dict) else {}
     if result.get("removed"):

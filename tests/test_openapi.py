@@ -311,13 +311,17 @@ def test_p25_operation_ids_are_present(schema: dict) -> None:
     Pre-auth uses the existing claim operation; it adds no route. Database
     dump/list/restore bring the total to 82 operations; the P40b project
     quartet takes it to 86; the P40c variable quartet to 90; P40d's
-    ``apply_project`` to 91.
+    ``apply_project`` to 91; P41b's discovery and address binding to 93;
+    P41d's project logs and diagnosis to 95; P41e's rename to 96.
     """
     op_ids = {op.get("operationId") for _, _, op in _operations(schema)}
     expected = {"get_self_token", "rotate_self_token"}
     missing = expected - op_ids
     assert not missing, f"P25 operationIds missing from the schema: {sorted(missing)}"
-    assert len(op_ids) == 91
+    assert {"get_link_project", "push_link_public_address"} <= op_ids
+    assert {"project_logs", "diagnose_project"} <= op_ids
+    assert "rename_project" in op_ids
+    assert len(op_ids) == 96
 
 
 def test_p40b_operation_ids_are_present(schema: dict) -> None:

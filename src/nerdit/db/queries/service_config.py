@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Sequence
 from datetime import datetime
 
 from nerdit.db.models import ErrorClass, JobStatus
 
 from ._base import _ACTIVE_STATUSES, QueriesBase, _serialized
+
+_CONFIG_KEY_RE = re.compile(r"[a-z_][a-z0-9_]*")
 
 _LAST_DUMP_PATCH_PATHS = {"dump": "'$.last_dump.dump'", "reason": "'$.last_dump.reason'"}
 
@@ -312,45 +316,49 @@ class ServiceConfigQueries(QueriesBase):
         await self._db.conn.commit()
 
     @_serialized
-    async def set_last_run(self, job_id: str, last_run: str) -> bool:
-        """Set only config.last_run, preserving concurrent deploy and release markers.
+    async def patch_job_config(
+        self,
+        job_id: str,
+        updates: dict[str, object] | None = None,
+        *,
+        remove: Sequence[str] = (),
+        expect_build_version: int | None = None,
+    ) -> bool:
+        """Set and remove top-level ``config`` keys in one statement.
 
-        Use a literal json_set path against the current row rather than stale whole-blob
-        writes. Invalid JSON skips the update and returns False; the run result still
-        reaches its caller.
+        ``json_set``/``json_remove`` rewrite paths inside the value the row holds
+        AT UPDATE TIME, so there is no read step to go stale: a long run, dump or
+        cutover never erases a key another writer committed meanwhile. Keys are
+        code literals, checked against a fixed grammar and bound as parameters.
+        With ``expect_build_version`` the write only lands on that generation;
+        callers must abandon a superseded write, never retry it unguarded.
+
+        Returns ``False`` when nothing matched: the row is gone, the version
+        moved, or the blob is not valid JSON (left untouched rather than
+        blanked).
+
+        Raises:
+            ValueError: A key outside ``[a-z_][a-z0-9_]*``.
         """
-        cursor = await self._db.conn.execute(
-            "UPDATE jobs SET config = json_set(config, '$.last_run', json(?)) "
-            "WHERE id = ? AND json_valid(config)",
-            (last_run, job_id),
-        )
-        await self._db.conn.commit()
-        return cursor.rowcount == 1
-
-    @_serialized
-    async def set_last_dump(self, job_id: str, last_dump: str) -> bool:
-        """Write ``config['last_dump']`` WITHOUT rewriting the rest of the blob.
-
-        (P37 / D-P37-11) The exact twin of :meth:`set_last_run`, for the same
-        reason: a dump or a restore is long-lived (an hour is a legal
-        ``timeout_s``) and nothing stops a redeploy, a release or a reconcile
-        from committing to the SAME row while the sibling container is still
-        streaming. A whole-blob read-modify-write would read the pre-commit
-        blob, await, and write it back over the newer one — erasing ``image`` /
-        ``build_version`` / ``release_pending``. ``json_set`` rewrites one path
-        inside the value the row holds AT UPDATE TIME, so there is no read step
-        to go stale; the path is a literal, never caller-derived.
-
-        ``json_valid`` guards the one case ``json_set`` would answer NULL and
-        blank the column. ``False`` therefore means "the row is gone, or its
-        blob is not valid JSON" — the dump's own result still reaches the
-        caller either way, because this stamp is bookkeeping, not the outcome.
-        """
-        cursor = await self._db.conn.execute(
-            "UPDATE jobs SET config = json_set(config, '$.last_dump', json(?)) "
-            "WHERE id = ? AND json_valid(config)",
-            (last_dump, job_id),
-        )
+        updates = updates or {}
+        for key in (*updates, *remove):
+            if not _CONFIG_KEY_RE.fullmatch(key):
+                raise ValueError(f"invalid config key: {key!r}")
+        expr = "config"
+        params: list[object] = []
+        if remove:
+            expr = f"json_remove({expr}{', ?' * len(remove)})"
+            params += [f"$.{key}" for key in remove]
+        if updates:
+            expr = f"json_set({expr}{', ?, json(?)' * len(updates)})"
+            for key, value in updates.items():
+                params += [f"$.{key}", json.dumps(value)]
+        sql = f"UPDATE jobs SET config = {expr} WHERE id = ? AND json_valid(config)"
+        params.append(job_id)
+        if expect_build_version is not None:
+            sql += " AND json_extract(config, '$.build_version') = ?"
+            params.append(expect_build_version)
+        cursor = await self._db.conn.execute(sql, params)
         await self._db.conn.commit()
         return cursor.rowcount == 1
 
@@ -373,23 +381,6 @@ class ServiceConfigQueries(QueriesBase):
             "WHERE id = ? AND json_valid(config) "
             "AND json_extract(config, '$.last_dump.run_id') = ?",
             (value, job_id, expect_run_id),
-        )
-        await self._db.conn.commit()
-        return cursor.rowcount == 1
-
-    @_serialized
-    async def update_job_config_guarded(
-        self, job_id: str, config: str, *, expect_build_version: int
-    ) -> bool:
-        """Update only the config blob while its build version matches the expected version.
-
-        Return False on missing/mismatched versions. Callers must abandon superseded
-        writes, never retry them unguarded; lifecycle columns remain unchanged.
-        """
-        cursor = await self._db.conn.execute(
-            "UPDATE jobs SET config = ? "
-            "WHERE id = ? AND json_extract(config, '$.build_version') = ?",
-            (config, job_id, expect_build_version),
         )
         await self._db.conn.commit()
         return cursor.rowcount == 1

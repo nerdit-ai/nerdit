@@ -15,7 +15,13 @@ from uuid import uuid4
 
 import typer
 
-from nerdit.cli.display import _plain, console, display_service_submitted, render_client_error
+from nerdit.cli.display import (
+    _plain,
+    call_or_exit,
+    console,
+    display_service_submitted,
+    render_client_error,
+)
 
 # Strict model-reference shape (S7): 'llama3.1:8b', 'phi3.5', 'library/llama:tag'.
 # Deliberately narrow — anything else falls through to the explicit error below.
@@ -272,8 +278,8 @@ async def _serve_model_async(
         raise typer.Exit(1)
 
     client = get_configured_client()
-    try:
-        workload = await client.serve_model(
+    workload = await call_or_exit(
+        client.serve_model(
             model=model_ref,
             gpus=gpus if gpus is not None else 0,
             name=name,
@@ -282,9 +288,7 @@ async def _serve_model_async(
             gpu_memory_utilization=gpu_memory_utilization,
             idempotency_key=uuid4().hex,
         )
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    )
 
     console.print(f"[green]Model serving:[/green] {workload.get('name')}")
     console.print(f"  Model:   {workload.get('model') or model_ref}")

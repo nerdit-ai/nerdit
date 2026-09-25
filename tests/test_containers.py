@@ -652,6 +652,25 @@ async def test_sweep_does_not_return_cross_instance_containers(mock_docker):
     assert await runtime_b.list_own_managed_containers() == []
 
 
+@pytest.mark.asyncio
+async def test_list_managed_keeps_containers_with_unparseable_created(mock_docker):
+    """A missing or garbage `Created` must not drop a live container from the
+    reconcile live set (that relaunches a duplicate); it reads as created now,
+    so the zombie sweep never reaps it early either."""
+    from datetime import UTC, datetime, timedelta
+
+    from nerdit.core.runtime.docker import DockerRuntime
+
+    garbage, missing = MagicMock(), MagicMock()
+    garbage.id, garbage.attrs = "garbage", {"Created": "garbage"}
+    missing.id, missing.attrs = "missing", {}
+    mock_docker.containers.list = MagicMock(return_value=[garbage, missing])
+
+    listed = await DockerRuntime(client=mock_docker).list_managed_containers()
+    assert [cid for cid, _ in listed] == ["garbage", "missing"]
+    assert all(datetime.now(UTC) - ts < timedelta(minutes=1) for _, ts in listed)
+
+
 # --- (P20) bounded log tail: `tail` + `max_bytes` -----------------------------
 
 
@@ -812,6 +831,32 @@ async def test_docker_logs_follow_ignores_the_new_bounds(mock_docker):
     assert lines == ["live"]
     assert "tail" not in container.logs.call_args.kwargs
     assert "max_bytes" not in container.logs.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_docker_logs_follow_drops_oldest_under_backpressure(mock_docker, monkeypatch):
+    """B4: a bounded follow queue keeps the newest lines and the end sentinel."""
+    import types
+
+    from nerdit.core.runtime import docker as docker_mod
+
+    class _InlineThread:
+        # Run the reader to completion before the consumer's first read.
+        def __init__(self, target, **_kw):  # noqa: ANN001
+            self._target = target
+
+        def start(self) -> None:
+            self._target()
+
+    monkeypatch.setattr(docker_mod, "_FOLLOW_QUEUE_MAX", 3)
+    monkeypatch.setattr(docker_mod, "threading", types.SimpleNamespace(Thread=_InlineThread))
+    container = mock_docker.containers.get.return_value
+    container.logs = MagicMock(return_value=iter([f"l{i}\n".encode() for i in range(8)]))
+    runtime = docker_mod.DockerRuntime(client=mock_docker)
+
+    lines = [line async for line in runtime.logs("cid", follow=True, since=1700000000)]
+    assert lines == ["l6", "l7"]
+    assert container.logs.call_args.kwargs["since"] == 1700000000
 
 
 # --- (P20) bounded wait -------------------------------------------------------
@@ -1092,3 +1137,13 @@ def test_every_launch_path_forces_its_own_network_namespace():
     for config in (app, run, backend_built):
         assert config.network_mode == "bridge"
         assert config.network_mode != "host"
+
+
+@pytest.mark.asyncio
+async def test_pids_limit_passed_to_docker(mock_docker):
+    """Security S3: a set pids_limit reaches docker-py (None adds no kwarg — the batch pin)."""
+    from nerdit.core.runtime.docker import DockerRuntime
+
+    runtime = DockerRuntime(client=mock_docker)
+    await runtime.run(ContainerConfig(image="app:1", gpu_ids=[], pids_limit=512))
+    assert mock_docker.containers.run.call_args.kwargs["pids_limit"] == 512

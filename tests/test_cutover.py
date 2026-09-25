@@ -305,8 +305,7 @@ def _record_step_order(queries, proxy, controller, events) -> tuple[list[str], d
     orig_live = proxy.live_routes
     orig_status = queries.update_job_status
     orig_audit = queries.insert_audit_log
-    orig_guarded = queries.update_job_config_guarded
-    orig_update_config = queries.update_job_config
+    orig_patch = queries.patch_job_config
     orig_destroy = controller._destroy_container
     orig_record = events.record
 
@@ -333,19 +332,18 @@ def _record_step_order(queries, proxy, controller, events) -> tuple[list[str], d
         order.append(f"audit:{kw['action']}")
         await orig_audit(**kw)
 
-    async def guarded(job_id, config, *, expect_build_version):
-        if "cutover_pending" not in json.loads(config):
+    async def patch(job_id, updates=None, *, remove=(), expect_build_version=None):
+        if "cutover_pending" in remove:
             order.append("pop")
-        return await orig_guarded(job_id, config, expect_build_version=expect_build_version)
-
-    async def update_config(job_id, config):
         # ``stamp_last_deploy`` lands through here; f5 is the write that flips
         # the phase to ``healthy``. Recorded explicitly so the "pop is LAST"
         # assertion below names every tail step instead of comparing the pop
         # against a max() that includes itself.
-        if (json.loads(config).get("last_deploy") or {}).get("phase") == "healthy":
+        if ((updates or {}).get("last_deploy") or {}).get("phase") == "healthy":
             order.append("stamp_healthy")
-        await orig_update_config(job_id, config)
+        return await orig_patch(
+            job_id, updates, remove=remove, expect_build_version=expect_build_version
+        )
 
     async def destroy(cid):
         order.append(f"destroy:{cid}")
@@ -359,8 +357,7 @@ def _record_step_order(queries, proxy, controller, events) -> tuple[list[str], d
         (queries, "set_endpoint_active_port", active),
         (queries, "update_job_status", status),
         (queries, "insert_audit_log", audit),
-        (queries, "update_job_config_guarded", guarded),
-        (queries, "update_job_config", update_config),
+        (queries, "patch_job_config", patch),
         (proxy, "register", register),
         (proxy, "live_routes", live_routes),
         (controller, "_destroy_container", destroy),
@@ -945,7 +942,7 @@ async def test_a_stop_racing_a_committed_cutover_tears_down_the_green(queries, t
     await queries.set_desired_state(job.id, "stopped")
     job.desired_state = "stopped"  # the stale snapshot
 
-    await controller._reconcile_one(job, {green}, [1])
+    await controller._reconcile_one(job, {green}, [])
 
     assert green not in runtime.live, "the freshly promoted green must be torn down"
     row = await queries.get_job(job.id)
@@ -1227,10 +1224,10 @@ async def test_a_redeploy_landing_mid_arm_is_never_clobbered(queries, tmp_path):
     """A CAS miss on the marker write aborts the arm — no task, no clobber."""
     controller, runtime, proxy, fake, job, _ep = await _full_setup(queries, tmp_path)
 
-    async def miss(job_id, config, *, expect_build_version):
+    async def miss(job_id, updates=None, *, remove=(), expect_build_version=None):
         return False
 
-    queries.update_job_config_guarded = miss  # type: ignore[assignment]
+    queries.patch_job_config = miss  # type: ignore[assignment]
 
     armed = await controller._cutover.maybe_cutover(job, True)
 
@@ -1876,3 +1873,53 @@ async def test_a_domain_bound_during_the_verify_window_is_repointed(queries, tmp
     ep = await queries.get_service_endpoint(NAME)
     live = await proxy.live_routes()
     assert live["nerdit-route-app@late.example.com"].dial == f"127.0.0.1:{ep.active_host_port}"
+
+
+@pytest.mark.parametrize("exhausted", [False, True])
+async def test_ephemeral_allocator_holds_excluded_candidates_and_closes_all(monkeypatch, exhausted):
+    made = []
+    ports = iter([45000] * 32 if exhausted else [45000, 45001, 45002])
+
+    class Candidate:
+        def __init__(self, *_args):
+            assert not any(candidate.closed for candidate in made)
+            self.closed = False
+            self.port = next(ports)
+            made.append(self)
+
+        def bind(self, address):
+            assert address == ("127.0.0.1", 0)
+
+        def getsockname(self):
+            return "127.0.0.1", self.port
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(cutover_mod.socket, "socket", Candidate)
+    if exhausted:
+        with pytest.raises(OSError, match="unreserved ephemeral"):
+            _reserve_ephemeral_port({45000, 45001})
+        assert len(made) == 32
+    else:
+        assert _reserve_ephemeral_port({45000, 45001}) == 45002
+        assert len(made) == 3
+    assert all(candidate.closed for candidate in made)
+
+
+async def test_cutover_excludes_all_reserved_stable_and_active_ports(
+    queries, tmp_path, monkeypatch
+):
+    controller, _runtime, _proxy_mgr, _fake, _job, endpoint = await _full_setup(queries, tmp_path)
+    _healthy(controller)
+    original = _reserve_ephemeral_port
+    excluded_seen = []
+
+    def choose(excluded):
+        excluded_seen.append(set(excluded))
+        return original(excluded)
+
+    monkeypatch.setattr(cutover_mod, "_reserve_ephemeral_port", choose)
+    await controller.reconcile()
+    await _drain_cutovers(controller)
+    assert excluded_seen and endpoint.host_port in excluded_seen[0]

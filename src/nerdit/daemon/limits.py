@@ -38,11 +38,6 @@ _MAX_DIAGNOSE_TAIL = 200
 # via `GET /events?since_id=…` — never a silently truncated replay.
 MAX_SSE_REPLAY = 1000
 
-#: Back-compat alias for the pre-`/capabilities` private name. Kept so the
-#: route module and its tests keep importing what they always did; the public
-#: spelling above is the one `/capabilities.limits` projects.
-_MAX_SSE_REPLAY = MAX_SSE_REPLAY
-
 # Global concurrency cap on `/events/stream`. Mirrors `WAIT_CONCURRENCY_MAX`
 # and for the same reason: an SSE connection is held open indefinitely, so an
 # uncapped stream route is a cheap connection-exhaustion vector on a LAN daemon.

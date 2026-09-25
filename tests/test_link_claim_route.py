@@ -33,6 +33,7 @@ from nerdit.daemon.auth import hash_token
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers
 from nerdit.daemon.idempotency import NO_BODY_CACHE_ACTIONS, NO_BODY_HASH_ACTIONS
 from nerdit.daemon.middleware import ScopedTokenAuthMiddleware
+from nerdit.daemon.routes.link import _LINK_MUTATION_LOCK
 from nerdit.daemon.routes.link import router as link_router
 from nerdit.daemon.schemas.link import LinkClaimRequest
 from nerdit.db.models import ApiToken, TokenRole
@@ -1797,6 +1798,65 @@ def test_refresh_learns_and_persists_the_hosted_domain(tmp_path: Path) -> None:
         "nodes_base_domain": DOMAIN,
         "changed": True,
     }
+
+
+class _LockProbeMetadata(FakeMetadata):
+    """Metadata answer that records the link lock state and can unlink mid-hop."""
+
+    def __init__(
+        self, *, unlink_store: ConfigStore | None = None, relink_to: str | None = None
+    ) -> None:
+        super().__init__()
+        self.unlink_store = unlink_store
+        self.relink_to = relink_to
+        self.lock_held: bool | None = None
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.lock_held = _LINK_MUTATION_LOCK.locked()
+        if self.unlink_store is not None:
+            self.unlink_store.commit(
+                self.unlink_store.stage("link", {"node_id": self.relink_to, "slug": None})
+            )
+        return super().handler(request)
+
+
+def test_refresh_fetches_metadata_without_the_link_lock(tmp_path: Path) -> None:
+    """The cloud hop must not stall claims, unlinks and pushes behind it."""
+    meta = _LockProbeMetadata()
+    h = _build(tmp_path, link=dict(_LINKED), cloud=meta)
+
+    response = _refresh(h)
+
+    assert response.status_code == 200, response.text
+    assert meta.lock_held is False
+
+
+def test_refresh_refuses_when_an_unlink_lands_during_the_hop(tmp_path: Path) -> None:
+    """The commit re-reads `[link]` under the lock, so an unlink mid-hop wins."""
+    h = _build(tmp_path, link=dict(_LINKED))
+    h.app.state.link_claim_transport = httpx.MockTransport(
+        _LockProbeMetadata(unlink_store=h.store).handler
+    )
+
+    response = _refresh(h)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "link.not_linked"
+    assert "nodes_base_domain" not in h.link_section()
+
+
+def test_refresh_refuses_when_the_node_is_relinked_during_the_hop(tmp_path: Path) -> None:
+    """An unlink + new claim mid-hop must not receive the old cloud's domain."""
+    h = _build(tmp_path, link=dict(_LINKED))
+    h.app.state.link_claim_transport = httpx.MockTransport(
+        _LockProbeMetadata(unlink_store=h.store, relink_to="node-other").handler
+    )
+
+    response = _refresh(h)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "link.config_changed"
+    assert "nodes_base_domain" not in h.link_section()
 
 
 def test_refresh_is_idempotent_and_does_not_ask_for_a_restart(tmp_path: Path) -> None:

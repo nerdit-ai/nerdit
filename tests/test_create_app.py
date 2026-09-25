@@ -133,6 +133,8 @@ _EXPECTED_OPERATIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     "start_device_link": ("/api/link/device", ("POST",)),
     "poll_device_link": ("/api/link/device/poll", ("POST",)),
     "push_link_entitlement": ("/api/link/entitlement", ("PUT",)),
+    "get_link_project": ("/api/link/projects/{project_id}", ("GET",)),
+    "push_link_public_address": ("/api/link/public-address", ("PUT",)),
     "push_link_github_token": ("/api/link/github-token", ("PUT",)),
     "nudge_git": ("/api/link/git-nudge", ("POST",)),
     "get_share": ("/api/services/{name}/share", ("GET",)),
@@ -146,6 +148,7 @@ _EXPECTED_OPERATIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     "remove_domain": ("/api/services/{name}/domains/{domain:path}", ("DELETE",)),
     # (P40b) The project quartet, tag Projects, `/api` only.
     "list_projects": ("/api/projects", ("GET",)),
+    "rename_project": ("/api/projects/{project}", ("PATCH",)),
     "create_project": ("/api/projects", ("POST",)),
     "get_project": ("/api/projects/{project}", ("GET",)),
     "delete_project": ("/api/projects/{project}", ("DELETE",)),
@@ -156,6 +159,8 @@ _EXPECTED_OPERATIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     "delete_variable": ("/api/projects/{project}/variables/{key}", ("DELETE",)),
     # (P40d) The declaration apply, same tag, same router.
     "apply_project": ("/api/projects/{project}/apply", ("POST",)),
+    "project_logs": ("/api/projects/{project}/services/{service}/logs", ("GET",)),
+    "diagnose_project": ("/api/projects/{project}/services/{service}/diagnose", ("GET",)),
 }
 
 
@@ -219,8 +224,10 @@ def test_api_router_and_tag_table(app):
     # list_database_dumps, restore_database_dump — all under the existing
     # Databases tag) takes it to 82; the P40b project quartet (list_projects,
     # create_project, get_project, delete_project, tag Projects) to 86; the
-    # P40c variable quartet (same tag) to 90; P40d's apply_project to 91.
-    assert len(ids) == len(set(ids)) == 91, "operation_id set drifted from 91"
+    # P40c variable quartet (same tag) to 90; P40d's apply_project to 91;
+    # P41b's project identity lookup and public address binding to 93;
+    # P41d's project logs and diagnosis to 95; P41e's rename to 96.
+    assert len(ids) == len(set(ids)) == 96, "operation_id set drifted from 96"
 
     found = {r.operation_id: (path, tuple(sorted(r.methods))) for path, r in routes}
     assert found == _EXPECTED_OPERATIONS

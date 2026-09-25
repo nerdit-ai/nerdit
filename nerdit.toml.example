@@ -33,6 +33,7 @@ pid_file = "~/.nerdit/nerditd.pid"
 
 [containers]
 default_image = "nvidia/cuda:12.4.1-runtime-ubuntu22.04"
+pids_limit = 4096               # max processes+threads per container (restart-required)
 
 [monitor]
 interval_seconds = 5

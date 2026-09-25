@@ -44,12 +44,9 @@ from nerdit.core.runtime.stub import StubRuntime
 from nerdit.core.sweeper import ZombieSweeper
 from nerdit.core.volumes import dump_staging_root
 
-# Track B WP19.b moved the app-assembly body (router imports, middleware
-# stack, tag table, legacy aliases, MCP mount, dashboard mount) to
-# `daemon/appfactory.py`; `create_app()` below stays a thin wrapper.
-# `DashboardHtmlMiddleware`/`_McpMount` are re-exported here (rather than
-# imported directly) so `test_create_app.py`/`test_mcp_http.py` — which
-# read/import them off this module — survive the split unmodified.
+# App assembly lives in `daemon/appfactory.py`; `create_app()` below is a thin
+# wrapper. `DashboardHtmlMiddleware`/`_McpMount` are re-exported because
+# `test_create_app.py`/`test_mcp_http.py` import them off this module.
 from nerdit.daemon.appfactory import (  # noqa: F401
     DashboardHtmlMiddleware,
     _McpMount,
@@ -70,12 +67,9 @@ from nerdit.daemon.bootstrap import (
 from nerdit.daemon.deploy_pipeline import redeploy_from_source
 from nerdit.daemon.service_purge import _sweep_data_tombstones
 
-# Re-exported for the retention/backup suites (Track B WP19.a moved the sweep
-# family to daemon/sweeps.py; the four loop functions are also lifespan's real
-# call sites, but `_prune_backups`/`_prune_volume_backups`/
-# `_run_retention_sweep` exist ONLY as bindings here, read by
-# tests/test_backup_volumes.py:32 and tests/test_retention.py (direct
-# `server_module.<name>` calls, no monkeypatch involved).
+# The four loop functions are lifespan's real call sites; the `_prune_*` trio
+# and `_run_retention_sweep` exist here ONLY as re-exports, called as
+# `server_module.<name>` by the backup and retention suites.
 from nerdit.daemon.sweeps import (  # noqa: F401
     _idempotency_sweep_loop,
     _proxy_reconcile_loop,
@@ -92,13 +86,10 @@ from nerdit.db.models import GpuVendor, Job
 from nerdit.db.queries import Queries
 from nerdit.utils.certs import ca_fingerprint
 
-# The archive-dir guard now lives in `utils.disk` so `daemon/routes/system.py`
-# can walk the SAME dir the sweep writes to (F14) without importing this module
-# (a route importing `daemon.server` would be a cycle). The alias keeps the old
-# private name bound in this namespace: WP19.a moved its call site to
-# `daemon/sweeps.py` (which imports the real name directly), so this binding
-# is now a pure re-export, reached as `server_module._resolve_archive_dir` by
-# tests/test_retention.py:437/:446/:457.
+# The archive-dir guard lives in `utils.disk` so `daemon/routes/system.py` can
+# walk the SAME dir the sweep writes to without importing this module (a
+# cycle). This alias is a pure re-export, reached as
+# `server_module._resolve_archive_dir` by tests/test_retention.py.
 from nerdit.utils.disk import resolve_archive_dir as _resolve_archive_dir  # noqa: F401
 from nerdit.utils.frozen import restore_host_loader_env
 from nerdit.utils.logging import setup_logging
@@ -124,17 +115,16 @@ IDEMPOTENCY_SWEEP_INTERVAL_SECONDS = 3600
 # which has nothing to kill). It equally bounds a plain-SIGTERM shutdown with a
 # long request in flight — deliberate. A constant, not a config key.
 #
-# The bound is a CANCEL. Since P22 that cancellation is handled honestly:
-# `IdempotencyMiddleware` catches `BaseException` and either releases the
-# straggler's claim (nothing committed) or pins it `interrupted` (a write
-# committed — replays answer `409 idempotency_interrupted` instead of
-# silently re-executing). Live-validated: SIGTERM mid-run → restart → the
-# retry sees `interrupted`, persisted across the reboot.
+# The bound is a CANCEL: `IdempotencyMiddleware` catches `BaseException` and
+# either releases the straggler's claim (nothing committed) or pins it
+# `interrupted` (a write committed — replays answer
+# `409 idempotency_interrupted` instead of silently re-executing), which
+# persists across the restart.
 GRACEFUL_SHUTDOWN_TIMEOUT_S = 30
 
 
 def _truncate_if_regular_file(fd: int) -> None:
-    """Truncate `fd` to 0 iff it refers to a regular file (P14b WP-B2c).
+    """Truncate `fd` to 0 iff it refers to a regular file.
 
     Bounds `nerditd.boot.log` across `POST /daemon/restart` self-execs: the
     inherited stderr fd survives every `os.execv` with its offset, so the
@@ -180,21 +170,25 @@ def _warn_if_unauthenticated_exposure(
 ) -> None:
     """Log a warning when the daemon is exposed to the network without auth.
 
-    The middleware silently bypasses auth when `auth_token` is `None`
-    (v0.1 compat). Two ways that becomes a network-reachable admin surface:
+    With `auth_token` unset the middleware grants the local admin principal to
+    any request whose Host is a loopback name and refuses other Hosts with 421.
+    That stops browser (DNS-rebinding) traffic, not a direct client that sends
+    `Host: localhost`, so two exposures still warrant a warning:
 
-    * The daemon is bound to a non-loopback host — every endpoint is directly
-      reachable without authentication.
+    * The daemon is bound to a non-loopback host — any network client can
+      reach it and forge a loopback Host.
     * **The dashboard apex re-exposes the daemon.** With
       `[proxy].dashboard_apex` on, the catch-all apex forwards `/api/*` from
       Caddy's LAN-facing HTTPS listener to the daemon (`127.0.0.1:<port>`)
-      *even when the daemon itself is bound to loopback* — so the host check
-      above misses it. Warn on this combination regardless of `daemon.host`.
+      *even when the daemon itself is bound to loopback*. Apex requests carry
+      the LAN Host and are refused, but a client forging a loopback Host
+      still gets through. Warn on this combination regardless of `daemon.host`.
     """
     if daemon.auth_token is None and daemon.host not in _LOOPBACK_HOSTS:
         logger.warning(
             "Daemon is bound to %s with no auth_token configured. "
-            "All endpoints are reachable without authentication. "
+            "Non-loopback Host names are refused, but any network client "
+            "that sends Host: localhost gets admin without authentication. "
             "Set auth_token in ~/.nerdit/config.toml or bind to 127.0.0.1.",
             daemon.host,
         )
@@ -205,9 +199,10 @@ def _warn_if_unauthenticated_exposure(
         logger.warning(
             "[proxy] dashboard_apex is enabled with no auth_token configured: "
             "the apex route forwards the daemon API (/api/*) from the proxy's "
-            "LAN-facing :%d HTTPS listener to the daemon, so every endpoint is "
-            "reachable without authentication over the network — even though the "
-            "daemon is bound to %s. Set auth_token in ~/.nerdit/config.toml or "
+            "LAN-facing :%d HTTPS listener to the daemon (bound to %s), which "
+            "refuses non-loopback Host names with 421: the apex dashboard does "
+            "not work, yet a LAN client that sends Host: localhost still gets "
+            "admin without authentication. Set auth_token in ~/.nerdit/config.toml or "
             "disable [proxy].dashboard_apex.",
             proxy.https_port,  # type: ignore[union-attr]  # apex_on ⇒ proxy is not None
             daemon.host,
@@ -287,12 +282,12 @@ async def lifespan(app: FastAPI):
             # dir from Tier-A so `nerdit serve <model>` launches — but keep it
             # OUT of the Tier-B allowlist above so scoped tokens still cannot
             # bind-mount the shared weights cache.
-            # (P14 WP-A1) <data_dir>/services holds the per-service named-volume
+            # <data_dir>/services holds the per-service named-volume
             # leaf dirs (daemon-computed host paths, never user-supplied). Carve
             # them out of Tier-A too — a Tier-A carve-out ONLY, kept out of the
             # Tier-B allowlist so a scoped token still cannot bind another
             # service's data dir via a user mount.
-            # (P37 D-P37-2) One 0o700 dir per in-flight dump — the one path a
+            # One 0o700 dir per in-flight dump — the one path a
             # sibling bind-mounts. A DEDICATED root: ``_under_allowed`` is
             # prefix-based, so carving out ``backups/`` would expose the v1 tars.
             system_mount_roots=[
@@ -347,11 +342,10 @@ async def lifespan(app: FastAPI):
     secret_manager, shared_scope_blocked, rotate_key_blocked = await build_secret_manager(
         settings, queries
     )
-    # (P25 §3.4.5) The proxy is constructed above, the secret manager here, so
-    # the edge-auth resolver is wired with a late setter rather than by
-    # reordering boot — a much smaller blast radius, and nothing has started
-    # yet: the proxy is first used by build_controllers below and only started
-    # further down the lifespan.
+    # The proxy is constructed above, the secret manager here, so the
+    # edge-auth resolver is wired with a late setter rather than by reordering
+    # boot. Nothing has started yet: the proxy is first used by
+    # build_controllers below and only started further down the lifespan.
     proxy_manager.set_secret_resolver(build_edge_auth_resolver(secret_manager))
     (
         model_controller,
@@ -366,8 +360,8 @@ async def lifespan(app: FastAPI):
     # passed at construction: one-off runs and [deploy].release executions are
     # rowless containers, invisible to every DB query the sweep makes, and the
     # required kwarg has no post-construction assignment path.
-    # The hook is now `protected_container_ids` — runs ∪ cutover
-    # greens. A green is managed-by=nerdit but is no row's `container_id`, so
+    # The hook is `protected_container_ids` — runs ∪ cutover greens. A green
+    # is managed-by=nerdit but is no row's `container_id`, so
     # without it the sweep would kill the candidate mid-verification.
     zombie_sweeper = ZombieSweeper(
         queries=queries,
@@ -383,7 +377,7 @@ async def lifespan(app: FastAPI):
     if settings.git.enabled and settings.git.watch_interval_s > 0:
 
         async def _auto_redeploy(job: Job) -> None:
-            """WP6's redeploy primitive, in-process (never an HTTP self-call)."""
+            """The redeploy primitive, in-process (never an HTTP self-call)."""
             await redeploy_from_source(
                 request_or_none=None,
                 app=app,
@@ -399,7 +393,7 @@ async def lifespan(app: FastAPI):
             settings.git,
             secret_manager,
             redeploy=_auto_redeploy,
-            # D-P24-8: the poller refuses to fire for a service the cutover
+            # The poller refuses to fire for a service the cutover
             # machinery would not protect, and says WHY in the feed.
             skip_reason=lambda job, cfg: cutover_skip_reason(
                 job, cfg, settings.services, proxy_manager
@@ -462,43 +456,42 @@ async def lifespan(app: FastAPI):
     mdns_advertiser = MdnsAdvertiser(settings.proxy, hostname=hostname)
     await mdns_advertiser.start()
 
-    # (P17d WP-D1) The offline product license. Loaded BEFORE the link manager
+    # The offline product license. Loaded BEFORE the link manager
     # because the [link] seam below is its one v1 consumer. A missing file is
     # the ordinary unlicensed state and costs one stat; a broken one degrades to
-    # doctor-visible and never aborts boot (D-LIC2). Published on app.state for
+    # doctor-visible and never aborts boot. Published on app.state for
     # the doctor / capabilities / install-route surfaces, which refresh THIS
     # holder in place — the [license].file *path* is restart-keyed, its content
     # deliberately is not.
     app.state.license = await build_license_state(settings, event_recorder)
 
-    # (P27 WP-C1) Outbound node link. Ships DARK: with [link].enabled false —
+    # Outbound node link. Ships DARK: with [link].enabled false —
     # or enabled but not yet claimed — `build_link_manager` returns None and
     # nothing at all is constructed or started, so a fresh install dials
     # nowhere. When it is on, the manager owns its own connect/renew/reconnect
-    # task; the daemon opens no inbound port for it (D-R3).
+    # task; the daemon opens no inbound port for it.
     link_manager = await build_link_manager(settings, event_recorder, queries=queries)
     # Publish on app.state BEFORE starting: the middleware's capability
     # resolution and the stale-bearer refusal both read this attribute, so it
     # must be set before any tunneled loopback request can possibly arrive
     # (uvicorn serves nothing until the lifespan yields, but the ordering
-    # should not depend on that — /security-review PR #114 defense-in-depth).
+    # should not depend on that — defense in depth).
     app.state.link_manager = link_manager
     if link_manager is not None:
-        # (P17d WP-D2) The ONE v1 entitlement call site, evaluated only when a
+        # The ONE entitlement call site, evaluated only when a
         # tunnel is actually about to start. The posture is fail-open-with-
-        # advisory and the caller owns it: W-D11 makes the relay the
-        # authoritative online judge of `remote_link`, so a second offline
+        # advisory and the caller owns it: the relay is the authoritative
+        # online judge of `remote_link`, so a second offline
         # judge could only ever disagree with it — and under manual issuance a
         # stale file on disk is certain. One WARNING, then the tunnel starts as
         # it always has.
         #
-        # The guard is ANY advisory reason, not `not allowed`: the D-LIC2
-        # state matrix requires a boot warning for FOUR states, two of which are
+        # The guard is ANY advisory reason, not `not allowed`: a boot warning
+        # is owed for FOUR states, two of which are
         # allowed-with-advisory — `invalid` and `expired_grace` — beside the
         # two refusals (`expired`, `feature_not_licensed`). Silence is
         # correct for exactly two rows: no license at all, and valid-with-the-
-        # feature. Every `allowed=False` decision carries a reason, so this
-        # guard is a superset of the old one and never drops a warning.
+        # feature. Every `allowed=False` decision carries a reason.
         decision = app.state.license.require_entitlement(FEATURE_REMOTE_LINK)
         if decision.reason is not None:
             logger.warning(
@@ -518,7 +511,6 @@ async def lifespan(app: FastAPI):
             queries,
             settings.notifications,
             secret_manager,
-            bus=event_bus,
             version=__version__,
             instance_id=settings.daemon.instance_id,
         )
@@ -529,7 +521,7 @@ async def lifespan(app: FastAPI):
         _zombie_sweep_loop(zombie_sweeper, ZOMBIE_SWEEP_INTERVAL_SECONDS)
     )
 
-    # (P37 D-P37-2) The filesystem twin of the boot run-orphan kill: no slot
+    # The filesystem twin of the boot run-orphan kill: no slot
     # can exist at boot, so every entry under <data_dir>/dump-staging and every
     # <data_dir>/backups/.staging-* or .tmp-nerdit-* leftover is an orphan. A
     # symlinked staging root is refused, not swept through. Awaited: a handful
@@ -568,7 +560,7 @@ async def lifespan(app: FastAPI):
     app.state.event_bus = event_bus
     app.state.proxy_manager = proxy_manager
     app.state.mdns_advertiser = mdns_advertiser
-    # (P27 WP-C1 item 5) `app.state.link_manager` is published above, before
+    # `app.state.link_manager` is published above, before
     # the manager starts — explicitly None when the link is off/unclaimed: the
     # auth middleware, the doctor `link` check and the /capabilities `link`
     # block all `getattr` it, and "absent" and "None" must mean the same
@@ -589,7 +581,7 @@ async def lifespan(app: FastAPI):
         "vendors": sorted({gpu.vendor.value for gpu in gpus}),
     }
     app.state.hostname = hostname
-    # (P26 WP1 / S-W10) The custom-domain reserved set, computed ONCE here.
+    # The direct-domain reserved set, computed ONCE here.
     # Every `[proxy]` key feeding it is restart-required, so recomputing it
     # per request could only ever read a config change the running proxy has
     # not applied — a window in which a racing PUT could bind a name the live
@@ -606,7 +598,7 @@ async def lifespan(app: FastAPI):
     app.state.proxy_task = proxy_task
     app.state.started_at = datetime.now(UTC)
 
-    # (P13c §3) Drive the mounted MCP sub-app's session manager: its Starlette
+    # Drive the mounted MCP sub-app's session manager: its Starlette
     # lifespan never runs under Mount, so its run() context is entered here and
     # exited in the `finally` below — same task as the enter (the same-task
     # requirement of anyio task groups), and unconditionally, so a startup step
@@ -636,7 +628,7 @@ async def lifespan(app: FastAPI):
         yield
         await event_recorder.record("daemon.stopping")
 
-        # (P27 WP-C1) Stop the tunnel FIRST, immediately after the stopping
+        # Stop the tunnel FIRST, immediately after the stopping
         # bookend and before any task cancellation: closing the relay socket is
         # what stops tunnelled ingress, so it must happen before the controllers
         # drain — and doing it here means the manager's `link.disconnected`

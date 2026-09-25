@@ -10,7 +10,9 @@ Dockerfiles and invoke the runtime.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,7 +24,7 @@ from nerdit.core.node_packages import (
     node_install_needs_source,
     resolve_node_packages,
 )
-from nerdit.core.node_runtime import DEFAULT_NODE_VERSION, resolve_node_version
+from nerdit.core.node_runtime import resolve_node_version
 
 if TYPE_CHECKING:
     from nerdit.config.project import DeployConfig
@@ -34,8 +36,6 @@ GENERATED_DOCKERFILE_NAME = "Dockerfile.nerdit"
 # Default container listen port for the Node buildpack when neither
 # `[deploy].port` nor any other hint is available.
 DEFAULT_NODE_PORT = 3000
-
-NODE_BASE_IMAGE = f"node:{DEFAULT_NODE_VERSION}-slim"
 
 # Default container listen port for the Python buildpack when neither
 # `[deploy].port` nor any other hint is available.
@@ -50,15 +50,40 @@ PYTHON_BASE_IMAGE = "python:3.11-slim"
 _TREE_REF = re.compile(r"^(-e|--editable|-r|--requirement|-c|--constraint)\b|^\.{1,2}(/|$)|^file:")
 
 
+def _read_regular(path: Path, cap: int = 1_048_576) -> str | None:
+    """Read a small regular file without following a symlink.
+
+    A git clone keeps symlinks, so a context file may point at `/dev/zero` or a
+    huge host file; this reads neither. Returns None on OSError, a symlink or
+    non-regular file, or content over `cap` bytes.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            data = fh.read(cap + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > cap:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
 def _requirements_reference_tree(requirements: Path) -> bool:
     """True when any requirements.txt line references the source tree.
 
-    Tolerant of read failures: on OSError take the safe (install-after-copy)
-    fallback by returning True, so a build never 404s on an unreadable pin file.
+    Tolerant of read failures: when the file cannot be read safely (see
+    `_read_regular`) take the safe (install-after-copy) fallback by returning
+    True, so a build never 404s on an unreadable pin file.
     """
-    try:
-        text = requirements.read_text(encoding="utf-8")
-    except OSError:
+    text = _read_regular(requirements)
+    if text is None:
         return True
     for raw in text.splitlines():
         line = raw.strip()
@@ -69,7 +94,7 @@ def _requirements_reference_tree(requirements: Path) -> bool:
     return False
 
 
-class BuildpackNotSupported(Exception):  # noqa: N818 — P4 public API name
+class BuildpackNotSupported(Exception):  # noqa: N818 — public API name
     """Raised when no supported buildpack matches the app folder."""
 
 
@@ -99,10 +124,7 @@ def _undeclared_public_env(context: Path, settings: BuildSettings) -> list[str]:
     keys = sorted(settings.public_env or {})
     if not keys:
         return []
-    try:
-        text = (context / "Dockerfile").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        text = ""
+    text = _read_regular(context / "Dockerfile") or ""
     # ponytail: token search from the first stage, so a declaration in ANOTHER
     # stage of a multi-stage build reads as declared. Parse the stage graph if
     # that ever warns falsely.
@@ -375,8 +397,8 @@ def _plan_python(context: Path, deploy_cfg: DeployConfig | None) -> BuildPlan:
         raise BuildpackNotSupported(
             "Node runtime and package-manager overrides do not apply to Python builds."
         )
-    # Port: an explicit [deploy].port wins, else the Python default. `port` is
-    # optional now, so an unset value (`None`) also falls through to the default.
+    # Port: an explicit [deploy].port wins, else the Python default (an unset
+    # `None` falls through too).
     port = deploy_cfg.port if (deploy_cfg and deploy_cfg.port) else DEFAULT_PYTHON_PORT
 
     # Dependency install: requirements.txt (the pin file) if present, else the

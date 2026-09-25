@@ -46,13 +46,21 @@ class IdempotencyQueries(QueriesBase):
         """Claim a principal/key pair using BEGIN IMMEDIATE and INSERT OR IGNORE.
 
         Do not call inside another transaction. Store only the optional bounded request
-        body hash, never the body.
+        body hash, never the body. An expired row never blocks a fresh claim.
 
         Returns:
             True if claimed; False if the caller must re-read the existing record.
         """
         await self._db.conn.execute("BEGIN IMMEDIATE")
         try:
+            # Same cutoff as the sweep, enforced in-claim so the TTL does not
+            # depend on the sweep interval.
+            await self._db.conn.execute(
+                """DELETE FROM idempotency_keys
+                   WHERE principal_id = ? AND idem_key = ?
+                     AND expires_at IS NOT NULL AND expires_at < ?""",
+                (principal_id, idem_key, datetime.now(UTC).isoformat()),
+            )
             cursor = await self._db.conn.execute(
                 """INSERT OR IGNORE INTO idempotency_keys
                    (principal_id, idem_key, method, path, state, expires_at, body_hash)

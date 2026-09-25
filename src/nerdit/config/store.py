@@ -8,7 +8,6 @@ and diffs; reject auth_token writes in favor of the token API.
 from __future__ import annotations
 
 import hashlib
-import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +37,7 @@ from nerdit.config.settings import (
     ServicesSettings,
 )
 from nerdit.db.models import ConfigDiagnostic, ConfigDiffEntry
+from nerdit.utils.fs import atomic_write
 
 
 class ConfigError(Exception):
@@ -139,6 +139,7 @@ _RESTART_KEYS: dict[str, frozenset[str]] = {
             "drop_all_caps",
             "no_new_privileges",
             "read_only_rootfs",
+            "pids_limit",
         }
     ),
     # The P20 trio is read off the settings captured at startup (the run route
@@ -750,16 +751,6 @@ class ConfigStore:
         payload = self._serialize(staged.new_raw)
         if payload == self._serialize(self.load_raw()):
             return hashlib.sha256(payload).hexdigest()
-        tmp_path = self._path.with_name(f"{self._path.name}.tmp-{os.getpid()}")
-        # Create the temp with 0600: ``os.replace`` adopts the temp inode's
-        # permissions, so the config file (which holds ``auth_token`` in plain
-        # text) must never be left world-readable by the umask default.
-        if tmp_path.exists():
-            tmp_path.unlink()
-        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, self._path)
+        # 0600: the config file holds ``auth_token`` in plain text.
+        atomic_write(self._path, payload)
         return hashlib.sha256(payload).hexdigest()

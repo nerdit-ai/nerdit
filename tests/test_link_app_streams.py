@@ -72,7 +72,7 @@ async def _seed_endpoint(queries: Any, job: Job, *, active_port: int | None = No
 
 
 def _resolver(queries: Any) -> AppStreamResolver:
-    return AppStreamResolver(queries, slug=SLUG, nodes_base_domain=DOMAIN)
+    return AppStreamResolver(queries, node_id=FIXTURE_NODE_ID, slug=SLUG, nodes_base_domain=DOMAIN)
 
 
 async def _force_share_row(db: Any, service_name: str) -> None:
@@ -97,14 +97,8 @@ class _SpyQueries:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def get_service_share(self, service_name: str) -> None:
+    async def resolve_shared_app(self, *args: object) -> None:
         self.calls.append("share")
-
-    async def get_service_by_name(self, service_name: str) -> None:  # pragma: no cover
-        self.calls.append("job")
-
-    async def get_service_endpoint(self, service_name: str) -> None:  # pragma: no cover
-        self.calls.append("endpoint")
 
 
 # ---------------------------------------------------------------------------
@@ -126,9 +120,9 @@ async def test_a_shared_running_service_resolves_to_its_live_port_and_hosted_hos
     await _seed_endpoint(queries, job, active_port=14999)
     await queries.set_service_share("demo", "private", job_id=await _jid(queries, "demo"))
 
-    target = await _resolver(queries).resolve("demo")
+    target = await _resolver(queries).resolve("demo", "demo--gpu-box.nodes.test")
 
-    assert target == AppTarget(service_name="demo", port=14999, host="demo--gpu-box.nodes.test")
+    assert target == AppTarget("demo", 14999, "demo--gpu-box.nodes.test", job.id, "private")
 
 
 async def test_an_ordinary_endpoint_resolves_to_its_reserved_port(queries) -> None:  # noqa: ANN001
@@ -136,7 +130,7 @@ async def test_an_ordinary_endpoint_resolves_to_its_reserved_port(queries) -> No
     reserved = await _seed_endpoint(queries, job)
     await queries.set_service_share("demo", "public", job_id=await _jid(queries, "demo"))
 
-    target = await _resolver(queries).resolve("demo")
+    target = await _resolver(queries).resolve("demo", "demo--gpu-box.nodes.test")
 
     assert target is not None
     assert target.port == reserved
@@ -148,7 +142,7 @@ async def test_a_service_without_a_share_row_is_refused(queries) -> None:  # noq
     job = await _seed_service(queries, "demo")
     await _seed_endpoint(queries, job)
 
-    assert await _resolver(queries).resolve("demo") is None
+    assert await _resolver(queries).resolve("demo", "demo--gpu-box.nodes.test") is None
 
 
 async def test_an_unshare_closes_the_path_on_the_next_resolve(queries) -> None:  # noqa: ANN001
@@ -157,11 +151,11 @@ async def test_an_unshare_closes_the_path_on_the_next_resolve(queries) -> None: 
     await _seed_endpoint(queries, job)
     await queries.set_service_share("demo", "private", job_id=await _jid(queries, "demo"))
     resolver = _resolver(queries)
-    assert await resolver.resolve("demo") is not None
+    assert await resolver.resolve("demo", "demo--gpu-box.nodes.test") is not None
 
     await queries.delete_service_share("demo")
 
-    assert await resolver.resolve("demo") is None
+    assert await resolver.resolve("demo", "demo--gpu-box.nodes.test") is None
 
 
 @pytest.mark.parametrize("kind", [JobKind.model, JobKind.database])
@@ -179,7 +173,7 @@ async def test_a_model_or_database_is_refused_even_with_a_share_row(
     await _seed_endpoint(queries, job)
     await _force_share_row(db, "demo")
 
-    assert await _resolver(queries).resolve("demo") is None
+    assert await _resolver(queries).resolve("demo", "demo--gpu-box.nodes.test") is None
 
 
 async def test_a_share_row_without_a_job_row_is_refused(db, queries) -> None:  # noqa: ANN001
@@ -189,7 +183,7 @@ async def test_a_share_row_without_a_job_row_is_refused(db, queries) -> None:  #
     later app deployed under the same name."""
     await _force_share_row(db, "ghost")
 
-    assert await _resolver(queries).resolve("ghost") is None
+    assert await _resolver(queries).resolve("ghost", "ghost--gpu-box.nodes.test") is None
 
 
 async def test_a_shared_service_with_no_endpoint_is_refused(queries) -> None:  # noqa: ANN001
@@ -198,7 +192,7 @@ async def test_a_shared_service_with_no_endpoint_is_refused(queries) -> None:  #
     await _seed_service(queries, "demo")
     await queries.set_service_share("demo", "private", job_id=await _jid(queries, "demo"))
 
-    assert await _resolver(queries).resolve("demo") is None
+    assert await _resolver(queries).resolve("demo", "demo--gpu-box.nodes.test") is None
 
 
 @pytest.mark.parametrize(
@@ -213,7 +207,12 @@ async def test_a_malformed_name_is_refused_without_touching_the_database(value: 
     """
     spy = _SpyQueries()
 
-    assert await AppStreamResolver(spy, slug=SLUG, nodes_base_domain=DOMAIN).resolve(value) is None
+    assert (
+        await AppStreamResolver(
+            spy, node_id=FIXTURE_NODE_ID, slug=SLUG, nodes_base_domain=DOMAIN
+        ).resolve(value, "demo--gpu-box.nodes.test")
+        is None
+    )
     assert spy.calls == []
 
 
@@ -221,7 +220,12 @@ async def test_a_well_formed_name_does_reach_the_share_read() -> None:
     """The falsifier for the test above: the gate is a filter, not a wall."""
     spy = _SpyQueries()
 
-    assert await AppStreamResolver(spy, slug=SLUG, nodes_base_domain=DOMAIN).resolve("demo") is None
+    assert (
+        await AppStreamResolver(
+            spy, node_id=FIXTURE_NODE_ID, slug=SLUG, nodes_base_domain=DOMAIN
+        ).resolve("demo", "demo--gpu-box.nodes.test")
+        is None
+    )
     assert spy.calls == ["share"]
 
 
@@ -233,7 +237,9 @@ async def test_the_resolver_never_logs_the_requested_name_when_it_is_malformed(
     caplog.set_level(logging.DEBUG, logger="nerdit.link.apps")
     spy = _SpyQueries()
 
-    await AppStreamResolver(spy, slug=SLUG, nodes_base_domain=DOMAIN).resolve("SECRETVALUE/../x")
+    await AppStreamResolver(
+        spy, node_id=FIXTURE_NODE_ID, slug=SLUG, nodes_base_domain=DOMAIN
+    ).resolve("SECRETVALUE/../x", "demo--gpu-box.nodes.test")
 
     logged = "\n".join(record.getMessage() for record in caplog.records)
     assert logged
@@ -279,8 +285,10 @@ async def test_a_linked_node_with_a_known_domain_gets_a_working_resolver(
     assert manager is not None
     resolve = manager._resolve_app
     assert resolve is not None
-    assert await resolve("demo") == AppTarget("demo", 14998, f"demo--{SLUG}.{DOMAIN}")
-    assert await resolve("other") is None
+    assert await resolve("demo", f"demo--{SLUG}.{DOMAIN}", None, None) == AppTarget(
+        "demo", 14998, f"demo--{SLUG}.{DOMAIN}", job.id, "private"
+    )
+    assert await resolve("other", f"other--{SLUG}.{DOMAIN}", None, None) is None
 
 
 async def test_a_node_without_a_known_domain_serves_no_app_stream(
@@ -297,9 +305,8 @@ async def test_a_node_without_a_known_domain_serves_no_app_stream(
     manager = await build_link_manager(settings, AsyncMock(), queries=queries)  # type: ignore[arg-type]
 
     assert manager is not None
-    assert manager._resolve_app is None
-    logged = "\n".join(record.getMessage() for record in caplog.records)
-    assert "nerdit link refresh" in logged
+    assert manager._resolve_app is not None
+    assert await manager._resolve_app("demo", "demo--gpu-box.nodes.test", None, None) is None
 
 
 async def test_without_queries_the_resolver_is_never_installed(tmp_path) -> None:  # noqa: ANN001
@@ -333,7 +340,9 @@ async def test_every_mux_context_carries_the_resolver(identity: NodeIdentity) ->
     clock = FakeClock()
     clockwork = Clockwork(clock)
 
-    async def resolve(name: str) -> AppTarget | None:  # pragma: no cover - identity only
+    async def resolve(
+        name: str, authority: str | None, job_id: str | None, access: str | None
+    ) -> AppTarget | None:  # pragma: no cover - identity only
         return None
 
     async with FakeRelay(verifier=identity.verifier, clock=clock) as relay:
@@ -387,3 +396,72 @@ def test_hosted_public_entitlement_is_false_until_the_cloud_pushes(
 
     assert manager.status().hosted_public_entitled is False
     assert manager.status().hosted_public_entitled_at is None
+
+
+async def test_explicit_legacy_nondefault_port_is_preserved(queries):
+    job = await _seed_service(queries, "demo")
+    await _seed_endpoint(queries, job)
+    await queries.set_service_share("demo", "private", job_id=job.id)
+    resolver = AppStreamResolver(
+        queries, node_id=FIXTURE_NODE_ID, slug=SLUG, nodes_base_domain="nodes.localhost:8000"
+    )
+    authority = "demo--gpu-box.nodes.localhost:8000"
+    target = await resolver.resolve("demo", authority)
+    assert target is not None and target.host == authority
+    assert await resolver.resolve("demo", "demo--gpu-box.nodes.localhost:8001") is None
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [
+        "user@demo--gpu-box.nodes.test",
+        "user:pass@demo--gpu-box.nodes.test",
+        "demo--gpu-box.nodes.test:bad",
+        "demo--gpu-box.nodes.test:65536",
+        "demo--gpu-box.nodes.test:0",
+        "demo--gpu-box.nodes.test:",
+        "demo--gpu-box.nodes.test/path",
+        "demo--gpu-box.nodes.test?query=x",
+        "demo--gpu-box.nodes.test#fragment",
+        "demo--gpu-box.nodes.test\n",
+    ],
+)
+async def test_malformed_authority_is_refused_before_database(authority):
+    spy = _SpyQueries()
+    resolver = AppStreamResolver(spy, node_id=FIXTURE_NODE_ID, slug=SLUG, nodes_base_domain=DOMAIN)
+    assert await resolver.resolve("demo", authority) is None
+    assert spy.calls == []
+
+
+async def test_legacy_audience_only_blocks_stale_public_cache_after_downgrade(queries):
+    job = await _seed_service(queries, "demo")
+    await _seed_endpoint(queries, job)
+    await queries.set_service_share("demo", "public", job_id=job.id)
+    resolver = _resolver(queries)
+    authority = "demo--gpu-box.nodes.test"
+    assert await resolver.resolve("demo", authority, None, "public") is not None
+    await queries.set_service_share("demo", "private", job_id=job.id)
+    assert await resolver.resolve("demo", authority, None, "public") is None
+    owner = await resolver.resolve("demo", authority, None, "private")
+    assert owner is not None and owner.job_id == job.id and owner.access == "private"
+
+
+@pytest.mark.parametrize("desired", ["stopped", "failed", "cancelled", "completed"])
+async def test_terminal_intent_cannot_route_a_retained_endpoint(queries, desired):
+    job = await _seed_service(queries, "demo")
+    await _seed_endpoint(queries, job, active_port=14999)
+    await queries.set_service_share("demo", "public", job_id=job.id)
+    await queries.set_desired_state(job.id, desired)
+    assert (
+        await _resolver(queries).resolve("demo", "demo--gpu-box.nodes.test", job.id, "public")
+        is None
+    )
+
+
+async def test_restarting_blue_remains_available_during_cutover(queries):
+    job = await _seed_service(queries, "demo")
+    await _seed_endpoint(queries, job, active_port=14999)
+    await queries.set_service_share("demo", "public", job_id=job.id)
+    await queries.update_job_status(job.id, JobStatus.restarting)
+    target = await _resolver(queries).resolve("demo", "demo--gpu-box.nodes.test", job.id, "public")
+    assert target is not None and target.port == 14999

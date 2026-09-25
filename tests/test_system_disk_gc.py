@@ -294,12 +294,12 @@ def test_disk_backups_accounting(tmp_path):
 
 def test_walk_backups_counts_real_backup_tar(tmp_path):
     """D1 naming contract: a real ``create_backup`` tar is counted by
-    ``_walk_backups`` (the disk-report walker) under the locked glob."""
+    ``_walk_tars`` (the disk-report walker) under the locked glob."""
     import asyncio
 
     from nerdit.core.backup import create_backup
     from nerdit.core.secrets import SecretManager
-    from nerdit.daemon.routes.system import _walk_backups
+    from nerdit.daemon.routes.system import _walk_tars
     from nerdit.db.database import Database
 
     async def _produce():  # noqa: ANN202
@@ -314,7 +314,7 @@ def test_walk_backups_counts_real_backup_tar(tmp_path):
             await db.close()
 
     result = asyncio.run(_produce())
-    walked = _walk_backups(tmp_path / "backups")
+    walked = _walk_tars(tmp_path / "backups", "nerdit-backup-*.tar.gz")
     assert walked["count"] == 1
     assert walked["bytes"] == (tmp_path / "backups" / result.basename).stat().st_size
 

@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from datetime import UTC, datetime
+from typing import TypeVar
 
 import httpx
+import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from nerdit.core.remediation_settle import parse_iso
+
 console = Console()
+
+T = TypeVar("T")
 
 
 def plain(value: object, *, missing: str = "-") -> str:
@@ -103,7 +110,7 @@ def render_client_error(exc: Exception) -> None:
             console.print("[red]Authentication required.[/red] This daemon expects a token.")
             console.print(
                 "[dim]Get it with `nerdit token` on the server, then "
-                "`nerdit connect <host> --token <token>`.[/dim]"
+                "`nerdit connect <host>` (it prompts for the token).[/dim]"
             )
             return
 
@@ -160,6 +167,15 @@ def render_client_error(exc: Exception) -> None:
         return
 
     console.print(f"[red]Error:[/red] {_plain(exc)}")
+
+
+async def call_or_exit(awaitable: Awaitable[T]) -> T:
+    """Await a client call; on any failure render it and exit 1."""
+    try:
+        return await awaitable
+    except Exception as exc:  # noqa: BLE001 — rendered for the user
+        render_client_error(exc)
+        raise typer.Exit(1) from exc
 
 
 def _status_cell(status: str, style: str) -> str:
@@ -329,12 +345,9 @@ def _token_expiry_state(expires_at: object) -> tuple[str, str]:
     """
     if expires_at is None:
         return "never", "active"
-    try:
-        parsed = datetime.fromisoformat(str(expires_at))
-    except ValueError:
+    parsed = parse_iso(str(expires_at))
+    if parsed is None:
         return _plain(expires_at), "active"
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
     rendered = parsed.astimezone(UTC).strftime("%Y-%m-%d %H:%MZ")
     return rendered, "expired" if parsed <= datetime.now(UTC) else "active"
 

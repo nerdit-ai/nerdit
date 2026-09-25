@@ -25,6 +25,7 @@ from nerdit.core.launch import (
     _RUN_TAIL_MAX_BYTES,
     _SCRUB_MIN_VALUE_LEN,
     AppContainerSpec,
+    apply_platform_overlay,
     build_app_container_config,
     build_run_container_config,
     finalize_container_config,
@@ -42,7 +43,7 @@ from nerdit.core.services import (
     _truncate_line,
 )
 from nerdit.core.volumes import VolumeSpecError
-from nerdit.db.models import GpuVendor, Job, JobKind, JobStatus
+from nerdit.db.models import ContainerConfig, GpuVendor, Job, JobKind, JobStatus
 from tests.test_services_reconcile import (
     FakeRuntime,
     FakeSecrets,
@@ -340,6 +341,7 @@ _SHARED_FIELDS = (
     "network_mode",
     "memory_limit",
     "cpu_limit",
+    "pids_limit",
     "log_config",
 )
 
@@ -351,8 +353,9 @@ _SHARED_FIELDS = (
         ContainerSettings(drop_all_caps=False, no_new_privileges=False),
         ContainerSettings(read_only_rootfs=True),
         ContainerSettings(default_memory_limit="256m", default_cpu_limit=0.5),
+        ContainerSettings(pids_limit=None),
     ],
-    ids=["defaults", "caps-off", "read-only-rootfs", "daemon-defaults"],
+    ids=["defaults", "caps-off", "read-only-rootfs", "daemon-defaults", "pids-unlimited"],
 )
 @pytest.mark.parametrize("cfg", [{}, {"memory_limit": "1g", "cpu_limit": 2.0}], ids=["bare", "row"])
 def test_run_container_hardening_is_field_equal_to_the_service_container(cs, cfg):
@@ -392,9 +395,19 @@ def test_run_container_hardening_is_field_equal_to_the_service_container(cs, cfg
     for field in _SHARED_FIELDS:
         assert getattr(run_config, field) == getattr(app_config, field), field
 
+    assert run_config.pids_limit == cs.pids_limit
+
     # ...and the two differ ONLY where they are meant to.
     assert app_config.ports is not None
     assert run_config.ports is None
+
+
+def test_pids_limit_defaults_to_4096_and_reaches_the_overlay():
+    """Security S3: every launched container gets the fork-bomb cap by default."""
+    assert ContainerSettings().pids_limit == 4096
+    config = ContainerConfig(image="postgres:16", gpu_ids=[])
+    apply_platform_overlay(config, {}, ContainerSettings(pids_limit=128), 5432, 9500)
+    assert config.pids_limit == 128
 
 
 # --- where the bounds constants live -----------------------------------------
@@ -1213,8 +1226,8 @@ async def test_run_once_stamp_never_rewrites_the_whole_config_blob(queries):
     await controller.shutdown()
 
 
-async def test_set_last_run_preserves_siblings_written_after_the_caller_read(queries):
-    """``set_last_run`` is one statement over the value the row holds NOW.
+async def test_last_run_stamp_preserves_siblings_written_after_the_caller_read(queries):
+    """The ``last_run`` stamp is one statement over the value the row holds NOW.
 
     Reproduces the lost update the read-modify-write helper allowed: the caller
     snapshots the blob, a release commits ``release_pending`` into the same row,
@@ -1232,7 +1245,7 @@ async def test_set_last_run_preserves_siblings_written_after_the_caller_read(que
     concurrent["release_pending"] = 7
     await queries.update_job_config(job.id, json.dumps(concurrent))
 
-    assert await queries.set_last_run(job.id, json.dumps({"run_id": "abc", "exit_code": 0}))
+    assert await queries.patch_job_config(job.id, {"last_run": {"run_id": "abc", "exit_code": 0}})
 
     cfg = json.loads((await queries.get_job(job.id)).config)
     assert cfg["release_pending"] == 7  # NOT erased by the stamp
@@ -1240,18 +1253,18 @@ async def test_set_last_run_preserves_siblings_written_after_the_caller_read(que
     assert cfg["image"] == snapshot["image"]  # every other sibling intact
 
 
-async def test_set_last_run_reports_a_miss_instead_of_blanking_the_blob(queries):
+async def test_last_run_stamp_reports_a_miss_instead_of_blanking_the_blob(queries):
     """A vanished row (or a non-JSON blob) is a ``False`` return, never a write.
 
     ``json_set`` answers NULL on an invalid document, and an unguarded UPDATE
     would then blank the column outright.
     """
-    assert await queries.set_last_run("no-such-job", json.dumps({"run_id": "x"})) is False
+    assert await queries.patch_job_config("no-such-job", {"last_run": {"run_id": "x"}}) is False
 
     job = _deploy_svc("app")
     await queries.create_job(job)
     await queries.update_job_config(job.id, "not json at all")
 
-    assert await queries.set_last_run(job.id, json.dumps({"run_id": "x"})) is False
+    assert await queries.patch_job_config(job.id, {"last_run": {"run_id": "x"}}) is False
     row = await queries.get_job(job.id)
     assert row.config == "not json at all"  # untouched, not blanked

@@ -127,6 +127,7 @@ class ContainerRuntime(Protocol):
         follow: bool = False,
         tail: int | None = None,
         max_bytes: int | None = None,
+        since: int | None = None,
     ) -> AsyncIterator[str]:
         """Stream container logs, bounding completed-container reads while consuming them.
 
@@ -138,6 +139,8 @@ class ContainerRuntime(Protocol):
             tail: Maximum trailing lines for a one-shot read, or None for no line cap.
             max_bytes: Maximum trailing bytes retained, or None for no byte cap.
             follow: Stream until disconnected, ignoring both one-shot caps.
+            since: Epoch seconds, follow branch only: yield lines at or after it
+                (a boundary second may repeat, a line is never lost).
         """
         ...
 

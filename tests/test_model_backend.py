@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import inspect
 import json
-import re
 
 import httpx
 import pytest
@@ -31,12 +30,9 @@ from nerdit.core.models import (
     sanitize_model_name,
 )
 from nerdit.db.models import GpuVendor
+from nerdit.utils.names import DNS_LABEL_RE
 
 pytestmark = pytest.mark.asyncio
-
-# The service_name grammar from db/models.py (ServiceCreateRequest.name) —
-# every sanitized model name must fit the shared UNIQUE namespace.
-SERVICE_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 class FakeOllama:
@@ -240,7 +236,7 @@ async def test_sanitize_truncates_long_refs_deterministically():
 )
 async def test_sanitize_always_matches_service_name_grammar(ref: str):
     name = sanitize_model_name(ref)
-    assert SERVICE_NAME_RE.fullmatch(name), name
+    assert DNS_LABEL_RE.fullmatch(name), name
     assert name.startswith("ollama")
 
 
@@ -382,7 +378,7 @@ async def test_vllm_requires_gpu_flag():
 async def test_sanitize_with_vllm_prefix():
     name = sanitize_model_name("meta-llama/Llama-3.1-8B", prefix="vllm")
     assert name == "vllm-meta-llama-llama-3-1-8b"
-    assert SERVICE_NAME_RE.fullmatch(name)
+    assert DNS_LABEL_RE.fullmatch(name)
 
 
 # --- 5c. VRAM-aware vLLM defaults (P21 WP2/D3) + per-serve overrides (WP3/D4) -------

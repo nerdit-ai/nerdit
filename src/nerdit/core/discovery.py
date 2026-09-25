@@ -240,7 +240,7 @@ def discover_gpu_system(
 def amd_gpu_present(sysfs_root: Path = Path("/sys/bus/pci/devices")) -> bool:
     """Return whether sysfs contains an AMD display-class PCI device."""
     try:
-        devices = sysfs_root.iterdir()
+        devices = list(sysfs_root.iterdir())
     except OSError:
         return False
     for device in devices:

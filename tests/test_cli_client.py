@@ -408,15 +408,13 @@ def test_get_configured_client_uses_daemon_token_when_no_remote(tmp_path, monkey
     assert client._headers == {"Authorization": "Bearer localtoken"}
 
 
-def test_get_configured_client_uses_daemon_port_locally(monkeypatch):
+def test_get_configured_client_uses_daemon_port_locally(tmp_path, monkeypatch):
     # Regression (P23 WP0): the local fallback used to hardcode DEFAULT_PORT,
     # so a CLI on a non-default-port install silently dialled 9321.
-    from nerdit.config import settings as settings_mod
-
-    patched = settings_mod.NerditSettings(
-        daemon=settings_mod.DaemonSettings(port=9333, auth_token="t")
-    )
-    monkeypatch.setattr(settings_mod, "load_settings", lambda *a, **kw: patched)
+    cfg_dir = tmp_path / ".nerdit"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.toml").write_text('[daemon]\nport = 9333\nauth_token = "t"\n')
+    monkeypatch.setenv("HOME", str(tmp_path))
 
     client = get_configured_client()
     assert client._base_url.endswith(":9333")
@@ -424,17 +422,16 @@ def test_get_configured_client_uses_daemon_port_locally(monkeypatch):
     assert client._headers == {"Authorization": "Bearer t"}
 
 
-def test_get_configured_client_remote_section_beats_daemon_port(monkeypatch):
+def test_get_configured_client_remote_section_beats_daemon_port(tmp_path, monkeypatch):
     # A configured [client] remote still wins over [daemon].port.
-    from nerdit.config import settings as settings_mod
-
-    patched = settings_mod.NerditSettings(
-        daemon=settings_mod.DaemonSettings(port=9333, auth_token="localtoken"),
-        client=settings_mod.ClientSettings(
-            remote_host="my-box.example.com", remote_port=4242, auth_token="remotetoken"
-        ),
+    cfg_dir = tmp_path / ".nerdit"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.toml").write_text(
+        '[daemon]\nport = 9333\nauth_token = "localtoken"\n'
+        '[client]\nremote_host = "my-box.example.com"\nremote_port = 4242\n'
+        'auth_token = "remotetoken"\n'
     )
-    monkeypatch.setattr(settings_mod, "load_settings", lambda *a, **kw: patched)
+    monkeypatch.setenv("HOME", str(tmp_path))
 
     client = get_configured_client()
     assert client._base_url == "http://my-box.example.com:4242"
@@ -643,3 +640,111 @@ async def test_wait_for_service_floors_only_the_transport_deadline():
 
     result = await _make_client(handler).wait_for_service("demo", timeout=-100)
     assert result["outcome"] == "converged"
+
+
+@pytest.mark.asyncio
+async def test_idempotency_key_rides_request_json_beside_if_match():
+    """The key is merged into the headers; no key sends no header."""
+    seen: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers)
+        return httpx.Response(200, json={})
+
+    client = _make_client(handler)
+    await client.stop_service("web", idempotency_key="k")
+    await client.stop_service("web")
+    await client.apply_config({}, idempotency_key="k2", if_match='"r1"')
+    assert seen[0]["Idempotency-Key"] == "k"
+    assert "Idempotency-Key" not in seen[1]
+    assert seen[2]["Idempotency-Key"] == "k2"
+    assert seen[2]["If-Match"] == '"r1"'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ident", "raw_path"),
+    [
+        ("..", b"/api/services/%2E%2E"),
+        ("a?b#c", b"/api/services/a%3Fb%23c"),
+        ("asso/api", b"/api/services/api--asso"),
+        ("web", b"/api/services/web"),
+    ],
+)
+async def test_service_name_is_one_encoded_segment(ident, raw_path):
+    """A malformed name reaches the services route, never another one."""
+    seen: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.raw_path)
+        return httpx.Response(200, json={})
+
+    await _make_client(handler).get_service(ident)
+    assert seen == [raw_path]
+
+
+@pytest.mark.asyncio
+async def test_service_name_with_slash_never_leaves_the_client():
+    """`../tokens` is a malformed qualified name: refused before any request."""
+    from nerdit.cli.client import QualifiedNameError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request expected")
+
+    with pytest.raises(QualifiedNameError):
+        await _make_client(handler).get_service("../tokens")
+
+
+@pytest.mark.asyncio
+async def test_raw_path_params_are_encoded():
+    """Non-service path params (secret key, token id) are one segment each."""
+    seen: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.raw_path)
+        return httpx.Response(200, json={})
+
+    client = _make_client(handler)
+    await client.delete_secret("web", "..")
+    await client.revoke_token("../audit")
+    assert seen == [b"/api/secrets/web/%2E%2E", b"/api/tokens/..%2Faudit"]
+
+
+# ---- upload_limit (best-effort pre-check against the daemon's cap) ----
+
+
+@pytest.mark.asyncio
+async def test_upload_limit_reads_the_daemon_cap():
+    from nerdit.cli.client import upload_limit
+
+    client = _make_client(
+        lambda request: httpx.Response(200, json={"deploy": {"max_upload_bytes": 10}})
+    )
+    assert await upload_limit(client) == 10
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(500, json={}),
+        httpx.Response(200, json={"deploy": {}}),
+        httpx.Response(200, json={"deploy": {"max_upload_bytes": True}}),
+    ],
+)
+async def test_upload_limit_falls_back_to_the_local_default(response):
+    from nerdit.cli.client import upload_limit
+    from nerdit.config.defaults import DEFAULT_MAX_UPLOAD_BYTES
+
+    assert await upload_limit(_make_client(lambda request: response)) == DEFAULT_MAX_UPLOAD_BYTES
+
+
+@pytest.mark.asyncio
+async def test_upload_limit_falls_back_when_the_daemon_is_unreachable():
+    from nerdit.cli.client import upload_limit
+    from nerdit.config.defaults import DEFAULT_MAX_UPLOAD_BYTES
+
+    def handler(request):
+        raise httpx.ConnectError("down", request=request)
+
+    assert await upload_limit(_make_client(handler)) == DEFAULT_MAX_UPLOAD_BYTES

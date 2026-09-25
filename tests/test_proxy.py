@@ -3413,6 +3413,81 @@ async def test_deregister_evicts_the_auth_cache(queries, hash_calls):
     assert hash_calls == [PW, PW]
 
 
+async def test_register_waits_for_an_in_flight_reconcile(queries):
+    """(B5) A tick's read-then-write never interleaves with a register's upsert."""
+    import asyncio
+
+    fake = FakeCaddy()
+    mgr = _proxy(queries, fake)
+    await _seed_running(queries, "alpha")
+    gate = asyncio.Event()
+    order: list[str] = []
+    real_live, real_upsert = mgr._admin.live_routes, mgr._admin.upsert_route
+    reads = 0
+
+    async def live_routes():
+        nonlocal reads
+        reads += 1
+        if reads == 1:  # the reconcile's snapshot
+            await gate.wait()
+        return await real_live()
+
+    async def upsert_route(obj, **kw):
+        order.append(obj["@id"] + ("" if gate.is_set() else "@blocked"))
+        return await real_upsert(obj, **kw)
+
+    mgr._admin.live_routes = live_routes  # type: ignore[method-assign]
+    mgr._admin.upsert_route = upsert_route  # type: ignore[method-assign]
+    tick = asyncio.create_task(mgr.reconcile())
+    await asyncio.sleep(0.05)
+    reg = asyncio.create_task(mgr.register("beta", 9499))
+    await asyncio.sleep(0.05)
+    assert order == [], "register must not write while the tick holds the lock"
+    gate.set()
+    await asyncio.gather(tick, reg)
+    assert order == ["nerdit-route-alpha", "nerdit-route-beta"]
+
+
+async def test_register_with_unresolved_auth_does_not_deadlock(queries, hash_calls):
+    """(B5) The fail-closed deregister inside register skips the non-reentrant lock."""
+    import asyncio
+
+    fake = FakeCaddy()
+    mgr = _protected_proxy(queries, fake, FakeSecrets())
+    await asyncio.wait_for(
+        mgr.register("alpha", 9401, edge_auth={"user": "alice", "password": PW_REF}), 1
+    )
+    assert fake.routes == []
+
+
+async def test_register_hashes_off_the_event_loop(queries, monkeypatch):
+    """(P1) bcrypt (~250 ms) runs in a worker thread, never on the loop."""
+    import threading
+
+    threads: list[threading.Thread] = []
+
+    def spy(plaintext: str) -> str:
+        threads.append(threading.current_thread())
+        return _stub_hash(plaintext)
+
+    monkeypatch.setattr(edgeauth, "hash_password", spy)
+    fake = FakeCaddy()
+    mgr = _protected_proxy(queries, fake, FakeSecrets({"alpha": PW}))
+    await mgr.register("alpha", 9401, edge_auth={"user": "alice", "password": PW_REF})
+    assert threads and threads[0] is not threading.main_thread()
+
+
+async def test_a_rotated_secret_keeps_one_cache_entry(queries, hash_calls):
+    """(P1) A cache miss evicts the service's older credential material."""
+    fake = FakeCaddy()
+    secrets = FakeSecrets({"alpha": PW})
+    mgr = _protected_proxy(queries, fake, secrets)
+    await mgr.register("alpha", 9401, edge_auth={"user": "alice", "password": PW_REF})
+    secrets.values["alpha"] = PW + "-rotated"
+    await mgr.register("alpha", 9401, edge_auth={"user": "alice", "password": PW_REF})
+    assert len([k for k in mgr._auth_cache if k[0] == "alpha"]) == 1
+
+
 async def test_a_successful_prune_evicts_the_auth_cache(queries, hash_calls):
     fake = FakeCaddy()
     mgr = _protected_proxy(queries, fake, FakeSecrets({"alpha": PW}))
@@ -4201,7 +4276,7 @@ async def test_tls_desired_app_dedupes_domains_against_the_subjects(queries):
     assert app["automation"]["policies"][0]["subjects"] == ["box"]
 
 
-async def test_load_domain_names_is_total_over_a_stubless_queries():
+async def test_load_domain_partition_is_total_over_a_stubless_queries():
     """No queries, a stub without the method, and a raising one all read []."""
 
     class _Boom:
@@ -4209,11 +4284,11 @@ async def test_load_domain_names_is_total_over_a_stubless_queries():
             raise RuntimeError("db down")
 
     mgr = _manager()  # queries is None
-    assert await mgr._load_domain_names() == []
+    assert await mgr._load_domain_partition() == ([], [])
     mgr._queries = object()  # a stub lacking the method
-    assert await mgr._load_domain_names() == []
+    assert await mgr._load_domain_partition() == ([], [])
     mgr._queries = _Boom()
-    assert await mgr._load_domain_names() == []
+    assert await mgr._load_domain_partition() == ([], [])
 
 
 # -- 10e. register / deregister / status --------------------------------------

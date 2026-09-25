@@ -17,11 +17,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from nerdit.config.project import _DNS_LABEL_RE
 from nerdit.core.backup import DUMP_TAR_GLOB, DUMP_TAR_RE
+from nerdit.core.remediation_settle import parse_iso
 from nerdit.core.workspaces import WorkspaceError, read_meta, settled_to_thread, workspace_lock
+from nerdit.daemon.imagegc import _live_service_names
 from nerdit.daemon.limits import STORED_TS_FORMAT
 from nerdit.utils.disk import du_bytes, resolve_archive_dir
+from nerdit.utils.names import DNS_LABEL_RE
 
 if TYPE_CHECKING:
     from nerdit.config.settings import RetentionSettings
@@ -73,97 +75,61 @@ async def _idempotency_sweep_loop(queries: Queries, interval: float) -> None:
         await asyncio.sleep(interval)
 
 
-def _prune_backups(data_dir: Path, keep_last: int) -> int:
-    """Delete the oldest `nerdit-backup-*.tar.gz` beyond `keep_last`.
+def _prune_tars(
+    data_dir: Path, keep_last: int, glob: str, name_re: re.Pattern[str] | None = None
+) -> int:
+    """Delete the oldest `<data_dir>/backups/<glob>` tars beyond `keep_last`.
 
-    The `<data_dir>/backups` dir does not exist until P14c ships backups, so
-    this is a no-op today. Runs in a worker thread (blocking stat/unlink).
+    With `name_re` the tars are grouped by its `service` group (non-matches are
+    skipped) and `keep_last` applies per service; without it, to all of them.
+    Runs in a worker thread (blocking stat/unlink).
     """
     backups_dir = data_dir / "backups"
     if not backups_dir.is_dir():
         return 0
-    # Per-file stat tolerance: a file deleted between glob and stat must not
-    # abort the pass (and thereby skip the sweep summary row — the sha anchor).
-    stamped = []
-    for p in backups_dir.glob("nerdit-backup-*.tar.gz"):
+    groups: dict[str, list[tuple[float, Path]]] = {}
+    for p in backups_dir.glob(glob):
+        key = ""
+        if name_re is not None:
+            match = name_re.match(p.name)
+            if match is None:
+                continue
+            key = match.group("service")
+        # Per-file stat tolerance: a file deleted between glob and stat must not
+        # abort the pass (and thereby skip the sweep summary row — the sha anchor).
         with contextlib.suppress(OSError):
-            stamped.append((p.stat().st_mtime, p))
-    files = [p for _, p in sorted(stamped)]
+            groups.setdefault(key, []).append((p.stat().st_mtime, p))
     removed = 0
-    for stale in files[:-keep_last]:
-        with contextlib.suppress(OSError):
-            stale.unlink()
-            removed += 1
+    for stamped in groups.values():
+        for _, stale in sorted(stamped)[:-keep_last]:
+            with contextlib.suppress(OSError):
+                stale.unlink()
+                removed += 1
     return removed
 
 
+# The three tar flavours have pairwise-disjoint globs, so no phase ever prunes
+# another flavour's tars (pinned by test).
 # `nerdit-volumes-<service>-<UTC %Y%m%dT%H%M%SZ>-<6 hex>.tar.gz`. The
 # service segment is greedy `.+` but the anchored stamp + 6-hex + extension pin
-# it exactly, so a hyphenated DNS-label service name parses correctly. This glob
-# is disjoint from the v1 `nerdit-backup-*` one — the v1 walkers never match a
-# volume tar and vice-versa (pinned by test).
+# it exactly, so a hyphenated DNS-label service name parses correctly. The
+# dump-tar grammar lives in `core/backup.py` beside the packer that mints it.
 _VOLUME_TAR_RE = re.compile(r"^nerdit-volumes-(?P<service>.+)-\d{8}T\d{6}Z-[0-9a-f]{6}\.tar\.gz$")
 
 
+def _prune_backups(data_dir: Path, keep_last: int) -> int:
+    """Control-plane `nerdit-backup-*` tars, one group."""
+    return _prune_tars(data_dir, keep_last, "nerdit-backup-*.tar.gz")
+
+
 def _prune_volume_backups(data_dir: Path, keep_last: int) -> int:
-    """Delete per-service `nerdit-volumes-<service>-*` beyond `keep_last`.
-
-    Grouped by the service parsed from the filename; within each service the
-    oldest (by mtime) beyond `keep_last` are removed. The v1 control-plane
-    `nerdit-backup-*` glob can never match this pattern, so this phase never
-    touches a control-plane tar. Runs in a worker thread (blocking stat/unlink).
-    """
-    backups_dir = data_dir / "backups"
-    if not backups_dir.is_dir():
-        return 0
-    by_service: dict[str, list[tuple[float, Path]]] = {}
-    for p in backups_dir.glob("nerdit-volumes-*.tar.gz"):
-        match = _VOLUME_TAR_RE.match(p.name)
-        if match is None:
-            continue
-        # Per-file stat tolerance: a file deleted between glob and stat must not
-        # abort the pass (mirror of `_prune_backups`).
-        with contextlib.suppress(OSError):
-            by_service.setdefault(match.group("service"), []).append((p.stat().st_mtime, p))
-    removed = 0
-    for stamped in by_service.values():
-        files = [p for _, p in sorted(stamped)]
-        for stale in files[:-keep_last]:
-            with contextlib.suppress(OSError):
-                stale.unlink()
-                removed += 1
-    return removed
-
-
-# The dump-tar grammar lives in ``core/backup.py`` beside the packer that mints
-# it (``core`` may not import from ``daemon``); disjoint from both globs above.
+    """Per-service `nerdit-volumes-<service>-*` tars."""
+    return _prune_tars(data_dir, keep_last, "nerdit-volumes-*.tar.gz", _VOLUME_TAR_RE)
 
 
 def _prune_dump_backups(data_dir: Path, keep_last: int) -> int:
-    """Delete per-service ``nerdit-dump-<service>-*`` beyond ``keep_last`` (P37,
-    D-P37-7): a twin of :func:`_prune_volume_backups`, ON by default
-    (``dump_keep_last`` = 5). Worker thread.
-    """
-    backups_dir = data_dir / "backups"
-    if not backups_dir.is_dir():
-        return 0
-    by_service: dict[str, list[tuple[float, Path]]] = {}
-    for p in backups_dir.glob(DUMP_TAR_GLOB):
-        match = DUMP_TAR_RE.match(p.name)
-        if match is None:
-            continue
-        # Per-file stat tolerance: a file deleted between glob and stat must not
-        # abort the pass (mirror of ``_prune_backups``).
-        with contextlib.suppress(OSError):
-            by_service.setdefault(match.group("service"), []).append((p.stat().st_mtime, p))
-    removed = 0
-    for stamped in by_service.values():
-        files = [p for _, p in sorted(stamped)]
-        for stale in files[:-keep_last]:
-            with contextlib.suppress(OSError):
-                stale.unlink()
-                removed += 1
-    return removed
+    """Per-service `nerdit-dump-<service>-*` tars (`dump_keep_last`, default 5)."""
+    return _prune_tars(data_dir, keep_last, DUMP_TAR_GLOB, DUMP_TAR_RE)
 
 
 async def _chunked_delete(sweep_call: Callable[[], Awaitable[int]]) -> int:
@@ -214,26 +180,21 @@ def _workspace_written_at(data_dir: Path, name: str, mtime_source: Path) -> date
         meta = read_meta(data_dir, name)
     except WorkspaceError:
         # A dir the write path could never have created (bad name / symlinked
-        # component), or — since the review round-1 fail-closed change — a
-        # sidecar that is present but corrupt/unreadable. Tolerance lives HERE,
-        # at the one call site where it is the design, instead of inside
-        # `read_meta` where it was an authz hole: a corrupt sidecar must not
-        # exempt a workspace from the sweep forever, and no ownership decision
-        # is being made here. It is still an orphan; fall through to the mtime
-        # rule.
+        # component), or a sidecar that is present but corrupt/unreadable.
+        # Tolerance lives HERE, not inside `read_meta` (which fails closed for
+        # ownership checks): a corrupt sidecar must not exempt a workspace from
+        # the sweep forever, and no ownership decision is made here. It is
+        # still an orphan; fall through to the mtime rule.
         meta = None
     if isinstance(meta, dict):
         raw = meta.get("last_written_at")
         if isinstance(raw, str):
-            with contextlib.suppress(ValueError):
-                written = datetime.fromisoformat(raw)
+            written = parse_iso(raw)
     if written is None:
         try:
             written = datetime.fromtimestamp(mtime_source.stat().st_mtime, UTC)
         except OSError:
             return None
-    if written.tzinfo is None:
-        written = written.replace(tzinfo=UTC)
     return written
 
 
@@ -252,7 +213,8 @@ def _scan_workspace_orphans(
 ) -> tuple[list[str], list[str], int]:
     """Find aged workspace orphans in a worker thread.
 
-    Any workload row, including stopped rows, protects its workspace. Legal names
+    Any workload row, including stopped rows, or a project row protects its
+    workspace (a project's workspace is named after the project). Legal names
     are returned for locked removal and fresh checks on the event loop; remove only
     junk the write path cannot create in this thread. The live set is a prefilter.
 
@@ -279,7 +241,7 @@ def _scan_workspace_orphans(
         written = _workspace_written_at(data_dir, entry.name, Path(entry.path))
         if written is None or written >= cutoff:
             continue
-        if _DNS_LABEL_RE.fullmatch(entry.name):
+        if DNS_LABEL_RE.fullmatch(entry.name):
             candidates.append(entry.name)
             continue
         path = Path(entry.path)
@@ -293,33 +255,38 @@ def _scan_workspace_orphans(
     return candidates, junk, junk_bytes
 
 
+async def _live_workspace_names(queries: Queries) -> set[str]:
+    """Names whose workspace is live.
+
+    Any workload row (any kind, any desired_state — a stopped service is still
+    live) or any project row protects it.
+    """
+    return _live_service_names(await queries.list_workload_configs()) | (
+        await queries.list_project_names()
+    )
+
+
 async def _sweep_workspace_phase(
     queries: Queries, orphan_days: int, data_dir: Path, now: datetime
 ) -> int:
     """Remove aged workspace orphans and return the count, or zero on failure.
 
-    Scan in a worker; lock each candidate on the event loop and recheck ownership
-    existence and age before removal. Log failures without stopping later phases.
+    A service row or a project row protects the workspace. Scan in a worker; lock
+    each candidate on the event loop and recheck row existence and age before
+    removal. Log failures without stopping later phases.
     Audit removed names/bytes only, with no paths, contents or SSE publication.
     """
     if orphan_days <= 0:
         return 0
     try:
-        rows = await queries.list_workload_configs()
-        # Any kind, any desired_state — a stopped service is still live.
-        live: set[str] = {
-            name for r in rows if isinstance((name := r.get("service_name")), str) and name
-        }
+        live = await _live_workspace_names(queries)
         cutoff = now - timedelta(days=orphan_days)
         candidates, names, total_bytes = await asyncio.to_thread(
             _scan_workspace_orphans, data_dir, live, cutoff
         )
         for name in candidates:
             async with workspace_lock(name):
-                fresh = await queries.list_workload_configs()
-                if name in {
-                    n for r in fresh if isinstance((n := r.get("service_name")), str) and n
-                }:
+                if name in await _live_workspace_names(queries):
                     continue  # a row appeared mid-sweep
                 # Every `to_thread` under a `workspace_lock` goes through
                 # `settled_to_thread` — the sweep task is a RAW asyncio task,
@@ -358,22 +325,19 @@ async def _sweep_workspace_phase(
 def retention_sweep_enabled(retention: RetentionSettings) -> bool:
     """True when at least one retention phase would prune something; the lifespan
     skips the sweep loop otherwise. Every phase's threshold must be represented
-    here (phase 3e, P37, was the one that proved it).
+    here: a phase missing from the predicate that gates its own loop never runs.
     """
     return bool(
         retention.job_log_days
         or retention.audit_days
         or retention.backup_keep_last
         or retention.volume_backup_keep_last
-        # Phase 3e (P37 / D-P37-7), default-ON at 5 per service.
+        # Phase 3e, default-ON at 5 per service.
         or retention.dump_keep_last
-        # Phase 3d (P29 / D-P29-8). Same class of omission as 3e was, found
-        # while fixing it: harmless in practice (3e's default keeps the loop
-        # alive anyway), but a phase missing from the predicate that gates its
-        # own loop is the bug, not the odds of hitting it.
+        # Phase 3d.
         or retention.workspace_orphan_days
-        # (P24a WP1) The durable feed's keep-last-N is default-ON (10000), so it
-        # is normally what keeps this loop alive at all.
+        # The durable feed's keep-last-N is default-ON (10000), so it is
+        # normally what keeps this loop alive at all.
         or retention.events_keep_last
     )
 
@@ -390,16 +354,18 @@ async def _run_retention_sweep(
     now = datetime.now(UTC)
     counts: dict[str, object] = {}
 
-    # Phase 1: job_logs, every kind (D-S-11 — the kind='batch' exemption is
-    # gone). Cutoff in the `datetime('now')` space format (job_logs.timestamp
-    # column) — NOT isoformat (§1.8).
+    # Phase 1: job_logs, every kind. Cutoff in the `datetime('now')` space
+    # format (job_logs.timestamp column) — NOT isoformat.
     if retention.job_log_days > 0:
         cutoff = (now - timedelta(days=retention.job_log_days)).strftime(STORED_TS_FORMAT)
-        removed = await _chunked_delete(lambda: queries.sweep_job_logs(cutoff))
-        if removed:
-            counts["job_logs"] = removed
+        try:
+            removed = await _chunked_delete(lambda: queries.sweep_job_logs(cutoff))
+            if removed:
+                counts["job_logs"] = removed
+        except Exception:
+            logger.exception("Retention job-log phase failed (sweep continues)")
 
-    # Phase 3: backup-keep (no-op until P14c seeds <data_dir>/backups). Runs
+    # Phase 3: control-plane backup-keep. Runs
     # BEFORE the audit prune so its count is known when the anchor row (below)
     # is written; isolated so a failure never blocks the anchor.
     if retention.backup_keep_last > 0:
@@ -410,7 +376,7 @@ async def _run_retention_sweep(
         except Exception:
             logger.exception("Retention backup-keep phase failed (sweep continues)")
 
-    # Phase 3b: per-database volume-tar keep (P15 WP7; no-op at the default 0).
+    # Phase 3b: per-database volume-tar keep (no-op at the default 0).
     # Isolated like phase 3 so a failure never blocks the anchor/summary row.
     if retention.volume_backup_keep_last > 0:
         try:
@@ -422,13 +388,13 @@ async def _run_retention_sweep(
         except Exception:
             logger.exception("Retention volume-backup-keep phase failed (sweep continues)")
 
-    # Phase 3c: durable event feed (P24a / D-P24-2). Runs BEFORE the audit phase
+    # Phase 3c: durable event feed. Runs BEFORE the audit phase
     # so the count is already in `counts` when the anchor row is written.
     removed = await _sweep_event_feed(queries, retention.events_keep_last)
     if removed:
         counts["events_deleted"] = removed
 
-    # Phase 3d: orphan agent workspaces (P29 / D-P29-8). Isolated like every
+    # Phase 3d: orphan agent workspaces. Isolated like every
     # other phase so a scan failure never blocks the anchor/summary row. The
     # live-name set is read fresh here (any kind, any desired_state) — the
     # DELETE-time `?purge=workspace` member is the other, disjoint reclaim
@@ -438,10 +404,9 @@ async def _run_retention_sweep(
     if swept:
         counts["workspace_orphans_removed"] = swept
 
-    # Phase 3e: per-database dump-tar keep (P37 / D-P37-7). A NEW phase letter,
-    # appended after 3d — the existing letters are load-bearing in the sweep
-    # summary row and in the retention suite, so nothing above is renumbered.
-    # Isolated like phases 3/3b so a failure never blocks the anchor/summary row.
+    # Phase 3e: per-database dump-tar keep (default 5). The phase letters are
+    # load-bearing in the retention suite, so new phases append, never
+    # renumber. Isolated like phases 3/3b so a failure never blocks the anchor/summary row.
     if retention.dump_keep_last > 0:
         try:
             removed = await asyncio.to_thread(
@@ -454,8 +419,8 @@ async def _run_retention_sweep(
 
     async def _write_sweep_row(params: dict[str, object]) -> None:
         # DB-only, no SSE publish — the ServiceController._audit system-
-        # principal norm (§1.11). Called strictly between (never inside)
-        # @_serialized frames (H5).
+        # principal norm. Called strictly between (never inside)
+        # @_serialized frames.
         await queries.insert_audit_log(
             action="retention.sweep",
             result="ok",
@@ -464,12 +429,12 @@ async def _run_retention_sweep(
             params_redacted=json.dumps(params, sort_keys=True),
         )
 
-    # Phase 4 (LAST): archive-first audit prune (D-H). Cutoff in the
+    # Phase 4 (LAST): archive-first audit prune. Cutoff in the
     # `datetime('now')` space format (audit_log.ts column). An archiving pass
     # writes TWO `retention.sweep` rows:
     #   * anchor row  — written by `_anchor` (`on_archived`) after the
     #     archive is fsynced+hashed but BEFORE the first row delete: carries
-    #     audit_archived + basename + sha256, the D-H tamper-evidence anchor. It
+    #     audit_archived + basename + sha256, the tamper-evidence anchor. It
     #     survives even if the daemon crashes mid-prune.
     #   * summary row — written below AFTER `archive_and_prune_audit` returns
     #     successfully: the completion record, carrying the full counts
@@ -527,7 +492,7 @@ async def _retention_sweep_loop(
     queries: Queries, retention: RetentionSettings, data_dir: Path
 ) -> None:
     """Off-tick data-retention sweep: `job_logs` (every kind),
-    archive-first audit prune, backup-keep, and the P29 workspace-orphan leg.
+    archive-first audit prune, tar keep-last-N, event feed and orphan workspaces.
 
     Sleeps **first** (unlike the zombie/idempotency sweepers, which run their
     body immediately at boot): an archive-writing sweep at boot is the wrong

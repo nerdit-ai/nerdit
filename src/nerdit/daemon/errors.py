@@ -6,6 +6,7 @@ Exception handlers and outer auth middleware share the same envelope.
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Iterable
 from typing import Any, cast
@@ -62,12 +63,22 @@ class NerditError(Exception):
         self.extra = extra
 
 
+# Client-supplied ids reach every audit row, the `audit.*` feed and the
+# response header, so only a short, header-safe token is echoed.
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+
+
+def _client_request_id(value: str | None) -> str | None:
+    """Return `value` when it is a well-formed request id, else None."""
+    return value if value and _REQUEST_ID_RE.fullmatch(value) else None
+
+
 def request_id_of(request: Request) -> str | None:
     """Return the request id assigned by `RequestIdMiddleware`, if any."""
     rid = getattr(request.state, "request_id", None)
     if rid:
         return rid
-    return request.headers.get("x-request-id") or None
+    return _client_request_id(request.headers.get("x-request-id"))
 
 
 def _envelope(
@@ -97,14 +108,17 @@ def _envelope(
 
 
 class RequestIdMiddleware(BaseHTTPMiddleware):
-    """Assign a request id (echoing `X-Request-Id` when provided).
+    """Assign a request id, echoing a well-formed `X-Request-Id`.
+
+    A malformed header (outside `[A-Za-z0-9._:-]{1,128}`) is replaced by a
+    minted id, never echoed.
 
     Added as the outermost custom middleware so the id is available on
     `request.state` to inner middlewares (auth) and the exception handlers.
     """
 
     async def dispatch(self, request: Request, call_next):  # noqa: ANN001
-        rid = request.headers.get("x-request-id") or uuid.uuid4().hex
+        rid = _client_request_id(request.headers.get("x-request-id")) or uuid.uuid4().hex
         request.state.request_id = rid
         response = await call_next(request)
         response.headers.setdefault("X-Request-Id", rid)

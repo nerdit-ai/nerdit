@@ -112,7 +112,7 @@ def _build_never_ran(cfg: dict) -> bool:
 def _version_of_tag(image: str) -> int | None:
     """Deploy generation encoded in an image tag (`repo:3` → `3`), else None.
 
-    A non-numeric tag (a pre-P13 or hand-written row) yields `None`, which
+    A non-numeric tag (an old or hand-written row) yields `None`, which
     every consumer reads as "nothing to CAS on".
     """
     suffix = str(image).rsplit(":", 1)[-1]
@@ -262,7 +262,7 @@ class AppImageBuilder:
             return False
 
         # --- layer 2: a target image still to build ---
-        # Through the controller delegate, not self.needs_build — the D-T-2
+        # Through the controller delegate, not self.needs_build — the
         # patch-point contract: an instance-assigned override on the CONTROLLER
         # must keep intercepting this predicate.
         if await self._c._needs_build(job):
@@ -485,7 +485,7 @@ class AppImageBuilder:
             # serve: the swap itself is held back by `ensure_built` for as
             # long as this task is registered. It runs under NO concurrency
             # bound — the `async with self.semaphore` block above has already
-            # closed, and D-P20-2 exempts a release from both run caps — so
+            # closed, and a release is exempt from both run caps — so
             # simultaneous releases are bounded only by how many services
             # happen to be deploying at once. Deliberate: queueing a migration
             # behind a cap the deployer cannot see would wedge the deploy
@@ -565,7 +565,7 @@ class AppImageBuilder:
         run_id = generate_id()
         # Claimed BEFORE any awaited work so a DELETE arriving mid-migration is
         # refused (409 service.run_in_progress) and the zombie sweeper protects
-        # the container. A release is exempt from both D-P20-2 caps (and the
+        # the container. A release is exempt from both run caps (and the
         # build semaphore was released before we got here), so this slot is a
         # registry entry, never a bound, and it never raises.
         self._c._register_run(job.id, run_id, is_release=True)
@@ -591,7 +591,7 @@ class AppImageBuilder:
                 # The (a) CAS passed but a redeploy committed before the marker
                 # write. Same supersession as the early-return above — abort,
                 # or the OLD generation's migration runs against the live
-                # volumes with no crash marker armed (Codex P1, PR #100). The
+                # volumes with no crash marker armed. The
                 # `finally` still frees the run slot claimed above.
                 await self._c._append_log_tolerant(
                     job.id,
@@ -622,7 +622,7 @@ class AppImageBuilder:
                 # for two minutes exactly the wrong story — they would assume
                 # the schema is untouched. The exception carries the output the
                 # container managed to print (already bounded and scrubbed
-                # through the same D-P20-1 choke point), which is the only
+                # through the same scrub choke point), which is the only
                 # evidence left of how far the migration got.
                 tail = exc.log_tail
                 message = (
@@ -687,7 +687,7 @@ class AppImageBuilder:
         it mounts the SAME named volumes the live old container is still writing
         to, since that is where the data to migrate lives.
 
-        `scrub` is an out-parameter: it is populated with the D-P20-1
+        `scrub` is an out-parameter: it is populated with the
         sensitive-value set the moment the env resolves, so a failure raised
         later still has the set available for redacting its own message.
         """
@@ -924,15 +924,13 @@ class AppImageBuilder:
         cfg = parse_job_config(row, warn=True)
         if cfg.get("build_version") != target_version:
             return False  # a newer generation owns the row
-        cfg["release_pending"] = target_version
-        if isinstance(target_version, int):
-            return await self._c._queries.update_job_config_guarded(
-                job_id, json.dumps(cfg), expect_build_version=target_version
-            )
-        # Defensive: `_version_of_tag` only ever yields `int | None` and the
-        # `None` case returned above, so there is nothing to CAS on here.
-        await self._c._queries.update_job_config(job_id, json.dumps(cfg))
-        return True
+        # `_version_of_tag` only ever yields `int | None`; a non-int is
+        # defensive and has nothing to CAS on.
+        return await self._c._queries.patch_job_config(
+            job_id,
+            {"release_pending": target_version},
+            expect_build_version=target_version if isinstance(target_version, int) else None,
+        )
 
     async def _clear_release_pending(self, job_id: str, target_version: int | None) -> None:
         """Clear the release marker with a database-enforced version CAS.
@@ -946,14 +944,11 @@ class AppImageBuilder:
         cfg = parse_job_config(row, warn=True)
         if target_version is not None and cfg.get("build_version") != target_version:
             return  # a newer generation owns the row (and the marker)
-        if cfg.pop("release_pending", None) is None:
+        if cfg.get("release_pending") is None:
             return
-        if target_version is not None:
-            await self._c._queries.update_job_config_guarded(
-                job_id, json.dumps(cfg), expect_build_version=target_version
-            )
-            return
-        await self._c._queries.update_job_config(job_id, json.dumps(cfg))
+        await self._c._queries.patch_job_config(
+            job_id, remove=["release_pending"], expect_build_version=target_version
+        )
 
     async def _write_terminal_settle(
         self,
@@ -970,8 +965,8 @@ class AppImageBuilder:
         newer generation to protect. A CAS miss writes nothing.
         """
         if target_version is None:
-            # Non-numeric image tag (pre-P13 / odd rows): nothing to CAS on, so
-            # keep today's two unconditional writes.
+            # Non-numeric image tag (old / odd rows): nothing to CAS on, so
+            # settle both columns in one unconditional write.
             await self._c._queries.update_job_status(
                 job_id,
                 JobStatus.failed,
@@ -979,8 +974,8 @@ class AppImageBuilder:
                 exit_code=-1,
                 error_class=error_class,
                 error_message=message,
+                desired_state=JobStatus.failed.value,
             )
-            await self._c._queries.set_desired_state(job_id, JobStatus.failed.value)
             return True
         return await self._c._queries.settle_failed_guarded(
             job_id,
@@ -1017,8 +1012,7 @@ class AppImageBuilder:
             migration. Superseded/no-op branches also return False.
         """
         # "build_failed" → "Build failed"; "release_failed" → "Release failed".
-        # Keeps every log line below reading correctly for either caller while
-        # rendering byte-identically to the pre-extraction text for a build.
+        # Keeps every log line below reading correctly for either caller.
         label = reason.replace("_", " ").capitalize()
 
         def _stamp_failed(blob: dict) -> None:
@@ -1040,7 +1034,7 @@ class AppImageBuilder:
         async def _audit_outcome(action: str) -> None:
             await self._audit_settle(action, job, audit_params)
 
-        # (F1-CLOBBER) The revert write is a version-guarded CAS: it settles the
+        # The revert write is a version-guarded CAS: it settles the
         # row only while it still owns `target_version`. A newer redeploy
         # generation that landed on the row mid-build owns it now, and its own
         # build task drives it forward — writing our (superseded) revert blob
@@ -1064,7 +1058,7 @@ class AppImageBuilder:
         async def _write_revert(blob: dict) -> bool:
             """Guarded revert write; `False` ⇒ a newer generation owns the row."""
             if target_version is None:
-                # Non-numeric image tag (pre-P13 / odd rows): nothing to
+                # Non-numeric image tag (old / odd rows): nothing to
                 # CAS on, so fall back to the unguarded write.
                 await self._c._queries.update_service_config(
                     job.id,
@@ -1199,10 +1193,10 @@ class AppImageBuilder:
         # failure the gate exists to prevent (pinned by
         # `test_a_restart_of_a_crashed_release_re_settles_rather_than_launching`).
         #
-        # (F5) The row write is a build_version CAS — see
+        # The row write is a build_version CAS — see
         # `_write_terminal_settle` for why this branch in particular must
         # never fire on a newer generation's behalf. The crash-loop sibling in
-        # `services.py` (F5-CRASHLOOP) settles a DIFFERENT, deliberately
+        # `services.py` settles a DIFFERENT, deliberately
         # unguarded scenario and is untouched here.
         if not await self._write_terminal_settle(
             job.id,

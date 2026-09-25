@@ -39,14 +39,6 @@ class DomainQueries(QueriesBase):
         )
         return [self._row_to_domain(r) for r in await cursor.fetchall()]
 
-    async def get_service_domain(self, domain: str) -> ServiceDomain | None:
-        """Return the domain claimant or None; case-insensitive collation prevents case-based
-        takeover.
-        """
-        cursor = await self._db.conn.execute(f"{_SELECT} WHERE domain = ?", (domain,))
-        row = await cursor.fetchone()
-        return self._row_to_domain(row) if row is not None else None
-
     @_serialized
     async def add_service_domain(
         self, service_name: str, domain: str, *, acme: bool | None, job_id: str

@@ -1468,6 +1468,27 @@ def test_get_view_never_surfaces_a_hand_forged_literal_password():
     assert r.json()["deploy"]["edge_auth"]["password"] == "***"
 
 
+def test_ai_url_userinfo_is_hidden_in_config_views_and_preview():
+    canary = "pw-CANARY-config-view"
+    binding = {
+        "provider": "api",
+        "model": "remote",
+        "base_url": f"https://svc:{canary}@api.example.com/v1",
+        "api_key": "${secrets.API_KEY}",
+    }
+    q = _queries(_app_job(config_extra={"ai": {"remote": binding}}))
+    client = _client(q)
+    for response in (
+        client.get("/config/apps/demo", headers=_auth(RO_RAW)),
+        _put(client, section="ai", body={"remote": binding}, dry_run="true"),
+    ):
+        assert response.status_code == 200, response.text
+        body = response.json()
+        view = body.get("view", body)
+        assert view["ai"]["remote"]["base_url"] == "https://api.example.com/v1"
+        assert canary not in response.text
+
+
 def test_get_view_masks_a_non_table_edge_auth_blob_wholesale():
     """A blob whose SHAPE cannot be reasoned about surfaces its existence only —
     it could be anything, including a bare password string."""

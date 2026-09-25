@@ -16,7 +16,6 @@ from fastapi import APIRouter, Request
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.core.runtime.protocol import ContainerRuntimeError, SandboxViolationError
 from nerdit.core.services import (
-    _TERMINAL_DESIRED_STATES,
     LaunchEnvNotReady,
     RunInterruptedError,
     RunPreconditionError,
@@ -33,6 +32,7 @@ from nerdit.daemon.auth import (
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.limits import _MAX_RUN_LOG_TAIL
 from nerdit.daemon.views.service import _not_found, _resolve_service
+from nerdit.db.enums import TERMINAL_STATUSES
 from nerdit.db.models import Job, JobKind, ServiceRunRequest, ServiceRunResponse
 
 logger = logging.getLogger(__name__)
@@ -129,7 +129,7 @@ def _preflight(
             f"(currently {max_timeout}) on the daemon.",
         )
 
-    if job.desired_state in _TERMINAL_DESIRED_STATES:
+    if job.desired_state in TERMINAL_STATUSES:
         # The controller refuses these too, but as `service_gone` — which the
         # §1.2 table maps to 404, and whose rationale is the delete race ("the
         # row vanished between resolve and launch"). Applied to a row the user
@@ -320,7 +320,7 @@ async def run_service_command(
                 f"The run container for '{ident}' started and was then lost by the runtime; "
                 "its exit is unobserved.",
                 # Deliberately does NOT point at `last_run`: `run_once` raises
-                # before it reaches `set_last_run`, so an interrupted run leaves
+                # before it stamps `last_run`, so an interrupted run leaves
                 # no stamp and `/diagnose` still shows the PREVIOUS run. The
                 # `log_tail` below is the only surviving record of this one.
                 hint="The command may have PARTIALLY applied its effects — data changes are "

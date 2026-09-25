@@ -152,6 +152,21 @@ def test_readonly_blocked_on_deploy(tmp_path):
     assert resp.json()["code"] == "forbidden"
 
 
+@pytest.mark.parametrize("apex", [True, False])
+def test_deploy_apex_reserved_name(tmp_path, apex):
+    """With the apex dashboard on (path mode) a fresh `api` would shadow its /api."""
+    app = _make_app(_queries(), tmp_path)
+    proxy = app.state.settings.proxy
+    proxy.enabled, proxy.dashboard_apex, proxy.mode = True, apex, "path"
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = _dry_post(client, _node_zip(), name="api")
+    if apex:
+        assert resp.status_code == 422
+        assert resp.json()["code"] == "service.reserved_name"
+    else:
+        assert resp.json().get("code") != "service.reserved_name"
+
+
 def test_deploy_invalid_name(tmp_path):
     resp = _post(_client(_queries(), tmp_path), _node_zip(), name="Bad_Name")
     assert resp.status_code == 422
@@ -1147,7 +1162,7 @@ class FakeBuildRuntime:
     async def list_managed_containers(self):
         return list(self.live.items())
 
-    async def logs(self, container_id, follow=False, tail=None, max_bytes=None):
+    async def logs(self, container_id, follow=False, tail=None, max_bytes=None, since=None):
         return
         yield  # pragma: no cover
 

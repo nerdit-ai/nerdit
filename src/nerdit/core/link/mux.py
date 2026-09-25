@@ -46,6 +46,7 @@ from nerdit.core.link.frames import (
     response_head_frame,
     stream_error_frame,
 )
+from nerdit.core.project_identity import PROJECT_DELEGATION_HEADER
 
 logger = logging.getLogger("nerdit.link.mux")
 
@@ -56,6 +57,9 @@ logger = logging.getLogger("nerdit.link.mux")
 #: `hello_ack.limits`), so it does not belong on `MuxContext`, and a
 #: test that needs it short monkeypatches this name — it is read at call time.
 REQUEST_BODY_TIMEOUT_S = 30.0
+
+# At most the existing concurrent-stream limit checks one committed tuple per tick.
+APP_RECHECK_INTERVAL_S = 1.0
 
 #: Maximum decoded bytes per `stream_response_body` frame — a **ceiling**,
 #: not a target. Base64 inflates by 4/3, so 64 KiB decoded is ~87 KiB on the
@@ -95,6 +99,8 @@ _REQUEST_DROPPED = frozenset({"host", "content-length"})
 #: anything is dialled, and any value that does not name a shared service is a
 #: 404 (`_NOT_SHARED_BODY`).
 APP_HEADER = "x-nerdit-app"
+APP_JOB_HEADER = "x-nerdit-app-job"
+APP_ACCESS_HEADER = "x-nerdit-app-access"
 
 #: The cloud's control-plane carrier (P32 D-P32-2) — the header that marks a
 #: stream as framed by the cloud's own server-side code rather than by a user,
@@ -127,7 +133,12 @@ _APP_REQUEST_DROPPED = frozenset(
         "authorization",
         "x-nerdit-role",
         APP_HEADER,
+        APP_JOB_HEADER,
+        APP_ACCESS_HEADER,
+        "x-forwarded-host",
+        "forwarded",
         CLOUD_CONTROL_HEADER,
+        PROJECT_DELEGATION_HEADER,
     }
 )
 
@@ -282,6 +293,11 @@ class StreamMux:
         else:
             self._app_client = httpx.AsyncClient(
                 follow_redirects=False,
+                http1=True,
+                http2=False,
+                # A pooled socket could still reach an old incarnation after
+                # its listener closes and a new job acquires the same port.
+                limits=httpx.Limits(max_keepalive_connections=0),
                 # Same reason as the loopback client above, and it matters more
                 # here: this is the path carrying a third party's cookies,
                 # headers and body to a local app port.
@@ -584,15 +600,29 @@ class StreamMux:
     async def _serve_app(self, stream: _Stream, app_name: str) -> None:
         """Serve one hosted app stream (P26 D-P26-H2), or answer 404.
 
-        The resolver is consulted on **every** stream, so an unshare closes the
-        path on the next request. A `None` answer — including "there is no
-        resolver", which is what an unlinked or domain-less node has — returns
+        Consult the resolver at admission and throughout the stream lifetime.
+        A `None` answer — including an unlinked node without a resolver — returns
         before any connection is attempted: the daemon must never dial on
         behalf of a name it has not authorised.
         """
         frame = stream.frame
         resolver = self._ctx.resolve_app
-        target = await resolver(app_name) if resolver is not None else None
+        carriers = (APP_HEADER, APP_JOB_HEADER, APP_ACCESS_HEADER, "x-forwarded-host")
+        if any(
+            sum(name.lower() == carrier for name, _ in frame.headers) > 1 for carrier in carriers
+        ):
+            await self._send_not_shared(frame)
+            return
+        target = (
+            await resolver(
+                app_name,
+                frame.header("x-forwarded-host"),
+                frame.header(APP_JOB_HEADER),
+                frame.header(APP_ACCESS_HEADER),
+            )
+            if resolver is not None
+            else None
+        )
         if target is None:
             await self._send_not_shared(frame)
             return
@@ -605,7 +635,7 @@ class StreamMux:
         # httpx honours an explicit `Host` over the URL authority
         # (`Request._prepare` uses `setdefault`), so the app sees the name
         # the browser typed while the socket still goes to loopback.
-        headers.append(("host", target.host))
+        headers.extend((("host", target.host), ("x-forwarded-host", target.host)))
 
         # `frame.path` is origin-relative by grammar (`frames.py`), so the
         # app is served at the ROOT of its hosted name — no base path, which is
@@ -614,14 +644,51 @@ class StreamMux:
         if frame.query:
             url = f"{url}?{frame.query}"
 
-        async with self._app_client.stream(
-            frame.method, url, headers=headers, content=stream.body()
-        ) as response:
-            stream.response = response
-            # The SAME pump: limits table, pacing, chunk-for-chunk SSE and the
-            # overflow rule are the loopback path's, unmodified. There is no
-            # second response policy to keep in sync.
-            await self._pump(stream, response)
+        async def validate_connected_target(event: str, _info: dict[str, object]) -> None:
+            # httpcore is pinned: this boundary is AFTER socket acquisition but
+            # BEFORE HTTP bytes. A connected TCP stream cannot migrate to a new
+            # service reusing its port after this final identity check.
+            if event == "http11.send_request_headers.started":
+                assert resolver is not None
+                current = await resolver(app_name, target.host, target.job_id, target.access)
+                if current != target:
+                    raise httpx.RequestError("The app stream authorization was revoked.")
+
+        async def serve() -> None:
+            async with self._app_client.stream(
+                frame.method,
+                url,
+                headers=headers,
+                content=stream.body(),
+                extensions={"trace": validate_connected_target},
+            ) as response:
+                stream.response = response
+                await self._pump(stream, response)
+
+        async def guard() -> None:
+            assert resolver is not None
+            while True:
+                await asyncio.sleep(APP_RECHECK_INTERVAL_S)
+                current = await resolver(app_name, target.host, target.job_id, target.access)
+                if current is None or current.job_id != target.job_id:
+                    return
+
+        serving = asyncio.create_task(serve())
+        watching = asyncio.create_task(guard())
+        try:
+            done, _ = await asyncio.wait((serving, watching), return_when=asyncio.FIRST_COMPLETED)
+            if serving in done:
+                await serving
+            else:
+                # Revocation (or a failed recheck) closes the upstream, including quiet SSE.
+                serving.cancel()
+                await asyncio.gather(serving, return_exceptions=True)
+                await watching
+                await self._fail_late(stream)
+        finally:
+            serving.cancel()
+            watching.cancel()
+            await asyncio.gather(serving, watching, return_exceptions=True)
 
     async def _send_not_shared(self, frame: OpenStream) -> None:
         """Answer an unroutable app stream with the one structured 404.

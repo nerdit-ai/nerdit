@@ -293,3 +293,26 @@ test("the template flow sends the advanced gpus/start overrides", async ({ page 
   await expect.poll(() => posted).not.toBeNull();
   expect(posted).toMatchObject({ gpus: 1, start: "uvicorn app:app", env: { MODEL: "llama3.1:8b" } });
 });
+
+test("duplicate display labels retain their distinct namespace links", async ({ page }) => {
+  await mockApi(page);
+  const project = (namespace: string) => ({
+    id: `prj_${namespace}`, name: "shared", namespace, services: [], addresses: []
+  });
+  await page.route(/\/api\/projects(\?.*)?$/, (route) => route.fulfill({
+    json: { items: ["alpha", "beta"].map(project), next_cursor: null }
+  }));
+  // The destination must resolve too: a 404 there bounces the page back to "/",
+  // which made the URL assertion race the detail fetch.
+  await page.route(/\/api\/projects\/(alpha|beta)$/, (route) => route.fulfill({
+    json: { ...project(route.request().url().split("/").pop() ?? ""), resources: [], home: { hostname: "test", node_id: null } }
+  }));
+  await loginAsToken(page);
+  const rows = page.getByTestId("app-row-shared");
+  await expect(rows).toHaveCount(2);
+  await rows.first().click();
+  await expect(page).toHaveURL("/projects/alpha");
+  await page.goto("/");
+  await rows.last().click();
+  await expect(page).toHaveURL("/projects/beta");
+});

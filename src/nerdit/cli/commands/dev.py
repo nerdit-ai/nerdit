@@ -222,7 +222,12 @@ async def _wait_and_report(client, name: str, service: dict, wait_timeout: int) 
 
 
 async def _deploy_once(
-    client, directory: Path, name: str, source_type: str | None, wait_timeout: int
+    client,
+    directory: Path,
+    name: str,
+    source_type: str | None,
+    wait_timeout: int,
+    max_bytes: int,
 ) -> str | None:
     """Redeploy once; returns the source type to use for the next change."""
     from nerdit.cli.upload import check_upload_size, create_dir_zip
@@ -237,7 +242,7 @@ async def _deploy_once(
         else:
             console.print(f"[dim]Change detected — uploading {label}...[/dim]")
             zip_bytes = create_dir_zip(directory)
-            check_upload_size(zip_bytes)
+            check_upload_size(zip_bytes, max_bytes)
             service = await client.deploy(
                 zip_bytes=zip_bytes, name=name, idempotency_key=uuid4().hex
             )
@@ -265,6 +270,10 @@ async def _watch(
     burst spanning several polls still produces exactly one deploy once the
     tree goes quiet.
     """
+    from nerdit.cli.client import upload_limit
+
+    # Read once: the cap is a restart-required daemon setting.
+    max_bytes = await upload_limit(client)
     snapshot = _snapshot(directory)
     pending_since: float | None = None
     deploys = 0
@@ -280,7 +289,9 @@ async def _watch(
                 continue
             pending_since = None
             deploys += 1
-            source_type = await _deploy_once(client, directory, name, source_type, wait_timeout)
+            source_type = await _deploy_once(
+                client, directory, name, source_type, wait_timeout, max_bytes
+            )
             # Deliberately NOT re-baselined here: the build runs server-side and
             # writes nothing locally, so a save made *while* a deploy was in
             # flight must still be seen by the next poll. Swallowing it would

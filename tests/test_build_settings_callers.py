@@ -442,9 +442,9 @@ async def test_local_deploy_checks_capabilities_once_before_archive(tmp_path, mo
     )
     order = []
 
-    def archive(directory):
+    def archive(directory, skipped_secrets=None):
         order.append("ZIP")
-        return create_dir_zip(directory)
+        return create_dir_zip(directory, skipped_secrets)
 
     def handler(request):
         order.append(request.method)

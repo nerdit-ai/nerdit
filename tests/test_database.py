@@ -69,3 +69,17 @@ async def test_path_property_returns_db_path(tmp_path):
 
     memory = Database(":memory:")
     assert memory.path == ":memory:"
+
+
+@pytest.mark.asyncio
+async def test_init_schema_does_not_create_file_uploads(tmp_path):
+    database = Database(str(tmp_path / "nerdit.db"))
+    await database.connect()
+    await database.init_schema()
+    try:
+        cursor = await database.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='file_uploads'"
+        )
+        assert await cursor.fetchone() is None
+    finally:
+        await database.close()

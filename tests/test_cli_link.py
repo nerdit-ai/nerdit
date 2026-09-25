@@ -1919,3 +1919,24 @@ async def test_a_slow_poll_cannot_overrun_the_advertised_device_timeout(capsys):
     assert excinfo.value.exit_code == 3
     assert elapsed < 10, f"overran the 1s budget by {elapsed:.1f}s"
     assert "Stopped polling after" in capsys.readouterr().out
+
+
+def test_cli_link_refuses_a_positional_preauth_key_before_any_network_hop(monkeypatch):
+    """(D-X16-O11) ``nerdit link nk_…`` exits 2 before any client exists, never echoing the key."""
+    from nerdit.cli.app import app
+
+    client = _fake_client()
+    built = []
+    monkeypatch.setattr(
+        "nerdit.cli.client.get_configured_client", lambda: built.append(1) or client
+    )
+
+    result = _runner.invoke(app, ["link", PREAUTH_KEY])
+
+    assert result.exit_code == 2
+    assert not built
+    client.claim_link.assert_not_awaited()
+    # CI forces a colour terminal: Rich styles the flag, so match on plain text.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    assert PREAUTH_KEY not in plain
+    assert "--key-stdin" in plain

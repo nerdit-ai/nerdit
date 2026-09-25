@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from nerdit.daemon.schemas._base import StrictRequestModel
 from nerdit.db.enums import JobStatus
+from nerdit.utils.names import DNS_LABEL_PATTERN
 
 
 class DatabaseCreateRequest(StrictRequestModel):
@@ -24,7 +25,7 @@ class DatabaseCreateRequest(StrictRequestModel):
     )
     name: str | None = Field(
         default=None,
-        pattern=r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+        pattern=DNS_LABEL_PATTERN,
         description="Optional service-name override (default: the backend name prefix)",
     )
 

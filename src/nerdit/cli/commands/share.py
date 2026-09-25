@@ -13,13 +13,14 @@ from uuid import uuid4
 
 import typer
 
-from nerdit.cli.display import console, render_client_error
+from nerdit.cli.display import call_or_exit, console, render_client_error
 from nerdit.cli.display import plain as _plain
 
 #: Machine ``state`` token → the one-line explanation of why a stored share is
 #: not answering yet. Keyed on the token from the daemon so an older/newer
 #: vocabulary degrades to "no extra line", never to a wrong sentence.
 _STATE_NOTES = {
+    "pending": "the share is stored; waiting for the cloud to assign a public address",
     "link_down": (
         "the tunnel is down — the URL answers once the link reconnects (check: nerdit link)"
     ),
@@ -85,11 +86,7 @@ async def _share_async(name: str, *, public: bool, consent: bool, show: bool) ->
     client = get_configured_client()
 
     if show:
-        try:
-            result = await client.get_share(name)
-        except Exception as exc:  # noqa: BLE001 — rendered for the user
-            render_client_error(exc)
-            raise typer.Exit(1) from exc
+        result = await call_or_exit(client.get_share(name))
         _render_share(name, result, verb="Shared")
         return
 
@@ -121,11 +118,7 @@ async def _unshare_async(name: str) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        result = await client.remove_share(name, idempotency_key=uuid4().hex)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    result = await call_or_exit(client.remove_share(name, idempotency_key=uuid4().hex))
 
     result = result if isinstance(result, dict) else {}
     if result.get("removed"):

@@ -14,6 +14,7 @@ from rich.markup import escape
 from nerdit.cli.commands.deploy import parse_env_pairs
 from nerdit.cli.display import (
     _plain,
+    call_or_exit,
     console,
     display_deploy_result,
     display_service_table,
@@ -42,11 +43,7 @@ async def _list_async(status: str | None) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        page = await client.list_services(status=status)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    page = await call_or_exit(client.list_services(status=status))
 
     items = page.get("items", [])
     if not items:
@@ -67,11 +64,7 @@ async def _stop_async(name: str) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        await client.stop_service(name, idempotency_key=uuid4().hex)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    await call_or_exit(client.stop_service(name, idempotency_key=uuid4().hex))
     console.print(f"[green]Stopping service {name}.[/green]")
 
 
@@ -87,11 +80,7 @@ async def _restart_async(name: str) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        await client.restart_service(name, idempotency_key=uuid4().hex)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    await call_or_exit(client.restart_service(name, idempotency_key=uuid4().hex))
     console.print(f"[green]Restarting service {name}.[/green]")
 
 
@@ -127,11 +116,7 @@ async def _redeploy_async(name: str, *, wait: bool, wait_timeout: int, dry_run: 
     from nerdit.cli.commands.deploy import _maybe_wait, _render_dry_run
 
     client = get_configured_client()
-    try:
-        service = await client.redeploy_app(name, dry_run=dry_run)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    service = await call_or_exit(client.redeploy_app(name, dry_run=dry_run))
     if dry_run:
         _render_dry_run(service)
         return
@@ -177,11 +162,9 @@ async def _rm_async(name: str, *, purge: str, force: bool) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        await client.remove_service(name, purge=purge, force=force, idempotency_key=uuid4().hex)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    await call_or_exit(
+        client.remove_service(name, purge=purge, force=force, idempotency_key=uuid4().hex)
+    )
     console.print(f"[green]Removed service {name}.[/green]")
 
 
@@ -250,11 +233,7 @@ async def _stats_async(name: str) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        result = await client.get_service_stats(name)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    result = await call_or_exit(client.get_service_stats(name))
 
     # Every value below is server-derived and therefore goes through ``_plain``
     # before it reaches a Rich sink — a service name or container id is not ours

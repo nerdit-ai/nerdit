@@ -259,6 +259,11 @@ class StreamLimits:
     body per stream, so trusting an advertised `max_body_bytes` verbatim
     would make the peer at the other end of the tunnel the author of this
     process's memory budget.
+
+    `max_pending_frames` and `stream_idle_timeout_s` are parsed for wire
+    parity (the table is frozen and every key is required) but not read
+    locally. The relay enforces both, and the daemon bounds a stream by
+    `mux.REQUEST_BODY_TIMEOUT_S` and `stream_absolute_timeout_s`.
     """
 
     max_concurrent_streams_per_node: int

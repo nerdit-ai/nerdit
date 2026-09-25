@@ -61,7 +61,7 @@ def _app(queries: Queries, *, token: str | None = None) -> FastAPI:
 
 def _client(queries: Queries, *, token: str | None = None) -> AsyncClient:
     transport = ASGITransport(app=_app(queries, token=token))
-    return AsyncClient(transport=transport, base_url="http://test")
+    return AsyncClient(transport=transport, base_url="http://127.0.0.1")
 
 
 def _row(

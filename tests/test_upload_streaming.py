@@ -77,16 +77,10 @@ class TestUploadStreaming:
         assert (Path(resp.json()["dir"]) / "train.py").is_file()
 
     def test_upload_spilling_past_spool_threshold(self):
-        """Archives that exceed the in-memory spool must still extract correctly."""
-        from nerdit.daemon.uploads import _UPLOAD_SPOOL_MAX
-
-        app = _make_app(max_upload_bytes=_UPLOAD_SPOOL_MAX * 5)
-        client = TestClient(app)
-
-        # Build a ZIP larger than _UPLOAD_SPOOL_MAX so the spool file spills to disk
-        large_payload = "x" * (_UPLOAD_SPOOL_MAX + 1024 * 1024)
+        """Archives past Starlette's in-memory spool (1 MiB) still extract."""
+        client = TestClient(_make_app())
+        large_payload = "x" * (2 * 1024 * 1024)
         zip_bytes = _make_zip({"train.py": "print('ok')", "big.txt": large_payload})
-        assert len(zip_bytes) > _UPLOAD_SPOOL_MAX
 
         resp = _post(client, zip_bytes)
         assert resp.status_code == 201
@@ -167,6 +161,39 @@ def test_malformed_archives_are_400(bad):
     resp = _post(client, bad)
     assert resp.status_code == 400
     assert resp.json()["code"] == "deploy.invalid_zip"
+
+
+@pytest.mark.parametrize(
+    ("name", "alias"),
+    [
+        ("app/config", "app/config"),
+        ("app/config", "./app/config"),
+        ("app/config", "app//config"),
+        ("app/config", "app/./config"),
+        ("nerdit.toml", "NERDIT.TOML"),
+        ("apps/api/nerdit.toml", "apps/API/NERDIT.TOML"),
+        ("apps/caf\u00e9/nerdit.toml", "apps/cafe\u0301/nerdit.toml"),
+    ],
+)
+def test_duplicate_extraction_paths_are_rejected(name, alias, tmp_path):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(name, "first")
+        zf.writestr(alias, "second")
+    upload_root = tmp_path / "uploads"
+    resp = _post(TestClient(_make_app(upload_dir=str(upload_root))), buf.getvalue())
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "deploy.invalid_zip"
+    assert list(upload_root.iterdir()) == []
+
+
+def test_preflight_allows_unrelated_case_distinct_paths():
+    from nerdit.daemon.uploads import _read_member
+
+    buf = io.BytesIO(
+        _make_zip({"nerdit.toml": "declaration", "README": "first", "readme": "second"})
+    )
+    assert _read_member(buf, "nerdit.toml") == b"declaration"
 
 
 class TestValidateAndExtractOffLoop:
@@ -259,3 +286,63 @@ class TestValidateAndExtractOffLoop:
 
         assert (out / "pkg" / "mod_999.py").is_file()
         assert ticks > 0, "the event loop never ran another task during the extraction"
+
+
+@pytest.mark.parametrize("path", ["/api/deploy", "/api/projects/asso/apply"])
+@pytest.mark.parametrize(
+    ("declared", "status", "code"),
+    [
+        (str(512 + 1_048_576 + 1), 413, "payload_too_large"),
+        (None, 411, "length_required"),
+        ("100", 200, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_upload_routes_bounded_before_parsing(path, declared, status, code):
+    """The multipart ingresses are refused on the declared length, unread."""
+    import json
+
+    from nerdit.daemon.bodylimit import BodyLimitMiddleware
+
+    called: list[str] = []
+    app = FastAPI()
+
+    @app.post(path)
+    async def _spy() -> dict:
+        called.append(path)
+        return {}
+
+    app.add_middleware(BodyLimitMiddleware, max_upload_bytes=512)
+    headers = [(b"content-type", b"multipart/form-data; boundary=x")]
+    if declared is not None:
+        headers.append((b"content-length", declared.encode()))
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": headers,
+        "client": ("127.0.0.1", 1),
+        "server": ("localhost", 80),
+    }
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    await app(scope, receive, send)
+    assert sent[0]["status"] == status
+    if code is None:
+        assert called == [path]
+    else:
+        assert called == []
+        body = json.loads(b"".join(m.get("body", b"") for m in sent[1:]))
+        assert body["code"] == code

@@ -1,7 +1,7 @@
 """Schemas for hosted shares, custom domains and service public URLs.
 
 The scalar public_url remains the LAN/proxy URL; public_urls lists all kinds.
-State is a machine token: ready, link_down, not_entitled or withheld. Hosted
+State is a machine token: ready, link_down, not_entitled, pending or withheld. Hosted
 entries never report withheld; domain entries never report link_down.
 Keep imports limited to leaf modules to avoid cycles through service views.
 """
@@ -27,10 +27,7 @@ class PublicUrlEntry(BaseModel):
     """
 
     url: str | None = Field(
-        description=(
-            "Absolute URL; null only for a hosted entry on a node that has been "
-            "unlinked since the share was set (the intent survives, the address does not)"
-        )
+        description=("Absolute URL; null while awaiting a hosted address or on an unlinked node")
     )
     kind: Literal["default", "hosted", "domain"] = Field(
         description=(
@@ -38,10 +35,10 @@ class PublicUrlEntry(BaseModel):
             "'domain' = a custom domain served by this node's proxy"
         )
     )
-    state: Literal["ready", "link_down", "not_entitled", "withheld"] = Field(
+    state: Literal["ready", "link_down", "not_entitled", "withheld", "pending"] = Field(
         description=(
             "Machine token: answers now / tunnel or link missing / public not entitled / "
-            "the proxy is not serving this service yet (domain entries)"
+            "the proxy is not serving this service yet (domain entries) / hosted address pending"
         )
     )
     access: Literal["private", "public"] | None = Field(
@@ -121,11 +118,11 @@ class ShareView(BaseModel):
     service_name: str = Field(description="Stable service name")
     access: Literal["private", "public"] = Field(description="Stored exposure mode")
     url: str | None = Field(
-        description="The hosted URL, or null when this node has no slug/hosted domain"
+        description="The hosted URL, or null while unlinked or awaiting a routable address"
     )
-    state: Literal["ready", "link_down", "not_entitled"] = Field(
+    state: Literal["ready", "link_down", "not_entitled", "pending"] = Field(
         description="ready = answers now; link_down = tunnel/link missing; "
-        "not_entitled = public without the entitlement"
+        "not_entitled = public without the entitlement; pending = awaiting a routable address"
     )
     created_at: datetime = Field(description="When the share was first created")
     origin: ShareOrigin = Field(

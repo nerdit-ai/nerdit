@@ -964,3 +964,18 @@ async def test_secret_values_never_reach_audit_or_idempotency_stores(tmp_path):
             assert all("sk-live-secret" not in row for row in rows)
     finally:
         await db.close()
+
+
+async def test_secret_io_runs_off_loop_and_maps_errors():
+    from nerdit.core.secrets import InvalidServiceName
+    from nerdit.daemon.errors import NerditError
+    from nerdit.daemon.secret_scope import secret_io
+
+    assert await secret_io(threading.get_ident) != threading.get_ident()
+
+    def boom():
+        raise InvalidServiceName("bad name")
+
+    with pytest.raises(NerditError) as exc:
+        await secret_io(boom)
+    assert (exc.value.status_code, exc.value.code) == (422, "secret.invalid_service")

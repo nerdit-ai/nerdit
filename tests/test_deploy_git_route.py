@@ -134,7 +134,7 @@ def _fake_clone(commit: str = "a" * 40, resolved: str = "main") -> AsyncMock:
 
 
 def _post(client: TestClient, monkeypatch, clone: AsyncMock, raw: str = SUB_RAW, **body):
-    monkeypatch.setattr(deploy_mod, "clone_source", clone)
+    monkeypatch.setattr(pipeline, "clone_source", clone)
     payload = {"repo_url": REPO, "name": "demo"}
     payload.update(body)
     return client.post("/deploy/git", json=payload, headers=_auth(raw))
@@ -192,7 +192,7 @@ def test_r1_fresh_deploy_stamps_git_source(tmp_path, monkeypatch):
 
 def test_r1_idempotency_key_persisted(tmp_path, monkeypatch):
     q = _queries()
-    monkeypatch.setattr(deploy_mod, "clone_source", _fake_clone())
+    monkeypatch.setattr(pipeline, "clone_source", _fake_clone())
     resp = _client(q, tmp_path).post(
         "/deploy/git",
         json={"repo_url": REPO, "name": "demo"},
@@ -647,7 +647,7 @@ def test_git_dry_run_writes_nothing_and_cleans_clone(tmp_path, monkeypatch):
     """A git dry-run returns the plan (200), writes nothing, and removes the clone."""
     q = _queries()
     clone = _fake_clone()
-    monkeypatch.setattr(deploy_mod, "clone_source", clone)
+    monkeypatch.setattr(pipeline, "clone_source", clone)
     resp = _client(q, tmp_path).post(
         "/deploy/git",
         params={"dry_run": "true"},
@@ -670,7 +670,7 @@ def test_git_dry_run_writes_nothing_and_cleans_clone(tmp_path, monkeypatch):
 
 def test_git_dry_run_audited_as_deploy_git_plan(tmp_path, monkeypatch):
     q = _queries()
-    monkeypatch.setattr(deploy_mod, "clone_source", _fake_clone())
+    monkeypatch.setattr(pipeline, "clone_source", _fake_clone())
     resp = _client(q, tmp_path, with_audit=True).post(
         "/deploy/git",
         params={"dry_run": "true"},
@@ -691,7 +691,7 @@ def test_git_dry_run_token_ref_redacted_under_deploy_git_plan(tmp_path, monkeypa
     reference string (which reveals the secret scope/key) ever lands."""
     q = _queries()  # fresh deploy → shared-scope ref (unscoped is 403 pre-clone)
     mgr = _secret_manager({"demo": {}, "_shared": {"GH_TOKEN": "raw-token-value"}})
-    monkeypatch.setattr(deploy_mod, "clone_source", _fake_clone())
+    monkeypatch.setattr(pipeline, "clone_source", _fake_clone())
     resp = _client(q, tmp_path, with_audit=True, secret_manager=mgr).post(
         "/deploy/git",
         params={"dry_run": "true"},
@@ -1041,7 +1041,7 @@ def test_dry_run_does_not_write_through_a_symlink(tmp_path, monkeypatch):
     victim.write_bytes(b"master-key-sentinel")
     q = _queries()
     monkeypatch.setattr(
-        deploy_mod, "clone_source", _fake_clone_with_link("Dockerfile.nerdit", victim)
+        pipeline, "clone_source", _fake_clone_with_link("Dockerfile.nerdit", victim)
     )
     resp = _client(q, tmp_path).post(
         "/deploy/git",
@@ -1065,7 +1065,7 @@ def test_dry_run_materializes_no_generated_files(tmp_path, monkeypatch):
         return real_rmtree(path, **kwargs)
 
     monkeypatch.setattr(pipeline.shutil, "rmtree", _spy)
-    monkeypatch.setattr(deploy_mod, "clone_source", _fake_clone())
+    monkeypatch.setattr(pipeline, "clone_source", _fake_clone())
     resp = _client(_queries(), tmp_path).post(
         "/deploy/git",
         params={"dry_run": "true"},

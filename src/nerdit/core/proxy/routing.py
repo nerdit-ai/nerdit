@@ -30,8 +30,8 @@ _DEFAULT_SCHEME_PORTS = {"https": 443, "http": 80}
 
 
 #: Separator between the service half and the domain half of a domain route's
-#: `@id` (P26 D-P26-2). `@` is not a legal character in a service NAME
-#: (`core/secrets.py`'s `_DNS_LABEL_RE`) nor in a DNS name, so
+#: `@id`. `@` is not a legal character in a service NAME
+#: (`utils/names.py`'s `DNS_LABEL_RE`) nor in a DNS name, so
 #: `nerdit-route-<svc>@<dom>` splits unambiguously on the FIRST `@` and a
 #: default id can never be mistaken for a domain one.
 _DOMAIN_SEP = "@"
@@ -43,7 +43,7 @@ def _route_id(service_name: str) -> str:
 
 
 def _domain_route_id(service_name: str, domain: str) -> str:
-    """Return the stable Caddy `@id` for one custom-domain route (P26 D-P26-2).
+    """Return the stable Caddy `@id` for one custom-domain route.
 
     Composite by design: every `@id`-keyed site in the proxy (prune, `GET
     /routes`, deregister, the cutover's all-or-nothing repoint) learns the
@@ -72,7 +72,7 @@ def _split_route_id(route_id: str) -> tuple[str, str | None]:
 
 
 def ordering_violations(live: Mapping[str, LiveRoute]) -> list[str]:
-    """Domain-route ids that sit AFTER the first default route (P26 S-W4).
+    """Domain-route ids that sit AFTER the first default route.
 
     Ordering is a **drift dimension**, not a one-shot placement: Caddy serves
     the first matching route, so in path mode a default route (matching
@@ -106,10 +106,10 @@ def ordering_violations(live: Mapping[str, LiveRoute]) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# Mode-aware seams (Invariant #2). These three route-shaping functions plus a  #
-# fourth, TLS-only site — `ProxyManager._tls_subjects` (feeding              #
-# `_bootstrap_config`) — are the ONLY code that knows about `mode`; P3.5   #
-# (subdomain) flips them, nothing else.                                        #
+# Mode-aware seams (Invariant #2). These three route-shaping functions plus a #
+# fourth, TLS-only site — `ProxyManager._tls_subjects` (feeding               #
+# `_bootstrap_config`) — are the ONLY code that knows about `mode`; a mode    #
+# flip changes them, nothing else.                                            #
 # --------------------------------------------------------------------------- #
 
 
@@ -117,7 +117,7 @@ def generate_route(service_name: str, *, mode: str = "path") -> str:
     """Return the route DATA persisted in `service_endpoints.route`.
 
     * `mode='path'`      → `"/<service_name>"` (the path prefix Caddy strips)
-    * `mode='subdomain'` → `""` (P3.5: identity moves to the Host header)
+    * `mode='subdomain'` → `""` (identity moves to the Host header)
     """
     if mode == "subdomain":
         return ""
@@ -145,7 +145,7 @@ def public_url_for(
     `public_port` overrides the port ADVERTISED in the URL (not the bind):
     when an external proxy fronts the embedded Caddy (public 443 → loopback
     `https_port`), the reachable port differs from the bound one. `None`
-    keeps the historical behaviour (advertise `https_port`).
+    advertises `https_port`.
     """
     if route is None:
         return None
@@ -160,7 +160,7 @@ def public_url_for(
 def domain_url_for(
     domain: str, *, scheme: str, https_port: int, public_port: int | None = None
 ) -> str:
-    """Return the public URL of a custom domain (P26 D-P26-14).
+    """Return the public URL of a custom domain.
 
     Not mode-aware, and deliberately so: a custom domain is served at its own
     ROOT in both proxy modes (the Host matcher carries the identity), which is
@@ -187,7 +187,7 @@ class RouteSpec:
     route: str  # persisted projection (generate_route output)
     caddy_id: str
     auth: EdgeAuthMaterial | None = None
-    """(P25 D-P25-8) Resolved edge-auth credential material, or ``None``.
+    """Resolved edge-auth credential material, or ``None``.
 
     ``None`` means the route serves openly. Never a *declaration*: by the time
     a spec exists the ``${secrets.…}`` reference has been resolved and hashed,
@@ -197,7 +197,7 @@ class RouteSpec:
     """
 
     kind: Literal["default", "domain"] = "default"
-    """(P26 D-P26-2) Which of a service's routes this is.
+    """Which of a service's routes this is.
 
     A service has exactly one ``"default"`` spec (the path prefix or the
     ``<service>.<base>`` Host) and one ``"domain"`` spec per custom domain.
@@ -209,11 +209,11 @@ class RouteSpec:
     shape: Literal["host", "path"] = "path"
     """The matcher shape this spec expects to be emitted and found live.
 
-    Per-spec rather than per-mode (P26 WP1): a domain route is Host-shaped in
+    Per-spec rather than per-mode: a domain route is Host-shaped in
     BOTH proxy modes, so the drift classifier must compare a live route against
     the shape ITS OWN spec asks for, never against the manager's mode-derived
-    ``_expected_shape``. Defaults to ``"path"`` so every pre-WP1 keyword
-    construction keeps its meaning unchanged.
+    ``_expected_shape``. Defaults to ``"path"``, the default route's shape in
+    path mode.
     """
 
     host: str | None = None
@@ -231,26 +231,20 @@ class LiveRoute:
     left behind by a mode flip when the upstream port happens to match.
 
     `count` is how many live route objects carry this `@id` (normally 1).
-    Duplicates arise from the pre-PATCH `POST /id` upsert (which appended on
-    Caddy 2.6.2) or an append race; `dial`/`shape` reflect the LAST
-    occurrence — the one the id map resolves to — and reconcile self-heals the
-    stale twins via `CaddyAdmin.dedupe_route`.
+    Duplicates arise from an append race or an older `POST /id` upsert (which
+    appended on Caddy 2.6.2); `dial`/`shape` reflect the LAST occurrence — the
+    one the id map resolves to — and reconcile self-heals the stale twins via
+    `CaddyAdmin.dedupe_route`.
 
-    A plain `dataclasses.dataclass` (Track B W22.M), not a
-    `typing.NamedTuple`: the NamedTuple form shadowed `tuple.count`
-    with this class's own `count` *field*, which mypy correctly flagged as an
-    `[assignment]` incompatibility (the base `tuple.count` is a *method*).
-    Nothing in this codebase used the tuple protocol (indexing, unpacking, or
-    positional construction beyond the keyword sites in
-    `CaddyAdmin.live_routes` and the tests) — equality/repr semantics are
-    unchanged by the switch, so the mypy override is deleted rather than kept.
+    A dataclass rather than a `NamedTuple` because the `count` field would
+    shadow `tuple.count`.
     """
 
     dial: str | None
     shape: str
     count: int = 1
     auth_fingerprint: str | None = None
-    """(P25 D-P25-7) Digest of the live ``authentication`` handler, or ``None``.
+    """Digest of the live ``authentication`` handler, or ``None``.
 
     ``None`` means the live route carries no auth handler; :data:`_AUTH_UNPARSABLE`
     means it carries one whose shape is not what we emit. Reconcile compares this
@@ -260,7 +254,7 @@ class LiveRoute:
     """
 
     index: int = -1
-    """(P26 S-W4) Position of this id in Caddy's live route array.
+    """Position of this id in Caddy's live route array.
 
     Of the LAST occurrence, for the same reason ``dial``/``shape`` are: that is
     the object the id map resolves to. Feeds :func:`ordering_violations`, the
@@ -280,14 +274,30 @@ class LiveRoute:
 _AUTH_UNPARSABLE = "unparsable"
 
 
+def _find_handler(node: Any, name: str) -> dict[str, Any] | None:
+    """Return the first handler object named `name` anywhere in `node`, else `None`."""
+    if isinstance(node, dict):
+        if node.get("handler") == name:
+            return node
+        for value in node.values():
+            found = _find_handler(value, name)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_handler(item, name)
+            if found is not None:
+                return found
+    return None
+
+
 def _extract_auth_fingerprint(route_obj: dict[str, Any]) -> str | None:
     """Digest the live `authentication` handler of a route object.
 
-    Sibling of `_extract_dial`: the same recursive walk, tolerant of both
-    emitted shapes (path mode nests the handler inside a `subroute`, subdomain
-    mode keeps it at the top level) and of unknown sibling keys — Caddy's own
-    Caddyfile adapter emits an extra `hash_cache` key we deliberately do not
-    write, and a newer Caddy may add more.
+    Tolerant of both emitted shapes (path mode nests the handler inside a
+    `subroute`, subdomain mode keeps it at the top level) and of unknown
+    sibling keys — Caddy's own Caddyfile adapter emits an extra `hash_cache`
+    key we deliberately do not write, and a newer Caddy may add more.
 
     Tri-state, matching `nerdit.core.proxy.edgeauth.load_edge_auth`'s
     posture: no handler → `None`; exactly one `http_basic` account carrying
@@ -295,23 +305,7 @@ def _extract_auth_fingerprint(route_obj: dict[str, Any]) -> str | None:
     ANY other shape (another provider, zero or several accounts, a missing key)
     → `_AUTH_UNPARSABLE`, i.e. drift.
     """
-
-    def walk(node: Any) -> dict[str, Any] | None:
-        if isinstance(node, dict):
-            if node.get("handler") == "authentication":
-                return node
-            for value in node.values():
-                found = walk(value)
-                if found is not None:
-                    return found
-        elif isinstance(node, list):
-            for item in node:
-                found = walk(item)
-                if found is not None:
-                    return found
-        return None
-
-    handler = walk(route_obj)
+    handler = _find_handler(route_obj, "authentication")
     if handler is None:
         return None
     providers = handler.get("providers")
@@ -338,30 +332,17 @@ def _extract_dial(route_obj: dict[str, Any]) -> str | None:
     """Pull the first `reverse_proxy` upstream `dial` out of a route object.
 
     Tolerant of both shapes we emit (path mode wraps the proxy in a `subroute`;
-    subdomain mode proxies directly), and of Caddy's config normalization, by
-    recursively scanning `handle` lists for a `reverse_proxy` handler.
+    subdomain mode proxies directly), and of Caddy's config normalization.
+    Only the first `reverse_proxy` is read: we emit one per route, so a
+    missing or malformed dial there reads as drift (`None`).
     """
-
-    def walk(node: Any) -> str | None:
-        if isinstance(node, dict):
-            if node.get("handler") == "reverse_proxy":
-                upstreams = node.get("upstreams") or []
-                if upstreams and isinstance(upstreams[0], dict):
-                    dial = upstreams[0].get("dial")
-                    if isinstance(dial, str):
-                        return dial
-            for value in node.values():
-                found = walk(value)
-                if found:
-                    return found
-        elif isinstance(node, list):
-            for item in node:
-                found = walk(item)
-                if found:
-                    return found
-        return None
-
-    return walk(route_obj)
+    handler = _find_handler(route_obj, "reverse_proxy")
+    upstreams = (handler.get("upstreams") if handler else None) or []
+    if upstreams and isinstance(upstreams[0], dict):
+        dial = upstreams[0].get("dial")
+        if isinstance(dial, str):
+            return dial
+    return None
 
 
 def _route_shape(route_obj: dict[str, Any]) -> str:

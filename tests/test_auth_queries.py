@@ -238,9 +238,9 @@ async def test_insert_audit_log_roundtrip(queries):
 
 def test_sentinels_are_admin():
     assert LEGACY_ADMIN.role == TokenRole.admin
-    assert LEGACY_ADMIN.is_legacy_admin is True
+    assert LEGACY_ADMIN.name == "legacy-admin"
     assert LOCAL.role == TokenRole.admin
-    assert LOCAL.is_legacy_admin is False
+    assert LOCAL.name == "local"
     assert LEGACY_ADMIN.is_admin and LOCAL.is_admin
 
 

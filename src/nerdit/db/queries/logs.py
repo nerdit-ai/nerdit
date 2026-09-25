@@ -40,6 +40,17 @@ class LogQueries(QueriesBase):
         await self._db.conn.commit()
 
     @_serialized
+    async def append_logs(
+        self, job_id: str, messages: Sequence[str], stream: LogStream = LogStream.stdout
+    ) -> None:
+        """Append log lines in order with one INSERT batch and one commit."""
+        await self._db.conn.executemany(
+            "INSERT INTO job_logs (job_id, stream, message) VALUES (?, ?, ?)",
+            [(job_id, stream.value, m) for m in messages],
+        )
+        await self._db.conn.commit()
+
+    @_serialized
     async def replace_crash_tail(self, job_id: str, lines: list[str]) -> None:
         """Atomically replace the latest crash capture, preserving ordinary log history.
 

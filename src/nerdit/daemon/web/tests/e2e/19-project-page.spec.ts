@@ -689,7 +689,7 @@ test("deleting a multi-service project needs its name typed, then returns to the
   await page.getByTestId("confirm-phrase-input").fill("asso");
 
   const deleteReq = page.waitForRequest(
-    (r) => r.method() === "DELETE" && new URL(r.url()).pathname === "/api/projects/asso"
+    (r) => r.method() === "DELETE" && new URL(r.url()).pathname === "/api/projects/prj_asso000000000003"
   );
   await confirmButton.click();
 
@@ -717,7 +717,7 @@ test("the project delete carries the data purge only when asked", async ({ page 
   await page.getByTestId("confirm-phrase-input").fill("asso");
 
   const deleteReq = page.waitForRequest(
-    (r) => r.method() === "DELETE" && new URL(r.url()).pathname === "/api/projects/asso"
+    (r) => r.method() === "DELETE" && new URL(r.url()).pathname === "/api/projects/prj_asso000000000003"
   );
   await dialog.getByRole("button", { name: "Delete", exact: true }).click();
   expect(new URL((await deleteReq).url()).searchParams.get("purge")).toBe("secrets,data");

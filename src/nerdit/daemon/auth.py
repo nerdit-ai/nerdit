@@ -33,7 +33,7 @@ class Principal:
     `token_id` is `None` for the legacy global token and the `token=None`
     bypass (neither is a row in `api_tokens`). `role` drives every coarse
     and fine-grained authorization decision. Quotas (`max_gpus`,
-    `max_concurrent_jobs`) are enforced atomically at job submission (S4).
+    `max_concurrent_jobs`) are enforced atomically at job submission.
     """
 
     token_id: str | None
@@ -41,13 +41,13 @@ class Principal:
     role: TokenRole
     max_gpus: int | None = None
     max_concurrent_jobs: int | None = None
-    is_legacy_admin: bool = False
-    # `None` = unscoped, today's behaviour. A `frozenset`
-    # keeps the frozen dataclass hashable.
+    # `None` = unscoped. A `frozenset` keeps the frozen dataclass hashable.
     scope_services: frozenset[str] | None = None
     # Carried, not just compared and dropped, so `/capabilities`
     # can project it without any I/O — the middleware already has the row.
     expires_at: datetime | None = None
+    # Link-only confidentiality restriction; never widens ownership or role.
+    project_id: str | None = None
 
     @property
     def is_admin(self) -> bool:
@@ -58,7 +58,7 @@ class Principal:
         """Whether `service_name`, or the project its row carries, is in scope.
 
         An unscoped principal (`scope_services is None`) is in scope for
-        everything; an empty scope grants nothing (P25 D-P25-3 fail-closed).
+        everything; an empty scope grants nothing (fail closed).
 
         Args:
             service_name: The label being acted on.
@@ -72,7 +72,7 @@ class Principal:
         return project is not None and project in self.scope_services
 
 
-# (P27 WP-C1) Synthetic tunnel principals carry `token_id = "link:<node_id>"`
+# Synthetic tunnel principals carry `token_id = "link:<node_id>"`
 # — a stable ownership + audit identity that is deliberately NOT a row in
 # `api_tokens`. Row-backed per-token quota reads (`count_active_jobs_public`
 # is fail-closed: missing row => cap 0) must route around them; the daemon-wide
@@ -102,22 +102,21 @@ CLOUD_CONTROL_ENTITLEMENT = "entitlement"
 CLOUD_CONTROL_GITHUB_TOKEN = "github-token"  # noqa: S105 - a header value, not a secret
 #: The push-to-deploy nudge, same carrier, its own value.
 CLOUD_CONTROL_GIT_NUDGE = "git-nudge"
+CLOUD_CONTROL_PUBLIC_ADDRESS = "public-address"
+CLOUD_CONTROL_PROJECT_DISCOVERY = "project-discovery"
 
 
 # Sentinel principals for the two permissive-by-default bypasses. Both map to
-# `admin` so the frozen baseline (which uses the global token or no token at
-# all) keeps full access.
+# `admin` so a daemon run with the global token or no token keeps full access.
 LEGACY_ADMIN = Principal(
     token_id=None,
     name="legacy-admin",
     role=TokenRole.admin,
-    is_legacy_admin=True,
 )
 LOCAL = Principal(
     token_id=None,
     name="local",
     role=TokenRole.admin,
-    is_legacy_admin=False,
 )
 # Fail-closed default for a request that reached a route without the auth
 # middleware attaching a principal. This should be unreachable in the real app
@@ -183,7 +182,11 @@ def require_cloud_principal(request: Request, control_value: str) -> Principal:
     """
     principal = current_principal(request)
     header = request.headers.get(CLOUD_CONTROL_HEADER)
-    if not is_link_token_id(principal.token_id) or header != control_value:
+    if (
+        not is_link_token_id(principal.token_id)
+        or principal.project_id is not None
+        or header != control_value
+    ):
         raise NerditError(
             403,
             "link.cloud_principal_required",
@@ -264,8 +267,11 @@ def may_manage_job(request: Request, job: Job) -> bool:
 
     Use the same predicate as the write gate so projected actions match permissions.
     """
+    principal = current_principal(request)
+    if principal.project_id is not None and principal.project_id != job.project_id:
+        return False
     return _owner_or_admin_allows(
-        current_principal(request),
+        principal,
         getattr(job, "submitted_by_token", None),
         getattr(job, "service_name", None),
         getattr(job, "project", None),
@@ -275,12 +281,15 @@ def may_manage_job(request: Request, job: Job) -> bool:
 def require_owner_or_admin(request: Request, job: Job) -> Principal:
     """Ensure the principal owns `job` or is an admin, and that `job` is in scope.
 
-    NULL-owner jobs (pre-P1 rows and legacy/local submissions) are
+    NULL-owner jobs (pre-ownership rows and legacy/local submissions) are
     **admin-only**: a non-admin scoped token can never act on a job it does not
     explicitly own. A row with no `service_name` (legacy batch leftovers) is
     outside every scope — fail closed. Returns the principal on success; raises
     `NerditError` (403 `forbidden`) otherwise.
     """
+    principal = current_principal(request)
+    if principal.project_id is not None and principal.project_id != job.project_id:
+        raise owner_denial()
     return _check_owner(
         request,
         getattr(job, "submitted_by_token", None),
@@ -294,7 +303,7 @@ def owner_denial() -> NerditError:
     """The one 403 every owner gate raises — rows, claims and projects alike.
 
     One envelope on purpose: a distinct message per subject would be an oracle
-    for "claimed, not deployed" or "project reserved, no row" (P39 / P40b).
+    for "claimed, not deployed" or "project reserved, no row".
     """
     return NerditError(
         403,
@@ -307,17 +316,24 @@ def owner_denial() -> NerditError:
 def require_project_owner_or_admin(request: Request, project: Project) -> Principal:
     """Ensure the principal owns `project` or is an admin, and that it is in scope.
 
-    The subject is `projects.submitted_by_token` (P40b / D-P40-5), never the
-    acting principal; a NULL owner is admin-only, the `require_owner_or_admin`
-    posture. The scope name is the project name (a label until P40d).
+    The subject is `projects.submitted_by_token` (D-P40-5), never the acting
+    principal; a NULL owner is admin-only, the `require_owner_or_admin`
+    posture. The scope name is the project name.
     """
+    principal = current_principal(request)
+    if principal.project_id is not None and principal.project_id != project.id:
+        raise owner_denial()
     return _check_owner(request, project.submitted_by_token, project.name, owner_denial())
 
 
 def require_service_scope(
-    request: Request, service_name: str, *, project: str | None = None
+    request: Request,
+    service_name: str,
+    *,
+    project: str | None = None,
+    display_name: str | None = None,
 ) -> Principal:
-    """Ensure a scoped token may act on `service_name` (D-P25-3 leg b).
+    """Ensure a scoped token may act on `service_name`.
 
     For routes whose target is a NAME, not a Job row (create paths, secrets,
     app-config, template deploys). Admin bypasses; an unscoped token passes;
@@ -330,11 +346,12 @@ def require_service_scope(
         return principal
     if principal.in_scope(service_name, project):
         return principal
-    raise _scope_denial(principal, service_name)
+    # ID-based callers need not know the canonical name used for membership.
+    raise _scope_denial(principal, display_name if display_name is not None else service_name)
 
 
-class QuotaExceeded(Exception):  # noqa: N818 — named by the P1 plan/contract
-    """Raised when an atomic quota reservation would breach a token's caps (S4).
+class QuotaExceeded(Exception):  # noqa: N818 — public API name
+    """Raised when an atomic quota reservation would breach a token's caps.
 
     Routes catch this and surface a 403 `quota_exceeded` envelope. `reason`
     is a short machine-friendly label (e.g. `max_concurrent_jobs`); `limit`

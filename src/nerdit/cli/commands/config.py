@@ -12,7 +12,7 @@ import uuid
 
 import typer
 
-from nerdit.cli.display import console, render_client_error
+from nerdit.cli.display import call_or_exit, console, render_client_error
 
 app_config_app = typer.Typer(
     name="app",
@@ -68,11 +68,7 @@ async def _get_async(section: str | None) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        data = await client.get_config(section)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    data = await call_or_exit(client.get_config(section))
 
     views = data if isinstance(data, list) else [data]
     for view in views:
@@ -203,11 +199,7 @@ async def _app_get_async(name: str) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        view = await client.get_app_config(name)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    view = await call_or_exit(client.get_app_config(name))
 
     console.print(
         f"[bold]{view.get('service_name')}[/bold]  "

@@ -35,7 +35,7 @@ from starlette.requests import Request
 from nerdit.core.events import EventBus
 from nerdit.daemon.auth import hash_token
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers
-from nerdit.daemon.limits import _MAX_SSE_REPLAY, EVENTS_STREAM_CONCURRENCY_MAX
+from nerdit.daemon.limits import EVENTS_STREAM_CONCURRENCY_MAX, MAX_SSE_REPLAY
 from nerdit.daemon.middleware import ScopedTokenAuthMiddleware
 from nerdit.daemon.routes.events import (
     _MAX_CATCHUP,
@@ -772,11 +772,11 @@ async def test_a_sweep_between_the_bounds_read_and_the_replay_still_gaps(feed):
 async def test_gap_frame_on_overflow_only_past_the_boundary(feed):
     """The ``limit + 1`` boundary, not a "a full page means probably more" guess.
 
-    Exactly ``_MAX_SSE_REPLAY`` rows behind the cursor is a *complete* replay
+    Exactly ``MAX_SSE_REPLAY`` rows behind the cursor is a *complete* replay
     and must not raise a gap; one more row must.
     """
     queries, bus, request = feed
-    await _seed_n(queries, _MAX_SSE_REPLAY)
+    await _seed_n(queries, MAX_SSE_REPLAY)
 
     agen = _event_frames(request, bus, queries, 0)
     try:
@@ -786,7 +786,7 @@ async def test_gap_frame_on_overflow_only_past_the_boundary(feed):
     finally:
         await agen.aclose()
 
-    await _seed_n(queries, 1)  # now _MAX_SSE_REPLAY + 1 rows behind the cursor
+    await _seed_n(queries, 1)  # now MAX_SSE_REPLAY + 1 rows behind the cursor
     agen = _event_frames(request, bus, queries, 0)
     try:
         first = await _drain(agen, 1)
@@ -807,7 +807,7 @@ async def test_gap_frame_on_a_pruned_cursor_even_with_a_tiny_backlog(feed):
     """The finding-4 regression pin.
 
     Retention swept past the client's cursor, leaving **far fewer** than
-    ``_MAX_SSE_REPLAY`` newer rows — so every count-based check reads this as a
+    ``MAX_SSE_REPLAY`` newer rows — so every count-based check reads this as a
     healthy, complete replay while the client silently loses everything between
     its cursor and the retained minimum. Only the retained-minimum comparison
     catches it, and the frame must precede the replay.
@@ -816,7 +816,7 @@ async def test_gap_frame_on_a_pruned_cursor_even_with_a_tiny_backlog(feed):
     await _seed_n(queries, 10)
     while await queries.sweep_events(6):  # keep ids 5..10
         pass
-    assert await queries.min_event_id() == 5
+    assert (await queries.feed_bounds())[0] == 5
 
     agen = _event_frames(request, bus, queries, 2)
     try:
@@ -834,7 +834,7 @@ async def test_gap_frame_on_a_pruned_cursor_even_with_a_tiny_backlog(feed):
 
 @pytest.mark.asyncio
 async def test_a_cursor_exactly_one_below_the_retained_minimum_is_not_a_gap(feed):
-    """``last_id + 1 == min_event_id()`` is a perfectly contiguous resume."""
+    """``last_id + 1 == feed_bounds()[0]`` is a perfectly contiguous resume."""
     queries, bus, request = feed
     await _seed_n(queries, 10)
     while await queries.sweep_events(6):
@@ -884,7 +884,7 @@ async def test_a_cursor_above_the_retained_maximum_gaps_and_then_flows(feed):
 
 @pytest.mark.asyncio
 async def test_an_empty_table_is_never_a_gap(feed):
-    """``min_event_id() == 0`` means "nothing retained", not "you were pruned"."""
+    """``feed_bounds()[0] == 0`` means "nothing retained", not "you were pruned"."""
     queries, bus, request = feed
 
     async def inject() -> None:

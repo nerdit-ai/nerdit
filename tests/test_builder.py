@@ -14,11 +14,13 @@ from nerdit.core.builder import (
     DEFAULT_NODE_PORT,
     DEFAULT_PYTHON_PORT,
     GENERATED_DOCKERFILE_NAME,
-    NODE_BASE_IMAGE,
     PYTHON_BASE_IMAGE,
     BuildpackNotSupported,
     detect,
 )
+from nerdit.core.node_runtime import DEFAULT_NODE_VERSION
+
+NODE_BASE_IMAGE = f"node:{DEFAULT_NODE_VERSION}-slim"
 
 
 def _write_package_json(tmp_path, scripts=None, workspaces=None):
@@ -319,6 +321,19 @@ def test_f3_builder_requirements_tree_refs_fall_back(tmp_path, dep):
     install = _idx(text, "RUN pip install --no-cache-dir -r requirements.txt")
     assert source_copy < install, f"{dep!r} must install after COPY . ."
     assert "COPY requirements.txt ./" not in text
+
+
+def test_symlinked_requirements_is_not_read(tmp_path):
+    """A requirements.txt symlink (a git clone keeps them) is never followed."""
+    outside = tmp_path / "outside.txt"
+    outside.write_text("flask\n")
+    ctx = tmp_path / "ctx"
+    ctx.mkdir()
+    (ctx / "requirements.txt").symlink_to(outside)
+
+    text = detect(ctx).dockerfile_text
+
+    assert _idx(text, "COPY . .") < _idx(text, "RUN pip install --no-cache-dir -r requirements.txt")
 
 
 def test_f3_builder_plain_requirements_keep_fast_path(tmp_path):

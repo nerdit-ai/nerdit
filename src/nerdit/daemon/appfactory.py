@@ -21,6 +21,7 @@ from starlette.types import Scope
 
 from nerdit import __version__
 from nerdit.config.settings import NerditSettings
+from nerdit.core.project_identity import PROJECT_MCP_PATH
 from nerdit.daemon.audit import AuditMiddleware
 from nerdit.daemon.bodylimit import BodyLimitMiddleware
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers
@@ -151,8 +152,8 @@ def build_app(
             )
         if importlib.util.find_spec("mcp") is None:
             raise RuntimeError(
-                "[mcp].http_enabled requires the optional 'mcp' extra. Install it "
-                "with: pip install 'nerdit[mcp]' — or disable [mcp].http_enabled."
+                "The bundled mcp dependency is missing; this installation is incomplete. "
+                "Repair it with: python -m pip install --upgrade nerdit."
             )
 
     app = FastAPI(
@@ -184,7 +185,8 @@ def build_app(
         get_queries=lambda: getattr(app.state, "queries", None),
         require_idempotency_key=settings.security.require_idempotency_key,
     )
-    app.add_middleware(BodyLimitMiddleware)
+    # Boot-frozen: `max_upload_bytes` is a restart key.
+    app.add_middleware(BodyLimitMiddleware, max_upload_bytes=settings.daemon.max_upload_bytes)
     app.add_middleware(
         AuditMiddleware,
         get_queries=lambda: getattr(app.state, "queries", None),
@@ -271,6 +273,7 @@ def build_app(
         # directly instead of 307-redirecting to `/api/mcp/` (see the class
         # docstring); both spellings then reach the wrapped transport.
         app.router.routes.append(_McpMount("/api/mcp", app=mcp_asgi))
+        app.router.routes.append(_McpMount(PROJECT_MCP_PATH, app=mcp_asgi))
         app.state.mcp_server = mcp_server
 
     mount_dashboard(app)

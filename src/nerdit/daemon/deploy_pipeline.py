@@ -39,8 +39,8 @@ from nerdit.config.build import BuildSettings
 from nerdit.config.defaults import ZIP_EXCLUDE_PATTERNS, app_image_repo, app_image_tag
 from nerdit.config.project import (
     _DISPLAY_UNSAFE_RE,
-    _DNS_LABEL_RE,
     PROJECT_CONFIG_NAME,
+    SECRET_REF_RE,
     DeployConfig,
     is_project_declaration,
     shared_secret_keys,
@@ -59,6 +59,7 @@ from nerdit.core.gitsource import (
     _AUTH_SIGNATURES,
     GITHUB_INSTALLATION_REF,
     GitSourceError,
+    GitSourceInfo,
     clone_source,
     git_source_meta,
     github_repo_slug,
@@ -89,11 +90,12 @@ from nerdit.daemon.views.hosted import load_hosted_context
 from nerdit.daemon.views.service import (
     _cutover_in_progress_error,
     _run_in_progress_error,
-    _service_response,
+    service_view,
 )
 from nerdit.db.models import Job, JobKind, JobStatus, Project, TokenRole
 from nerdit.db.queries import ProjectOwned, Queries, ServiceNameClaimed, ServiceNameTaken
 from nerdit.utils.ids import generate_id
+from nerdit.utils.names import DNS_LABEL_RE
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +137,7 @@ def _warn_unknown_deploy_keys(section: dict, app_name: str) -> list[str]:
     return [*shown, suffix.strip()] if suffix else shown
 
 
-# (Agent-DX) The one definition of each advisory wording. Both the deploy-result
+# The one definition of each advisory wording. Both the deploy-result
 # `hints` channel and the `?dry_run` plan `warnings` render THESE strings,
 # so the plan and the response can never drift apart.
 _UNKNOWN_KEYS_HINT = (
@@ -143,10 +145,8 @@ _UNKNOWN_KEYS_HINT = (
     "Check them against the [deploy] schema (there is no `build` key — run the "
     "build in your Dockerfile)."
 )
-# (P26 WP0 / L1) The hint named the trap but not the way out: an operator who
-# reads "set your base path" has no idea the daemon has a mode that removes the
-# requirement entirely. Naming `subdomain` here is the whole of WP0 —
-# `docs/guide/proxy.md` §7 has documented that mode since P3.5.
+# Names the way out as well as the trap: an operator told to "set your base
+# path" does not know the daemon has a mode that removes the requirement.
 _PATH_MODE_HINT = (
     "This node serves apps in 'path' proxy mode: the app is reachable at "
     "/{name}/, so a frontend build must set its base path to '/{name}/' "
@@ -155,12 +155,11 @@ _PATH_MODE_HINT = (
     "at the root of its own hostname and needs no base path."
 )
 
-# (P34, field failure 2026-08-23) The deploy verbs return the instant the row is
-# written — the build and the first launch happen off-tick — so a 201 saying
-# `status: building` is the NORMAL success shape, not a finished deploy. The
-# agent that hit this read `hints: []` beside it and concluded the deploy had
-# landed; the crash-loop was only discoverable by knowing to call
-# `get_events`/`diagnose_service` unprompted.
+# The deploy verbs return the instant the row is written (the build and the
+# first launch happen off-tick), so a 201 saying `status: building` is the
+# NORMAL success shape, not a finished deploy. An agent reading `hints: []`
+# beside it concludes the deploy landed, and a crash-loop is then only
+# discoverable by knowing to call `get_events`/`diagnose_service` unprompted.
 #
 # Two channels close that loop, carrying deliberately the SAME sentence so a
 # reader that parses only one of them still learns the whole fact:
@@ -170,13 +169,13 @@ _PATH_MODE_HINT = (
 #   call which blocks until the outcome is KNOWN.
 # * a `hints` entry carrying the same `why`, which is what makes "hints is
 #   never empty on an in-flight deploy" true. Both pre-existing hints are
-#   conditional (unknown keys / path mode AND a live proxy), so the empty list
-#   was the common case on exactly the nodes a remote agent works on.
+#   conditional (unknown keys / path mode AND a live proxy), so an empty list
+#   would be the common case on exactly the nodes a remote agent works on.
 _ASYNC_DEPLOY_WHY = (
     "deploy is asynchronous; this returns when the service is healthy or "
     "failed and includes the diagnosis on failure"
 )
-# (D) The failure-side companion: a deploy landing on a row that is ALREADY
+# The failure-side companion: a deploy landing on a row that is ALREADY
 # failed (a redeploy over a crash-looping app) must not answer with the generic
 # async sentence alone. Ordered FIRST for the same reason the unknown-key hint
 # is — it is about state the caller already owns. The interpolated `detail` is
@@ -280,7 +279,7 @@ def _parse_deploy_defaults(data: dict, fallback_name: str) -> tuple[dict, list[s
             hint=_DEPLOY_SHAPE_HINT,
         ) from exc
     # Non-fatal visibility for keys this daemon silently drops — into the
-    # daemon log, and (Agent-DX) back to the caller via the returned names.
+    # daemon log, and back to the caller via the returned names.
     unknown = _warn_unknown_deploy_keys(section, fallback_name)
     return section, unknown
 
@@ -316,7 +315,7 @@ _DEPLOY_SHAPE_HINT = (
 )
 
 
-#: (P40d) One declared service handed to `_finalize_deploy` by `apply_project`:
+#: One declared service handed to `_finalize_deploy` by `apply_project`:
 #: the judged project row (`None` only on a dry run of a project that does not
 #: exist yet -- a dry run creates nothing), the service name inside it, and its
 #: already validated `[services.<svc>]` table. A tuple, not a model (D-P40-12).
@@ -416,9 +415,43 @@ def reject_non_service_row(existing: Job | None, name: str) -> None:
         )
 
 
+# The built dashboard SPA is `index.html` + `assets/` and fetches `/api`; with
+# the apex on in path mode, service routes sit AHEAD of the apex catch-all, so
+# a service with one of these names would capture the dashboard's bearer
+# requests or replace its bundle.
+APEX_RESERVED_NAMES = frozenset({"api", "assets"})
+
+
+def apex_shadow_active(settings: Any) -> bool:
+    """Whether the dashboard is served at the proxy apex (path mode only)."""
+    proxy = getattr(settings, "proxy", None)
+    return bool(
+        getattr(proxy, "enabled", False)
+        and getattr(proxy, "dashboard_apex", False)
+        and getattr(proxy, "mode", "path") == "path"
+    )
+
+
+def reject_apex_shadow(request: Request, name: str, *, fresh: bool = True) -> None:
+    """Refuse a fresh service whose path route would shadow the apex dashboard.
+
+    Existing rows keep redeploying; `/doctor` flags them instead.
+    """
+    if fresh and name in APEX_RESERVED_NAMES and apex_shadow_active(request.app.state.settings):
+        raise NerditError(
+            422,
+            "service.reserved_name",
+            f"'{name}' is reserved while the dashboard is served at the proxy apex.",
+            hint=(
+                "The dashboard's /api and /assets paths live there; pick another "
+                "name or disable [proxy].dashboard_apex."
+            ),
+        )
+
+
 def _validate_request_name(name: str) -> None:
     """Validate request names before TOML parsing so errors identify the right input."""
-    if not _DNS_LABEL_RE.match(name):
+    if not DNS_LABEL_RE.fullmatch(name):
         raise NerditError(
             422,
             "deploy.invalid",
@@ -707,13 +740,12 @@ def resolve_effective_fields(
         eff_port = prev_cfg.get("port")
     eff_start = start if start is not None else zip_deploy.get("start")
     eff_health = health if health is not None else zip_deploy.get("health")
-    # (P14 WP-C1) Probe kind is TOML-only in v1 (no form/body field); the ZIP
+    # Probe kind is TOML-only (no form/body field); the ZIP
     # [deploy].health_type value wins, else the prior row's blob type carries
     # forward on a SILENT redeploy so a tcp probe survives. But if THIS request
     # supplies an explicit health path (form field or [deploy].health), the
     # redeploy is not silent about the probe: an explicit path is a request for
-    # an http probe, so the prior tcp type must NOT be carried forward and
-    # discard it (contract review MINOR-1).
+    # an http probe, so the prior tcp type must NOT be carried forward.
     explicit_health_path = health is not None or "health" in zip_deploy
     eff_health_type = zip_deploy.get("health_type")
     if eff_health_type is None and existing is not None and not explicit_health_path:
@@ -726,7 +758,7 @@ def resolve_effective_fields(
     eff_cpu_limit = zip_deploy.get("cpu_limit")
     if eff_cpu_limit is None and existing is not None:
         eff_cpu_limit = prev_cfg.get("cpu_limit")
-    # P14 WP-A1: named volumes are a list (no form field) — the ZIP [deploy]
+    # Named volumes are a list (no form field): the ZIP [deploy]
     # value wins, else the prior row's list carries forward on a redeploy.
     eff_volumes = zip_deploy.get("volumes")
     if eff_volumes is None and existing is not None:
@@ -760,7 +792,7 @@ def resolve_effective_fields(
     eff_auto_deploy = zip_deploy.get("auto_deploy")
     if eff_auto_deploy is None and existing is not None:
         eff_auto_deploy = prev_cfg.get("auto_deploy")
-    # (P25, D-P25-5) `edge_auth` is the eighth no-form-field [deploy] key and
+    # `edge_auth` is the eighth no-form-field [deploy] key (D-P25-5) and
     # a literal twin of `release`: the source's [deploy] table wins, else the
     # prior row's persisted blob carries forward. The carry-forward is the
     # SECURITY-relevant half here — a redeploy from a source that stays silent
@@ -852,7 +884,7 @@ def assemble_build_fields(
         build_fields["memory_limit"] = deploy_cfg.memory_limit
     if deploy_cfg.cpu_limit is not None:
         build_fields["cpu_limit"] = deploy_cfg.cpu_limit
-    # P14 WP-A1: persist the user-declared named volumes (the validated spec
+    # Persist the user-declared named volumes (the validated spec
     # list). `_ensure_data_volume` folds in the implicit `data:/data`
     # after the config blob is assembled, so this carries only the explicit
     # set. Absent ⇒ the implicit volume is still added below.
@@ -873,7 +905,7 @@ def assemble_build_fields(
         build_fields["cutover"] = deploy_cfg.cutover
     if deploy_cfg.auto_deploy is not None:
         build_fields["auto_deploy"] = deploy_cfg.auto_deploy
-    # (P25, D-P25-5) Persist the edge-auth declaration top-level under its own
+    # Persist the edge-auth declaration (D-P25-5) top-level under its own
     # literal key: the desired-route query and `core/launch.py` both read
     # `cfg['edge_auth']` verbatim. `model_dump()` because `build_fields`
     # is `json.dumps`'d into `jobs.config` — a pydantic model is not JSON
@@ -894,7 +926,7 @@ def classify_binding_action(
     prior_api: bool,
     existing: Job | None,
 ) -> tuple[str, list[str]]:
-    """The 5-way set/replace/preserve/remove/none classification (P13 WP9 / P15 D-A).
+    """The 5-way set/replace/preserve/remove/none classification.
 
     Shared by both `[ai.*]` and `[db.*]` (a literal mirror — D-A): the
     source declares a spec ⇒ `set` (fresh) / `replace` (redeploy over a
@@ -979,7 +1011,7 @@ def compute_overwrote_api_config(
         # under the same literal key), so a source that declares its own
         # [deploy].release over an API-authored one is a visible clobber too.
         or _explicit_changed(None, "release", effective.deploy_cfg.release, prev_cfg.get("release"))
-        # (P24b, PR #108 review) cutover/auto_deploy are literal twins of
+        # cutover/auto_deploy are literal twins of
         # release on the same PUT surface — same visibility rule.
         or _explicit_changed(None, "cutover", effective.deploy_cfg.cutover, prev_cfg.get("cutover"))
         or _explicit_changed(
@@ -1042,7 +1074,7 @@ def build_plan_body(
             "health": effective.eff_health,
             "memory_limit": effective.deploy_cfg.memory_limit,
             "cpu_limit": effective.deploy_cfg.cpu_limit,
-            # P14 WP-A1: names + container paths only (never a host
+            # Names + container paths only (never a host
             # path); includes the implicit data:/data retrofit.
             "volumes": _resolve_data_volume(effective.deploy_cfg.volumes)[0],
             # the pre-swap release command this deploy WOULD run
@@ -1079,9 +1111,8 @@ async def _remove_superseded_context(prev_cfg: dict, build_fields: dict) -> None
     `build_context_root or build_context_dir` it reads back), so a generation
     superseded BEFORE its build ran — two redeploys that both commit with
     sequential versions, neither hitting the 409 — would leak its extracted tree
-    under `upload_dir` forever. The §7 live run reproduced exactly this: two
-    concurrent ZIP redeploys, both 201, one cutover, and the loser's tree left
-    behind with its generated Dockerfile.
+    under `upload_dir` forever: two concurrent ZIP redeploys, both 201, one
+    cutover, and the loser's tree left behind with its generated Dockerfile.
 
     Safe unconditionally: a service container serves from its IMAGE, never the
     context dir, so removing a superseded (or already-built, or image-reused)
@@ -1206,7 +1237,7 @@ async def write_redeploy(
     # stamp writer provenance. A redeploy over API-set config is
     # last-writer-wins; the clobber is made VISIBLE (response flag +
     # audit param) only when the API actually authored what was
-    # overwritten (P13 WP9 narrowed rule, computed above).
+    # overwritten (computed above).
     config["config_source"] = "deploy"
     config["config_revision"] = int(prev_cfg.get("config_revision", 0)) + 1
     if overwrote_api_config:
@@ -1218,8 +1249,8 @@ async def write_redeploy(
     # Seed the new deploy generation's phase object (also clears
     # the previous generation's crash forensics carried by dict(prev_cfg)).
     _stamp_queued(config, version=next_ver, action="redeploy")
-    # (P14 WP-A1) Retrofit the implicit data volume + NERDIT_DATA_DIR —
-    # applies to pre-P14 rows on this redeploy (D-P14-4). Runs AFTER the
+    # Retrofit the implicit data volume + NERDIT_DATA_DIR onto rows that
+    # predate it (D-P14-4). Runs AFTER the
     # env merge so a user's explicit NERDIT_DATA_DIR still wins. The prior
     # implicit data path lets the wedge re-target its own persisted value
     # (never leaving a stale NERDIT_DATA_DIR when the mount moves).
@@ -1290,7 +1321,7 @@ async def write_fresh(
 ) -> Job:
     """Fresh deploy: assemble a brand-new config blob + reserve the row.
 
-    `declared` (P40d) presets the row's triple `(project, production, service)`
+    `declared` presets the row's triple `(project, production, service)`
     so `_stamp_project` leaves it alone and `reserve_service_for_token` judges
     the project the row JOINS by id; `None` keeps the legacy identity mapping.
 
@@ -1324,7 +1355,7 @@ async def write_fresh(
         config["db"] = db_spec
     # Seed the phase object for the first deploy generation.
     _stamp_queued(config, version=1, action="create")
-    # (P14 WP-A1) Every fresh deploy gets the implicit data volume +
+    # Every fresh deploy gets the implicit data volume +
     # NERDIT_DATA_DIR (D-P14-4).
     _ensure_data_volume(config)
     job = Job(
@@ -1542,7 +1573,7 @@ async def _finalize_deploy(
 ) -> dict:
     """Validate a prepared build context and create or update its service row.
 
-    `declared` (P40d) is set by `apply_project` only: the service's validated
+    `declared` is set by `apply_project` only: the service's validated
     `[services.<svc>]` table stands in for `[deploy]`, a fresh row is born with
     the project triple, and a row on the label that is not this project's
     service is 409 `service.name_taken`. Every other ingress passes `None` and
@@ -1568,13 +1599,14 @@ async def _finalize_deploy(
     # including the row re-read below (a DB error must not leak the tree).
     try:
         # Belt-and-braces: runs BEFORE _parse_deploy_defaults so a bad form
-        # name never mis-attributes to the app's nerdit.toml (PROBE-11).
+        # name never mis-attributes to the app's nerdit.toml.
         _validate_request_name(name)
         existing = await queries.get_service_by_name(name)
         # A name owned by a live kind=model/database row is not a redeploy
         # target — the create-race security boundary (ingresses are fast paths).
         reject_non_service_row(existing, name)
         reject_foreign_label(existing, declared, name)
+        reject_apex_shadow(request, name, fresh=existing is None)
         # Re-authorize on the SAME read the fresh-vs-redeploy branch uses: a
         # name created during the extraction/clone window must not slip onto
         # the redeploy path without an owner check (the caller's pre-ingress
@@ -1582,7 +1614,7 @@ async def _finalize_deploy(
         if existing is not None:
             require_owner_or_admin(request, existing)
         prev_cfg = parse_job_config(existing) if existing else {}
-        # (P34 / D) Captured BEFORE the redeploy write overwrites the phase
+        # Captured BEFORE the redeploy write overwrites the phase
         # object: "the generation you are replacing was failing" is exactly the
         # context a caller redeploying a crash-loop needs, and one line later it
         # is gone. `None` on a fresh deploy — there is no history to report.
@@ -1633,7 +1665,7 @@ async def _finalize_deploy(
 
         # Detect a buildpack and materialize the generated Dockerfile (if any).
         try:
-            plan = detect(context_dir, deploy_cfg)
+            plan = await asyncio.to_thread(detect, context_dir, deploy_cfg)
         except BuildpackNotSupported as exc:
             raise NerditError(
                 400,
@@ -1649,7 +1681,7 @@ async def _finalize_deploy(
                 ),
             ) from exc
 
-        # P5 (S8): parse+gate [ai.*] server-side on a served-model row; only
+        # Parse+gate [ai.*] server-side on a served-model row; only
         # the SPEC persists (config['ai']) — resolved to OPENAI_* at launch.
         if project_error is not None:
             raise NerditError(
@@ -1729,7 +1761,7 @@ async def _finalize_deploy(
             ai_spec, prior_ai, prior_ai_api, existing
         )
 
-        # P15 mirror (D-A) for [db.*], keyed on the db_source == "api" marker.
+        # The same classification for [db.*], keyed on the db_source == "api" marker.
         prior_db = prev_cfg.get("db") if isinstance(prev_cfg.get("db"), dict) else None
         prior_db_api = prev_cfg.get("db_source") == "api"
         db_action, db_diff_bindings = classify_binding_action(
@@ -1854,19 +1886,16 @@ async def _finalize_deploy(
         if shared_keys:
             await record_shared_referenced(request, name, shared_keys)
 
-        endpoint = await queries.get_service_endpoint(name)
-        gpu_ids = await queries.get_job_gpus(job.id)
-        hosted = await load_hosted_context(request)
-        resp = _service_response(request, job, gpu_ids, endpoint, hosted=hosted)
+        resp = await service_view(request, job, hosted=await load_hosted_context(request))
         body = resp.model_dump(mode="json")
         return {
             **body,
             "build": preview,
-            # Additive P7 field: agents detect an API-config clobber on redeploy.
+            # Agents detect an API-config clobber on redeploy.
             "overwrote_api_config": overwrote_api_config,
-            # (Agent-DX) The at-a-glance block + the ordered advisory channel,
-            # added at the ONE tail every ingress shares (ZIP / git / redeploy /
-            # template / workspace), so all five carry them from one edit.
+            # The at-a-glance block + the ordered advisory channel, built at
+            # the ONE tail every ingress shares (ZIP / git / redeploy /
+            # template / workspace), so all five carry them.
             # `summary` is PROJECTED from `body` — never recomputed.
             "summary": _deploy_summary(body),
             "hints": _deploy_hints(request, name, unknown_deploy_keys, failure_detail=prev_failure),
@@ -1882,9 +1911,9 @@ async def _finalize_deploy(
         raise
 
 
-# --- P24b WP6: redeploy from the row's recorded git source --------------------
+# --- Redeploy from the row's recorded git source ------------------------------
 #
-# `POST /deploy/{name}/redeploy` (and, in P24c, the GitWatch poller) carry no
+# `POST /deploy/{name}/redeploy` and the GitWatch poller carry no
 # deploy coordinates at all: every input is read back off `config['source']`,
 # which was stamped by the original `POST /deploy/git`. That makes the guard
 # set below load-bearing rather than redundant — the recorded URL/ref/subdir are
@@ -1988,6 +2017,68 @@ def resolve_github_installation_token(app: Any, repo_url: str) -> str | None:
     return token if isinstance(token, str) and token else None
 
 
+async def resolve_git_token(
+    request: Request,
+    secrets: Any,
+    name: str,
+    token_ref: str,
+    *,
+    repo_url: str,
+    include_service: bool,
+    project: Project | None,
+) -> str | None:
+    """Resolve a git credential reference; the core both deploy wrappers share.
+
+    `${github.installation}` never touches the secret store: it resolves by repo
+    through the link manager's mirror, and its absence is the loud
+    `422 deploy.github_token_absent` (D-GH-9 — the poller maps that one code back
+    to a quiet backoff). A secret ref reads the service scope only when
+    `include_service` (the caller proved it owns it), and `project`'s scope only
+    when it is provably the caller's (`project_owned_by_caller`), so a caller can
+    never have the daemon send another token's project secret to a repo host it
+    controls. Precedence is the launch-path one: service over project (D-P40-9),
+    then shared; a shared hit records `secret.shared_referenced`.
+
+    Returns:
+        The raw token, or `None` when the ref is unmatched or resolves nowhere.
+        The value lives only as a local — never in audit, config, logs, argv or
+        a response.
+    """
+    if token_ref == GITHUB_INSTALLATION_REF:
+        token = resolve_github_installation_token(request.app, repo_url)
+        if token is None:
+            raise github_token_absent_error(role=current_principal(request).role)
+        return token
+    if secrets is None:  # pragma: no cover - always wired in the daemon
+        raise NerditError(500, "internal", "Secret manager is not configured.")
+    project_mine = project_owned_by_caller(request, project)
+    scoped_project_id = project.id if project is not None and project_mine else None
+    try:
+        # `service_env=None` is the carve-out expressed structurally: an
+        # unproven name never reaches the service or project scope at all.
+        res = walk_secret_ref(
+            token_ref,
+            service_env=(
+                lambda: load_scoped(
+                    secrets,
+                    name,
+                    scoped_project_id,
+                    include_service=include_service,
+                    include_project=project_mine,
+                )[0]
+            )
+            if include_service or project_mine
+            else None,
+            shared_env=lambda: secrets.load(SHARED_SCOPE),
+        )
+    except SecretDecryptError as exc:
+        raise NerditError(500, "secret.decrypt_failed", str(exc)) from exc
+    if res.value is not None and res.source == "shared":
+        assert res.key is not None  # a resolved value implies a parsed key
+        await record_shared_referenced(request, name, [res.key])
+    return res.value
+
+
 async def _resolve_source_token(
     request: Request,
     secrets: Any,
@@ -1999,62 +2090,84 @@ async def _resolve_source_token(
 ) -> str:
     """Resolve a recorded `token_ref` to its raw value for a re-clone.
 
-    `${github.installation}` never touches the secret store:
-    it resolves through the link manager's mirror by repo, and its absence is
-    the loud `422 deploy.github_token_absent` (D-GH-9 — the poller maps
-    that one code back to a quiet backoff).
-
     The redeploy path always runs AFTER the owner-or-admin gate on an existing
-    row, so the per-service scope is provably the caller's — the fresh-deploy
-    `service_owned` carve-out in `routes/deploy.py::_resolve_token_ref` has
-    nothing to protect here. Row ownership proves the service scope ONLY: the
-    ROW's project scope is judged on its own (`project_owned_by_caller`, the
-    git route's gate), because a row can sit in a project its owner does not
-    own (the plan §5 rollback bounce: the boot backfill adopts by name) and a
-    caller-driven path must never send another token's project secret to a
-    repo host the caller recorded. Precedence is the launch-path one: service
-    scope over project scope (D-P40-9), then shared. The raw value lives only
-    as a local — never in audit params, config, logs, argv, or the response.
+    row, so the per-service scope is provably the caller's. Row ownership proves
+    the service scope ONLY: the ROW's project scope is judged on its own inside
+    `resolve_git_token`, because a row can sit in a project its owner does not
+    own (the boot backfill adopts rows into projects by name).
     """
-    if token_ref == GITHUB_INSTALLATION_REF:
-        token = resolve_github_installation_token(request.app, repo_url)
-        if token is None:
-            raise github_token_absent_error(role=current_principal(request).role)
-        return token
-    if secrets is None:  # pragma: no cover - always wired in the daemon
-        raise NerditError(500, "internal", "Secret manager is not configured.")
-    project = (
-        await request.app.state.queries.get_project(project_id) if project_id is not None else None
-    )
-    project_mine = project_owned_by_caller(request, project)
-    try:
-        # A grammar miss short-circuits inside the walk before either scope is
-        # loaded, so an unusable reference is still reported ahead of any
-        # decrypt failure.
-        res = walk_secret_ref(
-            token_ref,
-            service_env=lambda: load_scoped(
-                secrets, name, project_id if project_mine else None, include_project=project_mine
-            )[0],
-            shared_env=lambda: secrets.load(SHARED_SCOPE),
-        )
-    except SecretDecryptError as exc:
-        raise NerditError(500, "secret.decrypt_failed", str(exc)) from exc
-    if not res.matched:
+    if token_ref != GITHUB_INSTALLATION_REF and not SECRET_REF_RE.match(token_ref):
         # A persisted reference that no longer parses is unusable, and there is
         # no caller input to correct — same remediation as a missing one.
+        # Checked before any scope is loaded, so it wins over a decrypt failure.
         raise _source_credential_error(
             name, f"Service '{name}' records an unusable source credential reference."
         )
-    if res.value is not None:
-        if res.source == "shared":
-            assert res.key is not None  # a resolved value implies a parsed key
-            await record_shared_referenced(request, name, [res.key])
-        return res.value
-    raise _source_credential_error(
-        name,
-        f"The recorded source credential for '{name}' no longer resolves to a stored secret.",
+    project = (
+        await request.app.state.queries.get_project(project_id) if project_id is not None else None
     )
+    token = await resolve_git_token(
+        request,
+        secrets,
+        name,
+        token_ref,
+        repo_url=repo_url,
+        include_service=True,
+        project=project,
+    )
+    if token is None:
+        raise _source_credential_error(
+            name,
+            f"The recorded source credential for '{name}' no longer resolves to a stored secret.",
+        )
+    return token
+
+
+def validate_git_coordinates(
+    settings: Any, repo_url: str, ref: str | None, subdir: str | None
+) -> None:
+    """Run the clone guards on a URL/ref/subdir against the CURRENT `[git].allowed_hosts`.
+
+    Raises:
+        NerditError: The guard's own status, code, message and hint (mapped 1:1).
+    """
+    try:
+        validate_repo_url(repo_url, settings.git.allowed_hosts)
+        validate_ref(ref)
+        validate_subdir(subdir)
+    except GitSourceError as exc:
+        raise NerditError(exc.status_code, exc.code, exc.message, hint=exc.hint) from exc
+
+
+async def clone_into_uploads(
+    settings: Any,
+    repo_url: str,
+    *,
+    ref: str | None,
+    subdir: str | None,
+    token: str | None,
+) -> tuple[GitSourceInfo, Path]:
+    """Shallow-clone into a fresh upload dir under the `[git]` limits.
+
+    Returns:
+        The clone info and the clone ROOT (the cleanup target; `info.context_dir`
+        may be a subdir of it).
+
+    Raises:
+        GitSourceError: Propagated; each caller owns its error mapping.
+    """
+    dest_dir = Path(settings.daemon.upload_dir).expanduser() / generate_id()
+    info = await clone_source(
+        repo_url,
+        ref=ref,
+        subdir=subdir,
+        dest_dir=dest_dir,
+        token=token,
+        timeout_s=settings.git.clone_timeout_s,
+        max_bytes=settings.git.max_clone_bytes,
+        allowed_hosts=settings.git.allowed_hosts,
+    )
+    return info, dest_dir
 
 
 def _is_auth_failure(exc: GitSourceError) -> bool:
@@ -2105,7 +2218,7 @@ def _read_git_source(job: Job, name: str) -> dict:
     return source
 
 
-#: The identity an unattended GitWatch redeploy runs as (P24c / WP10). Admin so
+#: The identity an unattended GitWatch redeploy runs as. Admin so
 #: `require_owner_or_admin` passes on any owner's row — the poller acts for the
 #: daemon, not for whoever last deployed the service — and `token_id="system"`
 #: so every row it writes is attributable, matching `principal='system'` on the
@@ -2166,7 +2279,7 @@ async def redeploy_from_source(
     name = job.service_name or job.name or ""
     if not name:  # pragma: no cover - a service row always carries a name
         raise NerditError(500, "internal", "The service row carries no name.")
-    # Re-read the row AND bind to its identity (PR #108 review): the caller's
+    # Re-read the row AND bind to its identity: the caller's
     # authorization ran against `job`. If the service was deleted since, a
     # stale-object fallback would let `_finalize_deploy` silently recreate
     # it; if the name was re-created by another owner, adopting the
@@ -2181,8 +2294,8 @@ async def redeploy_from_source(
             f"Service '{name}' was deleted or replaced while the redeploy was being prepared.",
             hint="Re-run the redeploy against the current service.",
         )
-    # (P24c review) The run/release guard belongs to the PRIMITIVE, not to the
-    # route: the GitWatch poller drives this function in-process, and a P20 run
+    # The run/release guard belongs to the PRIMITIVE, not to the
+    # route: the GitWatch poller drives this function in-process, and a run
     # keeps the row `running` — squarely inside the poller's candidate set. A
     # push landing during a live release would otherwise bump the generation the
     # release owns, exactly the race the rollback route is the template for
@@ -2205,12 +2318,7 @@ async def redeploy_from_source(
 
     # Re-validate against the CURRENT allowlist: a host removed from
     # [git].allowed_hosts since the original deploy must stop redeploying.
-    try:
-        validate_repo_url(repo_url, settings.git.allowed_hosts)
-        validate_ref(ref)
-        validate_subdir(subdir)
-    except GitSourceError as exc:
-        raise NerditError(exc.status_code, exc.code, exc.message, hint=exc.hint) from exc
+    validate_git_coordinates(settings, repo_url, ref, subdir)
 
     token = None
     if token_ref is not None:
@@ -2223,20 +2331,12 @@ async def redeploy_from_source(
             project_id=fresh.project_id,
         )
 
-    dest_dir = Path(settings.daemon.upload_dir).expanduser() / generate_id()
     try:
-        info = await clone_source(
-            repo_url,
-            ref=ref,
-            subdir=subdir,
-            dest_dir=dest_dir,
-            token=token,
-            timeout_s=settings.git.clone_timeout_s,
-            max_bytes=settings.git.max_clone_bytes,
-            allowed_hosts=settings.git.allowed_hosts,
+        info, dest_dir = await clone_into_uploads(
+            settings, repo_url, ref=ref, subdir=subdir, token=token
         )
     except GitSourceError as exc:
-        # A row deployed before P24b records no `token_ref` (D-P24-14), so a
+        # An older row may record no `token_ref` (D-P24-14), so a
         # private repo's unauthenticated re-clone comes back as an auth
         # challenge. Report the missing *reference*, not the raw git failure —
         # the remediation is to record it once, not to fix the URL.

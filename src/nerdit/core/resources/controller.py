@@ -19,7 +19,6 @@ from typing import Generic, Protocol, TypeVar
 from nerdit.core.deploy_state import stamp_last_deploy
 from nerdit.core.events import EventBus
 from nerdit.core.jobconfig import parse_job_config
-from nerdit.core.resources.registry import BackendRegistry
 from nerdit.core.runtime.protocol import ContainerRuntime, ContainerRuntimeError
 from nerdit.db.enums import ErrorClass, JobStatus, LogStream
 from nerdit.db.queries import Queries
@@ -61,9 +60,9 @@ class ResourceController(ABC, Generic[B]):
         data_dir: str = "~/.nerdit",
         event_bus: EventBus | None = None,
     ) -> None:
-        self._registry: BackendRegistry[B] = BackendRegistry(
-            backend, extra_backends, default_backend, kind_label=self.kind_label.capitalize()
-        )
+        self._default = backend
+        self._backends: dict[str, B] = {backend.name: backend, **(extra_backends or {})}
+        self._default_name = default_backend or backend.name
         self._runtime = runtime
         self._queries = queries
         self._data_dir = str(Path(data_dir).expanduser())
@@ -79,7 +78,7 @@ class ResourceController(ABC, Generic[B]):
     @property
     def backend(self) -> B:
         """The default backend; use backend_for for a persisted row."""
-        return self._registry.default
+        return self._default
 
     def get_backend(self, name: str | None) -> B | None:
         """Resolve an explicit name, returning None for unknown names.
@@ -87,23 +86,33 @@ class ResourceController(ABC, Generic[B]):
         None selects the default. Write paths reject unknown names instead
         of using the reconcile path's fallback.
         """
-        return self._registry.get(name)
+        return self._backends.get(name or self._default_name)
 
     @property
     def default_backend_name(self) -> str:
-        return self._registry.default_name
+        return self._default_name
 
     @property
     def backends(self) -> list[str]:
         """Sorted registered backend names for capabilities."""
-        return self._registry.names
+        return sorted(self._backends)
 
     def backend_for(self, cfg: dict) -> B:
         """Resolve a row's backend, falling back to default if missing or unknown.
 
         Unknown names are logged so the reconcile loop can keep serving the row.
         """
-        return self._registry.resolve(cfg)
+        name = cfg.get("backend") or self._default_name
+        backend = self._backends.get(name)
+        if backend is None:
+            logger.warning(
+                "%s config names unknown backend %r; falling back to %r",
+                self.kind_label.capitalize(),
+                name,
+                self._default_name,
+            )
+            return self._backends[self._default_name]
+        return backend
 
     # --- Background image pull -----------------------------------------------
 

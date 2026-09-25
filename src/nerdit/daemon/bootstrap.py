@@ -478,20 +478,16 @@ async def build_link_manager(
 
     node_name = link.slug or socket.gethostname()
 
-    # (P26 D-P26-H1/H5) The hosted URL is computed, never guessed: without BOTH
-    # the claim's slug and the cloud's own base domain there is no authority to
-    # rewrite `Host` to, so no app stream can be served — and the resolver
-    # stays `None` rather than being handed a half-known name.
     resolve_app = None
-    if queries is not None and link.slug and link.nodes_base_domain:
+    if queries is not None:
+        if link.slug and link.nodes_base_domain:
+            await queries.pin_legacy_hosted_aliases(link.node_id, link.slug, link.nodes_base_domain)
         resolve_app = AppStreamResolver(
-            queries, slug=link.slug, nodes_base_domain=link.nodes_base_domain
+            queries,
+            node_id=link.node_id,
+            slug=link.slug,
+            nodes_base_domain=link.nodes_base_domain,
         ).resolve
-    elif queries is not None:
-        logger.info(
-            "Hosted shares inactive: [link].nodes_base_domain is unset — "
-            "run 'nerdit link refresh'. The tunnel still serves the daemon API."
-        )
     from nerdit import __version__  # noqa: PLC0415 - avoids a package-import cycle
 
     logger.info(

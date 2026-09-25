@@ -2,12 +2,14 @@
 
 Auth runs outside ExceptionMiddleware and records its own denied mutations.
 Resolve the live link capability first as a link:<node_id> submitter, preserving
-tunnel provenance even in local bypass mode. Otherwise token=None yields LOCAL,
-the legacy global token yields LEGACY_ADMIN, and public paths stay public.
+tunnel provenance even in local bypass mode. Otherwise token=None yields LOCAL
+(loopback Host names only, else 421), the legacy global token yields
+LEGACY_ADMIN, and public paths stay public.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import secrets
 import time
@@ -18,6 +20,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from nerdit.core.project_identity import PROJECT_DELEGATION_HEADER, PROJECT_MCP_PATH
 from nerdit.daemon.audit import derive_action, is_mcp_path, record_denial
 from nerdit.daemon.auth import (
     LEGACY_ADMIN,
@@ -26,7 +29,8 @@ from nerdit.daemon.auth import (
     Principal,
     hash_token,
 )
-from nerdit.daemon.errors import _envelope, request_id_of
+from nerdit.daemon.errors import NerditError, _envelope, request_id_of
+from nerdit.daemon.project_delegation import delegation_denial, narrow_project_request
 from nerdit.db.models import TokenRole
 
 logger = logging.getLogger(__name__)
@@ -35,8 +39,6 @@ logger = logging.getLogger(__name__)
 _PUBLIC_PATHS = {
     "/health",
     "/api/health",
-    "/docs",
-    "/openapi.json",
     "/api/docs",
     "/api/openapi.json",
     # trust bootstrap — the internal-CA root PEM is served pre-auth by
@@ -65,6 +67,17 @@ def _is_public(path: str, method: str) -> bool:
     )
 
 
+def _loopback_host(request: Request) -> bool:
+    """Whether the request's Host names this machine's loopback interface."""
+    host = request.url.hostname or ""  # port and IPv6 brackets already stripped
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 # Methods that never mutate state: skipped by the readonly gate and the
 # `last_used_at` throttle (avoids serializing safe reads on the shared conn).
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -88,8 +101,9 @@ def _expired(expires_at: datetime) -> bool:
 class ScopedTokenAuthMiddleware(BaseHTTPMiddleware):
     """Resolve the bearer token to a `Principal` on `request.state`.
 
-    When *token* is `None` (v0.1 compat / no auth configured) every request
-    passes through as the `LOCAL` admin principal. Otherwise the header is
+    When *token* is `None` (no auth configured) every request
+    passes through as the `LOCAL` admin principal, provided its Host is a
+    loopback name (else 421 `invalid_host`). Otherwise the header is
     validated, the legacy global token maps to `LEGACY_ADMIN`, and any
     other value is looked up (by SHA-256 hash) against `api_tokens`.
     """
@@ -113,32 +127,36 @@ class ScopedTokenAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):  # noqa: ANN001
         """Attach a principal and gate the request, hand-building any envelope."""
         path = request.url.path
+        project_headers = request.headers.getlist(PROJECT_DELEGATION_HEADER)
+        project_request = (
+            bool(project_headers)
+            or path == PROJECT_MCP_PATH
+            or path.startswith(PROJECT_MCP_PATH + "/")
+        )
 
-        # (P27 WP-C1 item 3) Tunnel capability → the synthetic node-link
-        # principal. This branch is FIRST by security requirement, not by
-        # taste:
+        # Tunnel capability → the synthetic node-link principal. This branch
+        # is FIRST by security requirement:
         #
         # (i) ORDERING. In local mode (`self.token is None`) the next branch
         #     grants LOCAL — an *admin* principal. A request arriving through
         #     the relay must never become a local admin: the tunnel's role is
-        #     permanently `submitter` (D-R2 as amended by ADR-W1) and that
-        #     ceiling is structural, enforced here at the single resolution
+        #     permanently `submitter`, enforced here at the single resolution
         #     choke point. Moving this branch below either the local shortcut
         #     or the legacy compare silently re-opens admin over the tunnel.
-        # (ii) PROVENANCE. `token_id = "link:<node_id>"` IS the checklist's
-        #     tunnel-provenance audit field — no schema change: every
-        #     AuditMiddleware row and every `_deny` row for a tunnelled
-        #     request already carries it in `principal_id` (+ `submitter`
-        #     in `principal_role`), filterable via GET /audit?principal_id=.
+        # (ii) PROVENANCE. `token_id = "link:<node_id>"` is the tunnel's audit
+        #     identity: every audit and `_deny` row for a tunnelled request
+        #     carries it in `principal_id` (+ `submitter` in `principal_role`),
+        #     filterable via GET /audit?principal_id=.
         # (iii) COST. `validate_capability` is `secrets.compare_digest`
-        #     against the capability proven on the LIVE connection (plus the
-        #     role ceiling and the reactive-expiry recheck), so this pre-check
-        #     adds no timing oracle; a bearer that is not the capability falls
-        #     through to the normal resolution chain completely unchanged.
+        #     against the capability proven on the LIVE connection, so this
+        #     pre-check adds no timing oracle; any other bearer falls through
+        #     to the normal resolution chain unchanged.
         #
-        # `_touch` is skipped deliberately — there is no `api_tokens` row
-        # to stamp — and so is the readonly gate (submitter mutates).
+        # `_touch` is skipped (no `api_tokens` row to stamp), and so is the
+        # readonly gate (submitter mutates).
         auth_header = request.headers.get("authorization", "")
+        if project_request:
+            return await self._serve_project(request, call_next, auth_header, project_headers)
         if auth_header:
             link_principal = self._link_principal(request, auth_header)
             if link_principal is not None:
@@ -148,10 +166,9 @@ class ScopedTokenAuthMiddleware(BaseHTTPMiddleware):
             if denial is not None:
                 return denial
 
-        # No token configured → local principal, skip auth (v0.1 backward compat).
+        # No token configured → local principal, skip auth.
         if self.token is None:
-            request.state.principal = LOCAL
-            return await call_next(request)
+            return await self._serve_local(request, call_next)
 
         # Public paths are always accessible (attach LOCAL defensively).
         if _is_public(path, request.method):
@@ -179,18 +196,14 @@ class ScopedTokenAuthMiddleware(BaseHTTPMiddleware):
             )
         presented = parts[1]
 
-        # Legacy global token → admin principal (no breaking change).
+        # Legacy global token → admin principal.
         #
         # Compared as **bytes**, never as `str`: `compare_digest` raises
-        # `TypeError` on a `str` holding any non-ASCII character, and
-        # `presented` comes straight out of an attacker-controlled
-        # `Authorization` header (Starlette decodes headers as latin-1, so
-        # `Bearer é` is a reachable input). Raised here the error would escape
-        # the FastAPI exception handlers — auth is outermost — as a bare 500
-        # with no envelope and no denial audit row. On the encoded form it is
-        # the `False` it always meant, so such a bearer falls through to the
-        # ordinary `invalid_token` denial. `LinkManager.validate_capability`
-        # fixes the same hazard on the tunnel path. `[daemon].auth_token` is
+        # `TypeError` on a non-ASCII `str`, and `presented` is attacker-controlled
+        # (Starlette decodes headers as latin-1, so `Bearer é` is reachable).
+        # Auth is outermost, so that error would escape as a bare 500 with no
+        # envelope and no denial audit row; encoded, it is a plain mismatch that
+        # falls through to `invalid_token`. `[daemon].auth_token` is
         # ASCII-validated at settings load, so no legitimate credential is
         # affected.
         if secrets.compare_digest(
@@ -234,8 +247,8 @@ class ScopedTokenAuthMiddleware(BaseHTTPMiddleware):
         await self._touch(principal, request.method)
 
         # Coarse role gate: readonly tokens may not perform mutating methods.
-        # Fine-grained owner/admin checks stay in the routes (S4).
-        # (P13c §3) The MCP mount is exempted boundary-exactly: an MCP POST is
+        # Fine-grained owner/admin checks stay in the routes.
+        # The MCP mount is exempted boundary-exactly: an MCP POST is
         # transport framing, not a mutation — every actual mutation happens on
         # the inner loopback hop carrying the same token, where this gate + the
         # route owner/admin checks + audit all run normally. Authentication is
@@ -254,6 +267,24 @@ class ScopedTokenAuthMiddleware(BaseHTTPMiddleware):
                 principal=principal,
             )
 
+        return await call_next(request)
+
+    async def _serve_project(self, request, call_next, auth_header, headers):  # noqa: ANN001
+        principal = self._link_principal(request, auth_header)
+        try:
+            if principal is None:
+                raise delegation_denial()
+            narrowed = await narrow_project_request(request, principal, headers)
+        except NerditError as exc:
+            return await self._deny(
+                request,
+                exc.status_code,
+                exc.code,
+                exc.message,
+                request_id_of(request),
+                principal=principal,
+            )
+        request.state.principal = narrowed
         return await call_next(request)
 
     async def _scoped_principal(self, presented: str) -> Principal | None:
@@ -339,6 +370,25 @@ class ScopedTokenAuthMiddleware(BaseHTTPMiddleware):
             role=TokenRole.submitter,
         )
 
+    async def _serve_local(self, request: Request, call_next):  # noqa: ANN001, ANN202
+        """Serve a token-less daemon's request as `LOCAL`, loopback Hosts only.
+
+        A browser page on a rebound DNS name carries that name as its Host, so
+        refusing non-loopback Hosts keeps it off the unauthenticated admin
+        surface. Public paths stay reachable under any Host.
+        """
+        if not _is_public(request.url.path, request.method) and not _loopback_host(request):
+            return await self._deny(
+                request,
+                421,
+                "invalid_host",
+                "Host not permitted: a daemon without [daemon].auth_token "
+                "only answers loopback names.",
+                request_id_of(request),
+            )
+        request.state.principal = LOCAL
+        return await call_next(request)
+
     async def _deny(
         self,
         request: Request,
@@ -370,6 +420,10 @@ class ScopedTokenAuthMiddleware(BaseHTTPMiddleware):
         effort: an audit failure must never mask the original denial.
         """
         action, target_type, target_id = derive_action(request.method, request.url.path)
+        if principal is None:
+            # An unauthenticated caller must not choose the row's action or
+            # target: keep the cardinality bounded.
+            action, target_type, target_id = "auth.denied", None, None
         # One writer for both halves (row + the admin-gated `audit.*` mirror an
         # admin watching live depends on), shared with the MCP transport's
         # pre-body refusals — see `audit.record_denial`.
@@ -409,8 +463,3 @@ class ScopedTokenAuthMiddleware(BaseHTTPMiddleware):
             await queries.touch_api_token(principal.token_id)
         except Exception:
             logger.warning("Failed to update token last_used_at", exc_info=True)
-
-
-# Backward-compatible alias: existing imports of `BearerAuthMiddleware` keep
-# working. The class was renamed to reflect its scoped-token behaviour.
-BearerAuthMiddleware = ScopedTokenAuthMiddleware

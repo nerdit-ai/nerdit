@@ -20,12 +20,12 @@ import io
 import json
 import zipfile
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
+from nerdit.config.settings import NerditSettings
 from nerdit.daemon.audit import AuditMiddleware
 from nerdit.daemon.auth import generate_token, hash_token
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers
@@ -49,7 +49,7 @@ def _app(queries, upload_root: Path) -> FastAPI:
     register_error_handlers(app)
     app.include_router(deploy_router)
     app.state.queries = queries
-    settings = MagicMock()
+    settings = NerditSettings(data_dir=str(upload_root.parent / "state"))
     settings.daemon.max_upload_bytes = 10 * 1024 * 1024
     settings.daemon.upload_dir = str(upload_root)
     app.state.settings = settings
@@ -127,8 +127,8 @@ async def test_overlapping_redeploys_yield_one_201_one_409_and_no_orphan_tree(qu
     _gate_the_writer(queries, 2)
     app = _app(queries, uploads)
 
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         first, second = await asyncio.gather(_deploy(client, raw, "a"), _deploy(client, raw, "b"))
 
     codes = sorted(r.status_code for r in (first, second))
@@ -158,8 +158,8 @@ async def test_a_later_redeploy_still_succeeds_after_a_refused_one(queries, tmp_
     ungated = _gate_the_writer(queries, 2)
     app = _app(queries, uploads)
 
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         await asyncio.gather(_deploy(client, raw, "a"), _deploy(client, raw, "b"))
         queries.update_service_config_guarded = ungated
         again = await _deploy(client, raw, "c")
@@ -230,8 +230,8 @@ async def test_a_rollback_overlapping_a_redeploy_cannot_regress_the_allocator(qu
 
     _gate_the_writer(queries, 2)
     app = _app(queries, uploads)
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         deployed, rolled = await asyncio.gather(_deploy(client, raw, "a"), _rollback(client, raw))
 
     codes = sorted(r.status_code for r in (deployed, rolled))
@@ -270,8 +270,8 @@ async def test_a_redeploy_cannot_pop_a_cutover_marker_armed_under_it(queries, tm
         return await inner(*args, **kwargs)
 
     queries.update_service_config_guarded = arm_then_write
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         resp = await _deploy(client, raw, "a")
 
     assert resp.status_code == 409, resp.text
@@ -292,8 +292,8 @@ async def test_a_redeploy_over_a_stale_cutover_marker_still_lands(queries, tmp_p
     await queries.update_job_config(row.id, json.dumps(cfg))
 
     app = _app(queries, tmp_path / "uploads")
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         resp = await _deploy(client, raw, "a")
 
     assert resp.status_code == 201, resp.text
@@ -318,8 +318,8 @@ async def test_sequential_redeploys_do_not_leak_the_superseded_context(queries, 
     uploads = tmp_path / "uploads"
     app = _app(queries, uploads)
 
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         first = await _deploy(client, raw, "a")
         second = await _deploy(client, raw, "b")
 

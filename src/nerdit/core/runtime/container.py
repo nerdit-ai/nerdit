@@ -35,6 +35,11 @@ class ContainerConfig(BaseModel):
         default=None,
         description="Container CPU core limit (e.g., 2.0 = two cores)",
     )
+    pids_limit: int | None = Field(
+        default=None,
+        description="Max processes/threads in the container (Docker pids_limit); "
+        "None leaves the runtime default",
+    )
     # --- Sandbox hardening (declared in P1/S1, wired in S5) ---
     cap_drop: list[str] | None = Field(
         default=None,

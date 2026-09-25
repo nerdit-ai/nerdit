@@ -489,12 +489,13 @@ async def test_the_injected_credentials_are_forwarded_verbatim() -> None:
     ctx, sink = _ctx(httpx.ASGITransport(app=app))
     mux = StreamMux(ctx)
 
-    await mux.handle(_frame())
+    await mux.handle(_frame(headers=[("x-nerdit-project-id", "prj_aaaaaaaaaaaaaaaa")]))
     await sink.wait_types("stream_response_head")
     await sink.settle()
 
     assert app.header("authorization") == f"Bearer {TOKEN}"
     assert app.header("x-nerdit-role") == "submitter"
+    assert app.header("x-nerdit-project-id") == "prj_aaaaaaaaaaaaaaaa"
     await mux.aclose()
 
 
@@ -1321,7 +1322,9 @@ def _app_frame(name: str = "demo", **kw: Any) -> OpenStream:
 def _resolver(target: AppTarget | None) -> Callable[[str], Any]:
     """A resolver double that records every name it was asked about."""
 
-    async def resolve(name: str) -> AppTarget | None:
+    async def resolve(
+        name: str, authority: str | None, job_id: str | None, access: str | None
+    ) -> AppTarget | None:
         calls.append(name)
         return target
 
@@ -1391,6 +1394,7 @@ async def test_app_stream_dials_the_live_port_with_host_rewritten_and_path_uncha
                 # defence-in-depth it is: relay-asserted control metadata never
                 # reaches a user's container, whatever framed the stream.
                 (CLOUD_CONTROL_HEADER, "entitlement"),
+                ("x-nerdit-project-id", "prj_aaaaaaaaaaaaaaaa"),
             ],
         )
     )
@@ -1403,7 +1407,13 @@ async def test_app_stream_dials_the_live_port_with_host_rewritten_and_path_uncha
     assert str(request.url) == "http://127.0.0.1:4321/x/y?q=1"
     assert request.headers["host"] == "demo--gpu-box.nodes.test"
     assert request.headers["x-forwarded-proto"] == "https"
-    for stripped in ("authorization", "x-nerdit-role", APP_HEADER, CLOUD_CONTROL_HEADER):
+    for stripped in (
+        "authorization",
+        "x-nerdit-role",
+        APP_HEADER,
+        CLOUD_CONTROL_HEADER,
+        "x-nerdit-project-id",
+    ):
         assert stripped not in request.headers, stripped
     assert sink.body() == b"<h1>hi</h1>"
     await mux.aclose()
@@ -1540,7 +1550,9 @@ async def test_share_deleted_mid_session_closes_the_next_stream() -> None:
     app_transport = _BytesTransport(200, [("content-type", "text/plain")], [b"served"])
     target: AppTarget | None = AppTarget("demo", 4321, "demo--gpu-box.nodes.test")
 
-    async def resolve(name: str) -> AppTarget | None:
+    async def resolve(
+        name: str, authority: str | None, job_id: str | None, access: str | None
+    ) -> AppTarget | None:
         nonlocal target
         answer, target = target, None  # the operator unshares between streams
         return answer

@@ -256,7 +256,7 @@ async def _make_env(
 
 
 def _client(app: FastAPI) -> AsyncClient:
-    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1")
 
 
 def _create_body() -> dict:
@@ -440,6 +440,37 @@ async def test_sweep_removes_expired_records():
         assert removed == 1
         assert await queries.get_idempotency_record(LOCAL_SCOPE, "old") is None
         assert await queries.get_idempotency_record(LOCAL_SCOPE, "new") is not None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_record_does_not_block_fresh_claim():
+    """The TTL holds in-claim: an expired completed record is replaced, not
+    replayed, even before the sweep runs."""
+    app, db, queries, scheduler = await _make_env()
+    try:
+        past = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        claim = {"principal_id": LOCAL_SCOPE, "idem_key": "K", "method": "POST"}
+        assert await queries.insert_idempotency_inprogress(
+            **claim, path="/services", expires_at=past
+        )
+        await queries.complete_idempotency_record(
+            principal_id=LOCAL_SCOPE,
+            idem_key="K",
+            response_status=201,
+            response_body="{}",
+            content_type="application/json",
+            resource_id=None,
+        )
+        assert await queries.insert_idempotency_inprogress(
+            **claim, path="/services", expires_at=future
+        )
+        record = await queries.get_idempotency_record(LOCAL_SCOPE, "K")
+        assert record is not None
+        assert record.state == "in_progress"
+        assert record.expires_at == future
     finally:
         await db.close()
 

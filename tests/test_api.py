@@ -53,7 +53,7 @@ def mock_queries():
 @pytest.fixture
 def client(mock_queries):
     app = _make_app(mock_queries)
-    return TestClient(app)
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 def test_health(client):
@@ -98,7 +98,7 @@ def test_list_images_endpoint(mock_queries):
     runtime = AsyncMock()
     runtime.list_images = AsyncMock(return_value=["nerdit-runtime-rocm:0.1", "nerdit-runtime:0.1"])
     app = _make_app(mock_queries, runtime=runtime)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1")
 
     resp = client.get("/images")
     assert resp.status_code == 200

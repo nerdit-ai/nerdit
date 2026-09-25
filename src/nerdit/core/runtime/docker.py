@@ -56,7 +56,7 @@ _WRITER_STATES = frozenset({"running", "restarting", "paused"})
 #: Ownership labels stamped on every container this daemon creates and on every
 #: image it builds. `managed-by` marks the resource as nerdit's; the value of
 #: `nerdit-instance` is the `[daemon].instance_id` of the daemon that made
-#: it, so co-located daemons never reclaim each other's resources (PR #81).
+#: it, so co-located daemons never reclaim each other's resources.
 _MANAGED_BY_LABEL = "managed-by"
 _INSTANCE_LABEL = "nerdit-instance"
 
@@ -64,7 +64,7 @@ _INSTANCE_LABEL = "nerdit-instance"
 #: `container.stats(stream=False)` is a *bounded single request* — not a
 #: stream — so `asyncio.to_thread`'s shared default executor is the right
 #: place for it (unlike the log-*follow* streams that pinned that pool and
-#: deadlocked the daemon on the playground, post-P15). It still parks a worker
+#: deadlocked the daemon). It still parks a worker
 #: for the ~1-2 s docker takes to collect two CPU samples, so a burst of
 #: `/stats` reads is capped here at four in flight; the rest queue on the
 #: semaphore instead of exhausting the pool that every other docker call
@@ -72,6 +72,10 @@ _INSTANCE_LABEL = "nerdit-instance"
 #: thread pool, which is also process-wide.
 _STATS_CONCURRENCY = 4
 _STATS_SEMAPHORE = asyncio.Semaphore(_STATS_CONCURRENCY)
+
+#: Lines buffered between a log-follow thread and its consumer; past it the
+#: oldest line is dropped, so a chatty app cannot grow daemon memory unbounded.
+_FOLLOW_QUEUE_MAX = 10_000
 
 
 def _as_int(value: object) -> int | None:
@@ -190,20 +194,20 @@ def _derive_network(raw: dict) -> tuple[int | None, int | None]:
 #: nothing about why its build failed.
 _BUILD_NOISE_PREFIXES = ("View build details:",)
 
-#: Per-line buffer for the build's stdout `StreamReader` (P29 review round-2,
-#: Codex 3803596893). asyncio's default is 64 KiB, and `readline()` raises a
-#: bare `ValueError` — NOT a `ContainerRuntimeError` — when a single line
-#: overruns it. `AppBuildManager.build` catches only `ContainerRuntimeError`,
-#: so the escape skipped `_settle_failed_generation` entirely and wedged the
-#: row in `building` forever. BuildKit `--progress=plain` legitimately emits
-#: lines past 64 KiB (echoed long `RUN` commands, inline-cache base64, big
-#: `COPY` file lists), so raise the bound and handle the overrun besides.
+#: Per-line buffer for the build's stdout `StreamReader`. asyncio's default
+#: is 64 KiB, and `readline()` raises a bare `ValueError` — NOT a
+#: `ContainerRuntimeError` — when a single line overruns it.
+#: `AppBuildManager.build` catches only `ContainerRuntimeError`, so the escape
+#: would skip `_settle_failed_generation` and wedge the row in `building`
+#: forever. BuildKit `--progress=plain` legitimately emits lines past 64 KiB
+#: (echoed long `RUN` commands, inline-cache base64, big `COPY` file lists),
+#: so raise the bound and handle the overrun besides.
 _BUILD_STREAM_LIMIT = 1_048_576
 
 #: What a caller sees in place of a line that overran even the raised bound.
 _BUILD_LINE_TRUNCATED = "[nerdit] build output line exceeded 1 MiB; truncated"
 
-#: (BUG-1) The buildx availability probe. `docker buildx version` exercises the
+#: The buildx availability probe. `docker buildx version` exercises the
 #: CLI's own plugin resolution — the exact mechanism `docker build` uses — so
 #: the verdict cannot disagree with what a real build would find. A stderr regex
 #: over the build output would instead depend on Docker's message wording.
@@ -211,30 +215,28 @@ _BUILDX_PROBE_ARGV = ("buildx", "version")
 #: Bounded well under the 2 s `/doctor` per-check budget, so the buildx leg can
 #: never turn an otherwise-successful docker check into "check failed or timed out".
 _BUILDX_PROBE_TIMEOUT_S = 1.0
-#: (Codex 3804646823) How long a POSITIVE buildx verdict may be reused. The
-#: memo was permanent, which made the cache asymmetric in the wrong direction:
-#: install→present needed no restart, but remove/break→missing needed one, and
-#: until then /doctor claimed a builder that was gone while failed builds fell
-#: back to BuildError/USER_ERROR. A bounded TTL restores the symmetry at one
-#: 1 s-bounded subprocess per daemon per window.
+#: How long a POSITIVE buildx verdict may be reused. A permanent memo would
+#: need a restart after the plugin is removed or broken (while /doctor claimed
+#: a builder that was gone); a bounded TTL keeps both transitions restart-free
+#: at one 1 s-bounded subprocess per daemon per window.
 _BUILDX_CACHE_TTL_S = 300.0
 
 
 def _kill_process_tree(proc) -> None:  # noqa: ANN001 — asyncio.subprocess.Process
     """SIGKILL a spawned child's whole session, not just its head.
 
-    (Codex 3804646864) `docker buildx version` runs the CLI's own
+    `docker buildx version` runs the CLI's own
     `docker-buildx` plugin as a child process (the plugin is a separate
     executable under `cli-plugins`), and `docker build` leaves BuildKit work
     behind the same way. Killing only the direct `docker` process reparents
     the rest to init; because a timed-out probe verdict is never cached, every
-    later /doctor call or failed build leaked another one.
+    later /doctor call or failed build would leak another one.
 
     Both spawn sites pass `start_new_session=True`, so the child is a
     session/group leader and its pid IS its pgid — one `killpg` reaps the
     tree. The `returncode` check keeps us from ever signalling a possibly
-    recycled pid; it leaves the same microscopic TOCTOU window the plain
-    `proc.kill()` it replaces already had. Callers still `await proc.wait()`
+    recycled pid; it leaves the same microscopic TOCTOU window a plain
+    `proc.kill()` has. Callers still `await proc.wait()`
     to reap.
     """
     if proc.returncode is not None:
@@ -264,7 +266,7 @@ async def _probe_buildx(docker_bin: str) -> str:
             *_BUILDX_PROBE_ARGV,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
-            # (Codex 3804646864) Its own session, so the kill below reaps the
+            # Its own session, so the kill below reaps the
             # CLI *and* the `docker-buildx` plugin it spawns.
             start_new_session=True,
         )
@@ -308,7 +310,7 @@ def _image_instance_label(attrs: dict) -> str | None:
     Tolerant of both shapes docker reports labels in (`Config.Labels` on an
     inspect payload, a flat `Labels` on a listing) and of an image with no
     labels at all. `None` means "no owning instance recorded" — either a
-    non-nerdit image or a `nerdit-app/*` image built before the label shipped.
+    non-nerdit image or an older unlabelled `nerdit-app/*` image.
     """
     labels = None
     config = attrs.get("Config")
@@ -389,9 +391,9 @@ class DockerRuntime:
     ) -> None:
         self._client = client or DockerClient.from_env()
         self._nvidia_available: bool | None = None
-        # (BUG-1) Memoizes ONLY the positive buildx verdict, and only until this
+        # Memoizes ONLY the positive buildx verdict, and only until this
         # monotonic deadline — see `buildx_available` for why the negative
-        # must always re-probe and why the positive is now bounded.
+        # must always re-probe and why the positive is bounded.
         self._buildx_ok_until: float | None = None
         # Labels every container this daemon creates (`nerdit-instance=<id>`)
         # and scopes the zombie sweep to the same label, so two daemons on one
@@ -560,7 +562,7 @@ class DockerRuntime:
             detach=True,
             # `nerdit-instance` scopes ownership to this daemon so a
             # co-located sibling daemon's zombie sweep never reaps it. Platform
-            # labels are spread LAST: extra_labels (P20 run attribution) can
+            # labels are spread LAST: extra_labels (run attribution) can
             # never overwrite ownership.
             labels={
                 **(config.extra_labels or {}),
@@ -571,14 +573,16 @@ class DockerRuntime:
         # docker-py rejects `nano_cpus=None`; only set it when a limit is given.
         if config.cpu_limit:
             kwargs["nano_cpus"] = int(config.cpu_limit * 1_000_000_000)
-        # /dev/shm sizing (P11 vLLM); only set when requested so the 64MB default
+        if config.pids_limit:
+            kwargs["pids_limit"] = config.pids_limit
+        # /dev/shm sizing (vLLM); only set when requested so the 64MB default
         # is otherwise untouched.
         if config.shm_size:
             kwargs["shm_size"] = config.shm_size
         # Run as a non-root in-image user (e.g. postgres/redis) so the
         # official database entrypoints take their non-root path under the
-        # untouched cap_drop=ALL / no-new-privileges sandbox. Guarded
-        # so every existing caller (user is None) keeps byte-identical kwargs.
+        # untouched cap_drop=ALL / no-new-privileges sandbox. Guarded so a
+        # caller with user=None sends no `user` kwarg.
         if config.user is not None:
             kwargs["user"] = config.user
         # Per-container json-file log caps (service/model only; callers
@@ -597,14 +601,11 @@ class DockerRuntime:
             kwargs["network_mode"] = config.network_mode
         # Service-mode published ports: bind each container port to its host port
         # on the loopback interface only (never 0.0.0.0 — the ProxyManager fronts
-        # services in P3). Guarded so batch (ports is None) keeps byte-identical
-        # kwargs; docker-py rejects `ports=None`.
+        # services). Guarded because docker-py rejects `ports=None`.
         #
-        # P5: `extra_port_bind_ips` adds *additional* host bind addresses
+        # `extra_port_bind_ips` adds *additional* host bind addresses
         # (e.g. the docker bridge gateway, so app containers can reach a model
-        # endpoint) alongside loopback. When unset, the loopback-only kwargs
-        # shape stays byte-identical to the pre-P5 form — the frozen batch and
-        # plain-service paths must never change.
+        # endpoint) alongside loopback; unset keeps the plain loopback shape.
         if config.ports:
             extras = config.extra_port_bind_ips
             if extras:
@@ -798,19 +799,21 @@ class DockerRuntime:
         follow: bool = False,
         tail: int | None = None,
         max_bytes: int | None = None,
+        since: int | None = None,
     ) -> AsyncIterator[str]:
         """Stream container logs as decoded lines.
 
         When *follow* is `True`, yields lines in real time via a
-        background thread and an `asyncio.Queue`; *tail* and *max_bytes* are
+        background thread and a bounded `asyncio.Queue`, starting at *since*
+        (epoch seconds) when given; *tail* and *max_bytes* are
         **ignored** on that branch — a follow stream is unbounded by
         construction and its consumer bounds it by disconnecting. Otherwise *tail* caps the
         trailing lines (server-side, `docker
         logs --tail`) and *max_bytes* the trailing bytes, enforced **while the
         stream is consumed** (see `_read_log_tail`). When the budget
         clips mid-line the first yielded line is a fragment: for a crash tail
-        recency beats alignment. With both `None` — every pre-P20 caller —
-        the legacy unbounded whole-buffer read is used unchanged.
+        recency beats alignment. With both `None` the whole buffer is read,
+        unbounded.
         """
         try:
             container = await asyncio.to_thread(self._client.containers.get, container_id)
@@ -818,20 +821,32 @@ class DockerRuntime:
             raise ContainerNotFoundError(f"Container {container_id} not found") from exc
 
         if follow:
-            queue: asyncio.Queue[str | None] = asyncio.Queue()
+            queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=_FOLLOW_QUEUE_MAX)
             loop = asyncio.get_running_loop()
+
+            def _enqueue(item: str | None) -> None:
+                # Runs on the loop thread. The None sentinel is always last, so
+                # it is never the line dropped.
+                # ponytail: drop-oldest under backpressure, no dropped-line counter
+                if queue.full():
+                    queue.get_nowait()
+                queue.put_nowait(item)
 
             def _put(item: str | None) -> None:
                 # asyncio.Queue is NOT thread-safe — hand the put to the loop.
                 # A closed loop (daemon shutdown) just drops the line.
                 try:
-                    loop.call_soon_threadsafe(queue.put_nowait, item)
+                    loop.call_soon_threadsafe(_enqueue, item)
                 except RuntimeError:
                     pass
 
+            # An int, never a datetime: docker-py's datetime conversion breaks
+            # on tz-aware values.
+            since_kw = {} if since is None else {"since": since}
+
             def _stream_logs() -> None:
                 try:
-                    for chunk in container.logs(stream=True, follow=True):
+                    for chunk in container.logs(stream=True, follow=True, **since_kw):
                         _put(chunk.decode("utf-8", errors="replace").rstrip("\n"))
                 except Exception:
                     pass
@@ -877,8 +892,8 @@ class DockerRuntime:
         Which is also why the call runs on a DEDICATED daemon thread and never
         on the shared default executor — same reasoning as `logs`' follow
         branch: a wait blocks for the container's entire lifetime, and the
-        default pool caps at `min(32, cpus + 4)` workers (the post-P15
-        pool-pinning deadlock, observed live).
+        default pool caps at `min(32, cpus + 4)` workers (pinning it has
+        deadlocked the daemon).
         """
         try:
             container = await asyncio.to_thread(self._client.containers.get, container_id)
@@ -934,11 +949,10 @@ class DockerRuntime:
             # `requests.exceptions.Timeout` at all: the read expires while
             # requests is streaming the response body, and `iter_content`
             # re-wraps urllib3's `ReadTimeoutError` as a plain
-            # `ConnectionError` (requests/models.py). Found live — the P20 WP3
-            # run-primitive timeout leg raised `ConnectionError` straight out
-            # of `run_once` instead of settling `timed_out=True`, and a
-            # `[deploy].release` overrunning `release_timeout_s` took the
-            # generic-Exception branch. A genuine docker outage is also a
+            # `ConnectionError` (requests/models.py). Unhandled, a run timeout
+            # would escape `run_once` instead of settling `timed_out=True`, and
+            # a `[deploy].release` overrunning `release_timeout_s` would take
+            # the generic-Exception branch. A genuine docker outage is also a
             # `ConnectionError`, so classify on the wrapped cause, never on the
             # type alone.
             if not _is_read_timeout(exc):
@@ -1070,7 +1084,7 @@ class DockerRuntime:
         Wraps the synchronous `client.images.pull` in a thread executor like
         every other docker-py call. Idempotent when the image is already
         present locally (Docker no-ops the layers). Registry/daemon failures
-        are mapped to `ContainerRuntimeError` so callers (the P5 model
+        are mapped to `ContainerRuntimeError` so callers (the model
         pull path) settle the workload cleanly.
         """
         try:
@@ -1103,8 +1117,8 @@ class DockerRuntime:
         the short image id; `size_bytes` is the image's on-disk size.
         `instance` is the image's `nerdit-instance` label — the daemon that
         built it (`build_image` stamps it) — or `None` for an image with
-        no such label (any non-nerdit image, and every `nerdit-app/*` image
-        built before the label shipped). Errors degrade to an empty list, like
+        no such label (any non-nerdit image, and older unlabelled
+        `nerdit-app/*` images). Errors degrade to an empty list, like
         `list_images`.
         """
         try:
@@ -1186,7 +1200,7 @@ class DockerRuntime:
         sweep, which KILLS, uses the instance-scoped variant below instead.
 
         Wraps the blocking docker-py call in `asyncio.to_thread`. Entries
-        whose `Created` timestamp cannot be parsed are skipped.
+        whose `Created` timestamp cannot be parsed read as created now.
         """
         return await self._list_managed(filters={"label": "managed-by=nerdit"})
 
@@ -1207,39 +1221,24 @@ class DockerRuntime:
         )
 
     async def list_own_labeled_containers(self, label: str, value: str) -> list[str]:
-        """Ids of THIS daemon's RUNNING containers carrying `label=value`.
-
-        Instance-scoped like `list_own_managed_containers` — this feeds a
-        KILL path (`_settle_crashed_release`), so it must never surface a
-        co-located sibling daemon's containers (the PR #81 regression class).
-        `containers.list` defaults to running-only, which is exactly the
-        orphan-reaping set; an already-exited orphan is inert. No `Created`
-        parsing (unlike `_list_managed`): a kill path must not skip a
-        container because a timestamp failed to parse.
-        """
-        containers = await asyncio.to_thread(
-            self._client.containers.list,
-            filters={
-                "label": [
-                    "managed-by=nerdit",
-                    f"nerdit-instance={self._instance_id}",
-                    f"{label}={value}",
-                ]
-            },
-        )
-        return [c.id for c in containers]
+        """Ids of THIS daemon's RUNNING containers carrying `label=value`."""
+        return await self._list_own_ids(f"{label}={value}")
 
     async def list_own_run_containers(self) -> list[str]:
-        """Ids of THIS daemon's RUNNING containers carrying `nerdit-run` (ANY value).
+        """Ids of THIS daemon's RUNNING containers carrying `nerdit-run` (ANY value)."""
+        # A bare label name in a docker filter matches presence with any value.
+        return await self._list_own_ids("nerdit-run")
 
-        A bare label name in a docker filter list matches *presence* with any
-        value, and docker AND-combines the list — so this is the exact-value
-        sibling of `list_own_labeled_containers` with the value dropped.
-        Instance-scoped for the same reason (this feeds the boot-side orphan
-        kill, a KILL path — the PR #81 regression class), running-only because
-        an already-exited orphan is inert, and with no `Created` parsing
-        because a kill path must not skip a container over an unparsable
-        timestamp.
+    async def _list_own_ids(self, label_filter: str) -> list[str]:
+        """Ids of THIS daemon's running managed containers also matching `label_filter`.
+
+        Feeds KILL paths (`_settle_crashed_release`, the boot-side orphan
+        kill), so it is instance-scoped and never surfaces a co-located
+        sibling daemon's containers. Docker
+        AND-combines the label list. `containers.list` defaults to
+        running-only, which is exactly the orphan-reaping set; an exited
+        orphan is inert. No `Created` parsing: a kill path must not depend on
+        a timestamp.
         """
         containers = await asyncio.to_thread(
             self._client.containers.list,
@@ -1247,7 +1246,7 @@ class DockerRuntime:
                 "label": [
                     "managed-by=nerdit",
                     f"nerdit-instance={self._instance_id}",
-                    "nerdit-run",
+                    label_filter,
                 ]
             },
         )
@@ -1257,9 +1256,12 @@ class DockerRuntime:
         containers = await asyncio.to_thread(self._client.containers.list, filters=filters)
         result: list[tuple[str, datetime]] = []
         for container in containers:
-            created_raw = container.attrs.get("Created") if container.attrs else None
-            if not created_raw:
-                continue
+            created_raw = (container.attrs or {}).get("Created") or ""
+            # ponytail: an unparseable Created reads as brand-new — never reaped
+            # early (and never dropped from the reconcile live set, which would
+            # relaunch a duplicate), but a row-less orphan with a garbage
+            # timestamp is never aged out either.
+            created_at = datetime.now(UTC)
             try:
                 # Docker returns RFC3339 with a trailing 'Z' and nanosecond
                 # precision; trim to microseconds and swap 'Z' for '+00:00'
@@ -1270,18 +1272,18 @@ class DockerRuntime:
                     normalized = f"{head}.{frac[:6]}"
                 created_at = datetime.fromisoformat(normalized).replace(tzinfo=UTC)
             except (ValueError, AttributeError):
-                continue
+                pass
             result.append((container.id, created_at))
         return result
 
     async def buildx_available(self) -> str:
         """Build-toolchain state, memoizing only the POSITIVE result, briefly.
 
-        (BUG-1) Caching `'missing'` would force a daemon restart after the
+        Caching `'missing'` would force a daemon restart after the
         operator installs the plugin, so the missing→present transition always
         re-probes.
 
-        (Codex 3804646823) A plugin CAN vanish (uninstall, a broken package
+        A plugin CAN vanish (uninstall, a broken package
         upgrade, a lost `DOCKER_CONFIG`), so the positive verdict is memoized
         only for `_BUILDX_CACHE_TTL_S`. Concurrent callers (a /doctor check
         and a failed build) may probe twice inside one window — harmless, the
@@ -1290,7 +1292,7 @@ class DockerRuntime:
         fresh `missing` in a build's classification would put two first-party
         surfaces in direct disagreement.
 
-        (Codex 3804646811) No docker CLI at all ⇒ `'no_cli'`, not
+        No docker CLI at all ⇒ `'no_cli'`, not
         `'unknown'`: that is a concluded, definite host fault (nothing on this
         node can build), while `unknown` is reserved for a probe that could
         not conclude and stays fail-open.
@@ -1339,16 +1341,16 @@ class DockerRuntime:
         Dockerfile so a passthrough (user-supplied) Dockerfile is labelled too.
 
         A non-zero exit raises `BuildError` carrying the exit code and the
-        last output line. There is no wall-clock bound (the classic path had none
-        either): the bound is consumer cancellation — if the generator is closed
-        or cancelled (the P20 drain that abandons builds), the child process is
+        last output line. There is no wall-clock bound: the bound is consumer
+        cancellation — if the generator is closed or cancelled (the restart
+        drain abandons builds), the child process is
         killed rather than left orphaned.
         """
         docker_bin = shutil.which("docker")
         if docker_bin is None:
-            # (Codex 3804646811) A PLATFORM error, not a plain BuildError:
-            # redeploying identical source cannot help, so the USER_ERROR this
-            # used to settle sent every caller off to fix an app that is fine.
+            # A PLATFORM error, not a plain BuildError: redeploying identical
+            # source cannot help, so a USER_ERROR would send every caller off
+            # to fix an app that is fine.
             # Path-free on purpose — this message is persisted into
             # `config['last_deploy']` and re-served over /diagnose.
             raise BuildPlatformError(
@@ -1375,7 +1377,7 @@ class DockerRuntime:
         argv.append(context_dir)
 
         try:
-            # (BUG-1) DECISION: DOCKER_CONFIG is deliberately NOT pinned here.
+            # DECISION: DOCKER_CONFIG is deliberately NOT pinned here.
             # The CLI already resolves plugins from $DOCKER_CONFIG/cli-plugins
             # (default $HOME/.docker/cli-plugins) and then the system-wide
             # plugin dirs, so a service-account HOME finds a system-wide install
@@ -1393,7 +1395,7 @@ class DockerRuntime:
                 stderr=asyncio.subprocess.STDOUT,
                 env={**os.environ, "DOCKER_BUILDKIT": "1"},
                 limit=_BUILD_STREAM_LIMIT,
-                # (Codex 3804646864) Its own session, so abandoning the
+                # Its own session, so abandoning the
                 # generator reaps BuildKit's children too, not just the CLI
                 # head. Verified safe: `daemon/lifecycle.py` stops the daemon
                 # with a single-pid `os.kill`, never a group signal, so
@@ -1429,11 +1431,11 @@ class DockerRuntime:
             rc = await proc.wait()
             if rc != 0:
                 tail_text = _build_failure_tail(tail)
-                # (BUG-1) Classify the failure by PROBING for the BuildKit
+                # Classify the failure by PROBING for the BuildKit
                 # builder, on the failure path only: a happy-path preflight
                 # would add a subprocess to every build to answer a question
                 # that only matters once one has already failed. The proactive
-                # half of BUG-1 lives in `check-deps` and `/doctor`.
+                # check lives in `check-deps` and `/doctor`.
                 # `== "missing"` and not `!= "present"`: `no_cli` is
                 # unreachable here (the early guard above already raised on it)
                 # and `unknown` must stay fail-open.

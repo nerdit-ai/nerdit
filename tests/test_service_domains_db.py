@@ -33,6 +33,10 @@ def _job(name: str, *, kind: JobKind = JobKind.service) -> Job:
     )
 
 
+async def _domain(queries, name: str) -> ServiceDomain | None:
+    return next((d for d in await queries.list_service_domains() if d.domain == name), None)
+
+
 async def _jid(queries, name: str) -> str:
     """Id of the live service named ``name`` — the row the route would have authorized."""
     job = await queries.get_service_by_name(name)
@@ -105,7 +109,7 @@ async def test_the_acme_check_constraint_is_the_backstop(db, queries):
 
 
 async def test_get_returns_none_when_the_name_is_free(queries):
-    assert await queries.get_service_domain("app.example.com") is None
+    assert await _domain(queries, "app.example.com") is None
 
 
 async def test_a_fresh_database_lists_nothing(queries):
@@ -127,7 +131,7 @@ async def test_claiming_a_free_name_inserts_it(queries):
         "domain",
     )
     assert row.created_at.tzinfo is not None  # normalized to aware UTC on read
-    assert await queries.get_service_domain("app.example.com") == row
+    assert await _domain(queries, "app.example.com") == row
 
 
 async def test_re_claiming_by_the_same_service_is_idempotent(db, queries):
@@ -164,7 +168,7 @@ async def test_a_second_service_can_never_take_a_bound_name(queries):
 
     assert outcome == "taken"
     assert row is not None and row.service_name == "first"
-    still = await queries.get_service_domain("app.example.com")
+    still = await _domain(queries, "app.example.com")
     assert still is not None and still.service_name == "first"
     assert await queries.get_service_domains("second") == []
 
@@ -197,7 +201,7 @@ async def test_claiming_refuses_a_name_no_live_service_owns(queries, kind):
     )
 
     assert (outcome, row) == ("no_service", None)
-    assert await queries.get_service_domain("app.example.com") is None
+    assert await _domain(queries, "app.example.com") is None
 
 
 async def test_a_stale_job_id_cannot_bind_a_recreated_name(queries):
@@ -217,7 +221,7 @@ async def test_a_stale_job_id_cannot_bind_a_recreated_name(queries):
         "demo", "app.example.com", acme=False, job_id=job1.id
     )
     assert stale == "no_service"
-    assert await queries.get_service_domain("app.example.com") is None
+    assert await _domain(queries, "app.example.com") is None
 
     # The live row's own id still writes — the predicate is not over-tight.
     live, _ = await queries.add_service_domain(
@@ -237,7 +241,7 @@ async def test_a_job_id_belonging_to_another_service_is_refused(queries):
     )
 
     assert outcome == "no_service"
-    assert await queries.get_service_domain("app.example.com") is None
+    assert await _domain(queries, "app.example.com") is None
 
 
 async def test_acme_stays_dormant_data_and_round_trips(queries):
@@ -251,7 +255,7 @@ async def test_acme_stays_dormant_data_and_round_trips(queries):
     outcome, updated = await _bind(queries, "demo", "app.example.com", acme=False)
     assert outcome == "exists"
     assert updated is not None and updated.acme is False
-    stored = await queries.get_service_domain("app.example.com")
+    stored = await _domain(queries, "app.example.com")
     assert stored is not None and stored.acme is False
 
 
@@ -272,22 +276,12 @@ async def test_an_unspecified_acme_keeps_the_stored_flag(queries):
 
     assert outcome == "exists"
     assert unchanged is not None and unchanged.acme is True
-    stored = await queries.get_service_domain("app.example.com")
+    stored = await _domain(queries, "app.example.com")
     assert stored is not None and stored.acme is True
 
     # …and on an INSERT it is plain ``false`` — never NULL in the column.
     _, fresh = await _bind(queries, "demo", "other.example.com", acme=None)
     assert fresh is not None and fresh.acme is False
-
-
-async def test_a_stray_case_variant_resolves_to_the_same_row(queries):
-    """The write path folds, but the point read must not depend on it."""
-    await queries.create_job(_job("demo"))
-    await _bind(queries, "demo", "app.example.com")
-
-    found = await queries.get_service_domain("APP.Example.CoM")
-
-    assert found is not None and found.service_name == "demo"
 
 
 async def test_list_is_one_read_ordered_by_service_then_domain(queries):
@@ -325,7 +319,7 @@ async def test_remove_reports_whether_a_row_was_there(queries):
 
     assert await queries.remove_service_domain("demo", "app.example.com") is True
     assert await queries.remove_service_domain("demo", "app.example.com") is False
-    assert await queries.get_service_domain("app.example.com") is None
+    assert await _domain(queries, "app.example.com") is None
 
 
 async def test_remove_is_scoped_to_the_owning_service(queries):
@@ -336,7 +330,7 @@ async def test_remove_is_scoped_to_the_owning_service(queries):
     await _bind(queries, "first", "app.example.com")
 
     assert await queries.remove_service_domain("second", "app.example.com") is False
-    assert await queries.get_service_domain("app.example.com") is not None
+    assert await _domain(queries, "app.example.com") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +427,7 @@ async def test_a_refused_delete_keeps_the_domains_and_reports_nothing(queries):
 
     assert refused == [{"service": "dep", "id": "s1", "binding": "default"}]
     assert seen == []
-    assert await queries.get_service_domain("app.example.com") is not None
+    assert await _domain(queries, "app.example.com") is not None
 
 
 async def test_an_absent_row_deletes_no_domain_and_never_calls_back(queries):
@@ -449,7 +443,7 @@ async def test_an_absent_row_deletes_no_domain_and_never_calls_back(queries):
     )
 
     assert seen == []
-    assert await queries.get_service_domain("app.example.com") is not None
+    assert await _domain(queries, "app.example.com") is not None
 
 
 async def test_a_recreated_name_starts_with_no_domains(queries):
@@ -460,7 +454,7 @@ async def test_a_recreated_name_starts_with_no_domains(queries):
     await queries.create_job(_job("demo"))
 
     assert await queries.get_service_domains("demo") == []
-    assert await queries.get_service_domain("app.example.com") is None
+    assert await _domain(queries, "app.example.com") is None
 
 
 async def test_the_two_cascade_callbacks_are_independent(queries):

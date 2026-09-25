@@ -49,6 +49,14 @@ class JobStatus(str, Enum):
     stopped = "stopped"
 
 
+# Settled; degraded/restarting/building are churn. Mirrors the terminal set
+# `get_reconcilable_services` filters on in SQL. Members equal their plain-str
+# values, so desired_state strings and JSON statuses test correctly against it.
+TERMINAL_STATUSES = frozenset(
+    {JobStatus.completed, JobStatus.cancelled, JobStatus.stopped, JobStatus.failed}
+)
+
+
 class JobKind(str, Enum):
     """Workload kinds; batch remains only for loading legacy rows."""
 

@@ -10,6 +10,7 @@ Pin route wiring through OpenAPI and a direct route call.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from fastapi import Response
@@ -189,6 +190,7 @@ class _StubRequest:
 
     def __init__(self, *, disconnect_after: int | None = None, headers: dict | None = None):
         self.headers = headers or {}
+        self.state = SimpleNamespace()
         self._checks = 0
         self._disconnect_after = disconnect_after
 

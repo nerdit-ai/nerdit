@@ -78,13 +78,13 @@ class WorkloadQueries(QueriesBase):
                (id, name, script_path, gpu_count, status,
                 container_id, created_at, started_at, finished_at,
                 exit_code, config,
-                error_class, error_message, submitted_via, kind,
+                error_class, error_message, kind,
                 submitted_by_token, idempotency_key,
                 desired_state, restart_policy, restart_count, health_check,
                 service_name, last_exit_at, restart_window_start,
                 project_id, environment, service)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?)""",
+                       ?, ?)""",
             (
                 job.id,
                 job.name,
@@ -99,7 +99,6 @@ class WorkloadQueries(QueriesBase):
                 job.config,
                 job.error_class.value if job.error_class else None,
                 job.error_message,
-                job.submitted_via,
                 job.kind.value,
                 job.submitted_by_token,
                 job.idempotency_key,
@@ -325,8 +324,13 @@ class WorkloadQueries(QueriesBase):
         finished_at: datetime | None = None,
         error_class: ErrorClass | None = None,
         error_message: str | None = None,
+        desired_state: str | None = None,
     ) -> None:
-        """Update a job's status and optional fields (container_id, timestamps, etc.)."""
+        """Update a job's status and optional fields (container_id, timestamps, etc.).
+
+        Pass ``desired_state`` to settle both columns in one statement, so a crash
+        cannot leave a terminal status with ``desired_state = running``.
+        """
         updates = ["status = ?"]
         params: list = [status.value]
 
@@ -348,6 +352,9 @@ class WorkloadQueries(QueriesBase):
         if error_message is not None:
             updates.append("error_message = ?")
             params.append(error_message)
+        if desired_state is not None:
+            updates.append("desired_state = ?")
+            params.append(desired_state)
 
         params.append(job_id)
         await self._db.conn.execute(

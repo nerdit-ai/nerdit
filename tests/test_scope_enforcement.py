@@ -32,8 +32,6 @@ from nerdit.daemon import deploy_pipeline
 from nerdit.daemon.auth import hash_token
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers
 from nerdit.daemon.middleware import ScopedTokenAuthMiddleware
-from nerdit.daemon.routes import app_templates as app_templates_route
-from nerdit.daemon.routes import deploy as deploy_route
 from nerdit.daemon.routes.app_config import router as app_config_router
 from nerdit.daemon.routes.app_templates import router as app_templates_router
 from nerdit.daemon.routes.databases import router as databases_router
@@ -290,8 +288,6 @@ class _FakeClone:
 def _no_network(monkeypatch):
     """No case in this file may reach the network: every clone site is faked."""
     clone = _FakeClone()
-    monkeypatch.setattr(deploy_route, "clone_source", clone)
-    monkeypatch.setattr(app_templates_route, "clone_source", clone)
     monkeypatch.setattr(deploy_pipeline, "clone_source", clone)
     return clone
 

@@ -529,10 +529,8 @@ def test_an_unresolvable_recorded_reference_is_409_before_the_clone(tmp_path, fa
 
 def test_the_git_route_stamps_token_ref_into_source_meta(tmp_path, monkeypatch):
     """WP6.3: the original ``POST /deploy/git`` records the reference NAME."""
-    from nerdit.daemon.routes import deploy as deploy_routes
-
     clone = _FakeClone()
-    monkeypatch.setattr(deploy_routes, "clone_source", clone)
+    monkeypatch.setattr(deploy_pipeline, "clone_source", clone)
     q = _queries(_git_row(source={"type": "zip"}))
     client = _client(
         q, tmp_path, secret_manager=_secret_manager({"demo": {"GH_TOKEN": "ghp-live"}})

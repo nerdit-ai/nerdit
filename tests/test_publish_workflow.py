@@ -482,3 +482,11 @@ def test_the_sdist_contents_are_checked_against_the_allowlist() -> None:
     assert code.index("Refuse an sdist") < code.index("upload-artifact"), (
         "the sdist gate runs before the artifact leaves the build job"
     )
+
+
+def test_standard_install_includes_mcp_with_compatible_extra() -> None:
+    import tomllib
+
+    project = tomllib.loads(PYPROJECT.read_text())["project"]
+    assert "mcp>=1.9,<2" in project["dependencies"]
+    assert project["optional-dependencies"]["mcp"] == ["mcp>=1.9,<2"]

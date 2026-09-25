@@ -36,7 +36,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -47,6 +47,7 @@ from fastapi import APIRouter, Request
 import nerdit
 from nerdit.config.settings import _is_ip_literal, _validate_dns_name
 from nerdit.config.store import ConfigError, ConfigStore
+from nerdit.core.link.hosted import hosted_host, hosted_label_fits, public_address_url
 from nerdit.core.link.identity import (
     LinkIdentityError,
     load_or_create_identity,
@@ -58,6 +59,9 @@ from nerdit.daemon.auth import (
     CLOUD_CONTROL_ENTITLEMENT,
     CLOUD_CONTROL_GIT_NUDGE,
     CLOUD_CONTROL_GITHUB_TOKEN,
+    CLOUD_CONTROL_PROJECT_DISCOVERY,
+    CLOUD_CONTROL_PUBLIC_ADDRESS,
+    LINK_TOKEN_PREFIX,
     require_cloud_principal,
     require_role,
 )
@@ -79,13 +83,18 @@ from nerdit.daemon.schemas.link import (
     LinkDevicePollView,
     LinkDeviceStartRequest,
     LinkDeviceStartView,
+    LinkedProjectView,
     LinkRefreshRequest,
     LinkRefreshView,
     LinkUnlinkView,
+    PublicAddressPushRequest,
+    PublicAddressPushView,
     _is_loopback,
 )
 from nerdit.db.models import TokenRole
 from nerdit.db.queries._base import mark_request_side_effect
+from nerdit.db.rows import ServicePublicAddress
+from nerdit.utils.names import DNS_LABEL_RE
 
 logger = logging.getLogger(__name__)
 
@@ -120,13 +129,6 @@ _CLAIM_TIMEOUT_S = 10.0
 #: per-read inactivity budget, not a total one — a byte every nine seconds
 #: satisfies it forever — and the exchange runs holding the mutation lock.
 _CLAIM_TOTAL_TIMEOUT_S = 30.0
-
-#: The frozen slug shape: a DNS label (slugs become `<slug>.node.<domain>`
-#: gateway hostnames cloud-side, so anything wider could not be routed anyway).
-#: The slug is also the second half of every hosted app name —
-#: `<app>--<slug>.<nodes_base_domain>`, still one label — so the same grammar
-#: carries both.
-_SLUG_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
 #: Operator guidance per cloud refusal code. The cloud's `link_code_*`
 #: vocabulary is frozen (`nerdit-cloud` `errors.py`); anything unmapped
@@ -336,7 +338,7 @@ class _StagedLink:
     mcp_skipped_reason: str | None
 
 
-def _commit_link_identity(  # noqa: PLR0913 - the claim's own inline locals, unchanged
+def _commit_link_identity(  # noqa: PLR0913 - every grant's staging inputs
     request: Request,
     store: ConfigStore,
     *,
@@ -403,8 +405,7 @@ def _commit_link_identity(  # noqa: PLR0913 - the claim's own inline locals, unc
     request.app.state.link_enrolled_key_file = str(key_file)
     # A linked node exists for the cloud's remote MCP gateway, which
     # forwards to this daemon's `/api/mcp` — so a claim that enables the
-    # link also enables the transport (a deliberate owner decision, made
-    # after a fresh install was found answering 405 there otherwise).
+    # link also enables the transport (otherwise the gateway meets a 405).
     # Two preconditions the daemon itself enforces at boot, checked here so
     # the required restart can never be turned into a boot refusal:
     # `[daemon].auth_token` (the transport is bearer-only) and the
@@ -491,11 +492,9 @@ async def claim_link(request: Request, body: LinkClaimRequest) -> LinkClaimView:
 
         # (D5) The relay endpoint must be known before the code is spent: a
         # successful claim that cannot be started is worse than a refused one.
-        # A fast-fail and nothing more, in `start_device_link`'s shape: the
-        # value the response and the audit report is re-resolved at the commit
-        # (`_relay_url_at_commit`), because the identity load and the
-        # cloud exchange below are awaits an admin can clear `[link].relay_url`
-        # inside, and a snapshot taken here would outlive its own truth.
+        # Only a fast-fail: the awaits below leave room for an admin to clear
+        # `[link].relay_url`, so the commit re-resolves it
+        # (`_relay_url_at_commit`).
         if not (body.relay_url or effective.get("relay_url")):
             raise NerditError(
                 422,
@@ -519,8 +518,7 @@ async def claim_link(request: Request, body: LinkClaimRequest) -> LinkClaimView:
             identity = await asyncio.to_thread(load_or_create_identity, key_file)
         except LinkIdentityError as exc:
             # The path belongs in the log (the identity.py precedent) and
-            # nowhere else: the response message stays path-free (P14c M3
-            # posture).
+            # nowhere else: the response message stays path-free.
             logger.error("Node identity unavailable for link claim: %s", exc)
             raise NerditError(
                 500,
@@ -532,8 +530,7 @@ async def claim_link(request: Request, body: LinkClaimRequest) -> LinkClaimView:
         node_id, slug, domain = await _exchange(request, body, identity.verifier)
 
         # The one staging tail, shared verbatim with the device poll's
-        # approved branch so the two grants cannot drift apart. Everything the
-        # claim used to do inline lives in it, in the same order.
+        # approved branch so the two grants cannot drift apart.
         committed = _commit_link_identity(
             request,
             store,
@@ -546,6 +543,38 @@ async def claim_link(request: Request, body: LinkClaimRequest) -> LinkClaimView:
             key_file_snapshot=effective.get("key_file"),
             data_dir_snapshot=stored_data_dir,
         )
+    return LinkClaimView(
+        **_linked_result(
+            request,
+            committed,
+            node_id=node_id,
+            slug=slug,
+            domain=domain,
+            held_domain=effective.get("nodes_base_domain"),
+            fingerprint=identity.fingerprint,
+            enable=bool(body.enable),
+            grant="key" if body.key is not None else "code",
+        )
+    )
+
+
+def _linked_result(  # noqa: PLR0913 - the linked facts both grant paths already hold
+    request: Request,
+    committed: _StagedLink,
+    *,
+    node_id: str,
+    slug: str,
+    domain: str | None,
+    held_domain: str | None,
+    fingerprint: str,
+    enable: bool,
+    grant: str,
+) -> dict[str, Any]:
+    """Audit a committed link as `link.created` and return the shared view fields.
+
+    Every grant (console code, pre-auth key, device approval) lands here, so
+    the audit row and the response are one vocabulary.
+    """
     logger.info("Linked as node %s (config etag %s)", node_id, committed.etag[:12])
 
     request.state.audit_target = node_id
@@ -554,51 +583,46 @@ async def claim_link(request: Request, body: LinkClaimRequest) -> LinkClaimView:
             "node_id": node_id,
             "slug": slug,
             # The identity.py-documented non-secret audit form of the key.
-            "verifier_fingerprint": identity.fingerprint,
+            "verifier_fingerprint": fingerprint,
             # The HOST only (the api_host rule): an ACCEPTED relay URL may
             # legitimately carry a path (a relay behind a prefix), and a path
             # is where credentials get parked — the durable row does not need
             # it, the config file already holds the full value.
             "relay_host": urlsplit(committed.relay_url).netloc,
-            "enabled": bool(body.enable),
+            "enabled": enable,
             # A public DNS name, not a secret — and the row is where
             # an operator later reconstructs which suffix a node was claimed
             # under. `None` when this cloud sent none.
             "nodes_base_domain": domain,
             "mcp_http_enabled": committed.mcp_http_enabled,
-            # Carried onto the success row too, not just the pre-flight
-            # one it replaces: with three ways into a link, "how did this node
-            # arrive" is a question the durable trail should be able to answer
-            # without joining anything. The device poll's success row (which
-            # audits as `link.created` through the same tail) writes
-            # `"device"` in this slot, so the three are one vocabulary.
-            "grant": "key" if body.key is not None else "code",
+            # WHICH grant was presented ("code", "key" or "device"), so "how
+            # did this node arrive" is answerable from the durable trail alone.
+            "grant": grant,
         }
     )
-    return LinkClaimView(
-        node_id=node_id,
-        slug=slug,
-        # What `[link]` holds now, for the `nodes_base_domain` reason one
-        # field down: a value resolved before the exchange could name a relay
-        # the config lost while the exchange was in flight.
-        relay_url=committed.relay_url,
-        enabled=bool(body.enable),
-        verifier_fingerprint=identity.fingerprint,
+    return {
+        "node_id": node_id,
+        "slug": slug,
+        # What `[link]` holds now: a value resolved before the exchange could
+        # name a relay the config lost while the exchange was in flight.
+        "relay_url": committed.relay_url,
+        "enabled": enable,
+        "verifier_fingerprint": fingerprint,
         # What the daemon now HOLDS, not merely what this exchange returned: a
         # cloud that sent nothing leaves an earlier refresh's value standing,
         # and reporting `null` there would read as "the node lost it".
-        nodes_base_domain=domain if domain is not None else effective.get("nodes_base_domain"),
+        "nodes_base_domain": domain if domain is not None else held_domain,
         # Hardcoded, not read off the staged diff: every `[link]` key is
-        # restart-keyed (config/store.py), so a claim ALWAYS needs a restart to
+        # restart-keyed (config/store.py), so a link ALWAYS needs a restart to
         # take effect — including the degenerate "same values" re-commit whose
         # diff would be empty. `restart_keys` still reports what changed.
-        requires_restart=True,
-        # The whole mutation: the [link] keys AND the [mcp] key this claim
+        "requires_restart": True,
+        # The whole mutation: the [link] keys AND the [mcp] key this link
         # staged, so automation reading restart_keys is not told half the story.
-        restart_keys=committed.restart_keys,
-        mcp_http_enabled=committed.mcp_http_enabled,
-        mcp_skipped_reason=committed.mcp_skipped_reason,
-    )
+        "restart_keys": committed.restart_keys,
+        "mcp_http_enabled": committed.mcp_http_enabled,
+        "mcp_skipped_reason": committed.mcp_skipped_reason,
+    }
 
 
 #: Skip reasons are machine-stable prefixes the CLI keys its remediation on
@@ -635,7 +659,11 @@ def _enable_mcp_transport(
     except ConfigError:  # pragma: no cover - known sections
         return False, "config_unreadable: config unreadable", []
     if importlib.util.find_spec("mcp") is None:
-        return False, f"{MCP_SKIP_NO_EXTRA}: the mcp extra is not installed in this build", []
+        return (
+            False,
+            f"{MCP_SKIP_NO_EXTRA}: the bundled mcp dependency is missing from this installation",
+            [],
+        )
     try:
         staged = store.stage("mcp", {"http_enabled": True})
         store.commit(staged)
@@ -682,6 +710,46 @@ def _validated_domain(value: object, *, submitted_code: str = "") -> str | None:
     return value
 
 
+async def _cloud_request(
+    request: Request,
+    api_url: str,
+    path: str,
+    payload: dict[str, object] | None = None,
+    *,
+    hint: str = "Check --api-url and this machine's outbound connectivity, then retry.",
+) -> httpx.Response:
+    """One bounded cloud hop: GET without `payload`, else POST it as JSON.
+
+    Status and body handling stay with the caller. A transport failure is 502
+    `link.cloud_unreachable` naming the netloc only — never the full URL (it
+    could carry an operator's paste), never a grant, never a response body.
+    """
+    # `transport=None` is the real network; tests inject an
+    # `httpx.MockTransport` through app.state so no suite ever dials out.
+    transport = getattr(request.app.state, "link_claim_transport", None)
+    try:
+        # The scalar httpx timeout is per-operation (a read-inactivity budget),
+        # so a slow-dripping endpoint could hold a hop — and with it any lock
+        # the caller holds, `_LINK_MUTATION_LOCK` included — indefinitely,
+        # wedging every later unlink. The asyncio deadline is the WALL-CLOCK
+        # bound on the whole hop.
+        async with asyncio.timeout(_CLAIM_TOTAL_TIMEOUT_S):
+            async with httpx.AsyncClient(
+                timeout=_CLAIM_TIMEOUT_S, follow_redirects=False, transport=transport
+            ) as http:
+                url = api_url.rstrip("/") + path
+                if payload is None:
+                    return await http.get(url)
+                return await http.post(url, json=payload)
+    except (httpx.HTTPError, TimeoutError) as exc:
+        raise NerditError(
+            502,
+            "link.cloud_unreachable",
+            f"The cloud endpoint {urlsplit(api_url).netloc} could not be reached.",
+            hint=hint,
+        ) from exc
+
+
 async def _exchange(
     request: Request, body: LinkClaimRequest, verifier: str
 ) -> tuple[str, str, str | None]:
@@ -697,7 +765,7 @@ async def _exchange(
     # interpolated into an error message.
     submitted = body.key or body.code or ""
     if body.key is not None:
-        url = body.api_url.rstrip("/") + "/api/link/preauth"
+        path = "/api/link/preauth"
         hostname, _version, _os = _machine_facts()
         payload_out: dict[str, object] = {
             "key": body.key,
@@ -705,31 +773,9 @@ async def _exchange(
             "hostname_hint": hostname,
         }
     else:
-        url = body.api_url.rstrip("/") + "/api/link/claim"
+        path = "/api/link/claim"
         payload_out = {"code": body.code, "credential_reference": verifier}
-    # `transport=None` is the real network; tests inject an
-    # `httpx.MockTransport` through app.state so no suite ever dials out.
-    transport = getattr(request.app.state, "link_claim_transport", None)
-    try:
-        # The scalar httpx timeout is per-operation (a read-inactivity budget),
-        # so a slow-dripping endpoint could hold the exchange — and with it
-        # `_LINK_MUTATION_LOCK` — indefinitely, wedging every later unlink.
-        # The asyncio deadline is the WALL-CLOCK
-        # bound on the whole hop.
-        async with asyncio.timeout(_CLAIM_TOTAL_TIMEOUT_S):
-            async with httpx.AsyncClient(
-                timeout=_CLAIM_TIMEOUT_S, follow_redirects=False, transport=transport
-            ) as http:
-                response = await http.post(url, json=payload_out)
-    except (httpx.HTTPError, TimeoutError) as exc:
-        # The netloc only — never the full URL (it could carry an operator's
-        # paste), never the code, never a response body.
-        raise NerditError(
-            502,
-            "link.cloud_unreachable",
-            f"The cloud endpoint {urlsplit(body.api_url).netloc} could not be reached.",
-            hint="Check --api-url and this machine's outbound connectivity, then retry.",
-        ) from exc
+    response = await _cloud_request(request, body.api_url, path, payload_out)
 
     if response.status_code >= 400:
         raise _refusal(response, submitted)
@@ -769,13 +815,15 @@ def _parse_claim_identity(
     # hostnames). A nonconforming `--api-url` endpoint answering 200 with the
     # submitted link code in either field would otherwise see that secret
     # persisted into config, echoed in the response, audited, and logged — the
-    # success path is a reflection channel exactly like `error.code` was.
+    # success path is a reflection channel exactly like `error.code`.
     # A link code cannot pass either shape.
     if (
         not isinstance(node_id, str)
         or not isinstance(slug, str)
         or not _is_uuid(node_id)
-        or not _SLUG_RE.fullmatch(slug)
+        # The frozen slug shape is a DNS label: slugs become gateway hostnames
+        # cloud-side and the second half of every `<app>--<slug>` hosted label.
+        or not DNS_LABEL_RE.fullmatch(slug)
         # The schema pins codes UPPERCASE while every reflectable shape here
         # is lowercase-only, so a conforming echo of the code as-sent is
         # impossible. The LOWERCASED form is still secret-equivalent (Crockford
@@ -969,21 +1017,20 @@ async def unlink_node(request: Request) -> LinkUnlinkView:
         # is right for a poll and wrong here — unlink is not one flow ending, it
         # is the daemon's whole enrolment being torn down, so every slot goes.
         #
-        # Without this the wipe below removes the key file the slot still points
-        # at while every poll pre-flight keeps passing: `node_id` was just
-        # cleared, the slot and its session are untouched, and the cloud happily
-        # confirms the approval for the verifier minted from the DELETED key. The
-        # commit would then write `node_id`/`slug`/`enabled = true` naming a
-        # credential that no longer exists, the next boot would mint a fresh
-        # keypair, and the tunnel could never authenticate as the enrolled node —
-        # "linked but unauthenticatable" until somebody unlinks again. Cheap to
-        # prevent here; invisible and baffling if it happens.
+        # Without this, a pending poll could still commit an approval for the
+        # verifier of the key wiped below: the next boot would mint a fresh
+        # keypair and the node would be "linked but unauthenticatable".
         request.app.state.link_device_pending = None
 
         # Non-DB durable effects follow (the config TOML write, the key wipe) —
         # pin the idempotency claim first, the documented
         # `mark_request_side_effect` contract.
         mark_request_side_effect()
+        # Clear before the config commit: a crash must not leave an unlinked
+        # identity with stale assignments that prevent a later re-link.
+        queries = getattr(request.app.state, "queries", None)
+        if queries is not None:
+            await queries.clear_service_public_addresses()
         try:
             # Contiguous stage+commit (D12), after the awaited stop. The
             # null-delete is the store's documented single explicit unlink
@@ -1073,10 +1120,8 @@ async def unlink_node(request: Request) -> LinkUnlinkView:
 async def _fetch_metadata(request: Request, body: LinkRefreshRequest) -> str:
     """GET the cloud's hosted metadata and return its `nodes_base_domain`.
 
-    The claim hop's exact plumbing — same client, same two nested deadlines
-    (the httpx scalar is a per-read inactivity budget; the `asyncio` one is
-    the wall clock, and this hop also runs holding `_LINK_MUTATION_LOCK`), same
-    `link_claim_transport` test seam — with one difference that shapes
+    The claim hop's exact plumbing (`_cloud_request`; the hop runs lock-free
+    and the commit retakes `_LINK_MUTATION_LOCK`) — with one difference that shapes
     every error below: **nothing secret is sent**. There is no code to leak, so
     the refusals need only be structured, not reflection-proof.
 
@@ -1084,21 +1129,7 @@ async def _fetch_metadata(request: Request, body: LinkRefreshRequest) -> str:
     (`link.refresh_unsupported`): an operator whose console is simply older
     than their daemon must be told to upgrade, not handed a generic 502.
     """
-    url = body.api_url.rstrip("/") + "/api/link/metadata"
-    transport = getattr(request.app.state, "link_claim_transport", None)
-    try:
-        async with asyncio.timeout(_CLAIM_TOTAL_TIMEOUT_S):
-            async with httpx.AsyncClient(
-                timeout=_CLAIM_TIMEOUT_S, follow_redirects=False, transport=transport
-            ) as http:
-                response = await http.get(url)
-    except (httpx.HTTPError, TimeoutError) as exc:
-        raise NerditError(
-            502,
-            "link.cloud_unreachable",
-            f"The cloud endpoint {urlsplit(body.api_url).netloc} could not be reached.",
-            hint="Check --api-url and this machine's outbound connectivity, then retry.",
-        ) from exc
+    response = await _cloud_request(request, body.api_url, "/api/link/metadata")
 
     if response.status_code == 404:
         raise NerditError(
@@ -1134,6 +1165,22 @@ async def _fetch_metadata(request: Request, body: LinkRefreshRequest) -> str:
     return domain
 
 
+def _linked_link_section(store: ConfigStore) -> dict[str, Any]:
+    """Return the effective `[link]` section, or 409 `link.not_linked`."""
+    try:
+        effective = store.effective_section("link")
+    except ConfigError as exc:  # pragma: no cover - "link" is a known section
+        raise _as_nerdit_error(exc) from exc
+    if not effective.get("node_id"):
+        raise NerditError(
+            409,
+            "link.not_linked",
+            "This daemon is not linked to a cloud account.",
+            hint="Run 'nerdit link <code>' first — the hosted domain comes with the claim.",
+        )
+    return effective
+
+
 @router.post(
     "/link/refresh",
     response_model=LinkRefreshView,
@@ -1158,23 +1205,25 @@ async def refresh_link(request: Request, body: LinkRefreshRequest) -> LinkRefres
     request.state.audit_params = audit_params({"api_host": urlsplit(body.api_url).netloc})
     _require_idempotency_key(request, "link refresh")
 
-    async with _LINK_MUTATION_LOCK:
-        store = _store(request)
-        try:
-            effective = store.effective_section("link")
-        except ConfigError as exc:  # pragma: no cover - "link" is a known section
-            raise _as_nerdit_error(exc) from exc
+    store = _store(request)
+    node_id_snapshot = _linked_link_section(store)["node_id"]
+    # Lock-free: the cloud hop is bounded at `_CLAIM_TOTAL_TIMEOUT_S`, and
+    # holding the lock across it would stall every claim, unlink and
+    # public-address push behind a refresh. The commit retakes the lock and
+    # re-reads `[link]`, so an unlink landing mid-hop wins, and an unlink plus
+    # a new claim mid-hop is refused rather than handed the old cloud's domain.
+    domain = await _fetch_metadata(request, body)
 
-        node_id = effective.get("node_id")
-        if not node_id:
+    async with _LINK_MUTATION_LOCK:
+        effective = _linked_link_section(store)
+        node_id = effective["node_id"]
+        if node_id != node_id_snapshot:
             raise NerditError(
                 409,
-                "link.not_linked",
-                "This daemon is not linked to a cloud account.",
-                hint="Run 'nerdit link <code>' first — the hosted domain comes with the claim.",
+                "link.config_changed",
+                "The link changed while the refresh was in flight.",
+                hint="Re-run 'nerdit link refresh' against the current link.",
             )
-
-        domain = await _fetch_metadata(request, body)
         changed = effective.get("nodes_base_domain") != domain
         # A TOML write is a non-DB durable effect, so the idempotency claim is
         # pinned ahead of it (the claim/unlink precedent): a cancellation between
@@ -1300,11 +1349,8 @@ class _DeviceMint:
     def __repr__(self) -> str:
         """Redacted for the reason `_DevicePending` is, and no other.
 
-        This one holds BOTH codes, and it is the shorter-lived of the two — so
-        the generated `__repr__` was easy to leave alone and would have been
-        the more embarrassing leak. No call site logs it today; that is a fact
-        about today's call sites, not a property of the type, and the type is
-        where the property belongs.
+        This one holds BOTH codes. No call site logs it, but redaction belongs
+        to the type, not to its call sites.
         """
         return f"_DeviceMint(expires_in={self.expires_in!r}, interval={self.interval!r})"
 
@@ -1377,30 +1423,18 @@ async def _mint_device_code(
     No secret is submitted, so refusal reflection checks receive an empty input.
     Validate returned user code and approval URL before presenting them to humans.
     """
-    url = body.api_url.rstrip("/") + "/api/link/device"
     hostname, daemon_version, os_name = _machine_facts()
-    transport = getattr(request.app.state, "link_claim_transport", None)
-    try:
-        async with asyncio.timeout(_CLAIM_TOTAL_TIMEOUT_S):
-            async with httpx.AsyncClient(
-                timeout=_CLAIM_TIMEOUT_S, follow_redirects=False, transport=transport
-            ) as http:
-                response = await http.post(
-                    url,
-                    json={
-                        "credential_reference": identity_verifier,
-                        "hostname_hint": hostname,
-                        "daemon_version": daemon_version,
-                        "os": os_name,
-                    },
-                )
-    except (httpx.HTTPError, TimeoutError) as exc:
-        raise NerditError(
-            502,
-            "link.cloud_unreachable",
-            f"The cloud endpoint {urlsplit(body.api_url).netloc} could not be reached.",
-            hint="Check --api-url and this machine's outbound connectivity, then retry.",
-        ) from exc
+    response = await _cloud_request(
+        request,
+        body.api_url,
+        "/api/link/device",
+        {
+            "credential_reference": identity_verifier,
+            "hostname_hint": hostname,
+            "daemon_version": daemon_version,
+            "os": os_name,
+        },
+    )
 
     if response.status_code >= 400:
         raise _refusal(response, "")
@@ -1615,35 +1649,22 @@ async def _poll_device_code(request: Request, pending: _DevicePending) -> _Devic
     Map refusals by HTTP status, since different statuses may share a cloud_code.
     Return that safe token as context, not as the discriminator.
     """
-    url = pending.api_url.rstrip("/") + "/api/link/device/poll"
-    transport = getattr(request.app.state, "link_claim_transport", None)
-    try:
-        async with asyncio.timeout(_CLAIM_TOTAL_TIMEOUT_S):
-            async with httpx.AsyncClient(
-                timeout=_CLAIM_TIMEOUT_S, follow_redirects=False, transport=transport
-            ) as http:
-                response = await http.post(
-                    url,
-                    json={
-                        # Verbatim from the slot, stripped only — the cloud
-                        # hashes `sha256(strip)` and forgives nothing else on
-                        # this machine-held field.
-                        "device_code": pending.device_code,
-                        # The verifier pinned at mint: D-X16-O22's constant-time
-                        # comparison against it runs before any state is
-                        # revealed, cloud-side.
-                        "credential_reference": pending.verifier,
-                    },
-                )
-    except (httpx.HTTPError, TimeoutError) as exc:
-        # The slot is KEPT: a transport failure says nothing about the request's
-        # fate, and the CLI retries on the next interval until its own timeout.
-        raise NerditError(
-            502,
-            "link.cloud_unreachable",
-            f"The cloud endpoint {urlsplit(pending.api_url).netloc} could not be reached.",
-            hint="Check this machine's outbound connectivity — polling can resume.",
-        ) from exc
+    # A transport failure KEEPS the slot: it says nothing about the request's
+    # fate, and the CLI retries on the next interval until its own timeout.
+    response = await _cloud_request(
+        request,
+        pending.api_url,
+        "/api/link/device/poll",
+        {
+            # Verbatim from the slot, stripped only — the cloud hashes
+            # `sha256(strip)` and forgives nothing else on this machine-held field.
+            "device_code": pending.device_code,
+            # The verifier pinned at mint: D-X16-O22's constant-time comparison
+            # against it runs before any state is revealed, cloud-side.
+            "credential_reference": pending.verifier,
+        },
+        hint="Check this machine's outbound connectivity — polling can resume.",
+    )
 
     if response.status_code == 202:
         # The two RFC 8628 non-terminal answers. The advertised interval is
@@ -2004,46 +2025,127 @@ async def poll_device_link(request: Request, body: LinkDevicePollRequest) -> Lin
         )
         _clear_pending(request, pending)
 
-    logger.info("Linked as node %s (config etag %s)", answer.node_id, committed.etag[:12])
-
     # The success of a device link IS a link creation, so it audits as
-    # `link.created` with the claim's exact param set rather than inventing a
-    # second vocabulary for the same event (D-P34-1). The override seam is the
-    # one `deploy.plan` already uses; `derive_action` stays path-only, so
-    # every non-approving poll still records as `link.device_poll`.
+    # `link.created` with the claim's exact param set (D-P34-1). The override
+    # seam is the one `deploy.plan` already uses; `derive_action` stays
+    # path-only, so every non-approving poll still records as `link.device_poll`.
     request.state.audit_action = "link.created"
-    request.state.audit_target = answer.node_id
-    request.state.audit_params = audit_params(
-        {
-            "node_id": answer.node_id,
-            "slug": answer.slug,
-            "verifier_fingerprint": pending.verifier_fingerprint,
-            "relay_host": urlsplit(committed.relay_url).netloc,
-            "enabled": pending.enable,
-            "nodes_base_domain": answer.domain,
-            "mcp_http_enabled": committed.mcp_http_enabled,
-            "grant": "device",
-        }
-    )
     return LinkDevicePollView(
         status="linked",
-        node_id=answer.node_id,
-        slug=answer.slug,
-        relay_url=committed.relay_url,
-        enabled=pending.enable,
-        verifier_fingerprint=pending.verifier_fingerprint,
-        # What the daemon now HOLDS, not merely what this exchange returned: a
-        # cloud that sent nothing leaves an earlier refresh's value standing.
-        nodes_base_domain=(
-            answer.domain if answer.domain is not None else effective.get("nodes_base_domain")
+        **_linked_result(
+            request,
+            committed,
+            node_id=answer.node_id,
+            slug=answer.slug,
+            domain=answer.domain,
+            held_domain=effective.get("nodes_base_domain"),
+            fingerprint=pending.verifier_fingerprint,
+            enable=pending.enable,
+            grant="device",
         ),
-        # Hardcoded, not read off the staged diff: every `[link]` key is
-        # restart-keyed, so a link ALWAYS needs a restart to take effect.
-        requires_restart=True,
-        restart_keys=committed.restart_keys,
-        mcp_http_enabled=committed.mcp_http_enabled,
-        mcp_skipped_reason=committed.mcp_skipped_reason,
     )
+
+
+def _cloud_only(hint: str | None = None) -> NerditError:
+    """The one 403 every cloud-written route answers to a non-cloud caller."""
+    return NerditError(
+        403,
+        "link.cloud_principal_required",
+        "This endpoint is written by the Nerdit cloud over the node link only.",
+        hint=hint,
+    )
+
+
+def _cloud_node(request: Request, control: str) -> str:
+    """Require the live tunnel identity to match the current linked configuration."""
+    principal = require_cloud_principal(request, control)
+    manager = getattr(request.app.state, "link_manager", None)
+    settings = getattr(request.app.state, "settings", None)
+    node_id = getattr(getattr(settings, "link", None), "node_id", None)
+    if (
+        not node_id
+        or manager is None
+        or manager.status().node_id != node_id
+        or principal.token_id != f"{LINK_TOKEN_PREFIX}{node_id}"
+    ):
+        raise _cloud_only()
+    return str(node_id)
+
+
+@router.get(
+    "/link/projects/{project_id}",
+    response_model=LinkedProjectView,
+    operation_id="get_link_project",
+)
+async def get_link_project(request: Request, project_id: str) -> LinkedProjectView:
+    """Confirm an immutable project identity for cloud discovery over the current link."""
+    # No `_LINK_MUTATION_LOCK`: a read. The identity check is synchronous and
+    # the snapshot is consistent under `db.write_lock`.
+    _cloud_node(request, CLOUD_CONTROL_PROJECT_DISCOVERY)
+    snapshot = await request.app.state.queries.get_committed_project_services(project_id)
+    if snapshot is None:
+        raise NerditError(404, "link.project_not_found", "The project no longer exists.")
+    project, services = snapshot
+    return LinkedProjectView(id=project.id, name=project.label, services=services)
+
+
+@router.put(
+    "/link/public-address",
+    response_model=PublicAddressPushView,
+    operation_id="push_link_public_address",
+)
+async def push_link_public_address(
+    request: Request, body: PublicAddressPushRequest
+) -> PublicAddressPushView:
+    """Accept a cloud assignment once for the current node, project and service job.
+
+    This value-idempotent route requires the public-address cloud carrier and
+    never creates a share. Repeating the same binding is safe without a request
+    key; changing it, targeting a replacement job or using an old link is refused.
+    Only explicit activation changes the canonical URL; store-only pushes cannot
+    deactivate it. Activation requires live sharing intent in the same transaction.
+    `url` is the assignment's canonical address whether or not it is `active`.
+    """
+    async with _LINK_MUTATION_LOCK:
+        node_id = _cloud_node(request, CLOUD_CONTROL_PUBLIC_ADDRESS)
+        changed = None
+        link = request.app.state.settings.link
+        legacy_host = (
+            hosted_host(body.service_name, link.slug, link.nodes_base_domain)
+            if link.slug
+            and link.nodes_base_domain
+            and hosted_label_fits(body.service_name, link.slug)
+            else None
+        )
+        if body.node_id == node_id:
+            try:
+                changed = await request.app.state.queries.set_service_public_address(
+                    ServicePublicAddress(**body.model_dump()),
+                    activate=body.activate,
+                    legacy_host=legacy_host,
+                )
+            except ValueError as exc:
+                raise NerditError(
+                    409,
+                    "link.public_address_conflict",
+                    "The service already has a different public address assignment.",
+                ) from exc
+        if changed is None:
+            raise NerditError(
+                409,
+                "link.public_address_stale",
+                "The assignment does not match this linked node and service incarnation.",
+            )
+        request.state.audit_target = node_id
+        request.state.audit_skip = not changed
+        address = await request.app.state.queries.get_service_public_address(
+            body.service_name, node_id, body.job_id
+        )
+        if address is None:
+            raise NerditError(409, "link.public_address_stale", "The service no longer exists.")
+        return PublicAddressPushView(
+            **address.model_dump(), url=public_address_url(body.slug), changed=changed
+        )
 
 
 @router.put(
@@ -2068,37 +2170,12 @@ async def push_link_entitlement(
     unsupported. Audit/event emission is change-only with the boolean alone;
     denials are always recorded.
     """
-    require_cloud_principal(request, CLOUD_CONTROL_ENTITLEMENT)
-
-    manager = getattr(request.app.state, "link_manager", None)
-    if manager is None:
-        # Unreachable in the real app — a tunnel principal cannot be resolved
-        # without a live manager, since the manager IS what validated the
-        # capability. Answering the SAME 403 rather than a 500 keeps the route
-        # from becoming an oracle for daemon internals.
-        raise NerditError(
-            403,
-            "link.cloud_principal_required",
-            "This endpoint is written by the Nerdit cloud over the node link only.",
-            hint="Only the cloud can confirm the linked account's access.",
-        )
-
-    # `manager.now()`, not `datetime.now(UTC)`: the seam's
-    # `received_at`, its TTL and its ordering comparison all read the
-    # manager's injected clock, and a skew check on a second clock would let the
-    # two disagree about which stamps are in the future. Identical in
-    # production — the default clock IS `datetime.now(UTC)`.
-    now = manager.now()
-    if body.issued_at > now + timedelta(seconds=ENTITLEMENT_MAX_FUTURE_SKEW_S):
-        raise NerditError(
-            422,
-            "validation_error",
-            "issued_at is too far in the future for this daemon's clock.",
-            hint=(
-                "Allowed skew is "
-                f"{ENTITLEMENT_MAX_FUTURE_SKEW_S} s — check clock sync on both ends."
-            ),
-        )
+    manager = _cloud_manager(
+        request,
+        CLOUD_CONTROL_ENTITLEMENT,
+        hint="Only the cloud can confirm the linked account's access.",
+    )
+    _refuse_future_skew(manager, body.issued_at)
 
     update = manager.set_hosted_public_entitled(body.hosted_public_entitled, body.issued_at)
 
@@ -2123,23 +2200,39 @@ async def push_link_entitlement(
     )
 
 
-def _cloud_manager(request: Request, *, hint: str) -> Any:
-    """The live link manager, or the same 403 the principal gate raises.
+def _cloud_manager(request: Request, control: str, *, hint: str | None = None) -> Any:
+    """Require the cloud principal for `control`, then return the live link manager.
 
-    Unreachable in the real app — a tunnel principal cannot be resolved
+    A missing manager is unreachable in the real app — a tunnel principal cannot be resolved
     without a live manager, since the manager IS what validated the
     capability. Answering the SAME 403 rather than a 500 keeps the route from
     becoming an oracle for daemon internals.
     """
+    require_cloud_principal(request, control)
     manager = getattr(request.app.state, "link_manager", None)
     if manager is None:
-        raise NerditError(
-            403,
-            "link.cloud_principal_required",
-            "This endpoint is written by the Nerdit cloud over the node link only.",
-            hint=hint,
-        )
+        raise _cloud_only(hint)
     return manager
+
+
+def _refuse_future_skew(manager: Any, issued_at: datetime) -> None:
+    """Refuse a cloud push stamped too far ahead of this daemon's clock.
+
+    `manager.now()`, not `datetime.now(UTC)`: the mirror's `received_at`, TTL
+    and ordering all read the manager's injected clock, and a skew check on a
+    second clock would let the two disagree about which stamps are in the
+    future. Identical in production — the default clock IS `datetime.now(UTC)`.
+    """
+    if issued_at > manager.now() + timedelta(seconds=ENTITLEMENT_MAX_FUTURE_SKEW_S):
+        raise NerditError(
+            422,
+            "validation_error",
+            "issued_at is too far in the future for this daemon's clock.",
+            hint=(
+                "Allowed skew is "
+                f"{ENTITLEMENT_MAX_FUTURE_SKEW_S} s — check clock sync on both ends."
+            ),
+        )
 
 
 @router.put(
@@ -2162,22 +2255,12 @@ async def push_link_github_token(
     audit carries installation ID, expiry and repo count. A forged replacement can
     break cloning, which fails closed; GitHub token lifetime remains at most one hour.
     """
-    require_cloud_principal(request, CLOUD_CONTROL_GITHUB_TOKEN)
     manager = _cloud_manager(
-        request, hint="Operators do not set GitHub tokens; the cloud mints and pushes them."
+        request,
+        CLOUD_CONTROL_GITHUB_TOKEN,
+        hint="Operators do not set GitHub tokens; the cloud mints and pushes them.",
     )
-
-    now = manager.now()
-    if body.issued_at > now + timedelta(seconds=ENTITLEMENT_MAX_FUTURE_SKEW_S):
-        raise NerditError(
-            422,
-            "validation_error",
-            "issued_at is too far in the future for this daemon's clock.",
-            hint=(
-                "Allowed skew is "
-                f"{ENTITLEMENT_MAX_FUTURE_SKEW_S} s — check clock sync on both ends."
-            ),
-        )
+    _refuse_future_skew(manager, body.issued_at)
 
     update = manager.set_github_token(
         installation_id=body.installation_id,
@@ -2232,9 +2315,10 @@ async def nudge_git(request: Request, body: GitNudgeRequest) -> GitNudgeView:
     actual resolved head. Return 202 best-effort, with empty lists when GitWatch is
     disabled. Audit canonical repo/ref/sha and matched service names.
     """
-    require_cloud_principal(request, CLOUD_CONTROL_GIT_NUDGE)
     manager = _cloud_manager(
-        request, hint="Operators do not nudge; GitWatch polls, and the cloud relays pushes."
+        request,
+        CLOUD_CONTROL_GIT_NUDGE,
+        hint="Operators do not nudge; GitWatch polls, and the cloud relays pushes.",
     )
     _require_idempotency_key(request, "git nudge")
 

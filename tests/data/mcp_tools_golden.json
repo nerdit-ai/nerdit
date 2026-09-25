@@ -125,7 +125,7 @@
           "title": "Idempotency Key"
         },
         "project": {
-          "description": "Project to apply; must equal ``[project].name`` in the source's ``nerdit.toml`` (422 ``project.name_mismatch`` otherwise). It need not exist yet: a real apply creates it for your token.",
+          "description": "Immutable prj_ ID or name of the project to apply. The resolved name must equal ``[project].name`` in ``nerdit.toml``. An unknown name may be created; an unknown or retired ID is refused.",
           "title": "Project",
           "type": "string"
         },
@@ -288,7 +288,7 @@
           "title": "Idempotency Key"
         },
         "name": {
-          "description": "Name of an existing project. Every deployed app already belongs to a project of its own name, so an app name is a valid project name.",
+          "description": "Immutable prj_ ID or name of an existing project. Prefer the ID from list_projects: a retired ID never addresses a same-name replacement.",
           "title": "Name",
           "type": "string"
         },
@@ -949,6 +949,35 @@
       "type": "object"
     }
   },
+  "diagnose_project": {
+    "description": "Diagnose one service of an explicit project under the existing owner/admin policy.\n\nPrefer an immutable project ID. The daemon resolves project membership and\nreuses diagnose_service's failure bundle; this grants no additional authority.\n",
+    "inputSchema": {
+      "properties": {
+        "log_tail": {
+          "default": 50,
+          "description": "Log lines to bundle; clamped to [1, 200].",
+          "title": "Log Tail",
+          "type": "integer"
+        },
+        "project": {
+          "description": "Immutable prj_ ID or name of an existing project. Prefer the ID from list_projects: a retired ID never addresses a same-name replacement.",
+          "title": "Project",
+          "type": "string"
+        },
+        "service": {
+          "default": "web",
+          "description": "Service inside the project; omit for web.",
+          "title": "Service",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "title": "diagnose_projectArguments",
+      "type": "object"
+    }
+  },
   "diagnose_service": {
     "description": "Use when: a service is failing and you need the reason, not the logs.\n\nBundles the deploy phase, crash forensics (``last_exit_code``,\n``oom_killed``), a fresh health probe, AI-binding readiness, a bounded\nlog tail and a single ``remediation_code`` to branch on \u2014 call it after\n``wait_for_service`` returns ``failed`` instead of scraping logs.\nOwner-or-admin read: the bundle carries env/secret key *names* and app\nlog lines, never secret values.\n",
     "inputSchema": {
@@ -1246,7 +1275,7 @@
     "inputSchema": {
       "properties": {
         "name": {
-          "description": "Name of an existing project. Every deployed app already belongs to a project of its own name, so an app name is a valid project name.",
+          "description": "Immutable prj_ ID or name of an existing project. Prefer the ID from list_projects: a retired ID never addresses a same-name replacement.",
           "title": "Name",
           "type": "string"
         }
@@ -1516,6 +1545,73 @@
       "type": "object"
     }
   },
+  "project_logs": {
+    "description": "Read bounded logs of one service resolved within an explicit project.\n\nPrefer the immutable project ID returned by list_projects. Membership is\nresolved by the daemon; a same-name replacement cannot inherit a retired ID.\nExisting node grants and local token roles still apply.\n",
+    "inputSchema": {
+      "properties": {
+        "grep": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Literal substring filter; never a regex.",
+          "title": "Grep"
+        },
+        "project": {
+          "description": "Immutable prj_ ID or name of an existing project. Prefer the ID from list_projects: a retired ID never addresses a same-name replacement.",
+          "title": "Project",
+          "type": "string"
+        },
+        "service": {
+          "default": "web",
+          "description": "Service inside the project; omit for web.",
+          "title": "Service",
+          "type": "string"
+        },
+        "since": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Inclusive ISO-8601 timestamp filter.",
+          "title": "Since"
+        },
+        "since_id": {
+          "default": 0,
+          "description": "Exclusive log cursor; ignored while tail is sent.",
+          "title": "Since Id",
+          "type": "integer"
+        },
+        "source": {
+          "default": "all",
+          "description": "Log stream: all, build or runtime.",
+          "title": "Source",
+          "type": "string"
+        },
+        "tail": {
+          "default": 100,
+          "description": "Newest matching lines; clamped to [1, 1000].",
+          "title": "Tail",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "title": "project_logsArguments",
+      "type": "object"
+    }
+  },
   "proxy_status": {
     "description": "Get the embedded proxy's typed state (TLS, apex, respawn, live routes).\n\nAuthenticated read: proxy state, TLS subjects + CA fingerprint, apex\nregistration, respawn backoff, and a tri-state live route table read\nfrom the Caddy admin API. Complements ``list_routes`` (the\nDB-authoritative inventory).\n",
     "inputSchema": {
@@ -1709,7 +1805,7 @@
     "inputSchema": {
       "properties": {
         "project": {
-          "description": "Name of an existing project. Every deployed app already belongs to a project of its own name, so an app name is a valid project name.",
+          "description": "Immutable prj_ ID or name of an existing project. Prefer the ID from list_projects: a retired ID never addresses a same-name replacement.",
           "title": "Project",
           "type": "string"
         },
@@ -2329,7 +2425,7 @@
           "title": "Idempotency Key"
         },
         "project": {
-          "description": "Project whose variables this call modifies. It need not exist yet: a set on an unknown name creates the project for your token.",
+          "description": "Immutable prj_ ID or name of the project to modify. An unknown name creates it for your token; an unknown or retired ID is refused.",
           "title": "Project",
           "type": "string"
         },
@@ -2377,7 +2473,7 @@
     }
   },
   "share_service": {
-    "description": "Use when: you need a URL you can open (public_url is LAN-only).\n\nExposes the app at ``https://<name>--<slug>.<domain>/`` via the cloud\nlink. ``access='private'`` (default) opens only for signed-in owners of this\nnode in the Nerdit console \u2014 works on every linked node, nothing to\nconfigure. ``access='public'`` makes the URL world-reachable: it needs a\nPro-entitled account (else 409 ``share.not_entitled``) AND either a\n``[deploy].edge_auth`` on the app or ``consent=true`` (else 409\n``share.unprotected``) \u2014 public means public. The node must be linked\n(409 ``share.link_required``). Returns ``{access, url, state}``; ``state``\nis ``ready`` | ``link_down`` | ``not_entitled``. The same URL then appears\nin ``get_service`` / ``list_routes`` under ``public_urls`` (kind\n``hosted``).\n\n``state`` and ``origin`` answer two DIFFERENT questions and you need\nboth. ``state`` is about the LINK \u2014 is the hosted path provisioned.\n``origin`` is about the APP behind it: ``{status, answers, hint}``, where\n``answers`` is true only while the service is running. A share can be\n``state: ready`` with ``origin.answers: false``, and then the URL returns\n``share.not_shared`` (the hosted resolver refuses a service with no live\norigin) \u2014 which reads exactly like \"never shared\". When ``answers`` is\nfalse, ``origin.hint`` says what to do; call ``diagnose_service``.\n",
+    "description": "Use when: you need a URL you can open (public_url is LAN-only).\n\nExposes the app at ``https://<name>--<slug>.<domain>/`` via the cloud\nlink. ``access='private'`` (default) opens only for signed-in owners of this\nnode in the Nerdit console \u2014 works on every linked node, nothing to\nconfigure. ``access='public'`` makes the URL world-reachable: it needs an\naccount in good standing (free during the public beta; else 409\n``share.not_entitled``) AND either a\n``[deploy].edge_auth`` on the app or ``consent=true`` (else 409\n``share.unprotected``) \u2014 public means public. The node must be linked\n(409 ``share.link_required``). Returns ``{access, url, state}``; ``state``\nis ``ready`` | ``link_down`` | ``not_entitled``. The same URL then appears\nin ``get_service`` / ``list_routes`` under ``public_urls`` (kind\n``hosted``).\n\n``state`` and ``origin`` answer two DIFFERENT questions and you need\nboth. ``state`` is about the LINK \u2014 is the hosted path provisioned.\n``origin`` is about the APP behind it: ``{status, answers, hint}``, where\n``answers`` is true only while the service is running. A share can be\n``state: ready`` with ``origin.answers: false``, and then the URL returns\n``share.not_shared`` (the hosted resolver refuses a service with no live\norigin) \u2014 which reads exactly like \"never shared\". When ``answers`` is\nfalse, ``origin.hint`` says what to do; call ``diagnose_service``.\n",
     "inputSchema": {
       "properties": {
         "access": {

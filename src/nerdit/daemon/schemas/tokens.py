@@ -6,10 +6,10 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field, computed_field, field_validator
 
-from nerdit.config.project import _DNS_LABEL_RE
 from nerdit.daemon.schemas._base import StrictRequestModel
 from nerdit.db.enums import TokenRole
 from nerdit.db.rows import ApiToken
+from nerdit.utils.names import DNS_LABEL_RE
 
 # One year, in seconds — the ceiling on both `expires_in_s` and the
 # `[security].token_default_ttl_s` site policy.
@@ -66,7 +66,7 @@ class TokenCreateRequest(StrictRequestModel):
             )
         deduped: list[str] = []
         for entry in value:
-            if not _DNS_LABEL_RE.match(entry):
+            if not DNS_LABEL_RE.fullmatch(entry):
                 raise ValueError(
                     f"Invalid scope_services entry '{entry}': must be a DNS label "
                     "(lowercase letters, digits and '-', 1-63 chars, starting and "

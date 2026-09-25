@@ -9,13 +9,11 @@ restart, avoiding repeated downloads for an invalid model.
 
 from __future__ import annotations
 
-import json
 import logging
 
 from nerdit.config.settings import ModelsSettings
 from nerdit.core.eventlog import EventRecorder, record_job_event
 from nerdit.core.events import EventBus
-from nerdit.core.jobconfig import parse_job_config
 from nerdit.core.models.backend import (
     ModelBackend,
     ModelPullError,
@@ -114,7 +112,7 @@ class ModelController(ResourceController[ModelBackend]):
 
     # --- ensure_model (weights) -----------------------------------------------
 
-    async def _ensure_model(self, job: Job, cfg: dict, host_port: int, container_id: str) -> None:
+    async def _ensure(self, job: Job, cfg: dict, host_port: int, container_id: str) -> None:
         """Pull weights over loopback and persist `model_pulled` on success.
 
         An unreachable server releases the attempt guard for a later reconcile
@@ -154,17 +152,11 @@ class ModelController(ResourceController[ModelBackend]):
             await record_job_event(self._events, "model.failed", job, reason="model_pull_failed")
             logger.warning("Model pull failed for %s: %s", job.service_name or job.id, exc)
             return
-        # Re-read the row before writing so a concurrent config update (e.g. a
-        # status-side write during the pull) is never clobbered with stale data.
-        row = await self._queries.get_job(job.id)
-        latest = parse_job_config(row) if row is not None else dict(cfg)
-        latest["model_pulled"] = True
-        await self._queries.update_job_config(job.id, json.dumps(latest))
+        # Keyed write: a concurrent config update during the pull is never clobbered.
+        await self._queries.patch_job_config(job.id, {"model_pulled": True})
         await self._queries.append_log(
             job.id, f"Model '{model}' ready (weights present)", LogStream.system
         )
         # Emit here: POST /models rows have no last_deploy to signal readiness.
         await record_job_event(self._events, "model.ready", job)
         logger.info("Model %s weights ready", job.service_name or job.id)
-
-    _ensure = _ensure_model

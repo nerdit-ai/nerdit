@@ -25,7 +25,6 @@ from datetime import datetime
 from pathlib import Path
 from secrets import token_hex
 
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
@@ -36,6 +35,8 @@ from cryptography.hazmat.primitives.serialization import (
     PrivateFormat,
     PublicFormat,
 )
+
+from nerdit.utils.fs import fsync_dir
 
 logger = logging.getLogger("nerdit.link.identity")
 
@@ -142,19 +143,6 @@ def sign_node_proof(private_key_b64: str, message: bytes) -> str:
     return _b64encode(private_key.sign(message))
 
 
-def verify_node_proof(reference: str, message: bytes, signature_b64: str) -> bool:
-    """Verify a proof using only the durable public credential reference."""
-    if not reference.startswith(ED25519_REFERENCE_PREFIX):
-        return False
-    try:
-        public_raw = _b64decode(reference.removeprefix(ED25519_REFERENCE_PREFIX))
-        signature = _b64decode(signature_b64)
-        Ed25519PublicKey.from_public_bytes(public_raw).verify(signature, message)
-    except (InvalidSignature, ValueError):
-        return False
-    return True
-
-
 # ---------------------------------------------------------------------------
 # The node's own identity
 # ---------------------------------------------------------------------------
@@ -238,23 +226,13 @@ def _warn_lax_parent(parent: Path) -> None:
         )
 
 
-def _fsync_dir(path: Path) -> None:
-    """`fsync` a directory so a rename inside it survives power loss."""
-    dir_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-
-
 def _read_key_file(key_file: Path) -> str:
     """Read the key file without ever following a symlink.
 
     `O_NONBLOCK` plus the `S_ISREG` check refuse FIFOs and devices, so a
     key path pointing at a writerless FIFO can never park the `open` (and
-    with it the lifespan that loads the identity) forever — the same fix as
-    the license path's `read_license_file` (PR #118 Codex round 2).
-    `O_NONBLOCK` is inert for regular-file reads.
+    with it the lifespan that loads the identity) forever, as in the license
+    path's `read_license_file`. `O_NONBLOCK` is inert for regular-file reads.
     """
     try:
         fd = os.open(key_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -310,10 +288,10 @@ def _generate_key_file(key_file: Path) -> str:
     # permanently breaking the ADR-W2 claim binding of an already-enrolled node.
     #
     # The temp name is UNIQUE per attempt (pid + random) and the install is a
-    # no-replace `os.link`: a fixed temp name made an interrupted first boot
-    # poison the next one (`O_EXCL` EEXIST on the orphan), and `os.replace`
-    # let a racing second caller overwrite an identity the first had already
-    # returned. Losing an install race is not an error — the loser adopts the
+    # no-replace `os.link`: a fixed temp name would let an interrupted first
+    # boot poison the next one (`O_EXCL` EEXIST on the orphan), and
+    # `os.replace` would let a racing second caller overwrite an identity the
+    # first had already returned. Losing an install race is not an error — the loser adopts the
     # installed key. A crash-orphaned `.*.tmp` holds a random key that was
     # never installed nor enrolled; it is inert and never blocks a retry.
     tmp = parent / f".{key_file.name}.{os.getpid()}.{token_hex(4)}.tmp"
@@ -331,7 +309,7 @@ def _generate_key_file(key_file: Path) -> str:
             tmp.unlink(missing_ok=True)
             return _read_key_file(key_file)
         tmp.unlink(missing_ok=True)
-        _fsync_dir(parent)
+        fsync_dir(parent)
     except OSError as exc:
         tmp.unlink(missing_ok=True)
         raise LinkIdentityError(f"cannot write node key {key_file}: {exc.strerror}") from exc

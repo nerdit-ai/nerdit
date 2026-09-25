@@ -28,32 +28,10 @@ class TestDaemonLifecycle:
     """Test DaemonLifecycle with a real subprocess daemon."""
 
     @staticmethod
-    def _kill_port_9321():
-        """Kill any process listening on port 9321.
-
-        ``fuser PORT/tcp`` is Linux-only; macOS' fuser takes file paths, so it
-        silently matches nothing there. Fall back to ``lsof``.
-        """
-        import subprocess as _sp
-
-        for cmd in (
-            ["fuser", "9321/tcp"],
-            ["lsof", "-t", "-nP", "-iTCP:9321", "-sTCP:LISTEN"],
-        ):
-            try:
-                out = _sp.check_output(cmd, stderr=_sp.DEVNULL).decode()
-            except Exception:
-                continue
-            for tok in out.split():
-                if tok.strip().isdigit():
-                    with contextlib.suppress(OSError):
-                        os.kill(int(tok.strip()), signal.SIGKILL)
-
-    @staticmethod
     def _daemon_gone() -> bool:
         """True when no daemon holds the port *or* the data dir's restore lock.
 
-        ``stop()`` only sends SIGTERM, and a fixed sleep is not a shutdown
+        The teardown only sends SIGTERM, and a fixed sleep is not a shutdown
         barrier: uvicorn closes the listening socket *first*, then runs the
         lifespan teardown (DB close, proxy teardown, releasing the
         ``.restore.lock`` the daemon holds shared for its whole life). On a data
@@ -89,32 +67,34 @@ class TestDaemonLifecycle:
         return False
 
     @pytest.fixture(autouse=True)
-    def _cleanup_daemon(self, tmp_path):
-        """Ensure daemon is stopped before and after each test."""
+    def _cleanup_daemon(self, tmp_path, monkeypatch):
+        """Run only this test's daemon, with isolated state and container identity."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        config_dir = tmp_path / ".nerdit"
+        config_dir.mkdir()
+        (config_dir / "config.toml").write_text(
+            f'[daemon]\ninstance_id = "test-{tmp_path.name}"\n'
+            "[proxy]\nenabled = false\nmdns = false\n"
+        )
         self.pid_file = str(tmp_path / "nerditd.pid")
         self.lc = DaemonLifecycle(pid_file=self.pid_file)
-        # Ensure port is free before test (previous daemon or user session)
-        default_lc = DaemonLifecycle()
-        if default_lc.is_running():
-            default_lc.stop()
-        if not self._wait_daemon_gone():
-            self._kill_port_9321()
-            self._wait_daemon_gone()
+        if not self._daemon_gone():
+            pytest.fail("Port 9321 is occupied; refusing to stop an unrelated daemon.")
         yield
-        # Cleanup: stop daemon if still running. Capture the PID first — stop()
-        # unlinks the PID file, so the force-kill below could never read it.
+        # Cleanup: SIGTERM the daemon if still running, SIGKILL if it wedges.
         pid = None
         with contextlib.suppress(OSError, ValueError):
             pid = int(Path(self.pid_file).read_text().strip())
-        self.lc.stop()
+        if pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)
         if not self._wait_daemon_gone():
             # Graceful shutdown wedged — escalate rather than leak the port and
             # the restore lock into the next test.
             if pid is not None:
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGKILL)
-            self._kill_port_9321()
-            self._wait_daemon_gone()
+            assert self._wait_daemon_gone(), "Test daemon did not release its port"
 
     def test_is_running_false_when_no_pid_file(self):
         assert self.lc.is_running() is False
@@ -142,15 +122,17 @@ class TestDaemonLifecycle:
         # Starting again should detect it's already running
         assert self.lc.start() is True
 
-    def test_stop(self):
-        self.lc.start()
-        self.lc.wait_for_ready(timeout=10.0)
-        assert self.lc.stop() is True
-        time.sleep(1)
-        assert self.lc.is_running() is False
+    def test_is_running_true_when_pid_owned_by_another_user(self, monkeypatch):
+        pid_path = Path(self.pid_file)
+        pid_path.write_text("1")
 
-    def test_stop_when_not_running(self):
-        assert self.lc.stop() is False
+        def _eperm(pid, sig):
+            raise PermissionError
+
+        monkeypatch.setattr("nerdit.daemon.lifecycle.os.kill", _eperm)
+        assert self.lc.is_running() is True
+        assert pid_path.exists()  # never unlinked for a live process
+        pid_path.unlink()  # keep the teardown away from pid 1
 
     def test_health_endpoint_returns_gpu_count(self):
         self.lc.start()
@@ -205,17 +187,10 @@ class TestDaemonLifecycle:
         # Note: it's in tmp_path so it won't be in ~/.nerdit
         assert log_file.exists()
 
-    def test_exit_stops_running_daemon(self):
+    def test_is_running_true_after_start(self):
         self.lc.start()
         self.lc.wait_for_ready(timeout=10.0)
         assert self.lc.is_running() is True
-
-        assert self.lc.stop() is True
-        time.sleep(1)
-        assert self.lc.is_running() is False
-
-    def test_exit_when_not_running(self):
-        assert self.lc.stop() is False
 
 
 class TestInitSharedRegistry:
@@ -683,3 +658,10 @@ async def test_init_uses_local_settings_and_preserves_service_errors(
         assert seen["client"] == {"host": "127.0.0.1", "port": 9444, "token": None}
         assert "http://127.0.0.1:9444/" in "\n".join(console.lines)
     assert seen["lifecycle"] == {"host": "127.0.0.1", "port": 9444, "pid_file": str(pid_file)}
+
+
+async def test_source_checkout_config_is_owner_only(monkeypatch, tmp_path):
+    import stat
+
+    config = await TestInitOnAnInstallerMadeInstall._run(monkeypatch, tmp_path, installed=False)
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600

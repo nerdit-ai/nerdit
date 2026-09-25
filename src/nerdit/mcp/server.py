@@ -2,9 +2,9 @@
 
 Design notes
 ------------
-* **Import-safe without the extra.** This module imports neither ``mcp`` nor
+* **Import-safe with lazy SDK imports.** This module imports neither ``mcp`` nor
   FastMCP at top level. Only :func:`build_server` does, lazily, so the rest of
-  the package (and its tests) load even when ``nerdit[mcp]`` is not installed.
+  the package (and its tests) load even when the SDK is missing from an incomplete installation.
 * **Testable tool logic.** The real work lives in the ``_impl`` coroutines,
   which take an explicit :class:`~nerdit.cli.client.NerditClient` so they can be
   driven by an ``httpx`` test transport. The FastMCP-registered tools are thin
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from nerdit.core.project_identity import PROJECT_DELEGATION_TOOLS
 from nerdit.mcp import transport
 from nerdit.mcp.errors import _CODE_BY_STATUS as _CODE_BY_STATUS
 from nerdit.mcp.errors import _bad_request as _bad_request
@@ -95,13 +96,13 @@ if TYPE_CHECKING:
     from nerdit.config.settings import NerditSettings
 
 
-# --- FastMCP wiring (requires the optional extra) ---------------------------
+# --- FastMCP wiring (requires the bundled SDK) ---------------------------
 
 
 def build_server(*, http: bool = False) -> Any:
     """Build and return the FastMCP server with all tools registered.
 
-    Imports FastMCP lazily so importing this module never requires the extra.
+    Imports FastMCP lazily so importing this module never loads the SDK.
     ``http=True`` configures the stateless streamable-HTTP transport (mounted
     by the daemon); the default stdio configuration is unchanged.
     """
@@ -125,7 +126,31 @@ def build_server(*, http: bool = False) -> Any:
             )
         except ImportError:  # pre-transport_security builds have no native check
             pass
-    mcp = FastMCP("nerdit", **kwargs)
+
+    class ProjectAwareMCP(FastMCP):
+        async def list_tools(self) -> Any:
+            listed = await super().list_tools()
+            if transport._REQUEST_PROJECT_ID.get() is not None:
+                return [tool for tool in listed if tool.name in PROJECT_DELEGATION_TOOLS]
+            return listed
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+            if (
+                transport._REQUEST_PROJECT_ID.get() is not None
+                and name not in PROJECT_DELEGATION_TOOLS
+            ):
+                await transport._record_tool_denial("/api/project-mcp", 403)
+                return {
+                    "error": {
+                        "code": "project.delegation_forbidden",
+                        "message": "This tool is not available under project-only delegation.",
+                        "status": 403,
+                        "request_id": None,
+                    }
+                }
+            return await super().call_tool(name, arguments)
+
+    mcp = ProjectAwareMCP("nerdit", **kwargs)
 
     # Registered from the domain-grouped ALL_TOOLS tuple (mcp/tools/__init__.py) —
     # each function's docstring becomes the tool description and its signature

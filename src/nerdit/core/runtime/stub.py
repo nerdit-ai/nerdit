@@ -35,6 +35,7 @@ class StubRuntime:
         follow: bool = False,
         tail: int | None = None,
         max_bytes: int | None = None,
+        since: int | None = None,
     ) -> AsyncIterator[str]:
         raise ContainerRuntimeError("Docker is not available. Start Docker and restart the daemon.")
         # Make this an async generator

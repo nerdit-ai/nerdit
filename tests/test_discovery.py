@@ -199,3 +199,7 @@ def test_discover_gpu_system_threads_amd_schedulable(monkeypatch):
 
     amd = [gpu for gpu in result.gpus if gpu.vendor == GpuVendor.amd]
     assert amd and all(gpu.schedulable for gpu in amd)
+
+
+def test_amd_gpu_absent_when_sysfs_is_missing(tmp_path):
+    assert amd_gpu_present(tmp_path / "missing") is False

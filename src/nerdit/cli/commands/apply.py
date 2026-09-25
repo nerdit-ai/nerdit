@@ -16,8 +16,13 @@ from uuid import uuid4
 
 import typer
 
-from nerdit.cli.commands.deploy import _git_name_default, _maybe_wait, _render_dry_run
-from nerdit.cli.display import _plain, console, render_client_error
+from nerdit.cli.commands.deploy import (
+    _git_name_default,
+    _maybe_wait,
+    _note_skipped_secrets,
+    _render_dry_run,
+)
+from nerdit.cli.display import _plain, call_or_exit, console
 
 #: `waiting_for_variables`: distinct from 1 (failed) and 3 (`--wait` timeout),
 #: so a script can tell "set the keys and re-run" from a real failure.
@@ -99,7 +104,7 @@ def _fail(message: str) -> typer.Exit:
     return typer.Exit(1)
 
 
-def _folder_source(path: str | None) -> tuple[str, bytes]:
+def _folder_source(path: str | None, max_bytes: int) -> tuple[str, bytes]:
     """Validate the folder's declaration client-side and zip it: `(project, zip_bytes)`."""
     from nerdit.cli.upload import check_upload_size, create_dir_zip
     from nerdit.config.project import (
@@ -124,9 +129,11 @@ def _folder_source(path: str | None) -> tuple[str, bytes]:
     except DeclarationError as exc:
         raise _fail(_plain(str(exc))) from exc
     console.print(f"[dim]Creating archive of {directory}...[/dim]")
-    zip_bytes = create_dir_zip(directory)
+    skipped_secrets: list[str] = []
+    zip_bytes = create_dir_zip(directory, skipped_secrets)
+    _note_skipped_secrets(skipped_secrets)
     try:
-        check_upload_size(zip_bytes)
+        check_upload_size(zip_bytes, max_bytes)
     except ValueError as exc:
         raise _fail(f"Error: {exc}") from exc
     return name, zip_bytes
@@ -164,22 +171,21 @@ async def _apply_async(
     wait_timeout: int = 60,
 ) -> None:
     """Resolve the source, POST the apply, render it, then optionally wait per label."""
-    from nerdit.cli.client import get_configured_client
+    from nerdit.cli.client import get_configured_client, upload_limit
 
     if repo and path:
         raise _fail("--repo cannot be combined with a local path argument.")
     if not repo and (ref or token_ref or project):
         raise _fail("--ref, --token-ref and --project require --repo.")
 
+    client = get_configured_client()
     zip_bytes: bytes | None = None
     if repo:
         name = project or _git_name_default(repo, None)
     else:
-        name, zip_bytes = _folder_source(path)
-
-    client = get_configured_client()
-    try:
-        result = await client.apply_project(
+        name, zip_bytes = _folder_source(path, await upload_limit(client))
+    result = await call_or_exit(
+        client.apply_project(
             name,
             zip_bytes=zip_bytes,
             repo_url=repo,
@@ -188,9 +194,7 @@ async def _apply_async(
             dry_run=dry_run,
             idempotency_key=None if dry_run else uuid4().hex,
         )
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    )
 
     if result.get("status") == "waiting_for_variables":
         missing = [_plain(key) for key in result.get("missing") or []]

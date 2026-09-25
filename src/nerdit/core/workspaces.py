@@ -16,11 +16,10 @@ import asyncio
 import contextlib
 import fnmatch
 import hashlib
-import io
 import json
 import os
 import re
-import zipfile
+import shutil
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -35,7 +34,8 @@ from nerdit.config.defaults import (
     ZIP_EXCLUDE_PATTERNS,
     matches_exclude_pattern,
 )
-from nerdit.config.project import _DNS_LABEL_RE
+from nerdit.utils.fs import atomic_write, fsync_dir
+from nerdit.utils.names import DNS_LABEL_RE
 
 _T = TypeVar("_T")
 
@@ -43,23 +43,23 @@ _T = TypeVar("_T")
 #: and would slip past `PurePosixPath.is_absolute()` — refuse it explicitly.
 _DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
 
-#: The basename shape `_atomic_write_bytes` stages (`<name>.tmp-<pid>`).
+#: The basename shape `atomic_write` stages (`<name>.tmp-<pid>`).
 #: Reserved: refused at write time, and skipped by every read of the tree.
 _TMP_GLOB = "*.tmp-*"
 
-#: Path-length grammar (P29 review round-2, Codex 3803596891). These are BOUNDS,
-#: not product caps: the D-P29-5 caps trio (files/bytes) lives in
+#: Path-length grammar. These are BOUNDS, not product caps: the caps trio
+#: (files/bytes) lives in
 #: `config/defaults.py`, but these two exist purely because the filesystem and
 #: this module's own staging suffix say so, so they stay beside the suffix that
 #: forces them.
 #:
 #: `.tmp-` (5 bytes) + a PID of at most 7 digits = 12 bytes of staging suffix,
 #: so 200 + 12 = 212 stays comfortably under the 255-byte component limit APFS
-#: and ext4 both enforce. Without this bound a perfectly legal 250-byte basename
-#: passed validation and then raised a raw `OSError(ENAMETOOLONG)` from
-#: `os.open` in the APPLY pass — after earlier files in the same batch had
-#: already landed, i.e. an unstructured 500 over a half-applied tree whose
-#: sidecar (written last) never got stamped.
+#: and ext4 both enforce. Without this bound a legal 250-byte basename would
+#: pass validation and then raise a raw `OSError(ENAMETOOLONG)` from `os.open`
+#: in the APPLY pass — after earlier files in the same batch had already
+#: landed, i.e. an unstructured 500 over a half-applied tree whose sidecar
+#: (written last) never got stamped.
 WORKSPACE_MAX_SEGMENT_BYTES = 200
 
 #: The whole relative path, UTF-8 bytes. Headroom under the tightest `PATH_MAX`
@@ -68,8 +68,8 @@ WORKSPACE_MAX_SEGMENT_BYTES = 200
 #: `mkdir` rather than at the staging `os.open`.
 WORKSPACE_MAX_PATH_BYTES = 900
 
-#: Hint reused by every secret-basename refusal (D-P29-3 — name only, never a
-#: content heuristic: false positives break agent loops).
+#: Hint reused by every secret-basename refusal (name only, never a content
+#: heuristic: false positives break agent loops).
 _SECRET_HINT = (
     "Secrets never belong in app files — use the secrets surface "
     "(`set_secret` / `nerdit secrets set`). Values written here transit the "
@@ -117,7 +117,7 @@ def validate_workspace_name(name: str) -> None:
     its own name). A bad name is a bad *path* — the name is one path component
     of the workspace surface — so it reuses `workspace.invalid_path`.
     """
-    if not _DNS_LABEL_RE.fullmatch(name):
+    if not DNS_LABEL_RE.fullmatch(name):
         raise WorkspaceError(
             422,
             "workspace.invalid_path",
@@ -181,15 +181,10 @@ def _meta_path(data_dir: Path, name: str) -> Path:
     return workspace_root(data_dir, name) / "meta.json"
 
 
-def workspace_exists(data_dir: Path, name: str) -> bool:
-    """True when the workspace's `meta.json` sidecar is present."""
-    return _meta_path(data_dir, name).is_file()
-
-
 def ensure_workspace_dirs(data_dir: Path, name: str) -> Path:
     """Create `workspaces/<name>/tree` lazily and return the tree path.
 
-    Perms are *enforced*, not assumed, on every call (the D-P14-3 posture of
+    Perms are *enforced*, not assumed, on every call (the posture of
     `ServiceController._ensure_volume_dirs`): all three levels are held
     `0o700`. No `0o1777` leaf here — a workspace is never container-mounted,
     the docker build context is read by the daemon process itself.
@@ -218,7 +213,7 @@ def is_excluded(rel_path: str) -> bool:
 
 
 def is_secret_basename(rel_path: str) -> bool:
-    """True for `.env` / `.env.*` basenames (D-P29-3 — name, never content).
+    """True for `.env` / `.env.*` basenames (by name, never content).
 
     Case-insensitive on every platform: `.ENV` and `.Env.local` are the same
     file as `.env` on macOS/Windows, and an exact-case guard would have let
@@ -229,7 +224,7 @@ def is_secret_basename(rel_path: str) -> bool:
 
 
 def is_tmp_basename(rel_path: str) -> bool:
-    """True for the `<name>.tmp-<pid>` residue `_atomic_write_bytes` stages.
+    """True for the `<name>.tmp-<pid>` residue `atomic_write` stages.
 
     A crash between the tmp create and the `os.replace` leaves one behind. It
     is daemon residue, never a user file (the write path refuses the name), so
@@ -239,7 +234,7 @@ def is_tmp_basename(rel_path: str) -> bool:
 
 
 def _check_path_lengths(path: str) -> None:
-    """Bound each segment and the whole path in UTF-8 BYTES (review round-2).
+    """Bound each segment and the whole path in UTF-8 BYTES.
 
     Bytes, not characters: the filesystem counts bytes, so a 101-character
     multibyte name can be a 202-byte component. Called from
@@ -274,10 +269,10 @@ def _check_path_lengths(path: str) -> None:
 
 
 def validate_file_path(path: str) -> None:
-    """Enforce the D-P29-4 guard family on one workspace-relative path.
+    """Enforce the path guard family on one workspace-relative path.
 
     Grammar first (`workspace.invalid_path`) — including the byte-length
-    bounds, which are grammar because the filesystem says so (review round-2) —
+    bounds, which are grammar because the filesystem says so —
     then the exclude set (`workspace.excluded_path`), then the secret-basename
     refusal (`workspace.secret_file`). The raw string is inspected *before*
     `PurePosixPath` collapses it — `a//b` and `a/` are rejections, not
@@ -305,7 +300,7 @@ def validate_file_path(path: str) -> None:
             f"Invalid file path '{path}': it {bad}.",
             hint="Paths are relative to the workspace root, e.g. 'src/app/main.py'.",
         )
-    # Length is grammar too (review round-2): a path the filesystem cannot hold
+    # Length is grammar too: a path the filesystem cannot hold
     # must be refused HERE, in the validation pass, so the all-or-nothing batch
     # contract holds by construction — the apply pass would otherwise raise a raw
     # ENAMETOOLONG with earlier files of the same batch already on disk.
@@ -386,55 +381,13 @@ def read_meta(data_dir: Path, name: str) -> dict[str, Any] | None:
 def write_meta(data_dir: Path, name: str, meta: dict[str, Any]) -> None:
     """Write `meta.json` atomically at `0o600`."""
     ensure_workspace_dirs(data_dir, name)
-    _atomic_write_bytes(
+    atomic_write(
         _meta_path(data_dir, name),
         json.dumps(meta, sort_keys=True).encode("utf-8"),
     )
 
 
 # --- atomic write ----------------------------------------------------------
-
-
-def _fsync_dir(path: Path) -> None:
-    """fsync a directory so renames inside it survive a power loss."""
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:  # pragma: no cover - platforms without directory fds
-        return
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _atomic_write_bytes(path: Path, payload: bytes, *, sync_dir: bool = True) -> None:
-    """Write *payload* to *path* atomically (durably) at `0o600`.
-
-    The `SecretManager._atomic_write` idiom: a sibling tmp file, then
-    `os.replace`. A crash between the two leaves the previous content intact —
-    a reader never observes a torn file.
-
-    `sync_dir=False` skips only the *parent directory* fsync, never the file's
-    own — per-file atomicity is unchanged. A batch writer passes it and fsyncs
-    each touched directory once at the end instead: a 500-file batch issued
-    ~1000 serialized fsyncs inside the workspace lock, i.e. seconds of 409
-    window for every concurrent caller.
-    """
-    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    if tmp.exists():
-        tmp.unlink()
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    if sync_dir:
-        _fsync_dir(path.parent)
 
 
 def _sweep_stale_tmp(tree: Path) -> None:
@@ -536,9 +489,9 @@ def read_file(data_dir: Path, name: str, path: str) -> str:
     try:
         return target.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
-        # Unreachable through the writer (D-P29-2 refuses non-text at write
+        # Unreachable through the writer (it refuses non-text at write
         # time); reachable when a file is dropped onto disk out of band — the
-        # same tamper zip_workspace's belt-and-braces re-filter defends against.
+        # same tamper copy_workspace's belt-and-braces re-filter defends against.
         raise WorkspaceError(
             422,
             "workspace.binary_content",
@@ -550,7 +503,7 @@ def read_file(data_dir: Path, name: str, path: str) -> str:
 def _checked_target(tree: Path, rel: str) -> Path:
     """Resolve `tree/rel` after walking every existing ancestor for symlinks.
 
-    The multi-segment walk is the D-P29-4 requirement neither `gitsource`
+    The multi-segment walk is what neither `gitsource`
     (lexical only) nor `volumes` (single level) provides: a symlink planted at
     *any* already-existing prefix directory relocates every write below it. The
     trailing `resolve()` containment check is defense-in-depth on top.
@@ -823,7 +776,7 @@ def write_files(
     ensure_workspace_dirs(data_dir, name)
     _sweep_stale_tmp(tree)
     # Each write's parent, each delete's parent and every created ancestor are
-    # fsynced ONCE after the loop (C8) rather than per file inside it.
+    # fsynced ONCE after the loop rather than per file inside it.
     touched: set[Path] = set()
     written = 0
     for rel, blob in encoded.items():
@@ -832,7 +785,9 @@ def write_files(
             parent.mkdir(exist_ok=True)
             os.chmod(parent, 0o700)
             touched.add(parent)
-        _atomic_write_bytes(target, blob, sync_dir=False)
+        # One fsync per touched directory at the end, not one per file: a
+        # 500-file batch would otherwise hold the workspace lock for seconds.
+        atomic_write(target, blob, sync_dir=False)
         touched.add(target.parent)
         written += 1
     removed = 0
@@ -844,11 +799,11 @@ def write_files(
             touched.add(target.parent)
             _prune_empty_dirs(tree, target)
     for directory in sorted(touched):
-        # A directory pruned by a delete above is simply gone; `_fsync_dir`
-        # swallows the open failure.
-        _fsync_dir(directory)
+        # A directory pruned by a delete above is simply gone.
+        with contextlib.suppress(FileNotFoundError):
+            fsync_dir(directory)
 
-    # --- meta (first write stamps the owner, D-P29-9) -----------------------
+    # --- meta (first write stamps the owner) --------------------------------
     now = datetime.now(UTC).isoformat()
     meta = (
         dict(existing_meta)
@@ -879,34 +834,43 @@ def _ancestors(tree: Path, target: Path) -> list[Path]:
 # --- deploy snapshot -------------------------------------------------------
 
 
-def zip_workspace(tree: Path) -> bytes:
-    """Zip the workspace tree deterministically for the deploy ingress.
+def _deployable_files(tree: Path) -> list[tuple[Path, str]]:
+    """Return `(path, posix_rel)` for every file a deploy snapshot carries.
 
-    Byte-deterministic across runs (sorted walk, fixed `date_time`) so two
-    snapshots of identical content are identical archives. The exclude set and
-    the secret-basename refusal are re-applied here as belt-and-braces: write
-    time is the enforcement point, this guards against out-of-band disk tamper.
+    The exclude set and the secret-basename refusal are re-applied here as
+    belt-and-braces: write time is the enforcement point, this guards against
+    out-of-band disk tamper. Symlinks are skipped by `_iter_tree_files`, and
     `meta.json` lives outside `tree/` so it structurally never appears.
+
+    Raises:
+        WorkspaceError: `workspace.empty` when nothing deployable remains.
     """
-    buf = io.BytesIO()
-    count = 0
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in _iter_tree_files(tree):
-            arcname = path.relative_to(tree).as_posix()
-            if is_excluded(arcname) or is_secret_basename(arcname):
-                continue
-            info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            archive.writestr(info, path.read_bytes())
-            count += 1
-    if count == 0:
+    files = [
+        (path, rel)
+        for path in _iter_tree_files(tree)
+        if not (is_excluded(rel := path.relative_to(tree).as_posix()) or is_secret_basename(rel))
+    ]
+    if not files:
         raise WorkspaceError(
             422,
             "workspace.empty",
             "The workspace holds no deployable files.",
             hint="Write at least one file with write_app_files before deploying.",
         )
-    return buf.getvalue()
+    return files
+
+
+def copy_workspace(tree: Path, dest: Path) -> None:
+    """Copy the deployable files into *dest*, the disposable deploy context.
+
+    Destinations are `dest / relative_to(tree)` of regular non-symlink files,
+    so containment holds by construction. The caller owns removing *dest* on
+    failure.
+    """
+    for path, rel in _deployable_files(tree):
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
 
 
 # --- concurrency -----------------------------------------------------------

@@ -7,18 +7,7 @@ import asyncio
 import typer
 
 from nerdit.cli.display import _plain, console, display_logs, render_client_error
-
-# The daemon's own forward-page cap. Read here only to recognise a FULL page —
-# "there is more backlog" — so the follower can drain it without waiting a poll
-# per page. A remote daemon with a different cap degrades to the old cadence,
-# never to a wrong result.
-from nerdit.daemon.limits import _MAX_LOG_TAIL
-
-# Terminal statuses for ``--follow``. A service settles at
-# ``stopped/failed/completed/cancelled`` (a clean ``on-failure``/``no`` exit
-# reaches ``completed``); ``restarting/degraded/building`` are transient
-# desired-state churn the follower must tail through, not stop on.
-_SERVICE_TERMINAL = ("stopped", "failed", "completed", "cancelled")
+from nerdit.db.enums import TERMINAL_STATUSES
 
 
 def logs(
@@ -102,6 +91,13 @@ async def _follow_polling(
     Advance to the larger of the displayed ID and scan watermark, including
     empty filtered pages, to avoid rescanning already-decided log ranges.
     """
+    # The daemon's own forward-page cap. Read here only to recognise a FULL page —
+    # "there is more backlog" — so the follower can drain it without waiting a poll
+    # per page. A remote daemon with a different cap degrades to the old cadence,
+    # never to a wrong result. Imported here: `daemon.limits` pulls in FastAPI,
+    # which would add ~150 ms to every CLI start.
+    from nerdit.daemon.limits import _MAX_LOG_TAIL
+
     since_id = 0
     while True:
         entries, watermark = await client.get_service_logs_page(
@@ -123,7 +119,7 @@ async def _follow_polling(
             since_id = max(since_id, watermark)
 
         service = await client.get_service(ident)
-        if service["status"] in _SERVICE_TERMINAL:
+        if service["status"] in TERMINAL_STATUSES:
             # Drain, not one last page: the dying lines of a chatty service can
             # exceed one server-capped page, and this is the caller's last read.
             await _drain(client, ident, since_id=since_id, grep=grep, since=since)

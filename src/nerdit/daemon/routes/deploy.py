@@ -22,21 +22,14 @@ from pydantic import ValidationError
 
 from nerdit.config.build import BuildSettings
 from nerdit.config.project import SECRET_REF_RE, rewrite_vars_ref
-from nerdit.core.bindings.secretref import walk_secret_ref
 from nerdit.core.gitsource import (
     GITHUB_INSTALLATION_REF,
     GitSourceError,
     GitSourceInfo,
-    clone_source,
     git_source_meta,
-    validate_ref,
-    validate_repo_url,
-    validate_subdir,
 )
 from nerdit.core.jobconfig import parse_job_config
-from nerdit.core.secrets import SHARED_SCOPE, SecretDecryptError
-from nerdit.core.variables import load_scoped
-from nerdit.daemon.audit import audit_params, record_shared_referenced
+from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import (
     current_principal,
     require_owner_or_admin,
@@ -48,11 +41,12 @@ from nerdit.daemon.deploy_pipeline import (
     _read_git_source,
     _stamp_queued,
     _validate_request_name,
-    github_token_absent_error,
+    clone_into_uploads,
     private_repo_hint,
     redeploy_from_source,
     reject_non_service_row,
-    resolve_github_installation_token,
+    resolve_git_token,
+    validate_git_coordinates,
 )
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.routes.services import reject_reserved_name
@@ -66,7 +60,7 @@ from nerdit.daemon.views.hosted import load_hosted_context
 from nerdit.daemon.views.service import (
     _cutover_in_progress_error,
     _run_in_progress_error,
-    _service_response,
+    service_view,
 )
 from nerdit.db.models import GitDeployRequest, JobStatus, TokenRole
 from nerdit.utils.ids import generate_id
@@ -121,9 +115,9 @@ async def deploy(
         {"name": name, "port": port, "gpus": gpus, "start": start, "env": env}
     )
     reject_reserved_name(name)
-    # Validate the FORM name before extraction (a bad name no longer costs the
-    # upload) and with request-field attribution (PROBE-11) — not misattributed
-    # to the ZIP's nerdit.toml downstream in _parse_deploy_defaults.
+    # Validate the form name before extraction, so a bad name never costs the
+    # upload and the error is attributed to the request field rather than to
+    # the ZIP's nerdit.toml.
     _validate_request_name(name)
     # Attribute the audit row to the validated app name (the path rules leave
     # deploy.create/plan's target null — the name rides in the form body).
@@ -134,21 +128,16 @@ async def deploy(
     existing = await queries.get_service_by_name(name)
     # A model row is not a redeploy target (fast path — rejects before extract).
     reject_non_service_row(existing, name)
-    # Authorize a redeploy against the *existing* row before mutating it — a
-    # redeploy overwrites another owner's service otherwise (a fresh deploy is
-    # gated by require_role alone, above). Pre-extraction so an unauthorized
-    # redeploy never consumes the upload.
-    # (P25 D-P25-3 leg b) The multipart form `name` is required and IS the
-    # service identity (the archive's nerdit.toml only ever consumes it), so the
-    # scope check runs PRE-EXTRACT — the upload is never even unpacked for an
-    # out-of-scope target. (D-P40-7) A redeploy widens by the ROW's project.
-    # Before the owner gate: an out-of-scope caller gets the one scope 403
-    # whether or not a row exists.
+    # Authorize before extraction, so an unauthorized caller never costs the
+    # upload. The form `name` IS the service identity, so scope is checked
+    # first (widened by the row's project, D-P40-7): an out-of-scope caller
+    # gets the one scope 403 whether or not a row exists. A redeploy then needs
+    # owner-or-admin on the existing row; a fresh deploy only the role above.
     require_service_scope(request, name, project=existing.project if existing else None)
     if existing is not None:
         require_owner_or_admin(request, existing)
-    # (P39) A name another token reserved by setting its secrets is refused
-    # before the upload is extracted; the row transaction re-checks it.
+    # A name another token reserved by setting its secrets is refused before
+    # the upload is extracted; the row transaction re-checks it.
     if existing is None:
         await reject_foreign_claim(request, name)
     parsed_env = _parse_env(env)
@@ -199,38 +188,31 @@ async def _resolve_token_ref(
     repo_url: str,
     project_id: str | None = None,
 ) -> str | None:
-    """Resolve a syntax-validated git credential reference without exposing its value.
+    """Resolve a syntax-validated git credential reference for a fresh deploy.
 
-    GitHub installation refs resolve by repo through the link mirror and fail with
-    422 deploy.github_token_absent when unavailable. Secret refs use per-service
-    scope only for a proven owner: an existing row the caller passed the owner
-    check on, or a claim the caller minted by setting the secrets first (P39).
-    Old secret files may outlive deleted rows, so any other fresh deployment may
-    use shared refs against shared storage only. The project scope (P40c) sits
-    under the service scope behind the same posture one level up: it is read
-    only when the project -- the row's `project_id`, else the project named
-    after the label (label == project in phase 1) -- is provably the caller's
-    (`project_owned_by_caller`), so a non-owner can never have the daemon send
-    another token's project secret to a repo it controls.
+    The shared resolution lives in `deploy_pipeline.resolve_git_token`; this
+    wrapper decides which scopes are proven. The service scope is the caller's
+    only via an existing row it passed the owner check on, or a claim it minted
+    by setting the secrets first: old secret files may outlive deleted
+    rows, so any other fresh deployment may use shared refs only. The project
+    is the row's `project_id`, else the project named after the label.
 
-    For owned services, shared refs prefer per-service overrides before shared
-    storage. Shared hits emit secret.shared_referenced. Raw values stay local, never
-    in audit, config, logs, argv or responses.
+    Raises:
+        NerditError: 403 `deploy.git_token_scope` when a service-scoped ref
+            names no scope the caller owns; 422 `deploy.git_token_unresolved`
+            when the ref resolves nowhere.
     """
     if token_ref is None:
         return None
+    mgr = getattr(request.app.state, "secret_manager", None)
     if token_ref == GITHUB_INSTALLATION_REF:
-        token = resolve_github_installation_token(request.app, repo_url)
-        if token is None:
-            raise github_token_absent_error(role=current_principal(request).role)
-        return token
+        return await resolve_git_token(
+            request, mgr, name, token_ref, repo_url=repo_url, include_service=False, project=None
+        )
     token_ref = rewrite_vars_ref(token_ref) or ""  # D-P40-9 alias, idempotent
     match = SECRET_REF_RE.match(token_ref)
     assert match is not None  # caller pre-validated against SECRET_REF_RE
     scope, key = match.group(1), match.group(2)
-    mgr = getattr(request.app.state, "secret_manager", None)
-    if mgr is None:  # pragma: no cover - always wired in the daemon
-        raise NerditError(500, "internal", "Secret manager is not configured.")
     owned = service_owned or await claim_owned_by_caller(request, name)
     queries = request.app.state.queries
     project = (
@@ -238,8 +220,7 @@ async def _resolve_token_ref(
         if project_id is not None
         else await queries.get_project_by_name(name)
     )
-    project_mine = project_owned_by_caller(request, project)
-    if not owned and not project_mine and scope != "shared":
+    if not owned and not project_owned_by_caller(request, project) and scope != "shared":
         # Fresh deploy: neither scope is provably the caller's.
         raise NerditError(
             403,
@@ -250,32 +231,11 @@ async def _resolve_token_ref(
                 f"the name for your token — or use `${{secrets.shared.{key}}}`."
             ),
         )
-    try:
-        # `service_env=None` is the carve-out expressed structurally: an
-        # unowned name never reaches the service or project scope at all, and
-        # each include_* flag admits only the scope proven above.
-        scoped_project_id = project.id if project is not None and project_mine else None
-        res = walk_secret_ref(
-            token_ref,
-            service_env=(
-                lambda: load_scoped(
-                    mgr,
-                    name,
-                    scoped_project_id,
-                    include_service=owned,
-                    include_project=project_mine,
-                )[0]
-            )
-            if owned or project_mine
-            else None,
-            shared_env=lambda: mgr.load(SHARED_SCOPE),
-        )
-    except SecretDecryptError as exc:
-        raise NerditError(500, "secret.decrypt_failed", str(exc)) from exc
-    if res.value is not None:
-        if res.source == "shared":
-            await record_shared_referenced(request, name, [key])
-        return res.value
+    token = await resolve_git_token(
+        request, mgr, name, token_ref, repo_url=repo_url, include_service=owned, project=project
+    )
+    if token is not None:
+        return token
     raise NerditError(
         422,
         "deploy.git_token_unresolved",
@@ -314,12 +274,7 @@ def validate_git_request(
             "Deploy-from-git is disabled on this daemon.",
             hint="Set [git].enabled = true to allow POST /deploy/git.",
         )
-    try:
-        validate_repo_url(repo_url, settings.git.allowed_hosts)
-        validate_ref(ref)
-        validate_subdir(subdir)
-    except GitSourceError as exc:
-        raise NerditError(exc.status_code, exc.code, exc.message, hint=exc.hint) from exc
+    validate_git_coordinates(settings, repo_url, ref, subdir)
     rewritten = rewrite_vars_ref(token_ref)
     if (
         rewritten is not None
@@ -356,18 +311,9 @@ async def clone_for_request(
     Raises:
         NerditError: The clone failure, with the role-aware private-repo hint.
     """
-    settings = request.app.state.settings
-    dest_dir = Path(settings.daemon.upload_dir).expanduser() / generate_id()
     try:
-        info = await clone_source(
-            repo_url,
-            ref=ref,
-            subdir=subdir,
-            dest_dir=dest_dir,
-            token=token,
-            timeout_s=settings.git.clone_timeout_s,
-            max_bytes=settings.git.max_clone_bytes,
-            allowed_hosts=settings.git.allowed_hosts,
+        info, dest_dir = await clone_into_uploads(
+            request.app.state.settings, repo_url, ref=ref, subdir=subdir, token=token
         )
     except GitSourceError as exc:
         raise NerditError(
@@ -433,18 +379,16 @@ async def deploy_git(
     existing = await queries.get_service_by_name(body.name)
     # A model row is not a redeploy target (fast path — rejects before clone).
     reject_non_service_row(existing, body.name)
-    # Authorize a redeploy against the existing row PRE-CLONE (R5): an
-    # unauthorized attempt must be rejected before it can consume clone
-    # timeout/bytes or resolve a private-repo credential.
-    # (P25 D-P25-3 leg b) Before `_resolve_token_ref`, not merely pre-clone: a
-    # shared-scope hit there writes a `secret.shared_referenced` audit row, so
-    # an out-of-scope caller must not reach it. (D-P40-7) A redeploy widens by
-    # the ROW's project. Before the owner gate: one scope 403 with or without a row.
+    # Authorize before `_resolve_token_ref`, not merely pre-clone: an
+    # unauthorized caller must not consume clone timeout/bytes or resolve a
+    # credential, and a shared-scope hit there writes a
+    # `secret.shared_referenced` audit row. Scope first (widened by the row's
+    # project, D-P40-7): one scope 403 with or without a row.
     require_service_scope(request, body.name, project=existing.project if existing else None)
     if existing is not None:
         require_owner_or_admin(request, existing)
-    # (P39) A name another token reserved by setting its secrets is refused
-    # before the clone; the row transaction re-checks it.
+    # A name another token reserved by setting its secrets is refused before
+    # the clone; the row transaction re-checks it.
     if existing is None:
         await reject_foreign_claim(request, body.name)
 
@@ -466,10 +410,10 @@ async def deploy_git(
         request, body.repo_url, ref=body.ref, subdir=body.subdir, token=token
     )
 
-    # `token_ref` persists the `${…}` reference NAME — never
-    # the token — so an unattended redeploy of a private repo can re-resolve the
-    # credential server-side. A reference name is not a credential; it is
-    # already recorded in this route's audit params.
+    # `token_ref` persists the `${…}` reference NAME, never the token, so an
+    # unattended redeploy of a private repo can re-resolve the credential
+    # server-side. A reference name is not a credential; the audit params
+    # already carry it.
     source_meta = git_source_meta(
         info, body.repo_url, subdir=body.subdir, token_ref=token_ref or None
     )
@@ -510,11 +454,10 @@ async def rollback(request: Request, name: str):
     """
     require_role(request, TokenRole.submitter, TokenRole.admin)
     request.state.audit_params = audit_params({"name": name})
-    # (P25 D-P25-3 leg b) The path name is authoritative and cheaper than the
-    # row load; it also fires before the P20/P24b in-progress 409 guards below,
-    # so an out-of-scope caller gets an auth error rather than a race verdict.
-    # (D-P40-7) The row is read first so its project can widen the scope; an
-    # out-of-scope caller gets the identical 403 with or without a row.
+    # Scope runs before the in-progress 409 guards below, so an out-of-scope
+    # caller gets an auth error rather than a race verdict. The row is read
+    # first only so its project can widen the scope (D-P40-7); the 403 is
+    # identical with or without a row.
     queries = request.app.state.queries
     existing = await queries.get_service_by_name(name)
     require_service_scope(request, name, project=existing.project if existing else None)
@@ -523,7 +466,7 @@ async def rollback(request: Request, name: str):
     # Authorize against the row before mutating it (owner or admin only).
     require_owner_or_admin(request, existing)
 
-    # (P20, PR #96 review F6) A rollback racing a live [deploy].release would
+    # A rollback racing a live [deploy].release would
     # abandon the running migration unobserved: the blind config write lowers
     # build_version, so the release's own completion handlers CAS-miss and its
     # real outcome (including a partially-applied migration) never surfaces —
@@ -531,8 +474,8 @@ async def rollback(request: Request, name: str):
     # generation whose migration is still executing. Refuse, same code as the
     # DELETE route (service_purge.py): the wait is bounded by
     # [services].release_timeout_s. No ?force hatch here (unlike DELETE):
-    # killing a live migration from a rollback needs kill-outcome semantics in
-    # the settle handlers that this PR does not add. A WEDGED generation (stale
+    # killing a live migration from a rollback needs kill-outcome semantics
+    # the settle handlers do not have. A WEDGED generation (stale
     # marker, daemon died mid-release) has no registered run slot, so the
     # documented stale-marker recovery path below is untouched.
     controller = getattr(request.app.state, "service_controller", None)
@@ -571,8 +514,8 @@ async def rollback(request: Request, name: str):
     # already built), so it is the one path that would otherwise inherit a
     # `release_pending` marker left by a wedged generation — and that marker
     # would make the controller settle the rolled-back generation
-    # `release_failed` on the next daemon start. A rollback runs no release
-    # (§0.27), so it clears the gate. The `release` command itself is carried
+    # `release_failed` on the next daemon start. A rollback runs no release,
+    # so it clears the gate. The `release` command itself is carried
     # forward untouched: it belongs to the app config, not to a generation. The
     # active-run gate above guarantees no release is executing when this pop runs.
     new_cfg.pop("release_pending", None)
@@ -613,10 +556,7 @@ async def rollback(request: Request, name: str):
             hint="Wait for the in-flight deploy or cutover to settle, then roll back again.",
         )
     job = await queries.get_service_by_name(name) or existing
-    endpoint = await queries.get_service_endpoint(name)
-    gpu_ids = await queries.get_job_gpus(job.id)
-    hosted = await load_hosted_context(request)
-    return _service_response(request, job, gpu_ids, endpoint, hosted=hosted)
+    return await service_view(request, job, hosted=await load_hosted_context(request))
 
 
 @router.post("/deploy/{name}/redeploy", status_code=201, operation_id="redeploy_app")
@@ -645,19 +585,18 @@ async def redeploy(
     settings = request.app.state.settings
 
     existing = await queries.get_service_by_name(name)
-    # (P25 D-P25-3 leg b / D-P40-7) Scope first, widened by the row's project:
-    # ahead of the 404 (no existence oracle), of the in-progress 409 guards
-    # (auth errors win) and of `redeploy_from_source`, which resolves the
-    # recorded token_ref and clones.
-    # NOTE: gitwatch-driven redeploys call that primitive in-process under an
-    # admin system principal, so scope is structurally inert there by design.
+    # Scope first, widened by the row's project (D-P40-7): ahead of the 404
+    # (no existence oracle), of the in-progress 409 guards (auth errors win)
+    # and of `redeploy_from_source`, which resolves the recorded token_ref and
+    # clones. GitWatch calls that primitive in-process under an admin system
+    # principal, so scope is inert there by design.
     require_service_scope(request, name, project=existing.project if existing else None)
     if existing is None:
         raise NerditError(404, "not_found", f"No service '{name}'.")
     # A model/database row is not a redeploy target.
     reject_non_service_row(existing, name)
     # Authorize against the row BEFORE anything that costs clone timeout/bytes
-    # or resolves a private-repo credential (the R5 ordering).
+    # or resolves a private-repo credential.
     require_owner_or_admin(request, existing)
 
     if not settings.git.enabled:

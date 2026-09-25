@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 
 from nerdit.config.settings import DatabasesSettings, ModelsSettings
@@ -109,13 +108,11 @@ class DataController(ResourceController[DataBackend]):
             old_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await old_task
-        # Fresh read-modify-write (mirrors the success write below): drop the
-        # stale flag if present, never clobbering a concurrent config update.
+        # Keyed removal of the stale flag, never clobbering a concurrent config
+        # update; the fresh read feeds the probe's backend choice.
         row = await self._queries.get_job(job.id)
         cfg = parse_job_config(row) if row is not None else parse_job_config(job)
-        if cfg.get("db_ready"):
-            cfg.pop("db_ready", None)
-            await self._queries.update_job_config(job.id, json.dumps(cfg))
+        await self._queries.patch_job_config(job.id, remove=["db_ready"])
         # Fire the probe unconditionally for the new container (no db_ready gate),
         # still bounded to one attempt per container.
         if container_id in self._ensure_attempted or job.id in self._ensure_tasks:
@@ -124,13 +121,13 @@ class DataController(ResourceController[DataBackend]):
 
         async def _run() -> None:
             try:
-                await self._ensure_ready(job, cfg, host_port, container_id)
+                await self._ensure(job, cfg, host_port, container_id)
             finally:
                 self._ensure_tasks.pop(job.id, None)
 
         self._ensure_tasks[job.id] = asyncio.create_task(_run())
 
-    async def _ensure_ready(self, job: Job, cfg: dict, host_port: int, container_id: str) -> None:
+    async def _ensure(self, job: Job, cfg: dict, host_port: int, container_id: str) -> None:
         """Probe over loopback and persist readiness for the current container.
 
         App containers use the separate bridge-host DSN. DataNotReadyError releases
@@ -169,11 +166,9 @@ class DataController(ResourceController[DataBackend]):
                 "Database provisioning failed for %s: %s", job.service_name or job.id, exc
             )
             return
-        # Re-read the row before writing so a concurrent config update (e.g. a
-        # status-side write during the probe) is never clobbered with stale data.
-        row = await self._queries.get_job(job.id)
         # Ignore success from a replaced container. None means the new id has
         # not been recorded yet and does not prove replacement.
+        row = await self._queries.get_job(job.id)
         if row is not None and row.container_id is not None and row.container_id != container_id:
             logger.debug(
                 "Skipping db_ready stamp for %s: container moved %s -> %s during probe",
@@ -182,14 +177,10 @@ class DataController(ResourceController[DataBackend]):
                 row.container_id,
             )
             return
-        latest = parse_job_config(row) if row is not None else dict(cfg)
-        latest["db_ready"] = True
-        await self._queries.update_job_config(job.id, json.dumps(latest))
+        await self._queries.patch_job_config(job.id, {"db_ready": True})
         await self._queries.append_log(
             job.id, "Database ready (accepting connections)", LogStream.system
         )
         # Emit here: POST /databases rows have no last_deploy readiness signal.
         await record_job_event(self._events, "database.ready", job)
         logger.info("Database %s ready", job.service_name or job.id)
-
-    _ensure = _ensure_ready

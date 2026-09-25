@@ -23,11 +23,13 @@ import shutil
 import socket
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+
+import httpx
 
 from nerdit.config.project import shared_secret_keys_for
 from nerdit.config.settings import (
@@ -50,18 +52,10 @@ from nerdit.core.deploy_state import stamp_last_deploy
 from nerdit.core.eventlog import EventRecorder, record_job_event
 from nerdit.core.events import EventBus
 from nerdit.core.health import (
-    DEFAULT_HEALTH_TIMEOUT_S as _DEFAULT_HEALTH_TIMEOUT_S,
-)
-from nerdit.core.health import (
-    DEFAULT_UNHEALTHY_THRESHOLD as _DEFAULT_UNHEALTHY_THRESHOLD,
-)
-from nerdit.core.health import (
-    as_float as _as_float,
-)
-from nerdit.core.health import (
-    as_int as _as_int,
-)
-from nerdit.core.health import (
+    DEFAULT_HEALTH_TIMEOUT_S,
+    DEFAULT_UNHEALTHY_THRESHOLD,
+    as_float,
+    as_int,
     check_health,
     check_tcp,
     run_probe,
@@ -102,24 +96,31 @@ from nerdit.core.sandbox import enforce_mount_allowlist, resolve_role
 from nerdit.core.secrets import SHARED_SCOPE, SecretDecryptError, SecretManager
 from nerdit.core.variables import load_scoped
 from nerdit.core.volumes import VolumeSpecError, create_dump_staging_dir, service_volumes
-from nerdit.db.enums import ErrorClass, GpuVendor, JobKind, JobStatus, LogStream, TokenRole
+from nerdit.db.enums import (
+    TERMINAL_STATUSES,
+    ErrorClass,
+    GpuVendor,
+    JobKind,
+    JobStatus,
+    LogStream,
+    TokenRole,
+)
 from nerdit.db.queries import Queries
 from nerdit.db.rows import Job
 from nerdit.utils.ids import generate_id
 
 logger = logging.getLogger(__name__)
 
-# Upper bound on health checks performed per reconcile tick (CRIT-5). Inline
-# checks run inside the single sequential WorkloadManager loop, so an unbounded
-# fan-out of slow endpoints would delay the reconcile cadence. The per-check
-# httpx timeout bounds each probe; this bounds their cumulative cost per tick.
+# Upper bound on health checks performed per reconcile tick (CRIT-5). A tick's
+# probes run concurrently, so this is also their concurrency bound; the
+# per-check timeout bounds the tick's probe phase to one probe's worth.
 _MAX_HEALTH_CHECKS_PER_TICK = 20
 
 # Hard ceiling on the exponential restart backoff (seconds).
 _MAX_BACKOFF_S = 60.0
 
 
-# --- (P37) Managed-database dump/restore constants ---------------------------
+# --- Managed-database dump/restore constants ---------------------------------
 
 #: Where the dump staging dir is bind-mounted inside the sibling container
 #: (D-P37-2). The daemon's ONLY mount into that container, and the only path
@@ -135,7 +136,7 @@ _DUMP_LOG_TAIL = 200
 #: not visibly wait; monkeypatched down by the controller tests.
 _QUIESCE_POLL_INTERVAL_S = 0.5
 
-#: The Redis multi-part-AOF layout (verified live, plan §0). ``appendonlydir/``
+#: The Redis multi-part-AOF layout (verified live). ``appendonlydir/``
 #: is what a server booted ``--appendonly yes`` reads at startup; a bare
 #: ``dump.rdb`` beside it is IGNORED, which is why the restore installs the RDB
 #: as the base file of a hand-written one-entry manifest (D-P37-6).
@@ -257,9 +258,8 @@ def _swap_aof_dir(volume_dir: Path, prepared: Path) -> None:
 class LaunchEnvNotReady(Exception):  # noqa: N818 — domain condition, not an error (retry signal)
     """Launch env (secrets / shared / [ai.*] bindings) is not yet resolvable.
 
-    Non-terminal, exactly like the return-based retry-next-tick exits it
-    replaces (P14 WP-0 C2.1 factoring): the caller logs the wait once and defers
-    the launch. `kind` selects the caller's dedupe/log channel:
+    Non-terminal, a retry-next-tick signal: the caller logs the wait once and
+    defers the launch. `kind` selects the caller's dedupe/log channel:
     `"binding"` → `ServiceController._log_binding_wait`;
     `"secrets"` / `"shared_secrets"` → `_log_secret_wait`.
     """
@@ -317,7 +317,7 @@ class RunPreconditionError(Exception):
     `reason ∈ {"service_gone", "no_image", "run_in_progress",
     "too_many_runs"}` — the run route maps them to 404 `not_found`, 409
     `run.no_image`, 409 `service.run_in_progress` and 409
-    `run.too_many_in_flight` respectively (P20 §1.2). Raised **before** any
+    `run.too_many_in_flight` respectively. Raised **before** any
     container exists, so there is never anything to clean up beyond the
     caller's registry slot.
     """
@@ -327,14 +327,13 @@ class RunPreconditionError(Exception):
         self.reason = reason
 
 
-# The settled-terminal desired_state values. `set_desired_state`
-# (db/queries/services.py) documents the live domain as `running | stopped`, so
-# only `stopped` is reachable today; the other three are carried deliberately as
-# a superset (they are the terminal `status` values `get_reconcilable_services`
-# filters on) so a future widening of the desired-state domain cannot silently
-# let a run through. A run against a row the user has terminally stopped is
-# refused as "service_gone" even though the row still physically exists.
-_TERMINAL_DESIRED_STATES = frozenset({"completed", "cancelled", "stopped", "failed"})
+#: Lines per `job_logs` write batch and the quiet interval (seconds) that
+#: flushes a partial batch.
+_LOG_BATCH = 256
+_LOG_FLUSH_S = 0.25
+#: Stored rows of the resume second a re-adopted follow checks for replays.
+# ponytail: a busier resume second re-inserts its lines past this bound.
+_LOG_RESUME_MAX = 4 * _LOG_BATCH
 
 
 class RunInterruptedError(ContainerRuntimeError):
@@ -353,12 +352,12 @@ class RunInterruptedError(ContainerRuntimeError):
 
 
 class RunMode(StrEnum):
-    """The kind of rowless container execution a slot tracks (P37, D-P37-9).
+    """The kind of rowless container execution a slot tracks (D-P37-9).
 
     ``dump`` is single-flight per row like ``run``, exempt from
     ``max_concurrent_runs`` like ``release``, and capped by its own
-    ``[services].max_concurrent_dumps``. Additive: ``is_release=`` stays valid on
-    every P20 call site. A restore takes a ``dump`` slot; ``last_dump.kind`` tells
+    ``[services].max_concurrent_dumps``. ``is_release=`` stays valid for
+    existing callers. A restore takes a ``dump`` slot; ``last_dump.kind`` tells
     them apart.
     """
 
@@ -399,12 +398,12 @@ class RunSlot:
 
     @property
     def is_release(self) -> bool:
-        """``True`` for a ``[deploy].release`` slot (the P20 spelling, derived)."""
+        """``True`` for a ``[deploy].release`` slot (derived from ``mode``)."""
         return self.mode is RunMode.release
 
 
 class DumpError(Exception):
-    """A managed-database dump or restore failed (P37, D-P37-11).
+    """A managed-database dump or restore failed (D-P37-11).
 
     ``reason`` is one of the locked tokens shared by the response, the event and
     ``config['last_dump']``: ``data_plane_unavailable``, ``exit_nonzero``,
@@ -421,7 +420,7 @@ class DumpError(Exception):
 
 @dataclass(frozen=True)
 class DumpResult:
-    """Outcome of one SUCCESSFUL dump or restore (P37, §1.2); every failure is a
+    """Outcome of one SUCCESSFUL dump or restore; every failure is a
     :class:`DumpError`. ``exit_code`` is ``0`` (``None`` on the Redis restore path,
     which runs no container); ``output_path`` is the verified dump inside the
     staging dir, ``None`` for a restore.
@@ -474,10 +473,9 @@ _GPU_OOM_MARKERS = (
     "torch.cuda.outofmemoryerror",
     "hip out of memory",
     "hiperroroutofmemory",
-    # vLLM's startup preflight refusal (observed live on vllm v0.25,
-    # 2026-08-06): the engine refuses to claim more VRAM than is free BEFORE
-    # the allocator can OOM — same GPU-sizing root cause, same fix, so it
-    # belongs to gpu_oom (D2 amendment, plan §0).
+    # vLLM's startup preflight refusal (observed on vllm v0.25): the engine
+    # refuses to claim more VRAM than is free BEFORE the allocator can OOM —
+    # same GPU-sizing root cause, same fix, so it belongs to gpu_oom.
     "is less than desired gpu memory utilization",
 )
 
@@ -523,7 +521,7 @@ _PRIV_SYSCALL_MARKERS = (
 # These are FILESYSTEM ROOTS, so they must only match a path token that actually
 # STARTS there: a plain substring test made ``Permission denied:
 # '/app/run/state.pid'` match `/run/`` and misreport an ordinary app bug as
-# `image_needs_privileges` (Codex, PR #138). The regex therefore requires a
+# `image_needs_privileges`. The regex therefore requires a
 # boundary immediately before the leading slash — start of line, whitespace
 # (which covers the `: ` and `, ` separators), a quote, or an opening paren —
 # i.e. the position where a path token begins in every observed error shape:
@@ -574,7 +572,7 @@ def _classify_service_exit(
     fixes (GPU sizing vs `[deploy].memory_limit`), and in the pathological
     both-flags case the CUDA marker names the allocator that actually failed.
     `derive_remediation` (`daemon/remediation.py`) ranks the same way for
-    model rows (architect ruling 2026-08-06), so a both-flags model crash reports
+    model rows, so a both-flags model crash reports
     class GPU_OOM with remediation `model.gpu_oom`; service rows have no
     gpu_oom remediation by D2's scoping and fall through to the cgroup rule.
     """
@@ -610,12 +608,11 @@ def _truncate_line(line: str) -> str:
 def _scrub_and_truncate(lines: list[str], values: Iterable[str]) -> list[str]:
     """The D-P20-1 redaction pipeline for a captured tail: scrub, THEN clamp.
 
-    The order is load-bearing, and it was the wrong way round once (PR #96
-    review F2): clamping first cut a secret longer than `_RUN_LINE_MAX_BYTES`
-    mid-value, so `scrub_secret_values`' literal match no longer found it
-    and the clamped 2 KiB PREFIX of the secret reached the run response and —
-    for a `[deploy].release` — `job_logs`, which ANY authenticated
-    principal (`readonly` included) can read. The `core/gitsource.py`
+    The order is load-bearing: clamping first would cut a secret longer than
+    `_RUN_LINE_MAX_BYTES` mid-value, so `scrub_secret_values`' literal match
+    would miss it and the clamped PREFIX of the secret would reach the run
+    response and — for a `[deploy].release` — `job_logs`, which ANY
+    authenticated principal (`readonly` included) can read. The `core/gitsource.py`
     `_scrub` precedent is the template: scrub, then slice.
 
     Scrubbing the un-clamped lines stays bounded — the tail is capped at
@@ -670,7 +667,7 @@ class ServiceController:
         self._secrets = secrets
         # Model-side hooks: off-tick image pull, backend container shape,
         # ensure_model. None => kind=model rows launch through the plain
-        # service path (image must pre-exist), exactly as before P5.
+        # service path (image must pre-exist).
         self._models = model_controller
         # Data-side hooks: off-tick image pull, backend container shape,
         # ensure_ready (wire-protocol readiness probe). None => kind=database rows
@@ -685,7 +682,7 @@ class ServiceController:
             else ModelsSettings().bridge_advertise_host
         )
         # URL layer: registered on RUNNING, deregistered on every terminal
-        # transition. `None` (or disabled) => services run on loopback as in P2.
+        # transition. `None` (or disabled) => services run on loopback only.
         self._proxy = proxy
         self._proxy_mode = proxy_mode
         # Defaults match production settings so bare-constructed controllers
@@ -698,7 +695,7 @@ class ServiceController:
         # Daemon-wide cap on concurrent route-initiated runs.
         # Restart-required key, so snapshotting at construction is exact.
         self._max_concurrent_runs = self._services_settings.max_concurrent_runs
-        # (P37 D-P37-9) The dump/restore pool, kept SEPARATE from the run cap
+        # (D-P37-9) The dump/restore pool, kept SEPARATE from the run cap
         # above: the two bound different resources (a run burns the image's
         # CPU, a dump burns daemon disk and the database's own replication
         # bandwidth), so neither borrows from the other. Same restart-required
@@ -747,6 +744,9 @@ class ServiceController:
         # Consecutive health-check failures per job id (in-memory: resets on
         # reboot, which is fine — degraded is observable, never load-bearing).
         self._health_failures: dict[str, int] = {}
+        # Shared by every HTTP health probe; created on first use, closed in
+        # shutdown(). No keepalive, so each probe still opens a fresh connection.
+        self._health_client: httpx.AsyncClient | None = None
         # Last BindingNotReady message logged per job id: the wait line is
         # written to job_logs once per DISTINCT message, not once per tick.
         self._binding_wait_msgs: dict[str, str] = {}
@@ -790,8 +790,7 @@ class ServiceController:
         which 409s `service.run_in_progress` rather than tearing a service
         down under a live migration. Releases count: deleting a service whose
         release container is mid-migration is exactly as unsafe as deleting one
-        mid-run (behaviour change vs pre-P20, where a delete during a build
-        succeeded).
+        mid-run.
         """
         return bool(self._active_runs.get(job_id))
 
@@ -913,7 +912,7 @@ class ServiceController:
     # A cutover GREEN is a second live container for a row that already has
     # one, so it is invisible to every DB query the sweep makes and must not be
     # torn down by a concurrent DELETE. Same posture, and the same three hooks,
-    # as the P20 rowless-run registry above.
+    # as the rowless-run registry above.
 
     def has_active_cutover(self, job_id: str) -> bool:
         """Whether a cutover verify is in flight for `job_id`.
@@ -1139,14 +1138,18 @@ class ServiceController:
             # Fresh re-read: the route's row is stale by the time we hold the
             # slot; this closes the resolve->launch delete window to near-zero.
             fresh = await self._queries.get_job(job.id)
-            if fresh is None or fresh.desired_state in _TERMINAL_DESIRED_STATES:
+            # `set_desired_state` documents the live domain as `running |
+            # stopped`, so only `stopped` is reachable today; the full terminal
+            # set guards a future widening of that domain. A run against a row
+            # the user has terminally stopped is refused as "service_gone" even
+            # though the row still physically exists.
+            if fresh is None or fresh.desired_state in TERMINAL_STATUSES:
                 raise RunPreconditionError("service_gone")
-            # Defence in depth behind the route's kind guard (WP4 answers a
-            # non-service row with 422 `run.not_supported`). A real refusal
-            # rather than an `assert`: an optimised interpreter (``python
-            # -O``) deletes an assert, and until that route ships this is the
-            # ONLY gate — a model or database row would otherwise launch its
-            # own image with its own env. Reuses the locked `service_gone`
+            # Defence in depth behind the route's kind guard (422
+            # `run.not_supported`). A real refusal rather than an `assert`: an
+            # optimised interpreter (``python -O``) deletes an assert, and a
+            # model or database row would otherwise launch its own image with
+            # its own env. Reuses the locked `service_gone`
             # reason instead of widening the error set.
             if fresh.kind is not JobKind.service:
                 raise RunPreconditionError("service_gone")
@@ -1177,7 +1180,7 @@ class ServiceController:
             if resolved.shared_keys:
                 await self._audit_shared_resolved(fresh, resolved.shared_keys, resolved.secret_env)
 
-            # --- the §1.1 protected-key overlay, verbatim ---
+            # --- the protected-key overlay ---
             env = dict(resolved.env)  # copy: never mutate the resolver's dict
             protected = resolved.injected_keys | {"PORT", "NERDIT_RUN_ID"}
             overrides = env_overrides or {}
@@ -1223,23 +1226,21 @@ class ServiceController:
                 scrub_values=scrub,
             )
 
-            # The ONLY persistence: config['last_run'], written by the
-            # single-statement `set_last_run` — NOT `_stamp_config`. A run is
-            # long-lived and a release is exempt from the run single-flight
-            # check, so a redeploy or a release legitimately commits
-            # to this row while the container is still going: a whole-blob
-            # read-modify-write would erase `image`/`build_version`/
-            # `release_pending` from under it. The guarded CAS twin is wrong
-            # here too — its expectation is generation-scoped, and `last_run` is
-            # not, so a redeploy would silently drop the stamp instead of
-            # merging it. A DB error must not eat the result the container
-            # already produced; a `False` return just means the row vanished (or
-            # its blob is not valid JSON) mid-run.
+            # The ONLY persistence: config['last_run'], one keyed
+            # `patch_job_config` write. A run is long-lived and a release is
+            # exempt from the run single-flight check, so a redeploy or a
+            # release legitimately commits to this row while the container is
+            # still going. No `expect_build_version`: that guard is
+            # generation-scoped and `last_run` is not, so a redeploy would
+            # silently drop the stamp instead of merging it. A DB error must
+            # not eat the result the container already produced; a `False`
+            # return just means the row vanished (or its blob is not valid
+            # JSON) mid-run.
             try:
-                stamped = await self._queries.set_last_run(
+                stamped = await self._queries.patch_job_config(
                     fresh.id,
-                    json.dumps(
-                        {
+                    {
+                        "last_run": {
                             "run_id": run_id,
                             "command": list(command),  # verbatim — owner-gated
                             "exit_code": result.exit_code,
@@ -1262,7 +1263,7 @@ class ServiceController:
                             "env_override_keys_dropped": sorted(set(overrides) - set(applied)),
                             "log_tail": result.log_tail,  # already scrubbed+clamped
                         }
-                    ),
+                    },
                 )
                 if not stamped:
                     logger.warning(
@@ -1279,16 +1280,16 @@ class ServiceController:
                 )
             return result
         finally:
-            # Unconditional (S1): every raise path above leaves the registry
+            # Unconditional: every raise path above leaves the registry
             # empty, or DELETE is wedged for this service until restart.
             self._discard_run(job.id, run_id)
 
-    # --- (P37) Managed-database dumps and restores --------------------------
+    # --- Managed-database dumps and restores --------------------------------
 
     def _dump_backend(self, cfg: dict) -> DataBackend:
         """Return the row's data backend, or raise ``data_plane_unavailable``.
 
-        The one precondition the controller owns (§1.2, D-P37-10); every other check
+        The one precondition the controller owns (D-P37-10); every other check
         is the route's. Sync and before :meth:`_register_run`, so no slot is claimed.
         """
         if self._data is None or self._data_dir is None:
@@ -1356,7 +1357,7 @@ class ServiceController:
         env: dict[str, str],
         staging: Path,
     ) -> ContainerConfig:
-        """Build the sibling's container config (D-P37-1/2/3): the P20 run shape
+        """Build the sibling's container config (D-P37-1/2/3): the one-off run shape
         (portless, GPU-less, ``cap_drop=ALL``, ``no_new_privileges``, bridge) plus
         ``user`` = the daemon's uid:gid and the staging dir as the ONLY mount, at
         ``/nerdit-dump``. The data volume is never mounted.
@@ -1374,12 +1375,12 @@ class ServiceController:
         return config
 
     async def _stamp_last_dump(self, job: Job, payload: dict) -> None:
-        """Write ``config['last_dump']`` best-effort via the single-statement
-        ``json_set`` (:meth:`Queries.set_last_dump`) — a redeploy may commit to the
-        row meanwhile. Failures are logged and swallowed (D-P37-11).
+        """Write ``config['last_dump']`` best-effort via the keyed
+        :meth:`Queries.patch_job_config` — a redeploy may commit to the row
+        meanwhile. Failures are logged and swallowed (D-P37-11).
         """
         try:
-            stamped = await self._queries.set_last_dump(job.id, json.dumps(payload))
+            stamped = await self._queries.patch_job_config(job.id, {"last_dump": payload})
             if not stamped:
                 logger.warning(
                     "last_dump stamp for database %s (run %s) matched no row",
@@ -1403,7 +1404,7 @@ class ServiceController:
         on_captured: Callable[[DumpResult], Awaitable[None]] | None = None,
     ) -> DumpResult:
         """Capture a logical, application-consistent dump of a managed database
-        (P37 WP2, D-P37-1/2/3/4/9/11).
+        (D-P37-1/2/3/4/9/11).
 
         A rowless sibling from the row's own image runs the backend's dump tool
         against ``bridge_host:<published port>`` and writes into a fresh ``0o700``
@@ -1653,7 +1654,7 @@ class ServiceController:
         """Install an RDB as the Redis multi-part-AOF base under a quiesce (D-P37-6).
 
         A ``dump.rdb`` dropped into ``/data`` of an ``--appendonly yes`` server is
-        ignored (verified live, plan §0); placed as
+        ignored (verified live); placed as
         ``appendonlydir/appendonly.aof.1.base.rdb`` beside a manifest it loads. The
         replacement dir is written complete while the server is up; only then is the
         row quiesced and the dirs swapped by two renames.
@@ -1820,15 +1821,32 @@ class ServiceController:
             logger.warning("Could not list managed containers for service tick", exc_info=True)
             return
         live_ids = {cid for cid, _ in live}
-        # Health-check budget for this tick (CRIT-5), shared across services.
-        budget = [_MAX_HEALTH_CHECKS_PER_TICK]
-        for job in services:
-            try:
-                await self._reconcile_one(job, live_ids, budget)
-            except Exception:
-                logger.exception("Error reconciling service %s", job.service_name or job.id)
+        # Health probes queued by this tick (CRIT-5), run together after the
+        # serial pass so one hanging endpoint cannot stall every other row.
+        probes: list[tuple[Job, Coroutine[object, object, None]]] = []
+        try:
+            for job in services:
+                try:
+                    await self._reconcile_one(job, live_ids, probes)
+                except Exception:
+                    logger.exception("Error reconciling service %s", job.service_name or job.id)
+        except BaseException:
+            for _, probe in probes:
+                probe.close()  # never started: avoid "coroutine never awaited"
+            raise
+        results = await asyncio.gather(*(probe for _, probe in probes), return_exceptions=True)
+        for (job, _), result in zip(probes, results, strict=True):
+            if isinstance(result, Exception):
+                logger.error(
+                    "Error probing service %s", job.service_name or job.id, exc_info=result
+                )
 
-    async def _reconcile_one(self, job: Job, live_ids: set[str], budget: list[int]) -> None:
+    async def _reconcile_one(
+        self,
+        job: Job,
+        live_ids: set[str],
+        probes: list[tuple[Job, Coroutine[object, object, None]]],
+    ) -> None:
         """Drive one service row toward its `desired_state`."""
         desired = job.desired_state or "running"
         live = job.container_id is not None and job.container_id in live_ids
@@ -1848,15 +1866,15 @@ class ServiceController:
             # — the fresh re-read below is what tears that one down.
             if self.has_active_cutover(job.id):
                 await self.cancel_cutover(job.id)
-            # Tear down the FRESH row, not this tick's snapshot (PR #108
-            # review): a verify that committed between the tick's fetch and
-            # the check above promoted the row to the green and finished its
-            # task, so `has_active_cutover` is honestly False — but this
-            # `job` still names the destroyed blue. Tearing that down would
-            # mark the row stopped while the freshly promoted green keeps
-            # running forever (row-backed ids are sweep-protected regardless
-            # of status). The re-read happens AFTER the cancel, so any commit
-            # that raced the check is visible in `container_id` here.
+            # Tear down the FRESH row, not this tick's snapshot: a verify that
+            # committed between the tick's fetch and the check above promoted
+            # the row to the green and finished its task, so
+            # `has_active_cutover` is honestly False — but this `job` still
+            # names the destroyed blue. Tearing that down would mark the row
+            # stopped while the freshly promoted green keeps running forever
+            # (row-backed ids are sweep-protected regardless of status). The
+            # re-read happens AFTER the cancel, so any commit that raced the
+            # check is visible in `container_id` here.
             fresh = await self._queries.get_job(job.id)
             await self._teardown_to_stopped(fresh if fresh is not None else job)
             return
@@ -1901,8 +1919,8 @@ class ServiceController:
         # touches the live container, and the route is repointed (and the
         # repoint VERIFIED) before blue is destroyed. `True` ⇒ a verify is in
         # flight (or just settled) and blue keeps serving; `False` ⇒ the row
-        # is not eligible and the pre-P24 destroy-first path below runs
-        # unchanged (pinned byte-identical by test_cutover.py).
+        # is not eligible and the destroy-first path below runs
+        # (pinned by test_cutover.py).
         if await self._cutover.maybe_cutover(job, live):
             return
 
@@ -1916,7 +1934,7 @@ class ServiceController:
             live = False
 
         if live:
-            await self._reconcile_live(job, budget)
+            await self._reconcile_live(job, probes)
         else:
             await self._reconcile_dead(job)
 
@@ -1951,6 +1969,12 @@ class ServiceController:
         except sqlite3.IntegrityError:
             logger.debug("append_log skipped for vanished job %s", job_id)
 
+    def forget(self, job_id: str) -> None:
+        """Drop per-job in-memory reconcile state for a deleted or stopped row."""
+        self._health_failures.pop(job_id, None)
+        self._binding_wait_msgs.pop(job_id, None)
+        self._shared_resolved_sigs.pop(job_id, None)
+
     async def _teardown_to_stopped(self, job: Job) -> None:
         """Tear a service down to the terminal `stopped` state.
 
@@ -1968,9 +1992,7 @@ class ServiceController:
             await self._destroy_container(job.container_id)
         await self._queries.release_gpus(job.id)
         await self._release_endpoint(job)
-        self._health_failures.pop(job.id, None)
-        self._binding_wait_msgs.pop(job.id, None)
-        self._shared_resolved_sigs.pop(job.id, None)
+        self.forget(job.id)
         await self._queries.update_job_status(
             job.id, JobStatus.stopped, finished_at=datetime.now(UTC)
         )
@@ -2030,7 +2052,7 @@ class ServiceController:
         await self._launch(job)
 
     async def _crash_scrub_values(self, job: Job) -> set[str] | None:
-        """Best-effort D-P20-1 scrub set for a crashed container's tail (PR #102 review).
+        """Best-effort D-P20-1 scrub set for a crashed container's tail.
 
         Re-runs the same launch-env resolution the dead container was started
         with (the `_launch` prelude, verbatim — incl. the model/database
@@ -2155,12 +2177,12 @@ class ServiceController:
                 exit_code=exit_code if exit_code is not None else -1,
                 error_class=error_class,
                 error_message=error_message,
+                # Settle desired_state to the terminal status so the row leaves
+                # get_reconcilable_services and is NOT relaunched every tick —
+                # honoring restart_policy='no' / a clean 'on-failure' exit. The
+                # /restart route flips desired_state back to 'running' to revive it.
+                desired_state=final.value,
             )
-            # Settle desired_state to the terminal status so the row leaves
-            # get_reconcilable_services and is NOT relaunched every tick — honoring
-            # restart_policy='no' / a clean 'on-failure' exit. The /restart route
-            # flips desired_state back to 'running' to revive it explicitly.
-            await self._queries.set_desired_state(job.id, final.value)
             await self._append_log_tolerant(
                 job.id,
                 f"Service exited (code={exit_code}); restart_policy={policy} → {final.value}",
@@ -2226,20 +2248,18 @@ class ServiceController:
                     f"Restart budget exhausted ({new_count} restarts in {window}s); "
                     f"last exit_code={exit_code}"
                 ),
+                desired_state=JobStatus.failed.value,  # settle (see _handle_crash)
             )
-            await self._queries.set_desired_state(
-                job.id, JobStatus.failed.value
-            )  # settle (see _handle_crash)
-            # (F5-CRASHLOOP) Stamp crash_loop only onto the generation that
+            # Stamp crash_loop only onto the generation that
             # actually crashed — the tick-start `job` snapshot the controller
             # observed exhausting its budget, captured BEFORE a redeploy could
             # bump the version. A redeploy may seed a newer queued generation in
             # this same tick; `expect_version` on the snapshot's version keeps
             # the failed stamp off it (matching the build-fail idiom above). When
-            # the snapshot carries no last_deploy (pre-P13 / POST /services row),
+            # the snapshot carries no last_deploy (a POST /services row),
             # skip the phase stamp entirely rather than risk stamping a
             # generation seeded mid-tick. The row-level `failed` transition
-            # above stays unguarded (the plan's "any → failed" row semantics).
+            # above stays unguarded ("any → failed" row semantics).
             snap_ld = parse_job_config(job, warn=True).get("last_deploy")
             crashed_version = snap_ld.get("version") if isinstance(snap_ld, dict) else None
             if crashed_version is not None:
@@ -2315,32 +2335,6 @@ class ServiceController:
         """Exponential backoff `min(60, 2**n)` seconds before the next launch."""
         return min(_MAX_BACKOFF_S, float(2 ** max(restart_count, 1)))
 
-    async def _stamp_config(
-        self,
-        job_id: str,
-        updates: dict[str, object] | None = None,
-        *,
-        pop: list[str] | None = None,
-    ) -> None:
-        """Fresh read-modify-write of a service row's `config` blob.
-
-        Re-reads the row via `get_job` *now* (never a tick-start snapshot) so a
-        redeploy landing mid-tick is never clobbered, applies `pop` then
-        `updates`, and persists via `update_job_config` — a blob-only write
-        that touches neither `status` nor the restart bookkeeping. Shared with
-        the crash-forensics writer here; WP2 routes its `last_deploy` phase
-        stamps through the same helper.
-        """
-        row = await self._queries.get_job(job_id)
-        if row is None:
-            return
-        cfg = parse_job_config(row, warn=True)
-        for key in pop or ():
-            cfg.pop(key, None)
-        if updates:
-            cfg.update(updates)
-        await self._queries.update_job_config(job_id, json.dumps(cfg))
-
     async def _persist_forensics(
         self,
         job_id: str,
@@ -2367,7 +2361,7 @@ class ServiceController:
         }
         if isinstance(exit_code, int):
             updates["last_exit_code"] = exit_code
-        await self._stamp_config(job_id, updates)
+        await self._queries.patch_job_config(job_id, updates)
 
     # --- Launch sequence ----------------------------------------------------
 
@@ -2381,23 +2375,23 @@ class ServiceController:
     ) -> ResolvedLaunchEnv:
         """Acquire the full launch env or raise `LaunchEnvNotReady`.
 
-        Pure of audit side effects (P14 WP-0 C2.1): the caller owns the wait-log
-        and shared-resolved audit. Loads the scoped variables (project < service,
-        D-P40-9) ONCE, lazily
-        loads the shared scope only when a `${secrets.shared.KEY}` ref is
-        actually unresolved, resolves `[ai.*]` then `[db.*]`
-        bindings, and merges the container env (config env ⊕ secrets ⊕ injected
-        ai ⊕ injected db ⊕ `PORT`). A decrypt failure or a not-ready binding
-        raises rather than returning — the caller re-establishes the exact
-        retry-next-tick semantics. Also reports `injected_keys` — the keys the binding resolvers
-        actually produced — for `run_once`'s protected-key overlay. Purely
-        additive: `_launch`'s behaviour is unchanged.
+        Pure of audit side effects: the caller owns the wait-log and
+        shared-resolved audit. Loads the scoped variables (project < service,
+        D-P40-9) ONCE, lazily loads the shared scope only when a
+        `${secrets.shared.KEY}` ref is actually unresolved, resolves `[ai.*]`
+        then `[db.*]` bindings, and merges the container env (config env ⊕
+        secrets ⊕ injected ai ⊕ injected db ⊕ `PORT`). A decrypt failure or a
+        not-ready binding raises rather than returning — the caller applies the
+        retry-next-tick semantics. Also reports `injected_keys` — the keys the
+        binding resolvers actually produced — for `run_once`'s protected-key
+        overlay.
         """
         # Scoped variables (project < service, D-P40-9), loaded ONCE — shared
         # between binding resolution and the container env. The project scope
         # is the ROW's `project_id`: the row was admitted under D-P40-5 rule 1,
-        # so a daemon-driven launch has no ownership question (bar the rollback
-        # bounce the plan's §5 leaves open: the boot backfill adopts by name).
+        # so a daemon-driven launch has no ownership question (bar the known,
+        # still-open daemon-version downgrade/upgrade bounce: the boot
+        # backfill adopts by name).
         # A decrypt failure is NON-terminal: raise, the admin restores the
         # key/file, launch converges.
         secret_env: dict[str, str] = {}
@@ -2522,11 +2516,11 @@ class ServiceController:
         container_port = int(cfg.get("port") or 8000)
         # [ai.*] AND [db.*] bindings are suppressed for model AND database rows:
         # both are bound-TO resources (a binding consumer's target), never
-        # binding consumers themselves (P15, mirror of the model suppression).
+        # binding consumers themselves.
         ai_specs = cfg.get("ai") if not (is_model or is_data) else None
         db_specs = cfg.get("db") if not (is_model or is_data) else None
 
-        # --- (P5 / S9) resolve the launch env (per-service secrets + shared +
+        # --- resolve the launch env (per-service secrets + shared +
         # [ai.*]/[db.*] bindings) BEFORE any resource acquisition. A not-ready
         # binding or an undecryptable secret raises LaunchEnvNotReady — NOTHING
         # acquired (no GPU, no host port, no endpoint row) — and the next tick
@@ -2690,7 +2684,7 @@ class ServiceController:
             # statics (POSTGRES_USER/DB/PGDATA) and sets user to the daemon's
             # uid:gid; a stray user-set secret in the scope (e.g.
             # POSTGRES_HOST_AUTH_METHOD) can therefore never reach the container
-            # (§1.3). PGDATA rides the GENERIC named-volume block below (the
+            # PGDATA rides the GENERIC named-volume block below (the
             # row's config['volumes'] was stamped at create) — no branch-local
             # volume set. The DataController adds the bridge-gateway extra port
             # bind so bound app containers can reach the port.
@@ -2740,7 +2734,7 @@ class ServiceController:
             )
             # A failed start counts against the restart budget (always retry the
             # start itself; the policy gate only governs *exit* handling).
-            # NOTE (WP3/WP4): a launch failure rides the restart loop and lands
+            # NOTE: a launch failure rides the restart loop and lands
             # as reason="crash_loop" once the budget is exhausted — there is NO
             # reason="launch_failed" write site (that locked enum value is
             # deliberately unused), so /diagnose must never branch on it.
@@ -2848,7 +2842,7 @@ class ServiceController:
         for key in present:
             env[key] = shared_env[key]
         config.env = env
-        # Reuse the P8 shared-resolved audit (names only; no per-service override
+        # Reuse the shared-resolved audit (names only; no per-service override
         # concept for models, so `overridden` is always empty here).
         await self._audit_shared_resolved(job, present, {})
 
@@ -2859,7 +2853,7 @@ class ServiceController:
         Normalizes both sides and checks *prefix* containment in either direction
         (not just equality): `data:/data` collides with a user mount at
         `/data/sub` (and the trailing-slash variants), because bind-mounting one
-        under the other shadows it (D-P14-4 / critique L2).
+        under the other shadows it (D-P14-4).
         """
 
         # `os.path.normpath` preserves an exactly-two-slash prefix (`//data`
@@ -2915,8 +2909,8 @@ class ServiceController:
             exit_code=-1,
             error_class=ErrorClass.user_error,
             error_message=message,
+            desired_state=JobStatus.failed.value,
         )
-        await self._queries.set_desired_state(job.id, JobStatus.failed.value)
         await stamp_last_deploy(
             self._queries,
             job.id,
@@ -2950,8 +2944,8 @@ class ServiceController:
         Command mode (`cfg['command']`) runs a shell command with no workspace
         mount; script mode mounts the script's directory at `/workspace`.
         With neither, the command is `None` so the prebuilt image's own
-        `CMD` runs (the P2 register-only path) — an empty list would instead
-        override `CMD` with nothing. Folder builds arrive in P4.
+        `CMD` runs (the register-only path) — an empty list would instead
+        override `CMD` with nothing.
         """
         custom_command = cfg.get("command")
         if custom_command:
@@ -2994,16 +2988,22 @@ class ServiceController:
         needlessly drift the service URL to a new port. Docker binds such a port
         fine (it uses `SO_REUSEADDR`), so the probe must too, or the stable-port
         guarantee breaks on every hard restart.
+
+        Both loopback and the wildcard are probed: on BSD/macOS `SO_REUSEADDR`
+        lets a loopback bind succeed beside a foreign `0.0.0.0` listener, and
+        only the wildcard sees a listener on another interface (the docker
+        bridge IP models also publish on).
         """
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind(("127.0.0.1", port))
-            return True
-        except OSError:
-            return False
-        finally:
-            sock.close()
+        for addr in ("127.0.0.1", "0.0.0.0"):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((addr, port))
+            except OSError:
+                return False
+            finally:
+                sock.close()
+        return True
 
     # --- (C) desired = running, container live -----------------------------
 
@@ -3042,7 +3042,9 @@ class ServiceController:
         if stamped:
             await record_job_event(self._events, "service.healthy", job)
 
-    async def _reconcile_live(self, job: Job, budget: list[int]) -> None:
+    async def _reconcile_live(
+        self, job: Job, probes: list[tuple[Job, Coroutine[object, object, None]]]
+    ) -> None:
         """Health-check a running service (and re-adopt its log stream).
 
         Daemon-restart recovery rides here: a still-running container adopted on
@@ -3051,9 +3053,26 @@ class ServiceController:
         `degraded` — the container is never killed on health alone.
         """
         now = datetime.now(UTC)
-        # Re-adopt the log stream if we are not already collecting it (reboot).
+        # Re-adopt the log stream if we are not already collecting it (reboot),
+        # resuming at the newest persisted row's second rather than replaying
+        # the container's whole log history into job_logs. Docker's `since` is
+        # inclusive and row timestamps are second-resolution insert times, so
+        # the rows already stored in that second are handed over as `seen`.
         if job.container_id and job.container_id not in self._log_tasks:
-            self._spawn_log_task(job.id, job.container_id)
+            last = await self._queries.get_logs(job.id, tail=1, streams=[LogStream.stdout])
+            since = None
+            seen: list[str] = []
+            if last:
+                ts = last[-1].timestamp
+                since = int(ts.replace(tzinfo=UTC).timestamp())
+                rows = await self._queries.get_logs(
+                    job.id,
+                    since_ts=ts.strftime("%Y-%m-%d %H:%M:%S"),
+                    limit=_LOG_RESUME_MAX,
+                    streams=[LogStream.stdout],
+                )
+                seen = [r.message for r in rows]
+            self._spawn_log_task(job.id, job.container_id, since, seen)
 
         # Model re-adoption: a daemon reboot mid-weights-pull leaves a live
         # container with config['model_pulled'] unset — re-fire the idempotent
@@ -3099,14 +3118,16 @@ class ServiceController:
         if within_start_period(hc, job.started_at, now=now):
             return  # within the grace period — defer health judgement
 
-        if budget[0] <= 0:
+        if len(probes) >= _MAX_HEALTH_CHECKS_PER_TICK:
             return  # tick health budget spent (CRIT-5) — check on a later tick
-        budget[0] -= 1
+        probes.append((job, self._probe_and_settle(job, hc)))
 
+    async def _probe_and_settle(self, job: Job, hc: dict) -> None:
+        """Run one health probe and apply the healthy/degraded transition."""
         endpoint = await self._queries.get_service_endpoint(job.service_name or "")
         if endpoint is None:
             return  # no published port to probe (should not happen for a live svc)
-        timeout = _as_float(hc.get("timeout_s"), _DEFAULT_HEALTH_TIMEOUT_S)
+        timeout = as_float(hc.get("timeout_s"), DEFAULT_HEALTH_TIMEOUT_S)
         # Dispatch on probe kind via the shared health.run_probe; a
         # junk/absent type falls through to http. A tcp connect synthesizes code
         # 200 so the failure/degraded machine below is oblivious to the probe kind.
@@ -3127,7 +3148,7 @@ class ServiceController:
             self._health_failures.pop(job.id, None)
             # First health 2xx flips launching → healthy (guarded; a
             # kind=model row also requires config['model_pulled'], a kind=database
-            # row config['db_ready'] — P15).
+            # row config['db_ready']).
             await self._stamp_healthy_from_launching(job)
             if job.status != JobStatus.running:
                 await self._queries.update_job_status(job.id, JobStatus.running)
@@ -3135,7 +3156,7 @@ class ServiceController:
                 logger.info("Service %s recovered → running", job.service_name or job.id)
             return
 
-        threshold = _as_int(hc.get("unhealthy_threshold"), _DEFAULT_UNHEALTHY_THRESHOLD)
+        threshold = as_int(hc.get("unhealthy_threshold"), DEFAULT_UNHEALTHY_THRESHOLD)
         failures = self._health_failures.get(job.id, 0) + 1
         self._health_failures[job.id] = failures
         if failures >= threshold and job.status != JobStatus.degraded:
@@ -3161,15 +3182,19 @@ class ServiceController:
             logger.warning("Service %s degraded (health)", job.service_name or job.id)
 
     async def _check_health(self, host_port: int, path: str, timeout: float) -> int | None:
-        """Delegate to the module-level `check_health`.
+        """Probe via the module-level `check_health` over the shared client.
 
-        Kept as a method so the reconcile call site (`self._check_health`) and
-        the tests that monkeypatch it stay stable (F6-PROBE-DUP dedup).
+        The one patch point for both the reconcile probe and the cutover verify
+        (`CutoverManager` calls it through `self._c`).
         """
-        return await check_health(host_port, path, timeout)
+        if self._health_client is None:
+            self._health_client = httpx.AsyncClient(
+                limits=httpx.Limits(max_keepalive_connections=0)
+            )
+        return await check_health(host_port, path, timeout, client=self._health_client)
 
     async def _check_tcp(self, host_port: int, timeout: float) -> bool:
-        """Delegate to the module-level `check_tcp` (P14 WP-C1).
+        """Delegate to the module-level `check_tcp`.
 
         Kept as a method for the same monkeypatch stability as `_check_health`.
         """
@@ -3187,7 +3212,7 @@ class ServiceController:
         un-clamped. They come back un-scrubbed too: redaction and the per-line
         clamp are the caller's, in that order (`_scrub_and_truncate`),
         because clamping here would cut a long secret mid-value and defeat the
-        literal match (PR #96 review F2).
+        literal match.
 
         Tolerant on purpose: the container has already run, so a failed log
         read must degrade to a partial (or empty) tail, never turn a completed
@@ -3257,8 +3282,7 @@ class ServiceController:
                 # The cap is enforced INSIDE the runtime's bounded wait, never by
                 # an `asyncio.wait_for` over the raw wait: cancelling the
                 # coroutine would leave the blocking thread pinned, and a few
-                # timed-out runs would exhaust the shared executor (the
-                # post-P15 pool-pinning bug class).
+                # timed-out runs would exhaust the shared executor.
                 timed_out = True
                 logger.warning(
                     "Run %s of service %s exceeded %ss; killing container",
@@ -3386,10 +3410,9 @@ class ServiceController:
 
         `status()` returns a docker state STRING (`"exited"`, `"dead"`, …)
         for a stopped-but-present container, so a bare truthiness check reads
-        every corpse as live — the P24b live run caught a crashed cutover green
-        burning the whole verify budget that way instead of failing
-        immediately. Only `running` (and a docker-native `restarting`,
-        which is "about to be up") count.
+        every corpse as live — a crashed cutover green would burn the whole
+        verify budget instead of failing immediately. Only `running` (and a
+        docker-native `restarting`, which is "about to be up") count.
         """
         try:
             return await self._runtime.status(container_id) in ("running", "restarting")
@@ -3417,11 +3440,17 @@ class ServiceController:
     async def _prune_old_images(self, job: Job) -> None:
         await self._builder.prune_old_images(job)
 
-    def _spawn_log_task(self, job_id: str, container_id: str) -> None:
+    def _spawn_log_task(
+        self,
+        job_id: str,
+        container_id: str,
+        since: int | None = None,
+        seen: list[str] | None = None,
+    ) -> None:
         """Start (and track) a background log-collection task for a container."""
         if container_id in self._log_tasks:
             return
-        task = asyncio.create_task(self._collect_logs(job_id, container_id))
+        task = asyncio.create_task(self._collect_logs(job_id, container_id, since, seen))
         self._log_tasks[container_id] = task
         task.add_done_callback(self._discard_log_task)
 
@@ -3440,17 +3469,83 @@ class ServiceController:
         if task is not None:
             task.cancel()
 
-    async def _collect_logs(self, job_id: str, container_id: str) -> None:
-        """Background task to collect container logs into the database."""
+    async def _collect_logs(
+        self,
+        job_id: str,
+        container_id: str,
+        since: int | None = None,
+        seen: list[str] | None = None,
+    ) -> None:
+        """Background task to collect container logs into the database.
+
+        Lines are written in batches of up to `_LOG_BATCH`, flushed after
+        `_LOG_FLUSH_S` of quiet. A pending `anext` is awaited rather than
+        wrapped in a timeout, so the generator is never cancelled mid-read. A
+        cancel (stop, restart, redeploy, delete, shutdown) still flushes the
+        pending batch, shielded, because a torn-down container can never be
+        re-read; a re-adopted one skips the overlap through `seen`.
+
+        Args:
+            seen: Rows already stored from the `since` second, in order. The
+                replay is a run of them: the first streamed line aligns at its
+                LAST match in `seen` (the replay is a suffix of `seen`, so a
+                later match can over-store but never over-skip), each following
+                line must match the next row, and the first mismatch or the end
+                of `seen` ends skipping. Repeated lines can therefore cost
+                duplicates, never dropped lines.
+        """
+        buf: list[str] = []
+        pending = seen or []
+        # Next `pending` index to match: -1 until aligned, None once done.
+        pos: int | None = -1 if pending else None
+
+        async def flush() -> None:
+            try:
+                await self._queries.append_logs(job_id, buf, LogStream.stdout)
+            except sqlite3.IntegrityError:
+                logger.debug("append_logs skipped for vanished job %s", job_id)
+            finally:
+                buf.clear()
+
+        nxt: asyncio.Future[str] | None = None
         try:
-            async for line in self._runtime.logs(container_id, follow=True):
-                await self._append_log_tolerant(job_id, line, LogStream.stdout)
+            it = aiter(self._runtime.logs(container_id, follow=True, since=since))
+            nxt = asyncio.ensure_future(anext(it))
+            while True:
+                done, _ = await asyncio.wait({nxt}, timeout=_LOG_FLUSH_S if buf else None)
+                if not done:
+                    await flush()
+                    continue
+                try:
+                    line = nxt.result()
+                except StopAsyncIteration:
+                    break
+                # A line is a replay (dropped) iff it keeps `pos` alive.
+                if pos is not None:
+                    if pos < 0:
+                        hits = [i for i, m in enumerate(pending) if m == line]
+                        pos = hits[-1] + 1 if hits else None
+                    elif pos < len(pending) and pending[pos] == line:
+                        pos += 1
+                    else:
+                        pos = None
+                if pos is None:
+                    buf.append(line)
+                nxt = asyncio.ensure_future(anext(it))
+                if len(buf) >= _LOG_BATCH:
+                    await flush()
         except ContainerRuntimeError as exc:
             logger.info("Log stream closed for service %s: %s", job_id, exc)
-        except asyncio.CancelledError:
-            raise
         except Exception:
             logger.exception("Log collection failed for service %s", job_id)
+        finally:
+            if nxt is not None:
+                nxt.cancel()
+            if buf:
+                try:
+                    await asyncio.shield(flush())
+                except Exception:
+                    logger.debug("Final log flush failed for service %s", job_id)
 
     async def shutdown(self) -> None:
         """Cancel log/health tasks; **leave service containers running**.
@@ -3468,4 +3563,7 @@ class ServiceController:
                 pass
         self._log_tasks.clear()
         self._build_tasks.clear()
+        if self._health_client is not None:
+            await self._health_client.aclose()
+            self._health_client = None
         logger.info("ServiceController stopped (containers left running)")

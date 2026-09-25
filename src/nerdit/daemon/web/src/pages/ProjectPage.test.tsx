@@ -131,11 +131,11 @@ describe("ProjectRoute", () => {
     expect((screen.getByLabelText("Secret value") as HTMLInputElement).value).toBe("pending-value");
   }, 10000);
 
-  it("renders the project page: names by scope, the null-ready state, never a secret value", async () => {
+  it("renders renamed project variables through its namespace without secret values", async () => {
     routes = {
       "/capabilities": CAPS,
       "/auth/check": { role: "admin" },
-      "/projects/asso": ASSO,
+      "/projects/asso": { ...ASSO, name: "new-label", namespace: "asso" },
       "/projects/asso/variables": {
         project: "asso",
         scope: "project",
@@ -149,6 +149,28 @@ describe("ProjectRoute", () => {
     expect(screen.getByText("Unknown")).toBeTruthy();
     // The secret scope has no plain key, so its values are never even asked for.
     expect(calls.some((call) => call.path.includes("service=api"))).toBe(false);
+  });
+
+  it.each(["asso", "prj_a"])("deletes the renamed ID and links its namespace when opened via %s", async (selector) => {
+    routes = {
+      "/capabilities": CAPS,
+      "/auth/check": { role: "admin" },
+      [`/projects/${selector}`]: { ...ASSO, name: "other", namespace: "asso" },
+      "/projects/other": { ...ASSO, id: "prj_other", name: "other" }
+    };
+    mount(`/projects/${selector}`);
+    await screen.findByTestId("project-page");
+    fireEvent.click(screen.getByTestId("app-row-api"));
+    expect((await screen.findByTestId("where")).textContent).toBe("/projects/asso/services/api");
+    cleanup();
+    mount(`/projects/${selector}`);
+    await screen.findByTestId("project-page");
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByText("Delete project…"));
+    fireEvent.change(screen.getByLabelText("Type other to confirm"), { target: { value: "other" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Delete$/ }));
+    await waitFor(() => expect(calls.filter((call) => call.init?.method === "DELETE").map((call) => call.path))
+      .toEqual(["/projects/prj_a?purge=secrets"]));
   });
 
   it("shows no variables UI (and no delete) to a non-owner", async () => {

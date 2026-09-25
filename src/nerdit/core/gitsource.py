@@ -114,9 +114,9 @@ def _clone_failed_hint(stderr: str, *, had_token: bool) -> str:
 
 
 #: The one `token_ref` literal that resolves to a cloud-pushed GitHub App
-#: installation token instead of a stored secret (P33 D-GH-3). Matched exactly:
+#: installation token instead of a stored secret. Matched exactly:
 #: there is no `${github.<anything else>}` grammar, and `${secrets.*}` refs
-#: are untouched so a daemon with no cloud at all behaves byte-identically.
+#: are untouched so a daemon with no cloud at all is unaffected.
 GITHUB_INSTALLATION_REF = "${github.installation}"
 #: The only host an installation token is ever presented to (the default).
 #: The mirror is keyed by `owner/name` (GitHub's own repo identity, no
@@ -129,22 +129,21 @@ GITHUB_INSTALLATION_REF = "${github.installation}"
 _GITHUB_HOST = "github.com"
 
 #: The env guard that opens the installation-token gate to a non-github host
-#: (security review F2). Any non-empty value opens it — the `make e2e-real`
+#: for dev/e2e. Any non-empty value opens it — the `make e2e-real`
 #: gate daemon sets it to `1` so `git.localhost` can play GitHub.
 _DEV_GITHUB_CLONE_BASE_ENV = "NERDIT_DEV_GITHUB_CLONE_BASE"
 
 
 def installation_token_allowed_for_host(github_host: str) -> bool:
     """Whether the cloud-minted GitHub installation token may be offered to
-    `github_host` (P33 D-GH-3; security review F2 / D9).
+    `github_host`.
 
     The token is presented to `github.com` only. A non-github host is the
     dev/e2e fixture case (`make e2e-real`'s `git.localhost`) and is allowed
     ONLY when the `NERDIT_DEV_GITHUB_CLONE_BASE` env guard is set non-empty.
-    This is the SAME trust decision the settings validator used to make at load
-    time; it moved here — the security boundary where the credential is actually
-    handed to a host — so a CLI process that loads a fixture config but never
-    resolves a token no longer hard-fails at load (D9). Fails closed: a
+    Checked here — where the credential is actually handed to a host — rather
+    than at settings load, so a CLI process that loads a fixture config but
+    never resolves a token does not fail at load. Fails closed: a
     non-github host without the guard offers nothing.
     """
     if github_host.strip().lower() == _GITHUB_HOST:
@@ -155,7 +154,7 @@ def installation_token_allowed_for_host(github_host: str) -> bool:
 def github_repo_slug(repo_url: str, github_host: str = _GITHUB_HOST) -> str | None:
     """`owner/name` (lower-case) of a clone URL on `github_host`, else `None`.
 
-    The key `LinkManager.github_token_for_repo` resolves by (D-GH-3):
+    The key `LinkManager.github_token_for_repo` resolves by:
     the host-less tail of `canonical_repo`, accepted only when the host
     is the configured GitHub host and the path is exactly two segments. A URL
     that fails `canonical_repo`'s own guards (no host, embedded
@@ -177,7 +176,7 @@ def github_repo_slug(repo_url: str, github_host: str = _GITHUB_HOST) -> str | No
 
 
 def canonical_repo(repo_url: str) -> str:
-    """Canonical `host/owner/repo` identity of a clone URL (P33 D-GH-6).
+    """Canonical `host/owner/repo` identity of a clone URL.
 
     Lower-cased, a trailing `.git` stripped, no trailing slash, and no port,
     query, or fragment — so `https://GitHub.com/Acme/App.git/` and
@@ -212,9 +211,9 @@ def git_source_meta(
 
     One writer for the three git ingresses (`POST /deploy/git`, the
     GitWatch/nudge redeploy, and app templates) so the recorded shape cannot
-    drift: `type`/`repo_url`/`repo` (D-GH-6 canonical identity)/`ref`/
+    drift: `type`/`repo_url`/`repo` (canonical identity)/`ref`/
     `commit_sha` always; `subdir`, `token_ref` (the `${…}` reference
-    NAME, never a token — D-P24-14) and `template_id` only when given.
+    NAME, never a token) and `template_id` only when given.
     """
     meta: dict = {
         "type": "git",
@@ -243,6 +242,15 @@ def validate_repo_url(repo_url: str, allowed_hosts: list[str]) -> None:
             422,
             "deploy.git_url_invalid",
             "repo_url must not start with '-'.",
+            hint="Use an https://<host>/<owner>/<repo>.git URL.",
+        )
+    # `urlsplit` strips edge whitespace and drops tab/CR/LF, but the raw string
+    # is what reaches git's argv and the recorded provenance.
+    if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in repo_url):
+        raise GitSourceError(
+            422,
+            "deploy.git_url_invalid",
+            "repo_url must not contain whitespace or control characters.",
             hint="Use an https://<host>/<owner>/<repo>.git URL.",
         )
     parts = urlsplit(repo_url)
@@ -297,6 +305,42 @@ def validate_subdir(subdir: str | None) -> None:
         )
 
 
+# Prefix of every networked git argv: no credential helper, and no redirects —
+# the askpass helper answers any host, so a redirect would carry the token (and
+# the clone) past the host allowlist.
+_GIT_NET_ARGS = ["git", "-c", "credential.helper=", "-c", "http.followRedirects=false"]
+
+
+def _require_git() -> None:
+    """Raise 503 `deploy.git_unavailable` when no `git` binary is on PATH."""
+    if not git_available():
+        raise GitSourceError(
+            503,
+            "deploy.git_unavailable",
+            "The git binary is not installed on the daemon host.",
+            hint="Install git, or set [git].enabled = false to disable deploy-from-git.",
+        )
+
+
+def _child_env() -> dict[str, str]:
+    """The allowlisted git child environment (never `os.environ` wholesale)."""
+    child_env = {
+        "PATH": os.environ.get("PATH", ""),
+        # Isolate HOME and null the global config: a url.<base>.insteadOf in
+        # the daemon user's ~/.gitconfig (or XDG git config) would rewrite the
+        # validated https URL to file://... or another host BEFORE the clone,
+        # bypassing the https-only + allowed_hosts egress guards. /dev/null is
+        # never a directory, so this holds on git versions without
+        # GIT_CONFIG_GLOBAL support too.
+        "HOME": "/dev/null",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    _forward_ca_bundle(child_env)
+    return child_env
+
+
 def _forward_ca_bundle(child_env: dict[str, str]) -> None:
     """Honour a daemon-level `SSL_CERT_FILE` override for git's TLS too.
 
@@ -313,17 +357,19 @@ def _forward_ca_bundle(child_env: dict[str, str]) -> None:
         child_env["GIT_SSL_CAINFO"] = bundle
 
 
-def _write_askpass_helper(parent: Path) -> Path:
-    """Write the static GIT_ASKPASS helper (0o700) beside the clone dir."""
+def _write_askpass_helper(parent: Path, env: dict[str, str], token: str) -> Path:
+    """Write the static GIT_ASKPASS helper (0o700) in `parent` and wire `env` to it."""
     fd, path = tempfile.mkstemp(prefix=".nerdit-askpass-", dir=str(parent))
     with os.fdopen(fd, "w") as handle:
         handle.write(_ASKPASS_SCRIPT)
     os.chmod(path, 0o700)
+    env["GIT_ASKPASS"] = path
+    env["NERDIT_GIT_TOKEN"] = token
     return Path(path)
 
 
 async def _run_git(
-    args: list[str], *, env: dict[str, str], timeout_s: float, token: str | None
+    args: list[str], *, env: dict[str, str], timeout_s: float
 ) -> tuple[int, bytes, bytes]:
     """Run a git subprocess with a hard timeout; kill + raise on expiry.
 
@@ -349,6 +395,30 @@ async def _run_git(
         ) from exc
     assert proc.returncode is not None  # communicate() has completed
     return proc.returncode, stdout, stderr
+
+
+async def _git_or_raise(
+    args: list[str],
+    *,
+    env: dict[str, str],
+    timeout_s: float,
+    token: str | None,
+    what: str,
+    hint: str | None = None,
+) -> bytes:
+    """Run git; on a non-zero exit raise 400 `deploy.git_clone_failed` with a scrubbed tail.
+
+    `hint` defaults to the clone-failure hint derived from the stderr tail.
+    """
+    rc, out, err = await _run_git(args, env=env, timeout_s=timeout_s)
+    if rc != 0:
+        tail = _scrub(err.decode("utf-8", "replace"), token)[-_STDERR_TAIL:]
+        if hint is None:
+            hint = _clone_failed_hint(tail, had_token=token is not None)
+        raise GitSourceError(
+            400, "deploy.git_clone_failed", f"git {what} failed: {tail}".rstrip(), hint=hint
+        )
+    return out
 
 
 def _tree_size(root: Path) -> int:
@@ -384,43 +454,20 @@ async def clone_source(
     (never leak a tree). The token, when present, reaches the child only via
     `GIT_ASKPASS` + `NERDIT_GIT_TOKEN` — never argv, never disk, never logs.
     """
-    if not git_available():
-        raise GitSourceError(
-            503,
-            "deploy.git_unavailable",
-            "The git binary is not installed on the daemon host.",
-            hint="Install git, or set [git].enabled = false to disable deploy-from-git.",
-        )
+    _require_git()
     validate_repo_url(repo_url, allowed_hosts)
     validate_ref(ref)
     validate_subdir(subdir)
 
     dest_dir = Path(dest_dir)
-    child_env = {
-        "PATH": os.environ.get("PATH", ""),
-        # Isolate HOME and null the global config: a url.<base>.insteadOf in
-        # the daemon user's ~/.gitconfig (or XDG git config) would rewrite the
-        # validated https URL to file://... or another host BEFORE the clone,
-        # bypassing the https-only + allowed_hosts egress guards. /dev/null is
-        # never a directory, so this holds on git versions without
-        # GIT_CONFIG_GLOBAL support too.
-        "HOME": "/dev/null",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_CONFIG_NOSYSTEM": "1",
-    }
-    _forward_ca_bundle(child_env)
+    child_env = _child_env()
     askpass_path: Path | None = None
     try:
         if token:
-            askpass_path = _write_askpass_helper(dest_dir.parent)
-            child_env["GIT_ASKPASS"] = str(askpass_path)
-            child_env["NERDIT_GIT_TOKEN"] = token
+            askpass_path = _write_askpass_helper(dest_dir.parent, child_env, token)
 
         clone_cmd = [
-            "git",
-            "-c",
-            "credential.helper=",
+            *_GIT_NET_ARGS,
             "clone",
             "--depth",
             "1",
@@ -430,50 +477,27 @@ async def clone_source(
             repo_url,
             str(dest_dir),
         ]
-        try:
-            rc, _out, err = await _run_git(
-                clone_cmd, env=child_env, timeout_s=timeout_s, token=token
-            )
-            if rc != 0:
-                tail = _scrub(err.decode("utf-8", "replace"), token)[-_STDERR_TAIL:]
-                raise GitSourceError(
-                    400,
-                    "deploy.git_clone_failed",
-                    f"git clone failed: {tail}".rstrip(),
-                    hint=_clone_failed_hint(tail, had_token=token is not None),
-                )
 
-            rc, out, err = await _run_git(
-                ["git", "-C", str(dest_dir), "rev-parse", "HEAD"],
-                env=child_env,
-                timeout_s=timeout_s,
-                token=token,
+        rev_parse_hint = "check the URL/ref; ref must be a branch or tag."
+
+        async def git(args: list[str], what: str, hint: str | None = None) -> bytes:
+            return await _git_or_raise(
+                args, env=child_env, timeout_s=timeout_s, token=token, what=what, hint=hint
             )
-            if rc != 0:
-                tail = _scrub(err.decode("utf-8", "replace"), token)[-_STDERR_TAIL:]
-                raise GitSourceError(
-                    400,
-                    "deploy.git_clone_failed",
-                    f"git rev-parse failed: {tail}".rstrip(),
-                    hint="check the URL/ref; ref must be a branch or tag.",
-                )
+
+        try:
+            await git(clone_cmd, "clone")
+            out = await git(
+                ["git", "-C", str(dest_dir), "rev-parse", "HEAD"], "rev-parse", rev_parse_hint
+            )
             commit_sha = out.decode("utf-8", "replace").strip()
 
             if ref is None:
-                rc, out, err = await _run_git(
+                out = await git(
                     ["git", "-C", str(dest_dir), "rev-parse", "--abbrev-ref", "HEAD"],
-                    env=child_env,
-                    timeout_s=timeout_s,
-                    token=token,
+                    "rev-parse",
+                    rev_parse_hint,
                 )
-                if rc != 0:
-                    tail = _scrub(err.decode("utf-8", "replace"), token)[-_STDERR_TAIL:]
-                    raise GitSourceError(
-                        400,
-                        "deploy.git_clone_failed",
-                        f"git rev-parse failed: {tail}".rstrip(),
-                        hint="check the URL/ref; ref must be a branch or tag.",
-                    )
                 resolved_ref = out.decode("utf-8", "replace").strip()
             else:
                 resolved_ref = ref
@@ -537,41 +561,22 @@ async def ls_remote_head(
     Create the mode-0700 askpass helper in a private temporary directory and remove
     it on every exit. Pass tokens through child env, never argv.
     """
-    if not git_available():
-        raise GitSourceError(
-            503,
-            "deploy.git_unavailable",
-            "The git binary is not installed on the daemon host.",
-            hint="Install git, or set [git].enabled = false to disable deploy-from-git.",
-        )
+    _require_git()
     validate_repo_url(repo_url, allowed_hosts)
     validate_ref(ref)
 
-    child_env = {
-        "PATH": os.environ.get("PATH", ""),
-        # Same isolation as the clone: an insteadOf rule in the daemon user's
-        # git config must not rewrite the validated URL past the guards.
-        "HOME": "/dev/null",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_CONFIG_NOSYSTEM": "1",
-    }
-    _forward_ca_bundle(child_env)
+    child_env = _child_env()
     with tempfile.TemporaryDirectory(prefix="nerdit-lsremote-") as scratch:
         if token:
-            askpass_path = _write_askpass_helper(Path(scratch))
-            child_env["GIT_ASKPASS"] = str(askpass_path)
-            child_env["NERDIT_GIT_TOKEN"] = token
+            _write_askpass_helper(Path(scratch), child_env, token)
         # Both patterns: the ref itself, and its peeled form. `--exit-code`
         # still succeeds as long as ONE of them matches (a branch, a lightweight
         # tag and `HEAD` simply have no `^{}` line). The suffix is appended
         # after `validate_ref`, so the ref grammar guard is unaffected.
         pattern = ref or "HEAD"
-        rc, out, err = await _run_git(
+        out = await _git_or_raise(
             [
-                "git",
-                "-c",
-                "credential.helper=",
+                *_GIT_NET_ARGS,
                 "ls-remote",
                 "--exit-code",
                 "--",
@@ -582,15 +587,7 @@ async def ls_remote_head(
             env=child_env,
             timeout_s=timeout_s,
             token=token,
-        )
-
-    if rc != 0:
-        tail = _scrub(err.decode("utf-8", "replace"), token)[-_STDERR_TAIL:]
-        raise GitSourceError(
-            400,
-            "deploy.git_clone_failed",
-            f"git ls-remote failed: {tail}".rstrip(),
-            hint=_clone_failed_hint(tail, had_token=token is not None),
+            what="ls-remote",
         )
 
     # Remote-controlled output, selected by REFNAME so the answer is the object

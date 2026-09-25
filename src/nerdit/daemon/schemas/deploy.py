@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 from nerdit.config.build import BuildSettings
 from nerdit.daemon.schemas._base import StrictRequestModel
+from nerdit.utils.names import DNS_LABEL_PATTERN
 
 # --- Deploy from a git repository (P11.5 / Part A) ---
 
@@ -23,7 +24,7 @@ class GitDeployRequest(StrictRequestModel):
 
     repo_url: str = Field(description="https:// clone URL on an allowed host")
     name: str = Field(
-        pattern=r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+        pattern=DNS_LABEL_PATTERN,
         description="DNS-label service name (stable identity, lowercase, 1-63 chars)",
     )
     ref: str | None = Field(
@@ -91,7 +92,7 @@ class TemplateDeployRequest(StrictRequestModel):
     """Deploy an app template into a new (or existing) service."""
 
     name: str = Field(
-        pattern=r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+        pattern=DNS_LABEL_PATTERN,
         description="DNS-label service name (stable identity, lowercase, 1-63 chars)",
     )
     env: dict[str, str | None] | None = None

@@ -13,7 +13,7 @@ from rich.table import Table
 from nerdit.cli.commands.deploy import parse_env_pairs
 from nerdit.cli.commands.secrets import SHARED_SERVICE, prompt_values
 from nerdit.cli.commands.secrets import _set_async as _set_machine_async
-from nerdit.cli.display import console, render_client_error
+from nerdit.cli.display import call_or_exit, console, render_client_error
 from nerdit.cli.display import plain as _plain
 
 vars_app = typer.Typer(
@@ -106,13 +106,11 @@ async def _set_async(
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        result = await client.set_variables(
+    result = await call_or_exit(
+        client.set_variables(
             project, values, secret=secret, service=service, idempotency_key=uuid4().hex
         )
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    )
     kind = "plain" if result.get("plain") else "secret"
     # Names of THIS write only, from the local map: never a value.
     console.print(
@@ -138,13 +136,9 @@ async def _unset_async(project: str, service: str | None, key: str) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        result = await client.delete_variable(
-            project, key, service=service, idempotency_key=uuid4().hex
-        )
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    result = await call_or_exit(
+        client.delete_variable(project, key, service=service, idempotency_key=uuid4().hex)
+    )
     console.print(
         f"[green]Deleted {_plain(key)} from {_plain(project)} "
         f"({_plain(result.get('scope'))}).[/green]"

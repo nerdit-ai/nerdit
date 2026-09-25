@@ -82,7 +82,8 @@ export default function ProjectRoute() {
   }
 
   const services = project.data.services;
-  const only = services.length === 1 && services[0].name === name ? services[0] : null;
+  const namespace = project.data.namespace ?? project.data.name;
+  const only = services.length === 1 && services[0].name === namespace ? services[0] : null;
   if (only && tab !== "project") {
     return (
       <ProjectDetail
@@ -97,7 +98,7 @@ export default function ProjectRoute() {
   // service to a label-keyed caller (the ⌘K palette's logs / redeploy actions):
   // a service tab or the redeploy hand-off goes to that service, never dropped
   // on the project page.
-  const home = services.find((svc) => svc.name === name);
+  const home = services.find((svc) => svc.name === namespace);
   const redeploy = (location.state as { redeploy?: boolean } | null)?.redeploy;
   if (home?.service && ((tab && tab !== "project") || redeploy)) {
     return (
@@ -178,13 +179,14 @@ function ProjectPage({
   const [purgeData, setPurgeData] = useState(false);
   const [purgeImages, setPurgeImages] = useState(false);
 
-  const { name, services } = detail;
+  const { id, name, services } = detail;
+  const namespace = detail.namespace ?? name;
   // D-P40-15: the daemon OMITS `variables` for a non-owner. That absence is the
   // owner test for everything owner-only here — no variables UI, no delete.
   const owner = detail.variables != null;
   const canWrite = owner && role !== "readonly";
   // The single-service layout links here as `/project`; its way back is the app.
-  const home = services.length === 1 && services[0].name === name;
+  const home = services.length === 1 && services[0].name === namespace;
   const serviceName = (label: string) =>
     services.find((svc) => svc.name === label)?.service ?? label;
 
@@ -194,7 +196,7 @@ function ProjectPage({
 
   function onConfirmDelete() {
     remove.mutate(
-      { name, purge: purge.join(",") },
+      { name: id, purge: purge.join(",") },
       {
         onSuccess: () => {
           toast("success", `Project ${name} deleted`);
@@ -210,7 +212,7 @@ function ProjectPage({
   return (
     <div className="mx-auto max-w-content space-y-6" data-testid="project-page">
       {home && (
-        <Link to={projectPath(name)} className="text-13 text-muted-foreground hover:text-foreground">
+        <Link to={projectPath(namespace)} className="text-13 text-muted-foreground hover:text-foreground">
           ← {name}
         </Link>
       )}
@@ -257,7 +259,7 @@ function ProjectPage({
                     name={svc.service ?? svc.name}
                     // The single-service home IS `/projects/:name`; every other
                     // row routes by its fields (`kindHomePath`).
-                    to={home ? projectPath(name) : serviceTo(name, svc.service) ?? kindHomePath(svc)}
+                    to={home ? projectPath(namespace) : serviceTo(namespace, svc.service) ?? kindHomePath(svc)}
                     badge={svc}
                     badgeTitle={deriveProject(svc, undefined, [], []).statusDetail}
                     address={svc}
@@ -427,7 +429,7 @@ function VariablesPanel({
           return (
             <ScopeGroup
               key={scope ?? ""}
-              project={detail.name}
+              project={detail.namespace ?? detail.name}
               service={scope}
               names={group}
               canWrite={canWrite}
@@ -456,8 +458,8 @@ function VariablesPanel({
               </Select>
             </Field>
             {/* Keyed by scope: switching it remounts both forms, dropping any typed value. */}
-            <PlainForm key={`plain:${target}`} project={detail.name} service={service} />
-            <SecretForm key={`secret:${target}`} project={detail.name} service={service} />
+            <PlainForm key={`plain:${target}`} project={detail.namespace ?? detail.name} service={service} />
+            <SecretForm key={`secret:${target}`} project={detail.namespace ?? detail.name} service={service} />
           </>
         )}
       </div>

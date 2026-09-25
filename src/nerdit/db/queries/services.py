@@ -158,12 +158,12 @@ class ServiceQueries(QueriesBase):
         Plain read (NOT `@_serialized`): a lightweight projection used by the
         delete reference guard, the image protected-set, GC's TOCTOU re-checks,
         and the C2 tombstone startup sweep. Each entry is
-        `{id, kind, service_name, status, desired_state, config}` with
-        `config` parsed to a dict (`{}` on a malformed/absent blob).
+        `{id, kind, service_name, status, desired_state, submitted_by_token,
+        config}` with `config` parsed to a dict (`{}` on a malformed/absent blob).
         """
         cursor = await self._db.conn.execute(
-            f"SELECT id, kind, service_name, status, desired_state, config "
-            f"FROM jobs WHERE {MANAGED_KINDS_SQL}"
+            "SELECT id, kind, service_name, status, desired_state, submitted_by_token, "
+            f"config FROM jobs WHERE {MANAGED_KINDS_SQL}"
         )
         rows = await cursor.fetchall()
         result: list[dict[str, object]] = []
@@ -176,6 +176,7 @@ class ServiceQueries(QueriesBase):
                     "service_name": r["service_name"],
                     "status": r["status"],
                     "desired_state": r["desired_state"],
+                    "submitted_by_token": r["submitted_by_token"],
                     "config": cfg,
                 }
             )
@@ -325,24 +326,7 @@ class ServiceQueries(QueriesBase):
                 await self._db.conn.execute("ROLLBACK")
                 return None
             if find_dependents is not None:
-                cursor = await self._db.conn.execute(
-                    "SELECT id, kind, service_name, status, config, submitted_by_token "
-                    f"FROM jobs WHERE {MANAGED_KINDS_SQL}"
-                )
-                raw = await cursor.fetchall()
-                rows: list[dict[str, object]] = []
-                for r in raw:
-                    cfg = _parse_config_blob(r[4])
-                    rows.append(
-                        {
-                            "id": r[0],
-                            "kind": r[1],
-                            "service_name": r[2],
-                            "status": r[3],
-                            "config": cfg,
-                            "submitted_by_token": r[5],
-                        }
-                    )
+                rows = await self.list_workload_configs()
                 deps = find_dependents(rows)
                 if deps:
                     await self._db.conn.execute("ROLLBACK")

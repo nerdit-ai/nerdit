@@ -19,12 +19,9 @@ from nerdit.core.project_identity import (
     SERVICE_NAME_RE,
     service_label,
 )
+from nerdit.utils.names import DNS_LABEL_RE, VOLUME_NAME_RE
 
 PROJECT_CONFIG_NAME = "nerdit.toml"
-
-# DNS-label rule for [deploy].name — same regex as ServiceCreateRequest.name
-# (db/models.py): lowercase, 1-63 chars, no leading/trailing '-'.
-_DNS_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 # [deploy].memory_limit grammar — docker ``mem_limit``: a bare byte
 # count or a number with an optional b/k/m/g suffix (case-insensitive).
@@ -94,9 +91,6 @@ def _redact_db_url(value: str) -> str:
 
 
 # Parse-time volume grammar; launch revalidates untrusted persisted specs.
-# DNS-label names cannot contain host paths; the daemon computes them.
-# Keep this definition independent of core.volumes to avoid an import cycle.
-_VOLUME_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
 _FORBIDDEN_VOLUME_PATHS = frozenset({"/", "/workspace"})
 _FORBIDDEN_VOLUME_PREFIXES = ("/proc", "/sys", "/dev")
 MAX_VOLUMES = 8
@@ -126,7 +120,7 @@ def validate_volume_specs(specs: list) -> list[str]:
             raise ValueError(f"volume spec #{index} must be '<name>:<path>'")
         if ":" in container_path:
             raise ValueError(f"volume spec #{index} has an extra ':'")
-        if not _VOLUME_NAME_RE.fullmatch(volname):
+        if not VOLUME_NAME_RE.fullmatch(volname):
             raise ValueError(
                 f"volume spec #{index}: invalid volume name, expected 1-32 lowercase "
                 "letters, digits or '-'"
@@ -286,7 +280,7 @@ class DeployConfig(BaseModel):
     @field_validator("name")
     @classmethod
     def _check_name_is_dns_label(cls, value: str) -> str:
-        if not _DNS_LABEL_RE.match(value):
+        if not DNS_LABEL_RE.fullmatch(value):
             # Value-free on purpose: this text reaches 422 bodies, CLI output and
             # agent transcripts, and a pasted credential must not ride along.
             raise ValueError(
@@ -684,7 +678,7 @@ def parse_project_declaration(
     if set(project) - {"name"}:
         raise DeclarationError("[project] takes only the 'name' key.")
     name = project.get("name")
-    pattern = PROJECT_NAME_RE if new_project else _DNS_LABEL_RE
+    pattern = PROJECT_NAME_RE if new_project else DNS_LABEL_RE
     if not isinstance(name, str) or not pattern.fullmatch(name):
         raise DeclarationError(
             "Invalid [project] name: a lowercase DNS label of at most 40 characters "

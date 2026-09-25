@@ -100,7 +100,7 @@ export interface LogEntry {
 export interface PublicUrlEntry {
   url: string | null;
   kind: "default" | "hosted" | "domain";
-  state: "ready" | "link_down" | "not_entitled" | "withheld";
+  state: "ready" | "link_down" | "not_entitled" | "withheld" | "pending";
   access: "private" | "public" | null;
   /** Domain entries only: the bound name. Null/absent on `default` and `hosted`. */
   domain?: string | null;
@@ -318,6 +318,8 @@ export interface SecretDeleted {
 export interface Project {
   id: string;
   name: string;
+  /** Immutable operational name; absent on daemons predating display rename. */
+  namespace?: string;
   services: Service[];
   addresses: PublicUrlEntry[];
 }
@@ -640,6 +642,9 @@ export interface Capabilities {
     audit_target_filter?: boolean;
     /** P40b — `/api/projects` exists; absent on older daemons (gate, never sniff). */
     projects?: boolean;
+    /** Cloud-assigned addresses and immutable project discovery over the link. */
+    public_address_bindings?: boolean;
+    public_address_routing?: boolean;
     /** P40c — `/api/projects/{project}/variables` exists; absent on older daemons. */
     variables?: boolean;
     /** P40d — `POST /api/projects/{project}/apply` exists; absent on older daemons. */

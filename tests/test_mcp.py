@@ -1,14 +1,13 @@
 """Tests for the minimal MCP server (P1 / S10).
 
-These cover three layers without requiring the optional ``mcp`` extra:
+These cover three layers including incomplete-installation handling:
 
 * the CLI import firewall (graceful degradation when ``mcp`` is absent),
 * the pure tool implementations driven by an ``httpx`` mock transport
   (error normalization, idempotency key, ``limit``/``tail`` bounds), and
 * the client changes (``cluster_stats`` path, ``Idempotency-Key`` header).
 
-A final test exercises real FastMCP wiring, guarded by ``importorskip`` so it
-runs only where ``nerdit[mcp]`` is installed.
+Real FastMCP wiring is required for the standard installation.
 """
 
 from __future__ import annotations
@@ -44,10 +43,10 @@ def _client(handler, *, token: str | None = None) -> NerditClient:
 # --- import firewall / graceful degradation --------------------------------
 
 
-def test_mcp_command_exits_when_extra_missing(monkeypatch, capsys):
+def test_mcp_command_exits_when_dependency_missing(monkeypatch, capsys):
     from nerdit.cli.commands.mcp import mcp
 
-    # Force the "extra not installed" branch regardless of the environment.
+    # Simulate an incomplete installation regardless of the environment.
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
 
     with pytest.raises(SystemExit) as exc_info:
@@ -55,7 +54,7 @@ def test_mcp_command_exits_when_extra_missing(monkeypatch, capsys):
 
     assert exc_info.value.code == 1
     err = capsys.readouterr().err
-    assert "mcp" in err
+    assert "MCP" in err
     assert "pip install" in err
 
 
@@ -700,7 +699,6 @@ async def test_serve_model_impl_forwards_engine_bounds():
 @pytest.mark.asyncio
 async def test_serve_model_tool_schema_exposes_engine_bounds():
     """The tool's introspected inputSchema is the agent-facing contract."""
-    pytest.importorskip("mcp")
 
     mcp_server = server.build_server()
     tools = await mcp_server.list_tools()
@@ -979,7 +977,6 @@ async def test_list_database_dumps_impl_403_becomes_forbidden_envelope():
 @pytest.mark.asyncio
 async def test_database_dump_tools_are_registered_with_their_args():
     """The pair is registered and its schema is the agent-facing contract."""
-    pytest.importorskip("mcp")
 
     mcp_server = server.build_server()
     tools = {t.name: t for t in await mcp_server.list_tools()}
@@ -2285,7 +2282,6 @@ async def test_restart_daemon_impl_propagates_409_as_structured_error():
 
 @pytest.mark.asyncio
 async def test_build_server_registers_all_tools():
-    pytest.importorskip("mcp")
 
     mcp_server = server.build_server()
     tools = await mcp_server.list_tools()
@@ -2348,6 +2344,8 @@ async def test_build_server_registers_all_tools():
         "resolve_variables",
         "write_project_files",
         "apply_project",
+        "project_logs",
+        "diagnose_project",
     }
     # The tool set is a public contract for external agents: pin the count so a
     # tool cannot be added or dropped without an explicit CHANGELOG decision.
@@ -2358,7 +2356,8 @@ async def test_build_server_registers_all_tools():
     # with set_variable/resolve_variables — deliberately no list/unset tool: a
     # plain value is read by its owner through the CLI/REST, not an agent;
     # (P40d) 55 → 57 with write_project_files/apply_project (the declaration).
-    assert len(names) == 57
+    # P41d adds project_logs/diagnose_project, bringing the set to 59.
+    assert len(names) == 59
 
 
 _MCP_TOOLS_GOLDEN_PATH = Path(__file__).parent / "data" / "mcp_tools_golden.json"
@@ -2375,7 +2374,6 @@ async def test_build_server_tool_schema_golden():
     (D-T-5); a param dropped or reshaped by either fails here even though the
     name set stays intact.
     """
-    pytest.importorskip("mcp")
 
     mcp_server = server.build_server()
     tools = await mcp_server.list_tools()
@@ -2414,7 +2412,6 @@ async def test_every_tool_property_has_a_description():
     One sentence per property, bounded so the schema stays a schema and the
     prose stays the place for purpose and refusal codes.
     """
-    pytest.importorskip("mcp")
 
     mcp_server = server.build_server()
     missing = []
@@ -2441,7 +2438,6 @@ _DEPLOY_DOC_TOOLS = ("deploy", "deploy_git", "deploy_app")
 
 
 async def _deploy_tool_descriptions() -> dict[str, str]:
-    pytest.importorskip("mcp")
     mcp_server = server.build_server()
     tools = await mcp_server.list_tools()
     return {t.name: (t.description or "") for t in tools if t.name in _DEPLOY_DOC_TOOLS}
@@ -2558,7 +2554,6 @@ async def test_deploy_tool_descriptions_carry_the_shared_sandbox_note():
     THERE — and it is ONE module constant, not four copies, so the four cannot
     drift apart.
     """
-    pytest.importorskip("mcp")
     from nerdit.mcp.tools._shared import SANDBOX_NOTE, SANDBOX_NOTE_PLACEHOLDER
 
     mcp_server = server.build_server()
@@ -2683,7 +2678,6 @@ async def test_share_tools_describe_the_contract():
     resulting URL shows up afterwards — the tool returns one URL, but every
     later read carries it under ``public_urls``.
     """
-    pytest.importorskip("mcp")
 
     mcp_server = server.build_server()
     tools = {t.name: t for t in await mcp_server.list_tools()}
@@ -2828,7 +2822,6 @@ async def test_domain_tools_describe_the_contract():
     that DNS and certificate trust are prerequisites it cannot satisfy itself,
     and know where the resulting URL shows up afterwards.
     """
-    pytest.importorskip("mcp")
 
     mcp_server = server.build_server()
     tools = {t.name: t for t in await mcp_server.list_tools()}
@@ -3002,3 +2995,56 @@ def test_sandbox_note_wrap_preserves_whitespace_and_whole_words():
     assert _wrap(" \t\n") == []
     assert _wrap("  a\t b\n c\u2003d  ", width=3) == ["a b", "c d"]
     assert _wrap("a long-hyphenated-word z", width=4) == ["a", "long-hyphenated-word", "z"]
+
+
+@pytest.mark.parametrize("project", ["asso", "prj_abcdefghijklmnop"])
+async def test_native_project_read_tools_keep_identity_and_log_bounds(project, monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, dict(request.url.params)))
+        return httpx.Response(200, json=[] if request.url.path.endswith("logs") else {"ok": True})
+
+    monkeypatch.setattr(projects_tools, "_request_client", lambda: _client(handler))
+    assert (
+        await projects_tools.project_logs(
+            project,
+            service="api",
+            tail=9000,
+            grep="error",
+            since="2026-09-01T00:00:00Z",
+            source="runtime",
+        )
+        == []
+    )
+    assert seen[-1] == (
+        f"/api/projects/{project}/services/api/logs",
+        {
+            "since_id": "0",
+            "tail": "1000",
+            "source": "runtime",
+            "grep": "error",
+            "since": "2026-09-01T00:00:00Z",
+        },
+    )
+    assert await projects_tools.diagnose_project(project, log_tail=0) == {"ok": True}
+    assert seen[-1] == (f"/api/projects/{project}/services/web/diagnose", {"log_tail": "1"})
+
+
+async def test_project_id_writes_stay_ids_on_inner_http_hop():
+    project = "prj_abcdefghijklmnop"
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"ok": True})
+
+    client = _client(handler)
+    await projects_tools._get_project_impl(client, project)
+    await projects_tools._apply_project_impl(client, project, dry_run=True)
+    await projects_tools._set_variable_impl(client, project, {"MODE": "test"})
+    assert seen == [
+        f"/api/projects/{project}",
+        f"/api/projects/{project}/apply",
+        f"/api/projects/{project}/variables",
+    ]

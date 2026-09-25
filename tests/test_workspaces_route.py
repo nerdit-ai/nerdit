@@ -558,7 +558,7 @@ def test_deploy_is_audited_as_workspace_create(tmp_path, monkeypatch):
 # --- concurrency (D-P29-10) ---------------------------------------------------
 
 
-def test_write_409_while_deploy_zip_holds_lock(tmp_path, monkeypatch):
+def test_write_409_while_deploy_snapshot_holds_lock(tmp_path, monkeypatch):
     """Deterministic by construction: hold the very lock the snapshot takes and
     assert both writers fail fast rather than queueing behind it."""
     _finalize_spy(monkeypatch)
@@ -885,20 +885,20 @@ async def test_cancelled_write_holds_lock_until_worker_settles(tmp_path, monkeyp
 
 
 async def test_cancelled_deploy_snapshot_holds_lock_until_worker_settles(tmp_path, monkeypatch):
-    """Same contract on the read-only zip: the lock is uniform, no exceptions."""
-    real = core_workspaces.zip_workspace
+    """Same contract on the snapshot copy, which must also leave no partial context."""
+    real = core_workspaces.copy_workspace
     started = threading.Event()
     release = threading.Event()
 
-    def _blocking(tree):
+    def _blocking(tree, dest):
+        real(tree, dest)
         started.set()
         release.wait(5)
-        return real(tree)
 
     client_app = _make_app(_queries(), tmp_path)
     with TestClient(client_app) as sync_client:
         assert _write(sync_client).status_code == 200
-    monkeypatch.setattr(core_workspaces, "zip_workspace", _blocking)
+    monkeypatch.setattr(core_workspaces, "copy_workspace", _blocking)
     lock = core_workspaces.workspace_lock("demo")
 
     async with AsyncClient(
@@ -910,12 +910,14 @@ async def test_cancelled_deploy_snapshot_holds_lock_until_worker_settles(tmp_pat
         await asyncio.to_thread(started.wait, 5)
         task.cancel()
         await asyncio.sleep(0.1)
-        assert lock.locked(), "the lock was freed while the zip worker was still running"
+        assert lock.locked(), "the lock was freed while the copy worker was still running"
         release.set()
         with contextlib.suppress(BaseException):
             await asyncio.wait_for(task, 5)
 
     assert not lock.locked()
+    uploads = tmp_path / "uploads"
+    assert not uploads.exists() or not any(uploads.iterdir()), "cancelled copy leaked its context"
 
 
 # --- pre-parse body bound (review round-1, Codex 3803274889) ------------------

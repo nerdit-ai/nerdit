@@ -141,7 +141,7 @@ def _make_app(queries, tmp_path, *, with_audit: bool = False) -> FastAPI:
 
 
 def _client(app: FastAPI) -> AsyncClient:
-    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1")
 
 
 def _auth(raw: str) -> dict:
@@ -748,7 +748,7 @@ def _dump_queries(job: Job | None = None, *, endpoint_port: int = 9500) -> Async
         )
     )
     q.list_workload_configs = AsyncMock(return_value=[])
-    q.set_last_dump = AsyncMock(return_value=True)
+    q.patch_job_config = AsyncMock(return_value=True)
     q.patch_last_dump_field = AsyncMock(return_value=True)
     return q
 
@@ -1257,7 +1257,7 @@ def _stamped_last_dump(q) -> dict:
         assert call.kwargs["expect_run_id"]
         patched[call.kwargs["field"]] = call.kwargs["value"]
     # The route never rewrites the blob: nothing but the named keys can change.
-    assert not q.set_last_dump.await_args_list
+    assert not q.patch_job_config.await_args_list
     return patched
 
 

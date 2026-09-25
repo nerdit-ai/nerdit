@@ -19,7 +19,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-import nerdit.daemon.routes.deploy as deploy_mod
+import nerdit.daemon.deploy_pipeline as pipeline
 from nerdit.core.gitsource import GitSourceInfo
 from nerdit.daemon.audit import AuditMiddleware
 from nerdit.daemon.auth import hash_token
@@ -211,7 +211,7 @@ async def test_deploy_zip_422_never_echoes_the_literal_api_key(harness):
 @pytest.mark.asyncio
 async def test_deploy_git_422_never_echoes_the_literal_api_key(harness, monkeypatch):
     client, queries = harness
-    monkeypatch.setattr(deploy_mod, "clone_source", _fake_clone())
+    monkeypatch.setattr(pipeline, "clone_source", _fake_clone())
     resp = await client.post(
         "/deploy/git",
         json={"repo_url": REPO, "name": "demo"},

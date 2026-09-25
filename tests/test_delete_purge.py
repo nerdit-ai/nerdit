@@ -838,6 +838,9 @@ class _RunController:
     def has_active_run(self, job_id: str) -> bool:
         return self._mine(job_id) and bool(self._container_ids or self._unbound)
 
+    def forget(self, job_id: str) -> None:
+        pass
+
     def active_run_container_ids_for(self, job_id: str) -> set[str]:
         return set(self._container_ids) if self._mine(job_id) else set()
 
@@ -1003,6 +1006,31 @@ def test_force_delete_unkillable_run_skips_data_purge(tmp_path):
     }
     # The failed kill is not counted as one.
     assert _purge_audit_params(q, "service.delete")["killed_runs"] == 0
+
+
+def test_data_purge_spares_a_name_retaken_during_the_delete_tail(tmp_path):
+    """A same-name row landing after the commit owns the tree; it is not rmtree'd."""
+    (tmp_path / "services" / "a").mkdir(parents=True)
+    (tmp_path / "services" / "a" / "blob").write_bytes(b"x" * 8)
+
+    q = _queries(_svc(), workloads=[])
+    q.get_service_by_name = AsyncMock(
+        side_effect=lambda _n: _svc(id="svc-new") if q.delete_service_checked.await_count else None
+    )
+    client = TestClient(
+        _app(runtime=FakeRuntime([]), queries=q, data_dir=tmp_path),
+        raise_server_exceptions=False,
+    )
+
+    resp = client.delete("/services/svc-a?purge=data", headers=_auth())
+    assert resp.status_code == 200
+    assert resp.json()["purged"]["data"] is False
+    assert (tmp_path / "services" / "a" / "blob").is_file()
+    assert _purge_audit_params(q, "service.purge_data") == {
+        "key": "services/a",
+        "purged": False,
+        "reason": "name_retaken",
+    }
 
 
 def test_force_delete_with_an_unbound_run_slot_skips_data_purge(tmp_path):

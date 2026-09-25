@@ -16,7 +16,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from rich.markup import escape
 
-from nerdit.cli.display import console, render_client_error
+from nerdit.cli.display import call_or_exit, console
 from nerdit.utils.certs import (
     FINGERPRINT_PREFIX,
     ca_fingerprint,
@@ -50,11 +50,7 @@ async def _trust_async(expected_fingerprint: str | None, output: Path | None) ->
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        pem = await client.get_proxy_ca()
-    except Exception as exc:
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    pem = await call_or_exit(client.get_proxy_ca())
 
     try:
         # Parse-then-reserialize: the fingerprint and the installed bytes must

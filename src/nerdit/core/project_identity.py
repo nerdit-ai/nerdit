@@ -16,12 +16,29 @@ import base64
 import re
 import secrets
 
+from nerdit.utils.names import DNS_LABEL_RE
+
 #: The environment every phase-1 row is written with (D-P40-13: the column
 #: exists now, phase 3 adds other values).
 PRODUCTION = "production"
 
 #: The service name a bare project name means (D-P40-14).
 DEFAULT_SERVICE = "web"
+
+PROJECT_ID_RE = re.compile(r"prj_[a-z2-7]{16}\Z")
+PROJECT_DELEGATION_HEADER = "x-nerdit-project-id"
+PROJECT_MCP_PATH = "/api/project-mcp"
+# Builds share the node's image namespace, so apply needs a node grant until
+# the builder can isolate project inputs and previously built images.
+PROJECT_DELEGATION_TOOLS = frozenset(
+    {
+        "get_project",
+        "project_logs",
+        "diagnose_project",
+        "set_variable",
+        "resolve_variables",
+    }
+)
 
 # D-P40-14: DNS-label grammar, <=40 chars, never containing ``--``. The
 # double dash is the label separator (D-P40-2), so a name carrying one would
@@ -31,16 +48,6 @@ PROJECT_NAME_RE = re.compile(r"^(?!.*--)[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$")
 
 #: Same grammar as a project name, <=20 chars (D-P40-14).
 SERVICE_NAME_RE = re.compile(r"^(?!.*--)[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$")
-
-#: Same grammar as a service name; reserved for phase 3 (D-P40-13).
-ENV_NAME_RE = re.compile(r"^(?!.*--)[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$")
-
-# The create-request label pattern (``daemon/schemas/services.py``,
-# ``config/project.py::_DNS_LABEL_RE``, ``secrets._DNS_LABEL_RE``), copied
-# rather than imported so this module stays cycle-free. A composed label must
-# pass it because every downstream key (volume dir, secret file AAD, hosted
-# label, ``@id``) re-validates against the same 63-octet DNS-label rule.
-_DNS_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 def mint_project_id() -> str:
@@ -80,7 +87,9 @@ def service_label(project: str, environment: str, service: str) -> str:
         label = project if service == DEFAULT_SERVICE else f"{service}--{project}"
     else:
         label = f"{service}--{environment}--{project}"
-    if not _DNS_LABEL_RE.fullmatch(label):
+    # Every downstream key (volume dir, secret file AAD, hosted label, ``@id``)
+    # re-validates against the same 63-octet DNS-label rule.
+    if not DNS_LABEL_RE.fullmatch(label):
         raise ValueError(f"composed label {label!r} is not a DNS label of at most 63 octets")
     return label
 

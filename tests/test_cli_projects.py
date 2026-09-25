@@ -246,3 +246,18 @@ def test_cli_create_parses_name(fake_client):
     result = _runner.invoke(projects_app, ["create", "asso"])
     assert result.exit_code == 0, result.output
     assert fake_client.calls[0][:2] == ("create_project", "asso")
+
+
+@pytest.mark.asyncio
+async def test_rename_project_uses_id_patch_and_idempotency_key():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PATCH"
+        assert request.url.path == "/api/projects/prj_test"
+        assert request.headers["Idempotency-Key"] == "rename-key"
+        assert json.loads(request.content) == {"name": "new-label"}
+        return httpx.Response(200, json={"id": "prj_test", "name": "new-label"})
+
+    result = await _make_client(handler).rename_project(
+        "prj_test", "new-label", idempotency_key="rename-key"
+    )
+    assert result["name"] == "new-label"

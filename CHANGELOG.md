@@ -4,6 +4,96 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.7.0 (2026-09-24)
+
+MCP in every installation, stable project IDs for agents, and a hardening pass
+that closes token-less LAN access. **Read "Before upgrading": some changes can
+break existing setups.**
+
+### Agents and MCP
+
+- **MCP is included in every installation.** `pip install nerdit` now ships the
+  MCP server alongside the prebuilt dashboard and mDNS, so `nerdit mcp` works
+  with no extra. `nerdit[mcp]` still installs. HTTP MCP still needs explicit
+  configuration (or linking) and a daemon authentication token.
+- **Project logs and diagnosis.** The new MCP tools `project_logs` and
+  `diagnose_project` take a project and a service (`web` by default), so an agent
+  no longer needs to look up the service's internal name first.
+- **Address projects by stable ID.** Project reads, apply and variable operations,
+  over REST and MCP, accept the immutable `prj_…` ID as well as the name. The ID
+  keeps pointing at the same project when its display name changes. A deleted ID
+  is refused, even if a new project reuses the name.
+
+### Projects
+
+- **Rename a project's display label** with `nerdit projects rename <project-id>
+  <name>`. Duplicate labels are allowed. The original namespace, service names,
+  public slugs and granted access don't change.
+- Project-scoped tokens can manage service-scope variables on the services
+  inside their project. `/secrets/{service}` stays label-only.
+- A Git project apply clones the repository once and builds every service from
+  that same commit.
+- **Delegated access from Nerdit Cloud.** A Cloud assistant connection can be
+  approved for a single project instead of the whole machine. It can then read
+  the project, its logs and diagnosis, and write variables, but can't deploy.
+  Deploying needs machine access. Cloud forwards variable values to the daemon
+  without storing them or reading them back. Older daemons refuse project-only
+  access instead of treating it as machine access.
+
+### Security and reliability
+
+- New `[containers].pids_limit` (default 4096) caps the processes and threads of
+  every service, run, model and database container.
+- Webhook deliveries add `X-Nerdit-Timestamp` and a replay-resistant
+  `X-Nerdit-Signature-V2`, an HMAC over `<timestamp>.<delivery>.<body>`.
+  `X-Nerdit-Signature` is unchanged. Targets now drain concurrently, so a dead
+  endpoint no longer delays the others.
+- `POST /api/deploy` and `POST /api/projects/{project}/apply` require a
+  `Content-Length`, so a chunked upload gets `411 length_required`. Both are
+  bounded at `[daemon].max_upload_bytes` + 1 MiB before parsing
+  (`413 payload_too_large`).
+- Failed authentications (a missing, invalid or stale bearer token) are audited
+  as `auth.denied`. Filter them with `GET /api/audit?action_prefix=auth`. An
+  `X-Request-Id` outside `[A-Za-z0-9._:-]{1,128}` is replaced by a new ID
+  instead of being echoed.
+- `nerdit connect` can read the token from a hidden prompt or one line of stdin,
+  which keeps it off argv (`--token` is still accepted). It warns when a
+  non-loopback host uses plain HTTP. `connect` and `nerdit init` write
+  `~/.nerdit/config.toml` atomically with mode 0600.
+- `nerdit link nk_…` with a positional key exits 2 and points to `--key-stdin`:
+  a pre-auth key never goes on argv.
+- Deleting a service with `purge=data` no longer removes the data of a same-name
+  service created after the delete committed. The response reports
+  `purged.data: false`.
+- The workspace cleanup no longer removes a project's workspace.
+- Under `[proxy].dashboard_apex` in path mode, new services named `api` or
+  `assets` are refused (`422 service.reserved_name`), and `nerdit doctor` warns
+  about existing ones.
+
+### Before upgrading
+
+- **Token-less LAN access is refused.** A daemon without `[daemon].auth_token`
+  now answers non-public requests only when the `Host` is `localhost` or a
+  loopback IP. Other hosts get `421 invalid_host`. If you reach a token-less
+  daemon from another machine (a `0.0.0.0` bind, or a token-less
+  `dashboard_apex`), configure a token first. Public paths (`/health`,
+  `/api/proxy/ca`, the dashboard shell, `/assets`) stay reachable. Daemons with
+  a token behave as before.
+- **`.env` files are no longer uploaded.** `nerdit deploy`, `apply`, `dev` and
+  the MCP `deploy` tool skip `.env*` files and symlinks that resolve outside the
+  app folder. If an image relied on a baked-in `.env`, move those values to
+  `nerdit secrets set` or `nerdit vars set`.
+- **Git redirects are no longer followed.** Clones and push-to-deploy polling
+  fail with `400 deploy.git_clone_failed` for a renamed or moved repository.
+  Redeploy it with its new URL. A `repo_url` containing whitespace or control
+  characters gets `422 deploy.git_url_invalid`, including on redeploys of an
+  existing source.
+- **Containers get a 4096-task cap** on the first restart after the upgrade.
+  Raise `[containers].pids_limit` if a workload needs more. The default memory
+  limit is unchanged.
+- Adding Cloud destinations or changing an assistant's approved scope
+  invalidates earlier OAuth credentials: reconnect the assistant.
+
 ## 0.6.4 (2026-09-21)
 
 Deploy a web frontend, API and worker as one project, with shared variables,

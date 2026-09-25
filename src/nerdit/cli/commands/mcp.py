@@ -1,10 +1,4 @@
-"""nerdit mcp — run the Model Context Protocol server (P1 / S10).
-
-The base package stays MCP-free; this command only becomes usable with the
-optional ``mcp`` extra. An import firewall checks for the dependency *before*
-any stdio handshake so a missing extra fails loudly and actionably instead of
-emitting a broken MCP transport an agent would hang on.
-"""
+"""Run the bundled MCP server, reporting incomplete installations before stdio starts."""
 
 from __future__ import annotations
 
@@ -14,11 +8,11 @@ import typer
 
 
 def mcp() -> None:
-    """Run the Nerdit MCP server over stdio (requires the ``mcp`` extra)."""
+    """Run the Nerdit MCP server over stdio."""
     if importlib.util.find_spec("mcp") is None:
         typer.echo(
-            "The MCP server requires the optional 'mcp' extra, which is not installed.\n"
-            "Install it with:  pip install 'nerdit[mcp]'",
+            "The bundled MCP dependency is missing; this installation is incomplete.\n"
+            "Repair it with:  python -m pip install --upgrade nerdit",
             err=True,
         )
         raise SystemExit(1)

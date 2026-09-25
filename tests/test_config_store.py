@@ -37,6 +37,14 @@ def test_redact_section_keeps_unset_secret_none():
     assert redact_section({"auth_token": None})["auth_token"] is None
 
 
+def test_redact_section_strips_embedded_url_credentials():
+    url = "https://user:password@example.com/v1"
+    assert redact_section({"base_url": url, "url": url}) == {
+        "base_url": "https://example.com/v1",
+        "url": "https://example.com/v1",
+    }
+
+
 # --- known sections / unknown section ----------------------------------------
 
 

@@ -143,7 +143,7 @@ function summaryRow(summary: ProjectSummary) {
   const worst = derived[0] ?? null;
   const single = summary.services.length === 1;
   // The home service is the one whose label IS the project name (field compare).
-  const home = summary.services.find((svc) => svc.name === summary.name) ?? summary.services[0];
+  const home = summary.services.find((svc) => svc.name === (summary.namespace ?? summary.name)) ?? summary.services[0];
   const latest = [...summary.services].sort((a, b) =>
     (b.started_at ?? b.created_at ?? "").localeCompare(a.started_at ?? a.created_at ?? "")
   )[0];
@@ -161,9 +161,9 @@ function summaryRow(summary: ProjectSummary) {
     : undefined;
   return (
     <AppRow
-      key={summary.name}
+      key={summary.id}
       name={summary.name}
-      to={`/projects/${encodeURIComponent(summary.name)}`}
+      to={`/projects/${encodeURIComponent(summary.namespace ?? summary.name)}`}
       sub={sub}
       badge={worst?.service ?? null}
       badgeTitle={detail}

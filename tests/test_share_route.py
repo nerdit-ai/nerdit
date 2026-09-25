@@ -136,9 +136,17 @@ def _queries(job: Job | None = None, shares: dict[str, ServiceShare] | None = No
         side_effect=lambda n: job if job is not None and job.service_name == n else None
     )
     q.list_service_shares = AsyncMock(side_effect=lambda: dict(table))
+    q.list_service_public_addresses = AsyncMock(return_value={})
+    q.list_service_hosted_aliases = AsyncMock(return_value={})
 
     async def _set(
-        name: str, access: str, *, job_id: str, preserve_existing: bool = False
+        name: str,
+        access: str,
+        *,
+        job_id: str,
+        preserve_existing: bool = False,
+        alias_node_id: str | None = None,
+        alias_host: str | None = None,
     ) -> ServiceShare:
         existing = table.get(name)
         row = ServiceShare(
@@ -304,7 +312,12 @@ def test_an_admin_may_share_someone_elses_app() -> None:
 
     assert response.status_code == 200, response.text
     q.set_service_share.assert_awaited_once_with(
-        "demo", "private", job_id="svc-1", preserve_existing=False
+        "demo",
+        "private",
+        job_id="svc-1",
+        preserve_existing=False,
+        alias_node_id="00000000-0000-4000-8000-00000000000a",
+        alias_host=HOSTED_URL.removeprefix("https://").rstrip("/"),
     )
 
 
@@ -351,7 +364,12 @@ def test_sharing_privately_writes_the_row_and_computes_the_url(recorder: AsyncMo
     assert body["state"] == "ready"
     assert body["created_at"]
     q.set_service_share.assert_awaited_once_with(
-        "demo", "private", job_id="svc-1", preserve_existing=False
+        "demo",
+        "private",
+        job_id="svc-1",
+        preserve_existing=False,
+        alias_node_id="00000000-0000-4000-8000-00000000000a",
+        alias_host=HOSTED_URL.removeprefix("https://").rstrip("/"),
     )
 
     row = q.insert_audit_log.await_args_list[-1].kwargs
@@ -395,7 +413,12 @@ def test_private_preview_preserves_existing_access(existing, recorder: AsyncMock
     assert response.status_code == 200
     assert response.json()["access"] == (existing or "private")
     q.set_service_share.assert_awaited_once_with(
-        "demo", "private", job_id="svc-1", preserve_existing=True
+        "demo",
+        "private",
+        job_id="svc-1",
+        preserve_existing=True,
+        alias_node_id="00000000-0000-4000-8000-00000000000a",
+        alias_host=HOSTED_URL.removeprefix("https://").rstrip("/"),
     )
     audit = json.loads(q.insert_audit_log.await_args.kwargs["params_redacted"])
     assert audit["access"] == (existing or "private")
@@ -506,22 +529,14 @@ def test_a_service_deleted_under_the_write_is_a_404_not_an_orphan_share() -> Non
     assert response.json()["code"] == "not_found"
 
 
-def test_a_name_that_cannot_fit_one_dns_label_is_refused() -> None:
-    """Checked at SHARE time: a row that can never resolve is not a share."""
+def test_a_long_legacy_name_records_intent_until_generated_address_activation() -> None:
     long_name = "a" * 60
     q = _queries(_svc(name=long_name))
-
     response = _put(_client(q), name=long_name)
-
-    assert response.status_code == 422
-    body = response.json()
-    assert body["code"] == "share.name_too_long"
-    assert "63" in body["message"]
-    # The message reports the LENGTH, never the composed label — the node slug
-    # and the hosted name are not things to scatter through bug reports.
-    assert SLUG not in json.dumps(body)
-    assert DOMAIN not in json.dumps(body)
-    q.set_service_share.assert_not_awaited()
+    assert response.status_code == 200
+    assert response.json()["state"] == "pending"
+    assert response.json()["url"] is None
+    assert q.share_table[long_name].access == "private"
 
 
 def test_public_is_refused_without_the_account_entitlement() -> None:

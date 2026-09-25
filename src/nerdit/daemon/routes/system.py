@@ -64,6 +64,7 @@ from nerdit.core.volumes import VolumeSpecError, dump_staging_root, tombstone_se
 from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import current_principal, require_role
 from nerdit.daemon.bootstrap import normalize_mount_roots
+from nerdit.daemon.deploy_pipeline import APEX_RESERVED_NAMES, apex_shadow_active
 from nerdit.daemon.errors import NerditError, request_id_of
 from nerdit.daemon.imagegc import (
     DEFAULT_INSTANCE_ID,
@@ -247,23 +248,20 @@ async def get_capabilities(request: Request) -> dict[str, Any]:
             "bridge_host": settings.models.bridge_host,
         }
 
-    # (P27 WP-C1 item 5) Node-link session state. Folded in here rather than
-    # given a GET /link of its own: /capabilities is already THE role-aware
-    # daemon self-knowledge surface and a pure `app.state` projection, which
-    # `LinkStatus` is by construction (no I/O, no locks) — so the existing
-    # `nerdit capabilities` + MCP `capabilities` paths surface the link for
-    # free, with zero new REST operations. Health-shaped consumption belongs to
-    # the doctor `link` check. Visible to every authenticated role (a state
-    # name and two timestamps are not secrets); `relay_host` is admin-only per
+    # Node-link session state. Folded in here rather than given a GET /link of
+    # its own: /capabilities is THE role-aware self-knowledge surface and a pure
+    # `app.state` projection, which `LinkStatus` is by construction (no I/O, no
+    # locks). Health-shaped consumption belongs to the doctor `link` check.
+    # Visible to every authenticated role (a state name and two timestamps
+    # are not secrets); `relay_host` is admin-only per
     # the `proxy.admin_addr`/`paths` precedent, and the capability token
     # appears nowhere at all.
     #
-    # (P26 WP-H) The block also carries the three hosted-share facts an agent
-    # needs before it calls `PUT /services/{name}/share`: the node `slug`
-    # and `nodes_base_domain` are the two halves of every hosted name, and
+    # The block also carries the three hosted-share facts an agent needs before
+    # it calls `PUT /services/{name}/share`: the node `slug` and
+    # `nodes_base_domain` are the two halves of every hosted name, and
     # `hosted_public_entitled` says whether `access='public'` can succeed at
-    # all. There is no `GET /link/status` route — this block IS the link
-    # status surface, and the plan's "/link/status fields" means these keys.
+    # all. This block IS the link status surface; there is no GET /link/status.
     link_manager = getattr(state, "link_manager", None)
     link_settings = getattr(settings, "link", None)
     slug = getattr(link_settings, "slug", None)
@@ -385,7 +383,7 @@ async def get_capabilities(request: Request) -> dict[str, Any]:
             if is_admin:
                 license_block["customer_id"] = claims.customer_id
 
-    # (P33, field failure 2026-08-23) The container sandbox an agent's image has
+    # The container sandbox an agent's image has
     # to survive. Read through `getattr` so a lightweight settings object
     # without `[containers]` still projects the shipped defaults rather than
     # raising (the `[proxy.acme]` precedent above). Visible to every role: it
@@ -418,7 +416,7 @@ async def get_capabilities(request: Request) -> dict[str, Any]:
                 "max_concurrent_jobs": principal.max_concurrent_jobs,
             },
         },
-        # (P25 D-P25-4 / D-P25-10) The agent's self-knowledge path: with no MCP
+        # The agent's self-knowledge path: with no MCP
         # tool for the token surface, this block is how an agent learns its own
         # lifetime and reach BEFORE the clock runs out — after it does, every
         # route including `/tokens/self` answers 403 `token_expired`.
@@ -473,7 +471,7 @@ async def get_capabilities(request: Request) -> dict[str, Any]:
         "limits": {
             "wait_timeout_max_s": _WAIT_TIMEOUT_MAX,
             "wait_concurrency_max": WAIT_CONCURRENCY_MAX,
-            # The P24a stream budgets: an agent that plans N concurrent
+            # The stream budgets: an agent that plans N concurrent
             # followers needs to know the daemon-wide cap BEFORE it opens the
             # N+1st and gets a `*.saturated` frame back.
             "events_stream_concurrency_max": EVENTS_STREAM_CONCURRENCY_MAX,
@@ -488,30 +486,35 @@ async def get_capabilities(request: Request) -> dict[str, Any]:
             "secrets_shared_scope": not getattr(state, "shared_scope_blocked", False),
             "app_templates": True,
             # Constant true on this build: lets a frontend distinguish this
-            # daemon from a pre-PR1 one, since FastAPI silently ignores the new
+            # daemon from an older one, since FastAPI silently ignores unknown
             # GET /audit ?target= / ?target_type= params (no 422 to sniff).
             "audit_target_filter": True,
             # Enabled-flag ONLY — never the target list, a target count,
             # or any URL: targets carry operator-chosen endpoints (and, when an
             # operator ignores the credential-placement warning, tokens).
             "notifications": getattr(getattr(settings, "notifications", None), "enabled", False),
-            # (P37) Constant ``True`` on this build: an unknown path is a plain 404,
+            # Constant ``True`` on this build: an unknown path is a plain 404,
             # so a capability flag is how an agent tells "predates dumps" from
             # "no such database". The surface exists; dumpability is the route's.
             "database_dumps": True,
-            # (P39) Constant ``True`` on this build: a 404 on `POST /secrets/{name}`
-            # is how a pre-P39 daemon says "deploy first", so the flag is how an
-            # agent tells "predates P39" from "no such service".
+            # Constant ``True`` on this build: a 404 on `POST /secrets/{name}`
+            # is how an older daemon says "deploy first", so the flag is how an
+            # agent tells "predates secrets-before-deploy" from "no such service".
             "secrets_before_deploy": True,
-            # (P40b) Constant ``True`` on this build: an unknown `/projects`
+            # Constant ``True`` on this build: an unknown `/projects`
             # path is a plain 404, so the flag is how an agent tells "predates
             # the project noun" from "no such project".
             "projects": True,
-            # (P40c) Constant ``True``: `/projects/{p}/variables` is a plain 404
-            # on a pre-P40c daemon, indistinguishable from "no such project".
+            "project_ids": True,
+            "project_rename_v1": True,
+            "project_delegation": True,
+            "public_address_bindings": True,
+            "public_address_routing": True,
+            # Constant ``True``: `/projects/{p}/variables` is a plain 404 on an
+            # older daemon, indistinguishable from "no such project".
             "variables": True,
-            # (P40d) Constant ``True``: `POST /projects/{p}/apply` is a plain
-            # 404/405 before P40d, and a legacy deploy of a `[project]` file
+            # Constant ``True``: `POST /projects/{p}/apply` is a plain 404/405
+            # on an older daemon, and a legacy deploy of a `[project]` file
             # answers `deploy.use_apply` only from this build on.
             "project_apply": True,
         },
@@ -641,7 +644,7 @@ async def get_doctor(request: Request) -> dict[str, Any]:
                 "in the daemon's service unit"
             )
         if buildx == "no_cli":
-            # (Codex 3804646811) Distinct from `unknown`: the daemon reached
+            # Distinct from `unknown`: the daemon reached
             # the socket but has no `docker` CLI to build with — concluded,
             # not inconclusive. `warn` for the same recorded reason as the
             # buildx branch above: a node serving only pre-built images is
@@ -680,11 +683,19 @@ async def get_doctor(request: Request) -> dict[str, Any]:
         if st == ProxyState.no_binary:
             # Enabled but the caddy binary is unresolved: a real misconfiguration
             # the operator asked for (proxy on) but cannot satisfy — warn, don't
-            # bury it in `skipped`. No path in the detail (M3).
+            # bury it in `skipped`. No path in the detail.
             return "warn", "proxy enabled but the caddy binary is missing — install caddy"
         if st == ProxyState.disabled:
             return "skipped", "proxy disabled"
         if st == ProxyState.available:
+            # A row predating the apex reservation still shadows the dashboard.
+            if apex_shadow_active(settings):
+                for name in sorted(APEX_RESERVED_NAMES):
+                    if await state.queries.get_service_by_name(name) is not None:
+                        return "warn", (
+                            f"service '{name}' shadows the dashboard at the proxy apex"
+                            " — rename it or disable [proxy].dashboard_apex"
+                        )
             return "ok", "proxy up"
         return "warn", "proxy starting (no successful tick yet)"
 
@@ -749,7 +760,7 @@ async def get_doctor(request: Request) -> dict[str, Any]:
                 # never worsens the top status.
                 #
                 # The detail says "encrypted secrets", not "secrets": legacy
-                # pre-P8 plaintext is deliberately not counted (it is
+                # plaintext is deliberately not counted (it is
                 # recoverable without the key), so claiming "no secrets stored"
                 # would be false on a node whose migration left a straggler.
                 if not manager.has_ciphertexts():
@@ -802,7 +813,7 @@ async def get_doctor(request: Request) -> dict[str, Any]:
         return await asyncio.to_thread(_probe)
 
     async def _data_dir_perms() -> tuple[str, str]:
-        # (P14 WP-A1 / D-P14-3) The named-volume leaf dirs are created world-
+        # The named-volume leaf dirs are created world-
         # writable+sticky (0o1777) so non-root container users can write; that is
         # safe ONLY because `data_dir` and `<data_dir>/services` are meant to
         # be private (0o700). Warn when `data_dir` itself is group/world
@@ -886,7 +897,7 @@ async def get_doctor(request: Request) -> dict[str, Any]:
         return "ok", "no restart-required config drift"
 
     async def _link() -> tuple[str, str]:
-        # (P27 WP-C1 item 5) The remote-access tunnel's health surface.
+        # The remote-access tunnel's health surface.
         # `status()` is a pure in-memory snapshot, so this check does no I/O
         # and lands well inside the 2 s budget. Details carry state, counters
         # and close codes only — never the relay URL, the key path, or the
@@ -931,9 +942,9 @@ async def get_doctor(request: Request) -> dict[str, Any]:
         # The mirrored GitHub installation tokens. A pure
         # `status()` / manager read like the link row. `ok` while a token
         # is live, `warn` when the soonest LIVE expiry is inside
-        # `GITHUB_TOKEN_WARN_LEAD_S` (the pusher is falling behind) OR (D2)
+        # `GITHUB_TOKEN_WARN_LEAD_S` (the pusher is falling behind) OR
         # when the mirror HELD a token that has since lapsed with no re-mint —
-        # the D-GH-9 quiet-backoff case, which must not read as a green
+        # GitWatch's quiet-backoff case, which must not read as a green
         # never-linked daemon while every private auto-deploy has silently
         # stopped — and `skipped` only when the mirror is genuinely empty (no
         # cloud, not linked, cold reconnect, or the online→offline edge cleared
@@ -978,9 +989,9 @@ async def get_doctor(request: Request) -> dict[str, Any]:
         # Details carry the state, the machine reason token, the plan token and
         # day counts. Never a path, never `customer_id`, never a byte of the
         # blob: this body is safe for every role, like every other check here.
-        # WP-D1's "warn in doctor during grace, FAIL after" lands exactly here —
-        # the tunnel's fate belongs to the relay (W-D11), which is why the
-        # entitlement decision at the [link] seam is advisory.
+        # "Warn during grace, FAIL after" lands exactly here — the tunnel's
+        # fate belongs to the relay, which is why the entitlement decision at
+        # the [link] seam is advisory.
         holder = getattr(state, "license", None)
         if holder is None or not holder.installed:
             return "skipped", "no license installed"
@@ -1003,8 +1014,7 @@ async def get_doctor(request: Request) -> dict[str, Any]:
             detail = f"valid — plan {claims.plan}, expires in {_whole_days(seconds)}d"
 
         # The feature gap is only meaningful when a tunnel is actually
-        # configured (the D-LIC2 matrix's "only evaluated when link is
-        # enabled"), and it is APPENDED rather than substituted: an in-grace
+        # configured, and it is APPENDED rather than substituted: an in-grace
         # license that also lacks the feature has two problems, and dropping
         # either half would send the operator to fix only one of them.
         link_enabled = getattr(state, "link_manager", None) is not None or getattr(
@@ -1016,7 +1026,7 @@ async def get_doctor(request: Request) -> dict[str, Any]:
         return status, detail
 
     async def _acme_http_port() -> tuple[str, str]:
-        # (P26 WP2 / S-W2-8) The one listener this daemon asks the OUTSIDE world
+        # The one listener this daemon asks the OUTSIDE world
         # to reach: the ACME HTTP-01 challenge port. Every other doctor row
         # reports something local; this one is the difference between "the CA
         # can validate us" and a domain stuck `pending` forever with no
@@ -1287,7 +1297,7 @@ async def _drain_and_restart(controller, drain_timeout_s: int) -> None:  # noqa:
             os.kill(os.getpid(), signal.SIGTERM)
 
 
-# --- GET /system/disk + POST /system/gc (P14b WP-A2) --------------------------
+# --- GET /system/disk + POST /system/gc ---------------------------------------
 #
 # Disk accounting composes docker's own `df` aggregate (the only source for
 # docker-side totals) with `du` walks over the bind-mount trees docker cannot
@@ -1369,34 +1379,11 @@ def _walk_workspaces(workspaces_root: Path) -> tuple[list[dict[str, Any]], int]:
     return out, total
 
 
-def _walk_backups(backups_dir: Path) -> dict[str, int]:
-    """`{bytes, count}` for `nerdit-backup-*.tar.gz` files (absent dir ⇒ 0/0)."""
-    total = 0
-    count = 0
-    try:
-        entries = list(os.scandir(backups_dir))
-    except OSError:
-        return {"bytes": 0, "count": 0}
-    for entry in entries:
-        try:
-            if not entry.is_file(follow_symlinks=False):
-                continue
-            if not fnmatch.fnmatch(entry.name, "nerdit-backup-*.tar.gz"):
-                continue
-            total += entry.stat(follow_symlinks=False).st_size
-            count += 1
-        except OSError:
-            continue
-    return {"bytes": total, "count": count}
+def _walk_tars(backups_dir: Path, glob: str) -> dict[str, int]:
+    """`{bytes, count}` for the `glob` tars in `backups_dir` (absent dir ⇒ 0/0).
 
-
-def _walk_volume_backups(backups_dir: Path) -> dict[str, int]:
-    """`{bytes, count}` for `nerdit-volumes-*.tar.gz` files (absent dir ⇒ 0/0).
-
-    A second bucket beside `_walk_backups`: the volume tars are
-    default-0 accumulate-forever (`[retention].volume_backup_keep_last`), so
-    they must never be invisible to disk observability. Its glob is disjoint from
-    the v1 control-plane one, so neither walker double-counts the other's tars.
+    Each tar flavour (control-plane, volume, dump) is its own disk-report
+    bucket; their globs are disjoint, so no bucket double-counts another's.
     """
     total = 0
     count = 0
@@ -1408,35 +1395,7 @@ def _walk_volume_backups(backups_dir: Path) -> dict[str, int]:
         try:
             if not entry.is_file(follow_symlinks=False):
                 continue
-            if not fnmatch.fnmatch(entry.name, "nerdit-volumes-*.tar.gz"):
-                continue
-            total += entry.stat(follow_symlinks=False).st_size
-            count += 1
-        except OSError:
-            continue
-    return {"bytes": total, "count": count}
-
-
-def _walk_dumps(backups_dir: Path) -> dict[str, int]:
-    """``{bytes, count}`` for ``nerdit-dump-*.tar.gz`` files (absent dir ⇒ 0/0).
-
-    A third bucket beside :func:`_walk_backups` and :func:`_walk_volume_backups`
-    (P37 / D-P37-7). The glob is disjoint from both older ones, so no walker
-    double-counts another flavour's tars — and dumps get their own line because
-    they are the flavour that repeats (an agent or a schedule can mint one per
-    run), which is exactly the growth an operator needs to see.
-    """
-    total = 0
-    count = 0
-    try:
-        entries = list(os.scandir(backups_dir))
-    except OSError:
-        return {"bytes": 0, "count": 0}
-    for entry in entries:
-        try:
-            if not entry.is_file(follow_symlinks=False):
-                continue
-            if not fnmatch.fnmatch(entry.name, DUMP_TAR_GLOB):
+            if not fnmatch.fnmatch(entry.name, glob):
                 continue
             total += entry.stat(follow_symlinks=False).st_size
             count += 1
@@ -1449,18 +1408,18 @@ def _backups_over_keep(backups_dir: Path, keep: int) -> int:
     """How many backup archives sit beyond `backup_keep_last` (0 when keep≤0)."""
     if keep <= 0:
         return 0
-    return max(0, _walk_backups(backups_dir)["count"] - keep)
+    return max(0, _walk_tars(backups_dir, "nerdit-backup-*.tar.gz")["count"] - keep)
 
 
 def _effective_archive_dir(settings: Any, data_dir: Path) -> Path | None:
-    """The audit-archive dir the retention SWEEP actually writes to (F14).
+    """The audit-archive dir the retention SWEEP actually writes to.
 
     Delegates to the sweep's own guard (`utils.disk.resolve_archive_dir`) so the
     report can never diverge from the writer: a custom
     `[retention].audit_archive_dir` is the dir that gets walked, and a value the
     guard rejects means archiving is DISABLED (`None`) ⇒ the route reports
     `archive_bytes: 0` with no error, which is the honest count. Walking
-    `<data_dir>/archive` unconditionally (the pre-F14 shape) would report a
+    `<data_dir>/archive` unconditionally would report a
     stale/absent default while the real archive grew unwatched.
     """
     retention = getattr(settings, "retention", None)
@@ -1574,10 +1533,10 @@ async def _build_disk_report(
         "workspaces": lambda: _walk_workspaces(data_dir / "workspaces"),
         "ollama": lambda: du_bytes(data_dir / "models" / "ollama"),
         "huggingface": lambda: du_bytes(data_dir / "models" / "huggingface"),
-        "backups": lambda: _walk_backups(data_dir / "backups"),
-        "volume_backups": lambda: _walk_volume_backups(data_dir / "backups"),
-        "dumps": lambda: _walk_dumps(data_dir / "backups"),
-        # (P37 / D-P37-2) Leftover staging dirs are invisible disk: a crash
+        "backups": lambda: _walk_tars(data_dir / "backups", "nerdit-backup-*.tar.gz"),
+        "volume_backups": lambda: _walk_tars(data_dir / "backups", "nerdit-volumes-*.tar.gz"),
+        "dumps": lambda: _walk_tars(data_dir / "backups", DUMP_TAR_GLOB),
+        # Leftover staging dirs are invisible disk: a crash
         # between a dump's staging mkdir and its ``finally`` leaves one behind
         # until the next boot sweep. Counted so an operator can SEE that.
         "dump_staging": lambda: du_bytes(dump_staging_root(data_dir)),
@@ -1629,7 +1588,7 @@ async def _build_disk_report(
             # Per-database volume tars: a disjoint glob from `backups`,
             # default-0 accumulate-forever, so counted explicitly here.
             "volume_backups": results.get("volume_backups") or {"bytes": 0, "count": 0},
-            # (P37) Logical dump tars — a third disjoint glob, swept per service
+            # Logical dump tars — a third disjoint glob, swept per service
             # by ``[retention].dump_keep_last`` (default 5).
             "dumps": results.get("dumps") or {"bytes": 0, "count": 0},
             # Bytes still sitting in ``<data_dir>/dump-staging/``; ``null`` when
@@ -1719,7 +1678,7 @@ async def _run_gc(request: Request, *, dry_run: bool, include_orphan_data: bool)
     # Ownership scope: only images this daemon built are reclaimable. A
     # co-located sibling daemon's `nerdit-app/*` images look orphan through our
     # DB (their rows live in the sibling's DB) — the instance label is what stops
-    # us deleting them (PR #81 container scoping, extended to images).
+    # us deleting them (container scoping, extended to images).
     orphan_repos = _orphan_app_repos(detailed, live_repos, protected, _instance_id(settings))
 
     images_removed: list[str] = []
@@ -1789,7 +1748,7 @@ async def _run_gc(request: Request, *, dry_run: bool, include_orphan_data: bool)
     # as /system/disk. `asyncio.to_thread` borrows the loop's *default* executor,
     # and a du walk still running there at `asyncio.run` teardown is JOINED —
     # under uvloop unboundedly — so a gc overlapping a /daemon/restart while a huge
-    # weights tree is walked wedges the re-exec (the c38c1d4 rule; F8). Overrun ⇒
+    # weights tree is walked wedges the re-exec. Overrun ⇒
     # null sizes + a `scan_timeout` warning, never a blocked loop. These values
     # are report-only: no destructive step depends on them.
     report_walks: dict[str, Callable[[], Any]] = {
@@ -1838,7 +1797,7 @@ async def _run_gc(request: Request, *, dry_run: bool, include_orphan_data: bool)
     }
 
 
-# --- POST /system/backup (P14c WP-B3) -----------------------------------------
+# --- POST /system/backup -----------------------------------------------------
 
 _BACKUP_CUSTODY_HINT = (
     "This archive contains the secrets master key (secrets.key). Copy it off-box "
@@ -1878,7 +1837,7 @@ async def create_backup_route(request: Request) -> BackupResponse:
         mark_request_side_effect()
         try:
             # The secrets and DB snapshots are sequenced, never atomic, and
-            # (enc file, variables.plain) is a cross-store pair (D-P40-1): a
+            # (enc file, variables.plain) is a cross-store pair: a
             # secret->plain flip landing between them would restore as an old
             # secret flagged plain. No variable write runs while a backup stages.
             # ponytail: held for the whole staging, not just the two snapshots.
@@ -1890,10 +1849,9 @@ async def create_backup_route(request: Request) -> BackupResponse:
                     # Neither the node-link private key nor the product license ever
                     # enters a backup tar, even when an operator-chosen
                     # [link].key_file / [license].file sits inside a captured tree
-                    # (P27 WP-C3 item 3 — a tar that can impersonate a node changes
-                    # the custody story; P17d D-LIC7 — a license is re-issuable, and
-                    # keeping it out keeps customer_id out of a tar that already
-                    # demands careful custody for the master key).
+                    # (a tar that can impersonate a node changes the custody story;
+                    # a license is re-issuable, and keeping it out keeps customer_id
+                    # out of a tar that already demands custody for the master key).
                     exclude_paths=(
                         resolve_key_file(settings.link.key_file, str(data_dir)),
                         resolve_license_file(settings.license.file, str(data_dir)),
@@ -1901,7 +1859,7 @@ async def create_backup_route(request: Request) -> BackupResponse:
                 )
         except SecretRotationInProgress as exc:
             # Reuse the class+code, never str(exc) — its message embeds the
-            # absolute staged-key path (D2/M3).
+            # absolute staged-key path.
             raise NerditError(
                 409,
                 "secret.rotation_in_progress",
@@ -1929,7 +1887,7 @@ async def create_backup_route(request: Request) -> BackupResponse:
         )
 
 
-# --- POST /system/backup/volumes (P15 WP7 — backup v2) ------------------------
+# --- POST /system/backup/volumes ---------------------------------------------
 
 _VOLUME_BACKUP_CUSTODY_HINT = (
     "This archive contains all database data and the SCRAM password verifiers "
@@ -1966,11 +1924,11 @@ async def create_volume_backup_route(
     backup.not_a_database` otherwise — app-volume backup is a later
     generalization). The tar lands under `<data_dir>/backups/` named
     `nerdit-volumes-<service>-*` — OUTSIDE the v1 control-plane glob, so the
-    P14b retention/disk walkers never sweep it. Idempotent and audited
+    control-plane retention/disk walkers never sweep it. Idempotent and audited
     `system.backup_volume` with `{service, backup: basename}` only (never the
     path or size). Guarded by the shared `_backup_lock` so a volume capture and
     a control-plane capture never interleave; `409 backup.in_progress` /
-    `500 backup.failed` reuse the P14c path-free codes. Unlike the control-plane
+    `500 backup.failed` reuse the control-plane path-free codes. Unlike the control-plane
     tar this NEVER contains the secrets master key (`contains_master_key` is
     always false).
     """

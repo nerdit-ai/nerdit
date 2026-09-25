@@ -12,7 +12,7 @@ from collections.abc import Collection, Iterable
 
 from nerdit.core.project_identity import DEFAULT_SERVICE, PRODUCTION, mint_project_id, service_label
 from nerdit.db.models import Job
-from nerdit.db.rows import Project, VariableFlag
+from nerdit.db.rows import LinkedProjectService, Project, VariableFlag
 
 from ._base import (
     _JOB_SELECT,
@@ -25,7 +25,7 @@ from ._base import (
     _serialized,
 )
 
-_PROJECT_SELECT = "SELECT id, name, submitted_by_token, created_at FROM projects"
+_PROJECT_SELECT = "SELECT id, name, display_name, submitted_by_token, created_at FROM projects"
 
 
 class ProjectQueries(QueriesBase):
@@ -37,11 +37,34 @@ class ProjectQueries(QueriesBase):
         row = await cursor.fetchone()
         return self._row_to_project(row) if row is not None else None
 
+    async def get_committed_project_services(
+        self, project_id: str
+    ) -> tuple[Project, list[LinkedProjectService]] | None:
+        """Read a complete identity/publication snapshot after pending writes settle."""
+        async with self._db.write_lock:
+            project = await self.get_project(project_id)
+            if project is None:
+                return None
+            cursor = await self._db.conn.execute(
+                "SELECT j.id AS job_id, j.service_name, j.environment, j.service, s.access, "
+                "EXISTS(SELECT 1 FROM service_endpoints e WHERE e.service_name = j.service_name "
+                "AND e.job_id = j.id) AS has_endpoint "
+                "FROM jobs j LEFT JOIN service_shares s ON s.service_name = j.service_name "
+                "WHERE j.project_id = ? AND j.kind = 'service' ORDER BY j.id",
+                (project_id,),
+            )
+            return project, [LinkedProjectService(**dict(row)) for row in await cursor.fetchall()]
+
     async def get_project_by_name(self, name: str) -> Project | None:
         """The project with this unique name, or `None`."""
         cursor = await self._db.conn.execute(f"{_PROJECT_SELECT} WHERE name = ?", (name,))
         row = await cursor.fetchone()
         return self._row_to_project(row) if row is not None else None
+
+    async def list_project_names(self) -> set[str]:
+        """Every project name (the workspace sweep's project-side live set)."""
+        cursor = await self._db.conn.execute("SELECT name FROM projects")
+        return {row[0] for row in await cursor.fetchall()}
 
     async def page_projects(
         self, *, names: Collection[str] | None = None, cursor: str | None = None, limit: int = 50
@@ -160,6 +183,15 @@ class ProjectQueries(QueriesBase):
         return project
 
     @_serialized
+    async def rename_project(self, project_id: str, name: str) -> Project | None:
+        """Change the display label without moving any operational namespace."""
+        await self._db.conn.execute(
+            "UPDATE projects SET display_name = ? WHERE id = ?", (name, project_id)
+        )
+        await self._db.conn.commit()
+        return await self.get_project(project_id)
+
+    @_serialized
     async def delete_project_checked(self, project_id: str) -> list[str] | None:
         """Delete the `projects` row once nothing references it (P40b / D-P40-17).
 
@@ -258,6 +290,7 @@ class ProjectQueries(QueriesBase):
         return Project(
             id=row["id"],
             name=row["name"],
+            display_name=row["display_name"],
             submitted_by_token=row["submitted_by_token"],
             created_at=row["created_at"],
         )

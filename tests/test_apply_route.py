@@ -22,6 +22,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+import nerdit.daemon.deploy_pipeline as pipeline
 import nerdit.daemon.routes.deploy as deploy_mod
 import nerdit.daemon.routes.projects as projects_mod
 from nerdit.config.settings import ServicesSettings
@@ -185,7 +186,7 @@ async def env(tmp_path, monkeypatch):
     legacy_extract = AsyncMock(side_effect=deploy_mod.extract_upload)
     monkeypatch.setattr(deploy_mod, "extract_upload", legacy_extract)
     clone = _fake_clone()
-    monkeypatch.setattr(deploy_mod, "clone_source", clone)
+    monkeypatch.setattr(pipeline, "clone_source", clone)
 
     e = _Env(app, queries, db, extract, clone)
     async with e.client:
@@ -267,12 +268,30 @@ async def test_apply_never_carries_auto_deploy_forward(env):
     assert json.loads(row.config)["auto_deploy"] is False
 
 
-async def test_git_source_clones_once_to_read_and_once_per_service(env):
+async def test_git_source_clones_once_for_every_service(env, monkeypatch):
+    """One clone per apply: a moving ref cannot split the services across commits."""
+    clone = _fake_clone()
+    shas = iter("abc")
+
+    async def _moving_head(*args, **kwargs) -> GitSourceInfo:
+        info = await clone.side_effect(*args, **kwargs)
+        return GitSourceInfo(
+            commit_sha=next(shas) * 40,
+            resolved_ref=info.resolved_ref,
+            context_dir=info.context_dir,
+        )
+
+    moving = AsyncMock(side_effect=_moving_head)
+    monkeypatch.setattr(pipeline, "clone_source", moving)
     resp = await env.apply_git(ref="main")
     assert resp.status_code == 200, resp.text
-    assert env.clone.await_count == 3
-    api = await env.queries.get_service_by_name("api--asso")
-    source = json.loads(api.config)["source"]
+    assert moving.await_count == 1
+    sources = [
+        json.loads((await env.queries.get_service_by_name(label)).config)["source"]
+        for label in ("asso", "api--asso")
+    ]
+    assert {s["commit_sha"] for s in sources} == {"a" * 40}
+    source = sources[1]
     assert source["type"] == "git" and source["repo_url"] == REPO and source["ref"] == "main"
     assert (await env.audit("project.apply"))[0][1]["source"] == "git"
 
@@ -517,10 +536,10 @@ async def test_git_declaration_refusal_happens_after_the_read_clone_and_writes_n
     env, monkeypatch
 ):
     clone = _fake_clone(DECLARATION.replace('"asso"', '"blog"'))
-    monkeypatch.setattr(deploy_mod, "clone_source", clone)
+    monkeypatch.setattr(pipeline, "clone_source", clone)
     resp = await env.apply_git()
     assert resp.status_code == 422 and resp.json()["code"] == "project.name_mismatch"
-    assert clone.await_count == 1  # the read, and no per-service clone
+    assert clone.await_count == 1  # the one clone per apply
     assert await env.count("jobs") == 0 and await env.count("projects") == 0
     assert not list((Path(env.app.state.settings.daemon.upload_dir)).glob("*"))
 
@@ -631,7 +650,57 @@ async def test_a_nested_nerdit_toml_under_a_declared_subdir_is_ignored(env):
     assert "release" not in config and "ai" not in config
 
 
+@pytest.mark.parametrize(
+    "alias", ["nerdit.toml", "./nerdit.toml", "././nerdit.toml", "NERDIT.TOML"]
+)
+async def test_duplicate_declaration_paths_are_rejected_before_mutation(env, alias):
+    buf = io.BytesIO(_zip())
+    with zipfile.ZipFile(buf, "a") as zf:
+        zf.writestr(alias, DECLARATION.replace("port = 8000", "port = 8080"))
+    resp = await env.client.post(
+        "/projects/asso/apply",
+        files={"archive": ("app.zip", buf.getvalue(), "application/zip")},
+        headers=_auth(A_RAW),
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == "deploy.invalid_zip"
+    assert await env.count("projects") == 0 and await env.count("jobs") == 0
+    env.untouched()
+
+
 # --- the legacy ingresses refuse a declaration ----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("subdir", "alias"),
+    [
+        (".", "NERDIT.TOML"),
+        ("apps/api", "apps/api/NERDIT.TOML"),
+        ("apps/api", "apps/API/NERDIT.TOML"),
+    ],
+)
+async def test_legacy_deploy_rejects_case_aliased_declaration(env, subdir, alias):
+    resp = await env.client.post(
+        "/deploy",
+        files={
+            "archive": (
+                "app.zip",
+                _zip(
+                    None,
+                    extra={
+                        str(Path(subdir) / "nerdit.toml"): DECLARATION,
+                        alias: "[deploy]\nport = 8000\n",
+                    },
+                ),
+                "application/zip",
+            )
+        },
+        data={"name": "asso", "build_settings": json.dumps({"subdir": subdir})},
+        headers=_auth(A_RAW),
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == "deploy.invalid_zip"
+    assert await env.count("projects") == 0 and await env.count("jobs") == 0
 
 
 async def test_legacy_zip_deploy_of_a_declaration_is_422_use_apply(env):
@@ -649,7 +718,7 @@ async def test_legacy_zip_deploy_of_a_declaration_is_422_use_apply(env):
 
 @pytest.mark.parametrize("toml", ['[project]\nname = "asso"\n', "[services]\n"])
 async def test_legacy_git_deploy_of_a_declaration_is_422_use_apply(env, monkeypatch, toml):
-    monkeypatch.setattr(deploy_mod, "clone_source", _fake_clone(toml))
+    monkeypatch.setattr(pipeline, "clone_source", _fake_clone(toml))
     resp = await env.client.post(
         "/deploy/git", json={"repo_url": REPO, "name": "asso"}, headers=_auth(A_RAW)
     )
@@ -742,3 +811,84 @@ async def test_workspace_is_a_third_exclusive_source(env):
         headers=_auth(A_RAW),
     )
     assert resp.status_code == 422 and resp.json()["code"] == "project.apply_source"
+
+
+async def test_apply_immutable_id_uses_current_name_and_preserves_owner(env):
+    row = await env.queries.create_project("asso", "tok-a")
+    result = await env.apply(project=row.id)
+    assert result.status_code == 200, result.text
+    assert result.json()["project"] == "asso"
+    jobs = await env.queries.list_project_services(row.id)
+    assert len(jobs) == 2 and {job.project_id for job in jobs} == {row.id}
+    denied = await env.apply(B_RAW, project=row.id)
+    assert denied.status_code == 409 and denied.json()["code"] == "project.owned"
+
+
+async def test_apply_retired_id_never_uses_same_name_replacement(env):
+    original = await env.queries.create_project("asso", "tok-a")
+    assert await env.queries.delete_project_checked(original.id) == []
+    replacement = await env.queries.create_project("asso", "tok-a")
+    for dry_run in (False, True):
+        result = await env.apply(project=original.id, params={"dry_run": str(dry_run).lower()})
+        assert result.status_code == 404
+    assert await env.queries.list_project_services(replacement.id) == []
+    env.untouched()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("toml", [DECLARATION, _NEEDS_KEY], ids=["complete", "missing"])
+async def test_apply_project_id_stays_pinned_during_source_read(env, monkeypatch, dry_run, toml):
+    original = await env.queries.create_project("asso", "tok-a")
+    read = projects_mod._read_declaration
+
+    async def replace_after_read(request, project, row, source):
+        data = await read(request, project, row, source)
+        assert await env.queries.delete_project_checked(original.id) == []
+        await env.queries.create_project("asso", "tok-a")
+        return data
+
+    monkeypatch.setattr(projects_mod, "_read_declaration", replace_after_read)
+    result = await env.apply(
+        project=original.id, toml=toml, params={"dry_run": str(dry_run).lower()}
+    )
+    assert result.status_code == 404, result.text
+    assert await env.count("jobs") == 0
+    assert (await env.queries.get_project_by_name("asso")).id != original.id
+    env.untouched()
+
+
+@pytest.mark.parametrize(
+    ("awaited", "toml", "dry_run"),
+    [
+        ("_missing_variables", _NEEDS_KEY, False),
+        ("_missing_variables", _NEEDS_KEY, True),
+        ("_preflight_service", DECLARATION, True),
+        ("_service_context", DECLARATION, True),
+        ("_finalize_deploy", DECLARATION, True),
+    ],
+)
+async def test_apply_project_id_is_rechecked_before_early_success(
+    env, monkeypatch, awaited, toml, dry_run
+):
+    original = await env.queries.create_project("asso", "tok-a")
+    original_call = getattr(projects_mod, awaited)
+    replaced = False
+
+    async def replace_after_await(*args, **kwargs):
+        nonlocal replaced
+        result = await original_call(*args, **kwargs)
+        if not replaced:
+            assert await env.queries.delete_project_checked(original.id) == []
+            await env.queries.create_project("asso", "tok-a")
+            replaced = True
+        return result
+
+    monkeypatch.setattr(projects_mod, awaited, replace_after_await)
+    result = await env.apply(
+        project=original.id, toml=toml, params={"dry_run": str(dry_run).lower()}
+    )
+    assert result.status_code == 404, result.text
+    assert result.json()["code"] == "not_found"
+    assert "missing" not in result.json() and "services" not in result.json()
+    assert await env.count("jobs") == 0
+    assert (await env.queries.get_project_by_name("asso")).id != original.id

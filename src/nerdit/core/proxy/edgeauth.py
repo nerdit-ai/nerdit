@@ -26,8 +26,7 @@ BCRYPT_MAX_PASSWORD_BYTES = 72
 
 # The fix for an over-length password is a SHORTER SECRET, never the
 # declaration — the default EdgeAuthInvalid sentence would send the operator
-# to `nerdit config app set`, which cannot help here (review-upheld P25
-# finding).
+# to `nerdit config app set`, which cannot help here.
 BCRYPT_LIMIT_HINT = (
     "the resolved password exceeds bcrypt's "
     f"{BCRYPT_MAX_PASSWORD_BYTES}-byte input limit; set a shorter secret "
@@ -54,7 +53,7 @@ class EdgeAuthSpec:
     password_ref: str
 
 
-class EdgeAuthInvalid(Exception):  # noqa: N818 — name locked by P25 §3.4.2
+class EdgeAuthInvalid(Exception):  # noqa: N818 — public name, kept stable
     """A persisted `edge_auth` blob is present but unusable.
 
     Carries the offending FIELD NAMES only (`user` / `password`), never
@@ -62,8 +61,7 @@ class EdgeAuthInvalid(Exception):  # noqa: N818 — name locked by P25 §3.4.2
 
     `hint` overrides the default repair-the-declaration sentence for the
     one case where the declaration is fine and the SECRET is the problem
-    (the bcrypt length refusal below) — a log line pointing an operator at
-    the wrong fix is a review-upheld defect, not a nicety.
+    (the bcrypt length refusal below), so the log points at the right fix.
     """
 
     def __init__(self, fields: tuple[str, ...], hint: str | None = None) -> None:
@@ -87,12 +85,12 @@ class EdgeAuthMaterial:
 
 
 def load_edge_auth(raw: object) -> EdgeAuthSpec | None:
-    """Tolerantly re-read a persisted edge_auth blob (D-P22-3 HealthCheck posture).
+    """Tolerantly re-read a persisted edge_auth blob, like `HealthCheck`.
 
     TRI-STATE, and the three states are NOT interchangeable:
 
     * absent / `raw is None`  → `None`: no edge auth, the route serves
-      openly — today's behaviour for every existing row;
+      openly;
     * declared and well-formed → the `EdgeAuthSpec`;
     * declared but MALFORMED (blank/missing `user`, missing `password`,
       or a `password` that does not match `SECRET_REF_RE`) → **raise**
@@ -159,14 +157,14 @@ def hash_password(plaintext: str) -> str:
     imported by value into `manager.py`) so tests can patch it: bcrypt salts
     per call, so its output is never byte-stable and a golden snapshot needs a
     deterministic stand-in. That same per-call salting is why
-    `ProxyManager._auth_cache` exists — see D-P25-6 for the (bounded,
-    convergent) one-upsert-per-authed-service churn after a restart.
+    `ProxyManager._auth_cache` exists; after a restart each authed service
+    still costs one (convergent) upsert, since the cache is memory-only.
 
     Raises `EdgeAuthInvalid` naming `password` — never the value —
     when the resolved plaintext exceeds bcrypt's 72-byte input limit (bcrypt
     >= 4 refuses rather than silently truncating, and truncating a credential
     on the user's behalf is worse than refusing to serve it). The caller
-    already routes `EdgeAuthInvalid` into the D-P25-8 fail-closed path; the
+    already routes `EdgeAuthInvalid` into the fail-closed path; the
     hint names the SECRET as the fix — the declaration is fine here — and
     `password_exceeds_bcrypt_limit` is the single source of the bound
     so the diagnose classifier can mirror it exactly.

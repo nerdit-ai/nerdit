@@ -278,7 +278,7 @@ async def test_on_launched_leaves_cleared_when_new_container_never_ready(queries
 async def test_on_launched_cancels_in_flight_probe_for_old_container(queries, tmp_path):
     """A relaunch cancels the previous container's in-flight probe before arming B.
 
-    An in-flight ``_ensure_ready`` for container A could otherwise stamp db_ready
+    An in-flight ``_ensure`` for container A could otherwise stamp db_ready
     AFTER on_launched's clear (its success write racing the relaunch), and its
     presence in ``_ensure_tasks`` would also block arming B's probe (the
     ``job.id in self._ensure_tasks`` guard). on_launched pops+cancels+reaps it
@@ -316,7 +316,7 @@ async def test_probe_does_not_stamp_after_container_moved(queries, tmp_path):
 
     Defense in depth: an in-flight probe whose success write lands after the row's
     container_id already advanced to a replacement would re-assert the stale-ready
-    lie ``on_launched`` just cleared. ``_ensure_ready`` re-checks the current
+    lie ``on_launched`` just cleared. ``_ensure`` re-checks the current
     container_id before stamping and skips on a mismatch.
     """
     runtime = FakeRuntime()
@@ -326,7 +326,7 @@ async def test_probe_does_not_stamp_after_container_moved(queries, tmp_path):
 
     async with FakePostgres() as pg:
         # Drive the probe as if it had been launched for the OLD container A.
-        await controller._ensure_ready(job, json.loads(job.config), pg.port, "A")
+        await controller._ensure(job, json.loads(job.config), pg.port, "A")
 
     row = await queries.get_job(job.id)
     assert "db_ready" not in json.loads(row.config)  # A's success did NOT stamp

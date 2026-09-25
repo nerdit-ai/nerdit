@@ -71,6 +71,14 @@ class EndpointQueries(QueriesBase):
             next_cursor = _encode_name_cursor(items[-1].service_name)
         return items, next_cursor
 
+    async def get_reserved_service_ports(self) -> set[int]:
+        """Read every stable and cutover port after pending writes settle."""
+        async with self._db.write_lock:
+            cursor = await self._db.conn.execute(
+                "SELECT host_port, active_host_port FROM service_endpoints"
+            )
+            return {port for row in await cursor.fetchall() for port in row if port is not None}
+
     async def get_service_endpoint(self, service_name: str) -> ServiceEndpoint | None:
         """Return the durable host-port reservation for `service_name`, or `None`."""
         cursor = await self._db.conn.execute(
@@ -128,7 +136,13 @@ class EndpointQueries(QueriesBase):
             existing = await cursor.fetchone()
             if existing is not None:
                 held = existing["host_port"]
-                if is_bindable is None or is_bindable(held):
+                cursor = await self._db.conn.execute(
+                    "SELECT 1 FROM service_endpoints WHERE active_host_port = ? "
+                    "AND service_name != ?",
+                    (held, service_name),
+                )
+                used_by_cutover = await cursor.fetchone() is not None
+                if not used_by_cutover and (is_bindable is None or is_bindable(held)):
                     await self._db.conn.execute(
                         "UPDATE service_endpoints SET job_id = ?, container_port = ? "
                         "WHERE service_name = ?",
@@ -143,8 +157,10 @@ class EndpointQueries(QueriesBase):
                     "DELETE FROM service_endpoints WHERE service_name = ?", (service_name,)
                 )
 
-            cursor = await self._db.conn.execute("SELECT host_port FROM service_endpoints")
-            used = {r["host_port"] for r in await cursor.fetchall()}
+            cursor = await self._db.conn.execute(
+                "SELECT host_port, active_host_port FROM service_endpoints"
+            )
+            used = {port for row in await cursor.fetchall() for port in row if port is not None}
             chosen: int | None = None
             for port in range(lo, hi + 1):
                 if port == DEFAULT_PORT or port in used:

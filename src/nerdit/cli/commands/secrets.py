@@ -14,7 +14,7 @@ from uuid import uuid4
 import typer
 
 from nerdit.cli.commands.deploy import parse_env_pairs
-from nerdit.cli.display import _plain, console, render_client_error
+from nerdit.cli.display import _plain, call_or_exit, console, render_client_error
 from nerdit.core.secrets import validate_secret_items
 
 SHARED_SERVICE = "shared"
@@ -109,11 +109,7 @@ async def _set_async(service: str, values: dict[str, str]) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        result = await client.set_secrets(service, values, idempotency_key=uuid4().hex)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    result = await call_or_exit(client.set_secrets(service, values, idempotency_key=uuid4().hex))
     _print_keys(result)
 
 
@@ -133,11 +129,7 @@ async def _list_async(service: str) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        result = await client.list_secrets(service)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    result = await call_or_exit(client.list_secrets(service))
     _print_keys(result)
 
 
@@ -192,11 +184,7 @@ async def _rotate_key_async() -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        result = await client.rotate_secrets_key(idempotency_key=uuid4().hex)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    result = await call_or_exit(client.rotate_secrets_key(idempotency_key=uuid4().hex))
     console.print(
         f"[green]Rotated secrets key — {result.get('services_rewritten', 0)} "
         "file(s) re-encrypted.[/green]"

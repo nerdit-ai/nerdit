@@ -388,9 +388,10 @@ async def test_follow_polling_service_stops_on_completed(monkeypatch):
     # The follower terminated on ``completed`` (initial fetch + one final drain,
     # no infinite loop).
     assert len(fake.logs_calls) == 2
-    from nerdit.cli.commands.logs import _SERVICE_TERMINAL
+    from nerdit.db.enums import TERMINAL_STATUSES
 
-    assert "completed" in _SERVICE_TERMINAL
+    assert "completed" in TERMINAL_STATUSES
+    assert "stopped" in TERMINAL_STATUSES
 
 
 # ---- nerdit services wait: the exit contract, one mapping, two callers (P23 WP2) ----

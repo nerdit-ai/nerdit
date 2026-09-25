@@ -62,7 +62,6 @@ from nerdit.core.link.identity import (
     resolve_key_file,
     sign_node_proof,
     valid_public_reference,
-    verify_node_proof,
 )
 from nerdit.core.link.manager import (
     AUTH_FAILURE_LIMIT,
@@ -131,5 +130,4 @@ __all__ = [
     "sign_node_proof",
     "stream_error_frame",
     "valid_public_reference",
-    "verify_node_proof",
 ]

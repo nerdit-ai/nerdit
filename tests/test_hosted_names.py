@@ -13,7 +13,6 @@ import pytest
 from nerdit.core.link.hosted import (
     HOSTED_SEPARATOR,
     MAX_DNS_LABEL,
-    SERVICE_NAME_RE,
     hosted_host,
     hosted_label,
     hosted_label_fits,
@@ -21,6 +20,7 @@ from nerdit.core.link.hosted import (
     is_service_name,
 )
 from nerdit.daemon.schemas.services import ServiceCreateRequest
+from nerdit.utils.names import DNS_LABEL_RE
 
 # --- composition --------------------------------------------------------------
 
@@ -110,4 +110,4 @@ def test_grammar_matches_the_api_service_name_pattern():
     API accepts must be routable, and one it refuses must not be."""
     field = ServiceCreateRequest.model_fields["name"]
     patterns = [m.pattern for m in field.metadata if hasattr(m, "pattern")]
-    assert SERVICE_NAME_RE.pattern in patterns
+    assert DNS_LABEL_RE.pattern in patterns

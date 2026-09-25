@@ -28,7 +28,7 @@ from nerdit.daemon.sse import (
     saturated_frame,
 )
 from nerdit.daemon.views.service import _not_found, _resolve_service
-from nerdit.db.models import JobStatus
+from nerdit.db.enums import TERMINAL_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -48,19 +48,6 @@ _POLL_INTERVAL_S = 1.0
 #: in bounded batches; consecutive non-empty polls skip the sleep, so catching
 #: up is fast without ever holding an unbounded result set.
 _POLL_CHUNK = 500
-
-#: Statuses at which a service is genuinely finished. `degraded` and
-#: `restarting` are deliberately ABSENT: they are transient desired-state
-#: churn a follower must tail *through*. Mirrors `_SERVICE_TERMINAL` in
-#: `cli/commands/logs.py` — the CLI poll-follower makes the same call.
-_TERMINAL_STATUSES = frozenset(
-    {
-        JobStatus.stopped,
-        JobStatus.failed,
-        JobStatus.completed,
-        JobStatus.cancelled,
-    }
-)
 
 
 def _log_frame(entry: Any) -> dict[str, str]:
@@ -179,7 +166,7 @@ async def _log_frames(
             if job is None:
                 yield _end_frame("deleted")
                 return
-            if job.status in _TERMINAL_STATUSES:
+            if job.status in TERMINAL_STATUSES:
                 async for frame in _drain_to_end(request, poll, cursor, job.status.value):
                     yield frame
                 return

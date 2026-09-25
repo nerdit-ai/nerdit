@@ -104,12 +104,6 @@ class EventQueries(QueriesBase):
         """Highest feed id, or `0` on an empty table (the new-target cursor)."""
         return await self._scalar_int("SELECT COALESCE(MAX(id), 0) FROM events")
 
-    async def min_event_id(self) -> int:
-        """Return the oldest retained ID, or zero when empty, for detecting pruned resume
-        cursors.
-        """
-        return await self._scalar_int("SELECT COALESCE(MIN(id), 0) FROM events")
-
     async def feed_bounds(self) -> tuple[int, int]:
         """Return min/max retained IDs in one consistent statement, or (0, 0) for an empty feed."""
         cursor = await self._db.conn.execute(

@@ -36,6 +36,8 @@ from typing import Any, Literal
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from nerdit.utils.fs import fsync_dir
+
 # ---------------------------------------------------------------------------
 # Pinned trust store (D-LIC3)
 # ---------------------------------------------------------------------------
@@ -635,7 +637,7 @@ def install_license_file(path: Path, blob: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
-        _fsync_dir(parent)
+        fsync_dir(parent)
     except (OSError, ValueError) as exc:
         # `ValueError` covers a path carrying an embedded NUL (`os.open`
         # raises it, not `OSError`); it has no `strerror`, so the detail
@@ -664,15 +666,6 @@ def remove_license_file(path: Path) -> bool:
         detail = getattr(exc, "strerror", None) or exc
         raise LicenseError(f"cannot remove license {path}: {detail}") from exc
     return True
-
-
-def _fsync_dir(path: Path) -> None:
-    """`fsync` a directory so a rename inside it survives power loss."""
-    dir_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
 
 
 # ---------------------------------------------------------------------------

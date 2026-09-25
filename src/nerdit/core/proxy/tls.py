@@ -30,11 +30,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: Name of the Caddy HTTP server block that carries the ACME HTTP-01 listener
-#:. One constant, two readers: `CaddyTlsMixin._bootstrap_config`
-#: writes it, and the supervisor asks the live admin API whether an ADOPTED
-#: Caddy actually carries it (review round 1) — a string literal in both places
-#: is exactly the drift that would make "listening" a lie.
+#: Name of the Caddy HTTP server block that carries the ACME HTTP-01 listener.
+#: One constant, two readers: `CaddyTlsMixin._bootstrap_config` writes it, and
+#: the supervisor asks the live admin API whether an ADOPTED Caddy actually
+#: carries it — a string literal in both places is exactly the drift that
+#: would make "listening" a lie.
 ACME_HTTP_SERVER = "nerdit-acme-http"
 
 
@@ -174,7 +174,7 @@ class CaddyTlsMixin:
         if acme_names:
             policies.append({"subjects": acme_names, "issuers": [self._acme_issuer()]})
         policies.append({"subjects": subjects, "issuers": [{"module": "internal"}]})
-        # The catch-all, LAST and subject-less (F4/F6). Deleting it would
+        # The catch-all, LAST and subject-less. Deleting it would
         # re-open public ACME as the fallback issuer for any Host-derived name
         # — see the module docstring.
         policies.append({"issuers": [{"module": "internal"}]})
@@ -232,13 +232,13 @@ class CaddyTlsMixin:
         return {
             "admin": {
                 "listen": self._settings.admin_addr,
-                # Never autosave the live config. Caddy's
-                # autosave file lives outside the daemon's `data_dir` and the
-                # live config carries bcrypt-hashed edge-auth material, so
-                # persistence here is credential sprawl for no benefit: the
-                # daemon reloads this bootstrap on every spawn and reconcile is
-                # the source of truth for routes. Applies to a Caddy WE spawn;
-                # an ADOPTED pre-WP1 process keeps autosaving until its next
+                # Never autosave the live config. Caddy's autosave file lives
+                # outside the daemon's `data_dir` and the live config carries
+                # bcrypt-hashed edge-auth material, so persistence here is
+                # credential sprawl for no benefit: the daemon reloads this
+                # bootstrap on every spawn and reconcile is the source of truth
+                # for routes. Applies to a Caddy WE spawn; an ADOPTED process
+                # spawned by an older daemon may keep autosaving until its next
                 # respawn (reconfiguring `/config/admin` restarts the admin
                 # listener mid-tick — not worth it). Documented in proxy.md.
                 "config": {"persist": False},
@@ -264,8 +264,8 @@ class CaddyTlsMixin:
                 # config. The wildcard in the POLICY subjects is load-bearing
                 # on its own: Caddy also auto-manages each Host-matched route
                 # name individually, and those auto-derived names get INTERNAL
-                # issuance because they match a policy — which since WP1 is
-                # guaranteed for EVERY name by the trailing catch-all (F4/F6).
+                # issuance because they match a policy — which the trailing
+                # catch-all guarantees for EVERY name.
                 #
                 # Custom domains are absent here on purpose: the DB is not
                 # readable at bootstrap time (this config is also passed as
@@ -302,11 +302,6 @@ class CaddyTlsMixin:
             logger.debug("[proxy] could not read service_domains for TLS", exc_info=True)
             return [], []
         return partition_domains(rows, acme_enabled=self._settings.acme.enabled)
-
-    async def _load_domain_names(self) -> list[str]:
-        """Every custom-domain name, sorted — the names half of the partition."""
-        names, _acme = await self._load_domain_partition()
-        return names
 
     async def _converge_tls(
         self,

@@ -604,7 +604,7 @@ class _FakeRuntime:
     async def inspect_state(self, cid):
         return None
 
-    async def logs(self, cid, follow=False, tail=None, max_bytes=None):
+    async def logs(self, cid, follow=False, tail=None, max_bytes=None, since=None):
         return
         yield  # pragma: no cover
 
@@ -791,3 +791,11 @@ def test_rotation_reencrypts_a_project_file_under_its_stem_aad(tmp_path):
     other.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
     with pytest.raises(SecretDecryptError):
         mgr.load(other.stem)
+
+
+def test_trailing_newline_label_is_rejected(tmp_path):
+    """S7: `$` admits a trailing newline under `.match`; the gate uses `fullmatch`."""
+    sm = SecretManager(tmp_path / "secrets")
+    with pytest.raises(InvalidServiceName):
+        sm.set("foo\n", {"K": "v"})
+    assert not list((tmp_path / "secrets").glob("foo*"))

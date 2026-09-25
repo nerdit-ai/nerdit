@@ -19,7 +19,8 @@ from nerdit.config.project import (
 )
 from nerdit.daemon.auth import current_principal, require_service_scope
 from nerdit.daemon.errors import NerditError
-from nerdit.db.models import Job, JobKind, JobStatus, TokenRole
+from nerdit.db.enums import TERMINAL_STATUSES
+from nerdit.db.models import Job, JobKind, TokenRole
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -37,15 +38,6 @@ DB_SHAPE_HINT = (
     "also requires database = '<db-name>'; 'external' requires a credential-free "
     "url (postgresql://|redis[s]://) and password = '${secrets.KEY}'."
 )
-
-# Statuses a model/database row may NOT be in for an [ai.*]/[db.*] binding to
-# deploy — the settled terminal set of `get_reconcilable_services`
-# (db/queries.py). Every other state (building/scheduled/running/degraded/
-# restarting) is converging or live, so deploy-during-provision works.
-MODEL_TERMINAL_STATUSES = frozenset(
-    {JobStatus.completed, JobStatus.cancelled, JobStatus.stopped, JobStatus.failed}
-)
-DB_TERMINAL_STATUSES = MODEL_TERMINAL_STATUSES
 
 
 def validate_deploy_fields(
@@ -137,7 +129,7 @@ async def require_served_models(queries, bindings: dict[str, AiBindingConfig]) -
         if binding.provider != "ollama":
             continue
         row = await queries.get_model_by_ref(binding.model)
-        if row is None or row.kind != JobKind.model or row.status in MODEL_TERMINAL_STATUSES:
+        if row is None or row.kind != JobKind.model or row.status in TERMINAL_STATUSES:
             raise NerditError(
                 422,
                 "ai.model_not_served",
@@ -257,7 +249,7 @@ async def require_provisioned_databases(  # noqa: ANN001
         # matches no row, so the 422 below still fires.
         database = binding.database or ""
         row = await queries.get_resource_by_ref(database, JobKind.database)
-        if row is None or row.kind != JobKind.database or row.status in DB_TERMINAL_STATUSES:
+        if row is None or row.kind != JobKind.database or row.status in TERMINAL_STATUSES:
             raise NerditError(
                 422,
                 "db.not_provisioned",

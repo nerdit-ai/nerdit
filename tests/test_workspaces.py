@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import os
 import threading
-import zipfile
 from pathlib import Path
 
 import pytest
@@ -28,6 +26,7 @@ from nerdit.core.workspaces import (
     WORKSPACE_MAX_PATH_BYTES,
     WORKSPACE_MAX_SEGMENT_BYTES,
     WorkspaceError,
+    copy_workspace,
     ensure_workspace_dirs,
     list_files,
     read_file,
@@ -38,7 +37,6 @@ from nerdit.core.workspaces import (
     workspace_lock,
     workspace_root,
     write_files,
-    zip_workspace,
 )
 
 NAME = "my-app"
@@ -492,10 +490,10 @@ def test_write_files_uses_the_caller_read_meta(tmp_path):
     assert meta["created_at"] == "2020-01-01T00:00:00+00:00"
 
 
-def test_meta_outside_tree_never_listed_never_zipped(tmp_path):
+def test_meta_outside_tree_never_listed_never_copied(tmp_path):
     _write(tmp_path, {"a.py": "1"})
     assert [e["path"] for e in list_files(tmp_path, NAME)["files"]] == ["a.py"]
-    assert _namelist(zip_workspace(tree_root(tmp_path, NAME))) == ["a.py"]
+    assert _copied(tree_root(tmp_path, NAME), tmp_path / "ctx") == ["a.py"]
 
 
 # --- listing / reading -----------------------------------------------------
@@ -540,7 +538,7 @@ def test_read_file_refuses_out_of_band_binary(tmp_path):
     """A non-UTF-8 file dropped onto disk stays inside the WorkspaceError contract.
 
     The writer refuses binary at write time (D-P29-2), so this is reachable only
-    by out-of-band tamper — the same scenario ``zip_workspace`` re-filters
+    by out-of-band tamper — the same scenario ``copy_workspace`` re-filters
     against. It must surface as a structured 422, never as a raw
     ``UnicodeDecodeError`` 500-ing through the route layer.
     """
@@ -553,57 +551,37 @@ def test_read_file_refuses_out_of_band_binary(tmp_path):
     assert "blob.bin" in exc.value.message
 
 
-# --- the zip ---------------------------------------------------------------
+# --- the snapshot copy -----------------------------------------------------
 
 
-def _namelist(blob: bytes) -> list[str]:
-    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
-        return zf.namelist()
+def _copied(tree: Path, dest: Path) -> list[str]:
+    copy_workspace(tree, dest)
+    return sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file())
 
 
-def test_zip_deterministic_bytes(tmp_path):
-    _write(tmp_path, {"a.py": "1", "src/b.py": "2"})
-    tree = tree_root(tmp_path, NAME)
-    first = zip_workspace(tree)
-    assert zip_workspace(tree) == first
-    _write(tmp_path, {"a.py": "1"})  # same content, rewritten
-    # A different mtime must not move a byte — the ZipInfo date_time is pinned,
-    # which is what makes two snapshots of identical content identical archives.
-    os.utime(tree / "a.py", (1_000_000_000, 1_000_000_000))
-    os.utime(tree / "src" / "b.py", (1_600_000_000, 1_600_000_000))
-    assert zip_workspace(tree) == first
-
-
-def test_zip_reapplies_excludes_and_secret_names(tmp_path):
-    _write(tmp_path, {"main.py": "ok"})
+def test_copy_carries_files_and_skips_tamper_and_symlinks(tmp_path):
+    _write(tmp_path, {"main.py": "ok", "src/b.py": "2"})
     tree = tree_root(tmp_path, NAME)
     # Dropped straight onto disk, bypassing the write-time guards.
     (tree / "node_modules").mkdir()
     (tree / "node_modules" / "x.js").write_text("junk", encoding="utf-8")
-    (tree / ".env").write_text("SECRET=1", encoding="utf-8")
-    assert _namelist(zip_workspace(tree)) == ["main.py"]
-
-
-def test_zip_empty_tree_raises_workspace_empty(tmp_path):
-    ensure_workspace_dirs(tmp_path, NAME)
-    tree = tree_root(tmp_path, NAME)
-    with pytest.raises(WorkspaceError) as exc:
-        zip_workspace(tree)
-    assert exc.value.code == "workspace.empty"
-
-    (tree / ".env").write_text("SECRET=1", encoding="utf-8")
-    with pytest.raises(WorkspaceError) as exc:
-        zip_workspace(tree)
-    assert exc.value.code == "workspace.empty"
-
-
-def test_zip_skips_symlinked_files(tmp_path):
-    _write(tmp_path, {"main.py": "ok"})
-    tree = tree_root(tmp_path, NAME)
+    (tree / ".ENV.local").write_text("SECRET=1", encoding="utf-8")
     secret = tmp_path / "outside.txt"
     secret.write_text("classified", encoding="utf-8")
     (tree / "leak.txt").symlink_to(secret)
-    assert _namelist(zip_workspace(tree)) == ["main.py"]
+    dest = tmp_path / "ctx"
+    assert _copied(tree, dest) == ["main.py", "src/b.py"]
+    assert (dest / "src" / "b.py").read_text(encoding="utf-8") == "2"
+
+
+def test_copy_empty_tree_raises_workspace_empty(tmp_path):
+    ensure_workspace_dirs(tmp_path, NAME)
+    tree = tree_root(tmp_path, NAME)
+    (tree / ".env").write_text("SECRET=1", encoding="utf-8")
+    with pytest.raises(WorkspaceError) as exc:
+        copy_workspace(tree, tmp_path / "ctx")
+    assert exc.value.code == "workspace.empty"
+    assert not (tmp_path / "ctx").exists()
 
 
 # --- lock registry ---------------------------------------------------------
@@ -776,7 +754,7 @@ def test_exclude_guard_is_case_insensitive(path):
     assert exc.value.code == "workspace.excluded_path"
 
 
-def test_zip_reapplies_the_casefolded_guards(tmp_path):
+def test_copy_reapplies_the_casefolded_guards(tmp_path):
     """Belt-and-braces: out-of-band files in the variant spelling never deploy."""
     _write(tmp_path, {"main.py": "ok\n"})
     tree = tree_root(tmp_path, NAME)
@@ -784,7 +762,7 @@ def test_zip_reapplies_the_casefolded_guards(tmp_path):
     (tree / "NODE_MODULES" / "x.js").write_text("nope\n", encoding="utf-8")
     (tree / ".ENV").write_text("K=v\n", encoding="utf-8")
 
-    assert _namelist(zip_workspace(tree)) == ["main.py"]
+    assert _copied(tree, tmp_path / "ctx") == ["main.py"]
 
 
 # --- C7: *.tmp-* residue -----------------------------------------------------
@@ -800,7 +778,7 @@ def test_tmp_basenames_are_refused(path):
 
 def test_stale_tmp_residue_is_invisible_and_swept(tmp_path):
     """A hard crash between tmp create and ``os.replace`` used to leave residue
-    inside ``tree/`` forever — counted against the caps, listed, and zipped."""
+    inside ``tree/`` forever — counted against the caps, listed, and deployed."""
     _write(tmp_path, {"main.py": "ok\n"})
     tree = tree_root(tmp_path, NAME)
     stale = tree / "main.py.tmp-99999"
@@ -811,7 +789,7 @@ def test_stale_tmp_residue_is_invisible_and_swept(tmp_path):
     listing = list_files(tmp_path, NAME)
     assert [e["path"] for e in listing["files"]] == ["main.py"]
     assert listing["total_bytes"] == len("ok\n")
-    assert _namelist(zip_workspace(tree)) == ["main.py"]
+    assert _copied(tree, tmp_path / "ctx") == ["main.py"]
 
     # The next write reclaims it (both the tree's and the sidecar's siblings).
     _write(tmp_path, {"other.py": "x\n"})

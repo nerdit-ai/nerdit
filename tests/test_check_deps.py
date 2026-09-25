@@ -1064,3 +1064,14 @@ class TestCheckDepsCommand:
         assert not called
         assert "no automatic installer" in result.output
         assert "update the NVIDIA driver on Windows" in result.output
+
+
+def test_find_dockerfile_ignores_the_working_directory(monkeypatch, tmp_path):
+    from nerdit.cli.commands.check_deps import _find_dockerfile
+
+    (tmp_path / "docker").mkdir()
+    (tmp_path / "docker" / "Dockerfile").write_text("FROM scratch\n")
+    monkeypatch.chdir(tmp_path)
+
+    found = _find_dockerfile()
+    assert found is None or not found.is_relative_to(tmp_path)

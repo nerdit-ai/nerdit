@@ -1327,18 +1327,11 @@ async def test_guarded_queries_return_false_on_version_mismatch_and_true_on_matc
     """
     await queries.create_job(_deploy_svc("app", version=2, release_pending=2))
     row = await queries.get_service_by_name("app")
-    blob = _cfg(row)
-    blob["release_pending"] = 99  # a visible marker only a real write can land
+    marker = {"release_pending": 99}  # a visible marker only a real write can land
 
-    assert (
-        await queries.update_job_config_guarded(row.id, json.dumps(blob), expect_build_version=1)
-        is False
-    )
+    assert await queries.patch_job_config(row.id, marker, expect_build_version=1) is False
     assert _cfg(await queries.get_service_by_name("app"))["release_pending"] == 2
-    assert (
-        await queries.update_job_config_guarded(row.id, json.dumps(blob), expect_build_version=2)
-        is True
-    )
+    assert await queries.patch_job_config(row.id, marker, expect_build_version=2) is True
     assert _cfg(await queries.get_service_by_name("app"))["release_pending"] == 99
 
     assert (

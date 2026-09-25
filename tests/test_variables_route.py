@@ -12,6 +12,7 @@ global token is the admin.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -322,6 +323,26 @@ async def test_a_composed_label_needs_a_row_inside_this_project(env):
         assert (resp.status_code, resp.json()["code"]) == (422, code)
 
 
+async def test_project_scoped_token_reaches_its_composed_service_scope(env):
+    """D-P40-7: a token scoped to `asso` reaches `api--asso` through the variables routes."""
+    assert (await _create(env, "asso", raw=SCOPED_RAW)).status_code == 201
+    await _service_row(env, "api--asso", "tok-scoped")
+    await env.db.conn.execute(
+        "UPDATE jobs SET project_id = (SELECT id FROM projects WHERE name = 'asso'), "
+        "service = 'api' WHERE service_name = 'api--asso'"
+    )
+    await env.db.conn.commit()
+    resp = await _put(env, "asso", {"K": SECRET}, raw=SCOPED_RAW, service="api")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["scope"] == "production/api"
+    assert (await _list(env, "asso", raw=SCOPED_RAW, service="api")).status_code == 200
+    assert (await _resolve(env, "asso", raw=SCOPED_RAW, service="api")).status_code == 200
+    assert (await _unset(env, "asso", "K", raw=SCOPED_RAW, service="api")).status_code == 200
+    # The legacy secrets surface stays label-only: the widening is the variables routes' alone.
+    resp = await env.client.get("/secrets/api--asso", headers=_auth(SCOPED_RAW))
+    assert resp.status_code == 403
+
+
 # --- precedence and the flag -------------------------------------------------------
 
 
@@ -594,3 +615,187 @@ async def test_delete_project_removes_the_project_file_and_the_flag_rows(env):
     # A recreated project starts empty: the id, and so the file, is new.
     await _create(env, "asso")
     assert _by_key(await _list(env, "asso")) == {}
+
+
+async def test_variable_id_resolves_inside_write_lock_and_keeps_local_ownership(env):
+    project = (await _create(env, "asso")).json()["id"]
+    await _service_row(env, "asso", "tok-a")
+    for service in (None, "web"):
+        result = await _put(env, project, {"MODE": "test"}, service=service, secret=False)
+        assert result.status_code == 200, result.text
+        assert result.json()["project"] == "asso"
+        assert _by_key(await _list(env, project, service=service))["MODE"]["value"] == "test"
+        assert (await _resolve(env, project, service=service)).status_code == 200
+        assert (
+            await _put(env, project, {"MODE": "foreign"}, raw=B_RAW, service=service)
+        ).status_code == 403
+        assert (await _unset(env, project, "MODE", service=service)).status_code == 200
+
+
+async def test_retired_project_id_cannot_create_or_write_same_name_replacement(env):
+    original = (await _create(env, "asso")).json()["id"]
+    assert await env.queries.delete_project_checked(original) == []
+    replacement = (await _create(env, "asso")).json()["id"]
+    for service in (None, "web"):
+        result = await _put(env, original, {"MODE": "stale"}, service=service)
+        assert result.status_code == 404
+    assert (await _list(env, replacement)).json()["variables"] == []
+    assert not env.mgr.exists(project_storage_name(original))
+
+
+async def test_idempotency_key_cannot_replay_across_project_incarnations(env):
+    original = (await _create(env, "asso")).json()["id"]
+    headers = {"Idempotency-Key": "one-project-only"}
+    assert (await _put(env, original, {"MODE": "old"}, headers=headers)).status_code == 200
+    assert await env.queries.delete_project_checked(original) == []
+    replacement = (await _create(env, "asso")).json()["id"]
+    result = await _put(env, replacement, {"MODE": "old"}, headers=headers)
+    assert result.status_code == 422 and result.json()["code"] == "idempotency_key_conflict"
+    assert (await _list(env, replacement)).json()["variables"] == []
+
+
+@pytest.mark.parametrize("service", [None, "web"])
+async def test_variable_id_is_rechecked_after_waiting_for_writer_lock(env, service):
+    original = (await _create(env, "asso")).json()["id"]
+    waiting = asyncio.Event()
+
+    class WriterLock(asyncio.Lock):
+        async def acquire(self):
+            waiting.set()
+            return await super().acquire()
+
+    lock = WriterLock()
+    env.app.state.variable_write_lock = lock
+    await lock.acquire()
+    waiting.clear()
+    task = asyncio.create_task(_put(env, original, {"MODE": "stale"}, service=service))
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        assert await env.queries.delete_project_checked(original) == []
+        replacement = (await _create(env, "asso")).json()["id"]
+    finally:
+        lock.release()
+    result = await task
+    assert result.status_code == 404
+    assert (await _list(env, replacement)).json()["variables"] == []
+    assert not env.mgr.exists("asso")
+
+
+@pytest.mark.parametrize("service", [None, "web"])
+async def test_project_retirement_waits_for_authorized_variable_writer(env, monkeypatch, service):
+    import nerdit.daemon.secret_scope as scopes
+
+    original = (await _create(env, "asso")).json()["id"]
+    judged, proceed, deletion_waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    judge = scopes.judge_project
+
+    class WriterLock(asyncio.Lock):
+        async def acquire(self):
+            if self.locked():
+                deletion_waiting.set()
+            return await super().acquire()
+
+    async def pause_after_identity(request, ident):
+        row = await judge(request, ident)
+        judged.set()
+        await proceed.wait()
+        return row
+
+    env.app.state.variable_write_lock = WriterLock()
+    monkeypatch.setattr(scopes, "judge_project", pause_after_identity)
+    write = asyncio.create_task(_put(env, original, {"MODE": "old"}, service=service, secret=False))
+    await asyncio.wait_for(judged.wait(), timeout=1)
+    delete = asyncio.create_task(env.client.delete(f"/projects/{original}", headers=_auth(A_RAW)))
+    try:
+        await asyncio.wait_for(deletion_waiting.wait(), timeout=1)
+        # The ID must remain authoritative while the writer still owns the lock.
+        assert await env.queries.get_project(original) is not None
+    finally:
+        proceed.set()
+        write_result, delete_result = await asyncio.gather(write, delete)
+    assert write_result.status_code == 200, write_result.text
+    assert write_result.json()["project"] == "asso"
+    assert delete_result.status_code == 200, delete_result.text
+    assert delete_result.json()["name"] == "asso"
+    replacement = (await _create(env, "asso")).json()["id"]
+    assert replacement != original
+    assert (await _put(env, original, {"MODE": "late"}, service=service)).status_code == 404
+    if service is not None:
+        assert env.mgr.load("asso")["MODE"] == "old"
+    else:
+        assert not env.mgr.exists(project_storage_name(original))
+
+
+@pytest.mark.parametrize("reader", [_list, _resolve], ids=["list", "resolve"])
+async def test_variable_reader_pins_identity_until_snapshot_finishes(env, monkeypatch, reader):
+    import nerdit.daemon.routes.projects as projects
+
+    original = (await _create(env, "asso")).json()["id"]
+    assert (
+        await _put(env, original, {"ORIGINAL_KEY": "original"}, service="web")
+    ).status_code == 200
+    judged, proceed, deletion_waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    owned = projects._owned
+
+    class WriterLock(asyncio.Lock):
+        async def acquire(self):
+            if self.locked():
+                deletion_waiting.set()
+            return await super().acquire()
+
+    async def pause_after_identity(request, ident):
+        row = await owned(request, ident)
+        judged.set()
+        await proceed.wait()
+        return row
+
+    env.app.state.variable_write_lock = WriterLock()
+    monkeypatch.setattr(projects, "_owned", pause_after_identity)
+    read = asyncio.create_task(reader(env, original, service="web"))
+    await asyncio.wait_for(judged.wait(), timeout=1)
+    delete = asyncio.create_task(env.client.delete(f"/projects/{original}", headers=_auth(A_RAW)))
+    try:
+        await asyncio.wait_for(deletion_waiting.wait(), timeout=1)
+        assert await env.queries.get_project(original) is not None
+    finally:
+        proceed.set()
+        read_result, delete_result = await asyncio.gather(read, delete)
+    assert read_result.status_code == 200, read_result.text
+    assert "ORIGINAL_KEY" in _by_key(read_result)
+    assert delete_result.status_code == 200, delete_result.text
+    replacement = (await _create(env, "asso")).json()["id"]
+    assert replacement != original
+    assert (
+        await _put(env, replacement, {"REPLACEMENT_KEY": "replacement"}, service="web")
+    ).status_code == 200
+    stale = await reader(env, original, service="web")
+    assert stale.status_code == 404 and "REPLACEMENT_KEY" not in stale.text
+
+
+@pytest.mark.parametrize("reader", [_list, _resolve], ids=["list", "resolve"])
+async def test_variable_reader_resolves_original_id_after_waiting_for_lock(env, reader):
+    original = (await _create(env, "asso")).json()["id"]
+    waiting = asyncio.Event()
+
+    class WriterLock(asyncio.Lock):
+        async def acquire(self):
+            waiting.set()
+            return await super().acquire()
+
+    lock = WriterLock()
+    env.app.state.variable_write_lock = lock
+    await lock.acquire()
+    waiting.clear()
+    read = asyncio.create_task(reader(env, original, service="web"))
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        # Simulate the operation already holding the lock retiring this identity.
+        assert await env.queries.delete_project_checked(original) == []
+        replacement = await env.queries.create_project("asso", "tok-a")
+        assert replacement.id != original
+        assert await env.queries.mint_secret_claim("asso", "tok-a")
+        env.mgr.set("asso", {"REPLACEMENT_KEY": "replacement"})
+    finally:
+        lock.release()
+    result = await read
+    assert result.status_code == 404 and "REPLACEMENT_KEY" not in result.text

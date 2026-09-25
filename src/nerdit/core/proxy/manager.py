@@ -12,6 +12,7 @@ pruning and ordering derive ownership from these IDs without caching domains.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -26,6 +27,7 @@ from urllib.parse import urlsplit
 
 from nerdit.config.defaults import DEFAULT_HOST, DEFAULT_PORT
 from nerdit.config.project import SECRET_REF_RE
+from nerdit.config.settings import LE_STAGING_DIRECTORY
 from nerdit.utils.certs import ca_fingerprint
 from nerdit.utils.install_layout import resolve_caddy_binary
 
@@ -116,7 +118,7 @@ def _spec_domain(spec: RouteSpec) -> str | None:
 
 
 class ProxyState(str, Enum):
-    """The observable lifecycle state of the embedded Caddy (P13b, 1.8).
+    """The observable lifecycle state of the embedded Caddy.
 
     A first-class projection of `ProxyManager`'s internal flags for the
     read-only `GET /proxy/status` surface, replacing the log-only
@@ -135,12 +137,12 @@ class ProxyState(str, Enum):
 class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
     """Owns the embedded Caddy process and reconciles service routes.
 
-    Process lifecycle (spawn/kill/respawn-backoff/adopt — the §1.3 patch
-    points) lives on `nerdit.core.proxy.supervisor.CaddySupervisorMixin`;
-    TLS subjects/bootstrap-config/adoption-sync live on
-    `nerdit.core.proxy.tls.CaddyTlsMixin`; this class owns route
-    shaping and the reconcile loop, and is the sole place state is
-    initialised (both mixins declare none).
+    Process lifecycle (spawn/kill/respawn-backoff/adopt) lives on
+    `nerdit.core.proxy.supervisor.CaddySupervisorMixin`; TLS
+    subjects/bootstrap-config/adoption-sync live on
+    `nerdit.core.proxy.tls.CaddyTlsMixin`; this class owns route shaping and
+    the reconcile loop, and is the sole place state is initialised (both
+    mixins declare none).
     """
 
     def __init__(
@@ -158,7 +160,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         self._queries = queries
         self._settings = settings
         self._hostname = hostname
-        # P9.5: pre-resolved `host:port` the apex catch-all reverse-proxies to
+        # Pre-resolved `host:port` the apex catch-all reverse-proxies to
         # (the daemon serving the dashboard + API). The host/port policy lives in
         # `server.py`; this module only dials what it is handed.
         self._dashboard_upstream = dashboard_upstream
@@ -166,10 +168,10 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         self._audit = audit
         self._admin = admin or CaddyAdmin(settings.admin_addr)
         # Resolve the binary once; `enabled` re-uses it so the gate is cheap.
-        # A frozen install prefers the Caddy bundled in its own
-        # tarball — the one tested combination for that release — but ONLY while
+        # A frozen install prefers the Caddy bundled in its own tarball — the
+        # one tested combination for that release — but ONLY while
         # `[proxy].caddy_binary` is untouched; an explicit value always wins,
-        # and a source checkout resolves through `PATH` exactly as before.
+        # and a source checkout resolves through `PATH`.
         self._binary = resolve_caddy_binary(settings.caddy_binary)
         self._pid_file = self._data_dir / "caddy.pid"
         self._log_file = self._data_dir / "caddy.log"
@@ -182,37 +184,35 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         # re-adoption re-checks; without it the _ensure_alive adopt branch (every
         # reconcile tick, ~5s) would re-verify TLS per tick.
         self._tls_synced = False
-        # Digest of the `apps.tls` subtree the latch above was
-        # set for. `_tls_synced` alone answered "has TLS been pushed at least
-        # once"; with custom domains the DESIRED subtree changes whenever a
-        # domain is added or removed, so the latch has to be keyed on content or
-        # a new domain would never get a certificate.
+        # Digest of the `apps.tls` subtree the latch above was set for. The
+        # DESIRED subtree changes whenever a custom domain is added or removed,
+        # so the latch is keyed on content or a new domain would never get a
+        # certificate.
         self._tls_hash: str | None = None
-        # Tri-state latch for the `nerdit-acme-http`
-        # listener: `None` = not yet determined for the current availability
-        # episode, `True`/`False` = the server block was/was not found on the
-        # live Caddy. `[proxy.acme]` is bound into the SPAWN-time bootstrap, so
-        # "the proxy is available" only implies "the :80 listener is bound" for a
-        # Caddy this process spawned with the current config. An ADOPTED one —
-        # the daemon was SIGKILLed after ACME was enabled and its Caddy outlived
-        # it — carries the `nerdit` server (so adoption succeeds) but no
-        # `nerdit-acme-http`, and inferring the bind from availability made
-        # `/proxy/status` and the doctor row both claim a listener that does
-        # not exist. Latched, so the extra admin read is once per episode, never
-        # per tick.
+        # Tri-state latch for the `nerdit-acme-http` listener: `None` = not yet
+        # determined for the current availability episode, `True`/`False` =
+        # the server block was/was not found on the live Caddy. `[proxy.acme]`
+        # is bound into the SPAWN-time bootstrap, so "the proxy is available"
+        # only implies "the :80 listener is bound" for a Caddy this process
+        # spawned with the current config. An ADOPTED one — the daemon was
+        # SIGKILLed after ACME was enabled and its Caddy outlived it — carries
+        # the `nerdit` server (so adoption succeeds) but no `nerdit-acme-http`,
+        # so inferring the bind from availability would make `/proxy/status`
+        # and the doctor row claim a listener that does not exist. Latched, so
+        # the extra admin read is once per episode, never per tick.
         self._acme_listener_live: bool | None = None
-        # The custom-domain route ids
-        # this manager last CONFIRMED live in Caddy — desired this tick AND
-        # present in the live table. It is the only fact that distinguishes a
-        # bound domain that answers from one that is merely stored: a row exists
-        # from the moment of the PUT, while its Host route lands on the next
-        # reconcile tick, and never at all while `_converge_tls` fails. Read
-        # by `views/hosted.py` through `live_domain_route_ids`; empty is
-        # the fail-closed value, so every path that ends a Caddy process's
-        # lifetime clears it (`_invalidate_convergence`).
+        # The custom-domain route ids this manager last CONFIRMED live in
+        # Caddy — desired this tick AND present in the live table. It is the
+        # only fact that distinguishes a bound domain that answers from one
+        # that is merely stored: a row exists from the moment of the PUT, while
+        # its Host route lands on the next reconcile tick, and never at all
+        # while `_converge_tls` fails. Read by `views/hosted.py` through
+        # `live_domain_route_ids`; empty is the fail-closed value, so every
+        # path that ends a Caddy process's lifetime clears it
+        # (`_invalidate_convergence`).
         self._live_domain_ids: frozenset[str] = frozenset()
-        # Log-once latch for the "domain routes withheld because the
-        # TLS subtree has not converged" condition. Same shape as
+        # Log-once latch for the "domain routes withheld because the TLS
+        # subtree has not converged" condition. Same shape as
         # `_foreign_warned`: the condition is re-evaluated every ~5 s tick and
         # a persistent one must not write a line per tick.
         self._tls_withheld_warned = False
@@ -228,15 +228,15 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         # one-shot log latch) this tracks the live condition, so it is cleared
         # whenever the proxy is adopted, respawned, or turned off.
         self._conflict = False
-        # `(service_name, ref) -> plaintext | None` — a CALLABLE,
+        # `(service_name, project_id, ref) -> plaintext | None` — a CALLABLE,
         # never the `SecretManager`: the proxy resolves the one reference a row
         # declares and has no business enumerating the secret store. `None`
         # (unwired) makes every edge-auth declaration unresolvable, i.e. fail
         # closed, which is the correct posture for a daemon that somehow booted
         # without the wiring.
         self._secret_resolver = secret_resolver
-        # bcrypt is ~100 ms BY DESIGN, and the reconcile loop
-        # rebuilds every route object every tick, so the hash is memoized on
+        # bcrypt is ~100 ms BY DESIGN, and the reconcile loop rebuilds every
+        # route object every tick, so the hash is memoized on
         # `(service_name, user, sha256(plaintext))`. The username is part of
         # the key because the cached material EMBEDS it: keying on the digest
         # alone would return stale material — and therefore an unchanged
@@ -248,6 +248,9 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         # once per reconcile tick, so a permanent misconfiguration does not spam
         # a line every five seconds.
         self._edge_auth_failed: set[str] = set()
+        # register/deregister/reconcile each read the live table then write it;
+        # without one lock a tick can re-write a dial a cutover just replaced.
+        self._routes_lock = asyncio.Lock()
 
     def set_secret_resolver(self, resolver: Callable[[str, str | None, str], str | None]) -> None:
         """Wire the edge-auth `(service_name, project_id, ref)` resolver after construction.
@@ -291,13 +294,13 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
     def mode(self) -> str:
         return self._settings.mode
 
-    # -- read accessors (P13b, observability) ---------------------------------
+    # -- read accessors (observability) ----------------------------------------
 
     @property
     def state(self) -> ProxyState:
         """The current `ProxyState`, derived from the internal flags.
 
-        Precedence (1.8): `disabled` (proxy off) → `no_binary` (on but the
+        Precedence: `disabled` (proxy off) → `no_binary` (on but the
         `caddy` binary is unresolved) → `foreign_conflict` (the admin port is
         owned by a non-nerdit process) → `available` (up and ours) → `backoff`
         (a respawn has been attempted, waiting out the delay) → `starting` (on,
@@ -488,14 +491,12 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
     def _expected_shape(self) -> str:
         """The matcher shape a DEFAULT route must carry in the current mode.
 
-        Compared against `LiveRoute` `shape` by `register` /
-        `reconcile`: a live route whose dial matches but whose
-        matcher is the OTHER mode's shape is drift and must be upserted. It feeds `build_route`,
-        which STAMPS the answer onto the
-        spec; the drift comparisons then read `spec.shape`, never this
-        property. Custom-domain routes are Host-shaped in either mode, so a
-        mode-derived expectation would read every one of them as drift and
-        rewrite it every tick.
+        A live route whose dial matches but whose matcher is the OTHER mode's
+        shape is drift and must be upserted. `build_route` STAMPS this answer
+        onto the spec; the drift comparisons in `register` / `reconcile` then
+        read `spec.shape`, never this property. Custom-domain routes are
+        Host-shaped in either mode, so a mode-derived expectation would read
+        every one of them as drift and rewrite it every tick.
         """
         return "host" if self._settings.mode == "subdomain" else "path"
 
@@ -503,7 +504,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
     def withheld_services(self) -> frozenset[str]:
         """Services whose route is currently WITHHELD by the fail-closed path.
 
-        (P26 S-W8) A snapshot of the D-P25-8 latch, read by
+        A snapshot of the withheld-route latch, read by
         `views/hosted.py` to decide whether a custom domain is `ready` or
         `withheld`: the app is deployed and the proxy is up, but its declared
         `edge_auth` cannot be materialized, so neither its default route nor
@@ -529,7 +530,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         The apex serves the dashboard/API at `https://<host>/` iff the proxy is
         on, the opt-in `[proxy].dashboard_apex` flag is set, AND the proxy is in
         `path` mode. Subdomain mode Host-matches per service and leaves the apex
-        routeless by design, so the flag is a no-op there (Decision 1); when it is
+        routeless by design, so the flag is a no-op there; when it is
         off, `_reconcile_apex` prunes any apex route a mode flip left behind.
         """
         return self.enabled and self._settings.dashboard_apex and self._settings.mode == "path"
@@ -546,7 +547,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
     ) -> RouteSpec:
         """Build a route spec for the service's active upstream and resolved edge auth.
 
-        `project_id` is the ROW's (P40c): the password ref resolves through the
+        `project_id` is the ROW's: the password ref resolves through the
         merged project < service reader. The proxy materializes only
         owner-declared config, so there is no ownership question here.
 
@@ -566,8 +567,8 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
             auth=None
             if edge_auth is None
             else self._resolve_auth(service_name, project_id, edge_auth),
-            # `mode` enters HERE and is recorded on the spec; from
-            # this point the emitter and the drift classifier read the spec's
+            # `mode` enters HERE and is recorded on the spec; from this point
+            # the emitter and the drift classifier read the spec's
             # own shape, never the manager's mode. That is what lets a
             # Host-shaped domain route coexist with a path-shaped default.
             kind="default",
@@ -579,6 +580,23 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
             ),
         )
 
+    async def _build_route_off_loop(
+        self,
+        service_name: str,
+        host_port: int,
+        edge_auth: EdgeAuthSpec | None,
+        project_id: str | None,
+    ) -> RouteSpec:
+        """`build_route`, in a worker thread when edge auth needs a secret read + bcrypt.
+
+        Callers hold `_routes_lock`, so only one thread touches `_auth_cache`.
+        """
+        if edge_auth is None:
+            return self.build_route(service_name, host_port, project_id=project_id)
+        return await asyncio.to_thread(
+            self.build_route, service_name, host_port, edge_auth, project_id=project_id
+        )
+
     def build_domain_route(
         self,
         service_name: str,
@@ -587,13 +605,13 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         *,
         auth: EdgeAuthMaterial | None,
     ) -> RouteSpec:
-        """Resolve the `RouteSpec` for ONE custom domain (P26 D-P26-2).
+        """Resolve the `RouteSpec` for ONE custom domain.
 
         Host-shaped in **both** proxy modes — the domain is served at its own
         root, which is the whole point — and carrying the service's already
         resolved *auth* material rather than re-resolving it: bcrypt is ~100 ms
         by design, and a service's domain routes must present exactly the same
-        credential as its default route (S-W5). `route` is `""` because a
+        credential as its default route. `route` is `""` because a
         domain route has no persisted projection; `service_endpoints.route`
         describes the default route only.
         """
@@ -612,10 +630,9 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         """One domain spec per name, reusing *spec*'s resolved auth material.
 
         Takes the service's DEFAULT spec so the credential is resolved exactly
-        once per service per tick (S-W5) and so a service whose auth could not be
+        once per service per tick and so a service whose auth could not be
         materialized never reaches here at all — it failed before the default
-        spec existed, and its domain routes are withheld with it (fail closed,
-        D-P25-8).
+        spec existed, and its domain routes are withheld with it (fail closed).
         """
         return [
             self.build_domain_route(spec.service_name, spec.host_port, domain, auth=spec.auth)
@@ -656,6 +673,8 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         )
         material = self._auth_cache.get(cache_key)
         if material is None:
+            # A miss means the credential changed: keep one entry per service.
+            self._evict_auth_cache(service_name)
             # `edgeauth.hash_password`, through the module (never imported by
             # value), so tests can patch it: bcrypt salts per call, so its output
             # is never byte-stable and a golden needs a deterministic stand-in.
@@ -731,8 +750,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         )
         if spec.shape == "host":
             # `spec.host` is stamped by `build_route`/`build_domain_route`;
-            # the fallback keeps a hand-built spec (tests, older call sites)
-            # meaning exactly what it did before WP1.
+            # the fallback serves a hand-built spec that omits it.
             host = spec.host or (
                 f"{spec.service_name}.{self._settings.base_domain or self._hostname}"
             )
@@ -742,11 +760,11 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                 "handle": [*auth_handlers, proxy_handler],
             }
             if spec.kind == "domain":
-                # Terminal: a matched custom domain STOPS route
-                # evaluation, so no later path route can also handle the
-                # request. Only the domain routes carry it — adding it to the
-                # subdomain-mode default would change a shape pinned by goldens
-                # for no gain (a Host default already matches nothing else).
+                # Terminal: a matched custom domain STOPS route evaluation, so
+                # no later path route can also handle the request. Only the
+                # domain routes carry it — adding it to the subdomain-mode
+                # default would change a shape pinned by goldens for no gain (a
+                # Host default already matches nothing else).
                 obj["terminal"] = True
             return obj
         return {
@@ -813,7 +831,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                 )
             return
         if self._settings.acme.enabled:
-            # (S-W2-15) One line, at the one moment the posture is decided. The
+            # One line, at the one moment the posture is decided. The
             # HOST of the directory, never the whole URL and never the account
             # email: an operator reading a shared log should learn which CA this
             # node talks to without the log becoming a place credentials or PII
@@ -825,14 +843,11 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                 self._settings.acme.http_port,
             )
             if directory_host == _LE_PRODUCTION_HOST:
-                # (review round 1) A staging GUARD, not a permanent nag. The
-                # default directory IS production, so every correctly configured
-                # node used to log this at WARNING on every single boot —
-                # including after the operator did validate against staging and
-                # has the leaves on disk to prove it. A warning that fires on the
-                # correct steady state teaches operators to ignore warnings. Once
-                # this node has issued anything from this directory, the same
-                # sentence is an `info`: it is context, not a caution.
+                # A staging GUARD, not a permanent nag. The default directory IS
+                # production, so a warning on every boot would fire on the
+                # correct steady state and teach operators to ignore warnings.
+                # Once this node has issued anything from this directory, the
+                # same sentence is an `info`: it is context, not a caution.
                 issued_before = (
                     self._storage_root
                     / "certificates"
@@ -844,10 +859,9 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                     "— rate limits apply (5 duplicate certificates per week)%s",
                     ""
                     if issued_before
-                    else "; validate with the staging directory first "
-                    "(https://acme-staging-v02.api.letsencrypt.org/directory)",
+                    else f"; validate with the staging directory first ({LE_STAGING_DIRECTORY})",
                 )
-        # P3.5: a SINGLE-LABEL wildcard base (`*.localhost`, `*.box`) is
+        # A SINGLE-LABEL wildcard base (`*.localhost`, `*.box`) is
         # rejected by every strict TLS client — RFC 6125 (enforced by OpenSSL,
         # so curl/Python/browsers) requires at least two labels after the
         # `*`. Caddy ≤2.7 masked this by minting an exact-name leaf per
@@ -866,7 +880,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                     base,
                     base,
                 )
-        # D5: subdomain mode with no base_domain is legal (the hostname
+        # Subdomain mode with no base_domain is legal (the hostname
         # fallback is tested behavior) but almost always a misconfiguration —
         # warn loudly instead of failing startup on existing TOML.
         if self._settings.mode == "subdomain" and not self._settings.base_domain:
@@ -941,10 +955,9 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                 #
                 # The Linux hint names the binary WE resolved, never
                 # `$(which caddy)`: on a frozen release install the bundled
-                # Caddy is not on PATH at all, so that substitution expanded to
-                # the empty string and the suggested command was a silent no-op
-                # against the very binary that needed the capability. A P30
-                # system unit already carries AmbientCapabilities=
+                # Caddy is not on PATH, so that substitution would expand to
+                # the empty string and make the command a silent no-op. The
+                # installer's system unit already carries AmbientCapabilities=
                 # CAP_NET_BIND_SERVICE, so this path is reached mainly by a
                 # --user unit or a hand-started daemon — for which setcap on the
                 # resolved path is the real fix.
@@ -978,12 +991,12 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
     ) -> None:
         """Record a `system` audit row for a route change (route is non-secret).
 
-        *domain* names the custom domain when the row concerns one of
-        a service's domain routes rather than its default. It rides
+        *domain* names the custom domain when the row concerns one of a
+        service's domain routes rather than its default. It rides
         `params_redacted`; `target_id` stays the SERVICE, so every route row
         for an app still groups under one target. A domain is public DNS the
         operator chose, never a bearer capability, so writing it verbatim is
-        safe — the same reasoning as the `domain.added` event (S-W9).
+        safe — the same reasoning as the `domain.added` event.
         """
         if not self._audit:
             return
@@ -1051,23 +1064,45 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                 None reads the names here.
             project_id: The row's project, for the merged edge-auth secret read.
         """
+        async with self._routes_lock:
+            await self._register_unlocked(
+                service_name,
+                host_port,
+                edge_auth,
+                with_domains=with_domains,
+                domains=domains,
+                project_id=project_id,
+            )
+
+    async def _register_unlocked(
+        self,
+        service_name: str,
+        host_port: int,
+        edge_auth: object = None,
+        *,
+        with_domains: bool = False,
+        domains: Sequence[str] | None = None,
+        project_id: str | None = None,
+    ) -> None:
+        """`register` body; the caller holds `_routes_lock`."""
         if not self.enabled or not self._available:
             return
         new_dial = f"127.0.0.1:{host_port}"
         try:
             try:
-                spec = self.build_route(
-                    service_name, host_port, load_edge_auth(edge_auth), project_id=project_id
+                spec = await self._build_route_off_loop(
+                    service_name, host_port, load_edge_auth(edge_auth), project_id
                 )
             except (EdgeAuthInvalid, EdgeAuthUnresolved) as exc:
                 self._note_edge_auth_failure(service_name, exc)
-                await self.deregister(service_name)
+                # Not the public `deregister`: `_routes_lock` is not reentrant.
+                await self._deregister_unlocked(service_name)
                 return
             self._edge_auth_failed.discard(service_name)
             specs = [spec]
             if with_domains:
-                # The same gate reconcile applies: a domain Host route
-                # may only be written once the live `apps.tls` is known to
+                # The same gate reconcile applies: a domain Host route may only
+                # be written once the live `apps.tls` is known to
                 # carry the catch-all internal-issuer policy. On the normal path
                 # the hash latch has held since boot, so this is zero admin I/O;
                 # when it has not, the cutover commits the DEFAULT route only and
@@ -1089,7 +1124,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
             if live is None:
                 return  # couldn't read state — let the reconcile loop register
             wrote_default = False
-            # (S-W8) Domain ids this call leaves live — the ones already current
+            # Domain ids this call leaves live — the ones already current
             # plus the ones it successfully upserts. A per-route upsert failure
             # below `continue`s, so the id never enters the set and the surface
             # keeps reporting that domain `withheld` until a reconcile tick
@@ -1105,8 +1140,8 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                     and current.auth_fingerprint == _desired_fingerprint(one)
                 ):
                     # Already current: upstream, matcher shape, no duplicates AND
-                    # the same edge-auth state (D-P25-7 — without that term an auth
-                    # change on an otherwise-current route is invisible here).
+                    # the same edge-auth state (without that term an auth change
+                    # on an otherwise-current route is invisible here).
                     if one.kind == "domain":
                         live_domains.add(one.caddy_id)
                     continue
@@ -1131,7 +1166,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                 wrote_default = wrote_default or one.kind == "default"
                 if one.kind == "domain":
                     live_domains.add(one.caddy_id)
-            # P9.5: an absent-id upsert (a genuinely new service) appends the
+            # An absent-id upsert (a genuinely new service) appends the
             # route to the END of the array — AFTER the apex catch-all — which
             # would shadow the just-registered service (the apex has no matcher
             # and Caddy takes the first terminal match) until the next reconcile
@@ -1149,14 +1184,20 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
             logger.warning("[proxy] register failed for %s", service_name, exc_info=True)
 
     async def deregister(self, service_name: str) -> None:
-        """Remove a service's route now (best-effort; never raises). Also drops the service's
-        memoized credential material and its
+        """Remove a service's routes now (best-effort; never raises)."""
+        async with self._routes_lock:
+            await self._deregister_unlocked(service_name)
+
+    async def _deregister_unlocked(self, service_name: str) -> None:
+        """`deregister` body; the caller holds `_routes_lock`.
+
+        Also drops the service's memoized credential material and its
         withheld-route latch: a route torn down is a state transition, so the
-        next failure is logged once more rather than staying silent forever. Removes EVERY route
-        the service owns — its default plus one per
-        custom domain — derived from the live table by splitting the composite
-        `@id`. When the live table is unreadable only the default id is
-        deleted; the prune loop removes the rest on the next reconcile tick.
+        next failure is logged once more rather than staying silent forever.
+        Removes EVERY route the service owns — its default plus one per custom
+        domain — derived from the live table by splitting the composite `@id`.
+        When the live table is unreadable only the default id is deleted; the
+        prune loop removes the rest on the next reconcile tick.
         """
         # Eviction runs even when the proxy is off/unavailable: the cache is
         # process state, not Caddy state, and a service whose route we cannot
@@ -1164,7 +1205,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         # no longer own.
         self._evict_auth_cache(service_name)
         self._edge_auth_failed.discard(service_name)
-        # (S-W8) Same reasoning as the cache eviction: this runs even when the
+        # Same reasoning as the cache eviction: this runs even when the
         # proxy is off, because the snapshot is process state. A service whose
         # routes we are tearing down (or cannot reach to tear down) must stop
         # reporting its domains `ready` immediately, not one tick later.
@@ -1215,8 +1256,14 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         """
         if not self.enabled:
             return
+        # Outside the lock: a Caddy respawn must not block registrations.
         if not await self._ensure_alive():
             return
+        async with self._routes_lock:
+            await self._reconcile_unlocked()
+
+    async def _reconcile_unlocked(self) -> None:
+        """`reconcile` body; the caller holds `_routes_lock`."""
         try:
             desired = await self._queries.list_active_service_routes()
             domain_rows = await self._queries.list_service_domains()
@@ -1234,21 +1281,21 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         for row in domain_rows:
             domains_by_service.setdefault(row.service_name, []).append(row.domain)
 
-        # BEFORE any route write: the certificate must exist before the
-        # Host route that will present it. The rows were just read, so this costs
-        # no extra query, and the hash latch makes a converged tick free.
+        # BEFORE any route write: the certificate must exist before the Host
+        # route that will present it. The rows were just read, so this costs no
+        # extra query, and the hash latch makes a converged tick free.
         #
         # The return value is a GATE, not a log line: until the live `apps.tls`
         # is known to carry the trailing catch-all policy, a Host route landing
-        # in front of an ADOPTED pre-WP1 Caddy would hand the name to that
-        # Caddy's default (public ACME) issuers. So a failed convergence
+        # in front of an ADOPTED Caddy spawned without that policy would hand
+        # the name to that Caddy's default (public ACME) issuers. So a failed convergence
         # withholds every domain spec this tick — the same fail-closed shape the
         # edge-auth `withheld` set uses below, and the prune loop tears down
         # any domain route already live, which is the safe direction: no Host
         # route without a certificate policy that pins it to the internal CA.
         #
-        # The partition — every name, and the subset that gets a
-        # PUBLIC certificate — is computed from the rows just read, in the one
+        # The partition — every name, and the subset that gets a PUBLIC
+        # certificate — is computed from the rows just read, in the one
         # place the "acme=1 AND [proxy.acme].enabled" rule lives. Still one read
         # of `service_domains` per tick.
         all_names, acme_names = partition_domains(
@@ -1277,7 +1324,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         # route down), and the prune loop must not clear their withheld latch —
         # that would re-log the same permanent misconfiguration every tick.
         withheld: set[str] = set()
-        # (S-W8, Codex round 2 #3835632983) Ids whose convergence this tick
+        # Ids whose convergence this tick
         # FAILED — a raised upsert, or a re-anchor that deleted the route and
         # could not put it back. They are still `desired`, and a failed upsert
         # leaves the STALE object in Caddy, so presence alone would advertise
@@ -1290,21 +1337,21 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         wrote = False
         for entry in desired:
             try:
-                # Route building can now FAIL, and a failure must
-                # skip THIS entry without aborting the tick — hence the build
-                # sits in its own try ahead of the write block below.
-                spec = self.build_route(
+                # Route building can FAIL, and a failure must skip THIS entry
+                # without aborting the tick — hence the build sits in its own
+                # try ahead of the write block below.
+                spec = await self._build_route_off_loop(
                     entry.service_name,
                     entry.host_port,
                     load_edge_auth(entry.edge_auth),
-                    project_id=entry.project_id,
+                    entry.project_id,
                 )
             except (EdgeAuthInvalid, EdgeAuthUnresolved) as exc:
                 # Fail closed: NOT added to `desired_ids`, so the prune loop
                 # deletes any live route for this service — including one that
                 # was serving UNAUTHENTICATED a moment ago (the "owner declared
                 # edge_auth but hasn't set the secret yet" transition, which is
-                # exactly when serve-it-anyway would leak the app). (P26 S-W5)
+                # exactly when serve-it-anyway would leak the app).
                 # The service's DOMAIN routes are withheld with it: they are
                 # built from this spec and it never existed.
                 withheld.add(entry.service_name)
@@ -1337,8 +1384,8 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                 )
                 try:
                     if current is not None and current.count > 1:
-                        # Self-heal duplicates left by the pre-PATCH upsert (or an
-                        # append race): the survivor is the id-map target whose
+                        # Self-heal duplicates left by an append race (or an
+                        # older POST-based upsert): the survivor is the id-map target whose
                         # dial/shape `current` already reflects, so the drift
                         # decision below stays valid. No audit row — infrastructure
                         # convergence, same rationale as the TLS sync.
@@ -1360,7 +1407,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                             domain=_spec_domain(one),
                         )
                         wrote = True
-                    # DB write LAST (P3.5 D3 write-order hardening): a failed upsert
+                    # DB write LAST: a failed upsert
                     # leaves the OLD route string in the row, so `route_changed`
                     # re-fires and the upsert naturally retries next tick. Writing
                     # the DB first would converge the row while Caddy still serves
@@ -1368,7 +1415,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                     if route_changed:
                         await self._queries.set_endpoint_route(entry.service_name, one.route)
                 except Exception:
-                    # (S-W8) The route may still be PRESENT in Caddy — with its
+                    # The route may still be PRESENT in Caddy — with its
                     # OLD dial / matcher / auth handler. Present is not
                     # converged, so mark it and keep it out of the live set.
                     unconverged.add(one.caddy_id)
@@ -1421,13 +1468,8 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         # deleted and re-inserted at index 0; `specs_by_id` guards against
         # re-anchoring something the prune loop just removed.
         live_after = await self._admin.live_routes() if wrote else live
-        # (S-W8, Codex round 1) The tick's verdict on which custom domains
-        # actually answer: DESIRED this tick (so a TLS-withheld tick, an
-        # edge-auth-withheld service and a domain removed from the table all
-        # drop out) AND present in Caddy (so a route the upsert loop failed to
-        # write is not advertised). Derived from the post-write read when there
-        # was one, else from the read the tick opened with — nothing was written
-        # in that case, so it is still accurate.
+        # The post-write read when there was one, else the read the tick opened
+        # with — nothing was written in that case, so it is still accurate.
         observed = live_after if live_after is not None else live
         if live_after is not None:
             for rid in ordering_violations(live_after):
@@ -1449,8 +1491,7 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                 # rationale as `dedupe_route`.
                 logger.warning("[proxy] re-anchored Host route %s ahead of the path routes", rid)
 
-        # (S-W8, Codex round 1; tightened round 2 #3835632983) The tick's verdict
-        # on which custom domains actually answer: DESIRED this tick (so a
+        # The tick's verdict on which custom domains actually answer: DESIRED this tick (so a
         # TLS-withheld tick, an edge-auth-withheld service and a domain removed
         # from the table all drop out) AND OBSERVED CONVERGED — present in Caddy
         # dialling the port we want, with the matcher shape we want and the auth
@@ -1510,9 +1551,8 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
             if present and count == 1 and is_last and dial == self._dashboard_upstream:
                 return  # converged — single apex, last, correct dial → zero writes
             if count > 1:
-                # Concurrent appends (the reconcile tick and the inline
-                # register() fast-path both read the apex as absent) left
-                # duplicate catch-alls; an earlier twin shadows every service
+                # Duplicate catch-alls (concurrent appends, e.g. by the daemon
+                # that spawned an adopted Caddy); an earlier twin shadows every service
                 # ordered after it even when the last copy looks converged.
                 # Collapse the twins, then re-anchor a single apex LAST below.
                 await self._admin.dedupe_route(_APEX_ID)

@@ -22,13 +22,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 #: One value-free sentence per `reason` — the half of a refusal that is safe
-#: to send back (Codex round 1, P1 #3831777111). `message` quotes the input so
-#: a human reading a log sees what they typed; that string must never leave the
-#: daemon, because the "domain" a caller submits is an arbitrary path segment
-#: and a mis-paste can be a bearer token — which would then ride the `422`
-#: body into the MCP tool result and the agent transcript. The route builds its
-#: envelope from these instead, and the machine `reason` beside it is what an
-#: agent actually branches on.
+#: to send back. `message` quotes the input so a human reading a log sees
+#: what they typed; that string must never leave the daemon, because the
+#: "domain" a caller submits is an arbitrary path segment and a mis-paste can
+#: be a bearer token — which would then ride the `422` body into the MCP tool
+#: result and the agent transcript. The route builds its envelope from these
+#: instead, and the machine `reason` beside it is what an agent branches on.
 _PUBLIC_MESSAGES: dict[str, str] = {
     "empty": "A domain is required.",
     "whitespace": "A domain must not contain whitespace.",
@@ -67,8 +66,8 @@ class DomainInvalid(ValueError):  # noqa: N818 — name matches EdgeAuthInvalid,
 
     `reason` is one of `empty`, `whitespace`, `not_bare`, `has_port`,
     `wildcard`, `ip_literal`, `idn`, `single_label`, `grammar`,
-    `reserved` (S-W10) and is what the route puts in the `422
-    domain.invalid` envelope's `detail`. There are **two** human halves and
+    `reserved` and is what the route puts in the `422 domain.invalid`
+    envelope's `detail`. There are **two** human halves and
     the difference is a security boundary: `message` quotes the offending
     input and stays inside the daemon (logs, tests, a developer's traceback),
     while `public_message` — derived from `reason` alone — is what any
@@ -103,7 +102,7 @@ def normalize_domain(raw: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ReservedNames:
-    """The set of names this node already answers for, folded (S-W10).
+    """The set of names this node already answers for, folded.
 
     Membership is by suffix as well as by equality: reserving `dev.lan` also
     reserves everything under it, because in subdomain mode every service's own
@@ -124,8 +123,8 @@ def reserved_names(
 ) -> ReservedNames:
     """Build the reserved set from this node's own names.
 
-    Computed **once at boot** into `app.state.domain_reserved` (S-W10), and
-    that is a security property, not an optimisation: every `[proxy]` key
+    Computed **once at boot** into `app.state.domain_reserved`, and that is a
+    security property, not an optimisation: every `[proxy]` key
     here is restart-required, so a set recomputed per request could only ever
     differ by reading a config change that the running proxy has not applied —
     a window in which a racing write could bind a name the live Caddy is about
@@ -139,11 +138,11 @@ def reserved_names(
     aliases generate no URL and ride no TLS subject, but in **path mode the
     apex and every default route carry no Host matcher**, so a request that
     reaches the proxy under *any* name the box resolves to lands on them; a
-    user domain bound to such an alias would capture that traffic (WP1
-    security review). The caller supplies them so this module stays pure
-    (no socket I/O). `hostname_override` is OR-ed in ahead of *hostname* so a
-    caller that passes an empty string — several unit tests do — still
-    reserves the configured name. Empty entries are dropped; everything is
+    user domain bound to such an alias would capture that traffic. The caller
+    supplies them so this module stays pure (no socket I/O).
+    `hostname_override` is OR-ed in ahead of *hostname* so a caller that
+    passes an empty string — several unit tests do — still reserves the
+    configured name. Empty entries are dropped; everything is
     folded with `normalize_domain` so comparison is case-insensitive.
     """
     raw = [

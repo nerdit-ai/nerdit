@@ -129,8 +129,9 @@ async def share_service(
         Exposes the app at ``https://<name>--<slug>.<domain>/`` via the cloud
         link. ``access='private'`` (default) opens only for signed-in owners of this
         node in the Nerdit console — works on every linked node, nothing to
-        configure. ``access='public'`` makes the URL world-reachable: it needs a
-        Pro-entitled account (else 409 ``share.not_entitled``) AND either a
+        configure. ``access='public'`` makes the URL world-reachable: it needs an
+        account in good standing (free during the public beta; else 409
+        ``share.not_entitled``) AND either a
         ``[deploy].edge_auth`` on the app or ``consent=true`` (else 409
         ``share.unprotected``) — public means public. The node must be linked
         (409 ``share.link_required``). Returns ``{access, url, state}``; ``state``

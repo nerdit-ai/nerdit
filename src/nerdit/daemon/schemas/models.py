@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from nerdit.daemon.schemas._base import StrictRequestModel
 from nerdit.db.enums import JobStatus
+from nerdit.utils.names import DNS_LABEL_PATTERN
 
 
 class ModelServeRequest(StrictRequestModel):
@@ -25,7 +26,7 @@ class ModelServeRequest(StrictRequestModel):
     gpus: int = Field(default=0, ge=0, description="GPUs the model server needs (0 = CPU; shared)")
     name: str | None = Field(
         default=None,
-        pattern=r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+        pattern=DNS_LABEL_PATTERN,
         description="Optional service-name override (default: sanitized model ref)",
     )
     backend: str | None = Field(

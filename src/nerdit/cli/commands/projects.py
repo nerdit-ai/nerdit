@@ -17,7 +17,7 @@ from uuid import uuid4
 import typer
 from rich.table import Table
 
-from nerdit.cli.display import console, display_service_table, render_client_error
+from nerdit.cli.display import call_or_exit, console, display_service_table, render_client_error
 from nerdit.cli.display import plain as _plain
 
 projects_app = typer.Typer(
@@ -43,11 +43,7 @@ async def _list_async(*, json_out: bool) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        page = await client.list_projects()
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    page = await call_or_exit(client.list_projects())
     if json_out:
         _echo_json(page)
         return
@@ -57,6 +53,7 @@ async def _list_async(*, json_out: bool) -> None:
         return
     table = Table(title="Projects")
     table.add_column("Name", style="cyan")
+    table.add_column("ID")
     table.add_column("Services")
     table.add_column("Addresses")
     for item in items:
@@ -64,6 +61,7 @@ async def _list_async(*, json_out: bool) -> None:
         addresses = [entry.get("url") for entry in item.get("addresses", [])]
         table.add_row(
             _plain(item.get("name")),
+            _plain(item.get("id")),
             ", ".join(_plain(s) for s in services) if services else "[dim]none[/dim]",
             "\n".join(_plain(a) for a in addresses) if addresses else "[dim]none[/dim]",
         )
@@ -82,19 +80,37 @@ async def _create_async(name: str) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        result = await client.create_project(name, idempotency_key=uuid4().hex)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    result = await call_or_exit(client.create_project(name, idempotency_key=uuid4().hex))
     console.print(
         f"[green]Created project {_plain(result.get('name'))}[/green] ({_plain(result.get('id'))})"
     )
 
 
+@projects_app.command("rename")
+def projects_rename(
+    project_id: str = typer.Argument(..., help="Immutable project ID (prj_…)."),
+    name: str = typer.Argument(..., help="New display name (lowercase DNS label, ≤ 40)."),
+) -> None:
+    """Rename a project's display label; service names and public URLs stay fixed."""
+    asyncio.run(_rename_async(project_id, name))
+
+
+async def _rename_async(project_id: str, name: str) -> None:
+    from nerdit.cli.client import get_configured_client
+
+    try:
+        result = await get_configured_client().rename_project(
+            project_id, name, idempotency_key=uuid4().hex
+        )
+    except Exception as exc:  # noqa: BLE001 — rendered for the user
+        render_client_error(exc)
+        raise typer.Exit(1) from exc
+    console.print(f"Renamed project {_plain(result.get('id'))} to {_plain(result.get('name'))}.")
+
+
 @projects_app.command("show")
 def projects_show(
-    name: str = typer.Argument(..., help="Project name"),
+    name: str = typer.Argument(..., help="Immutable project ID or original namespace"),
     json_out: bool = typer.Option(False, "--json", help="Print the raw JSON body."),
 ) -> None:
     """Show a project: services, referenced resources, addresses, home node."""
@@ -105,11 +121,7 @@ async def _show_async(name: str, *, json_out: bool) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        project = await client.get_project(name)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    project = await call_or_exit(client.get_project(name))
     if json_out:
         _echo_json(project)
         return
@@ -146,7 +158,7 @@ async def _show_async(name: str, *, json_out: bool) -> None:
 
 @projects_app.command("delete")
 def projects_delete(
-    name: str = typer.Argument(..., help="Project name"),
+    name: str = typer.Argument(..., help="Immutable project ID or original namespace"),
     purge: str = typer.Option(
         "secrets", "--purge", help="CSV of purge targets per service: secrets,data,images,workspace"
     ),

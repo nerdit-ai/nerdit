@@ -129,15 +129,14 @@ async def _sweep_data_tombstones(queries: Queries, data_dir: Path) -> None:
 
 # --- ?purge parsing + the dependents/reference-guard family -----------------
 
-# P14b WP-B1 — the `?purge` targets on `DELETE /services`. The default is
-# `secrets` only (D-P14-1); `data`/`images` are opt-in destructive.
-# `workspace` joins them as a fourth opt-in member — the agent
-# workspace tree is user-authored source, so it is never removed by default.
+# The `?purge` targets on `DELETE /services`. The default is `secrets` only;
+# `data`/`images`/`workspace` are opt-in destructive (the agent workspace tree
+# is user-authored source, so it is never removed by default).
 _PURGE_TARGETS = frozenset({"secrets", "data", "images", "workspace"})
 
 
 def _parse_purge(raw: str) -> set[str]:
-    """Parse the `?purge` CSV into a validated target set (P14b WP-B1).
+    """Parse the `?purge` CSV into a validated target set.
 
     An unknown token is a structured 422 `service.invalid_purge` (the hint is
     derived from `_PURGE_TARGETS`, so a new member needs no prose edit here).
@@ -228,7 +227,7 @@ def _find_model_dependents(
 def _find_cross_owner_dependents(
     rows: list[dict], target_model: str, *, exclude_id: str, caller_token: str | None
 ) -> list[dict[str, str | None]]:
-    """Matched dependents whose row is owned by a token OTHER than the caller (M2).
+    """Matched dependents whose row is owned by a token OTHER than the caller.
 
     Like `_find_model_dependents` but keeps only rows a foreign token owns —
     fail-closed on a NULL `submitted_by_token` (legacy/local rows count as
@@ -271,9 +270,7 @@ def _find_db_dependents(
 def _find_cross_owner_db_dependents(
     rows: list[dict], target_service: str, *, exclude_id: str, caller_token: str | None
 ) -> list[dict[str, str | None]]:
-    """Matched `[db.*]` dependents whose row is owned by a token OTHER than the caller
-    (M2).
-    """
+    """Matched `[db.*]` dependents whose row is owned by a token OTHER than the caller."""
     deps: list[dict[str, str | None]] = []
     for row, binding in _iter_db_dependents(rows, target_service, exclude_id=exclude_id):
         owner = row.get("submitted_by_token")
@@ -321,7 +318,7 @@ def _in_use_error(
 
 
 def _forbidden_cross_owner(label: str = "model") -> NerditError:
-    """Build the 403 refusing a non-admin `force` over a foreign-owned dependent (M2)."""
+    """Build the 403 refusing a non-admin `force` over a foreign-owned dependent."""
     return NerditError(
         403,
         "forbidden",
@@ -363,7 +360,7 @@ async def _purge_secrets(request: Request, job: Job, name: str) -> bool:
 
 
 def _secret_file_kept(request: Request, name: str) -> bool:
-    """Whether a secret file survives this delete and so needs its claim re-minted (D-P39-6).
+    """Whether a secret file survives this delete and so needs its claim re-minted.
 
     A secrets file kept past the row must stay reachable by its owner and
     unclaimable by anyone else: without the claim, a stranger's fresh deploy
@@ -427,9 +424,9 @@ async def _purge_data(
     """Best-effort `rmtree` of `<data_dir>/services/<name>` (fail-closed seam).
 
     A missing dir counts as success (nothing to purge); a spec/OS failure reports
-    `False` (recovery is the opt-in GC data reclaim, D-P14-2).
+    `False` (recovery is the opt-in GC data reclaim).
 
-    `skip_reason` (F12) short-circuits **before any filesystem access**: the caller
+    `skip_reason` short-circuits **before any filesystem access**: the caller
     could not confirm the container is gone, so the dir is left alone and the audit
     row carries the reason. When it is `None` the audit params keep their original
     two-key shape (no `reason: null` on the happy path).
@@ -548,7 +545,7 @@ async def _undo_tombstone_or_raise(
     """Rename a pre-delete tombstone back, or raise the loud `db.restore_failed`.
 
     Both non-committing exits from the delete's atomic span need this: the delete
-    was REFUSED by the in-transaction re-check, or (review round-2) the row was
+    was REFUSED by the in-transaction re-check, or the row was
     already gone so this request deleted nothing. Either way the database's data
     was renamed aside before the commit point and must go back — and a rename-back
     that cannot be confirmed must never be papered over, because the alternative
@@ -671,7 +668,7 @@ async def delete_service(
 ) -> ServiceDeletedResponse:
     """Delete a service: reference-guard, tear down, remove the row, purge on request.
 
-    Order (P14b WP-B1): validate `?purge` → model reference guard (409
+    Order: validate `?purge` → model reference guard (409
     `resource.in_use` unless `?force`; a cross-owner dependent makes `force`
     admin-only) → run-race hook (409 `service.run_in_progress` unless `?force`,
     which kills the run) → synchronous teardown (container stop/kill/remove,
@@ -690,7 +687,7 @@ async def delete_service(
         raise _not_found(ident)
     require_owner_or_admin(request, job)
 
-    # --- (P15 D5) database delete is explicit-destructive --------------------
+    # --- database delete is explicit-destructive ------------------------------
     # A kind=database row's data dir and minted password are useless without each
     # other; deleting the row without purging its data leaves an unrecoverable
     # orphan (initdb never re-runs on a non-empty PGDATA, so a recreated row's
@@ -718,7 +715,7 @@ async def delete_service(
         if not force:
             raise _in_use_error(ident, dependents, relaunched=False, label=label)
         # `force` bypasses, but a dependent owned by ANOTHER token requires admin
-        # (security M2): a submitter cannot force-kill a resource foreign apps rely on.
+        # a submitter cannot force-kill a resource foreign apps rely on.
         principal = current_principal(request)
         if principal.role != TokenRole.admin:
             for dep in dependents:
@@ -740,11 +737,10 @@ async def delete_service(
             }
         )
 
-    # --- run-race hook (P20: the run primitive shipped) -----------------------
+    # --- run-race hook -------------------------------------------------------
     # `has_active_run` covers one-off runs AND `[deploy].release` executions
     # — both are rowless containers holding the service's data volume, so a
-    # delete underneath either is a torn teardown. Deleting during a *release*
-    # therefore 409s where it used to succeed (documented behaviour change).
+    # delete underneath either is a torn teardown.
     #
     # The rule: an UNFORCED delete during a run/release 409s; a FORCED delete
     # kills that service's run containers and proceeds. Without the escape hatch
@@ -769,7 +765,7 @@ async def delete_service(
             )
         # Best-effort, same swallow-everything posture as the teardown below —
         # and remembered the same way: a kill that RAISED may have left a
-        # migration writing to the very tree the data purge would rmtree (F12),
+        # migration writing to the very tree the data purge would rmtree,
         # so those container ids are re-probed there. The registry slot is
         # deliberately NOT discarded here: `_execute_container_once` frees its
         # own slot when its wait returns, and reaching into the controller's
@@ -813,15 +809,15 @@ async def delete_service(
                     "cancel it and kill the candidate container."
                 ),
             )
-        # Captured BEFORE the cancel, which destroys the evidence (PR #108
-        # review): a verify still inside `runtime.run()` has no container id
-        # registered, and cancelling the task cannot stop the underlying
-        # docker thread — the green may start (bind-mounting the service data
-        # tree) AFTER the cancel returned empty-handed. Same hazard class as
-        # the unbound run above, gated the same fail-closed way at the data
-        # purge. If the id bound between the check and the cancel, the
-        # cancel's late re-read killed it — the flag then skips the purge
-        # conservatively, which is the right side to err on.
+        # Captured BEFORE the cancel, which destroys the evidence: a verify
+        # still inside `runtime.run()` has no container id registered, and
+        # cancelling the task cannot stop the underlying docker thread — the
+        # green may start (bind-mounting the service data tree) AFTER the
+        # cancel returned empty-handed. Same hazard class as the unbound run
+        # above, gated the same fail-closed way at the data purge. If the id
+        # bound between the check and the cancel, the cancel's late re-read
+        # killed it — the flag then skips the purge conservatively, which is
+        # the right side to err on.
         unbound_cutover = controller.has_unbound_cutover(job.id)
         await controller.cancel_cutover(job.id)
 
@@ -830,7 +826,7 @@ async def delete_service(
     # `has_active_cutover` check above or under the cancel that followed it —
     # promoted the green onto the row, so this snapshot still names the blue the
     # commit destroyed. Tearing THAT down would leave the promoted green alive
-    # (still answering the repointed dial) and would let the F12 gate below count
+    # (still answering the repointed dial) and would let the purge gate below count
     # a confirmed teardown while that green still bind-mounts the data tree.
     # Rebinding is safe: id/kind/service_name are immutable, and only
     # `container_id`/`status` matter downstream.
@@ -844,7 +840,7 @@ async def delete_service(
     # container (the reconciler will never see this row again). Every failure is
     # swallowed (best-effort by design) — but we remember that one happened, because
     # an unconfirmed teardown must not be followed by an rmtree of the container's
-    # bind-mounted data dir (F12; the probe itself is deferred to the purge section
+    # bind-mounted data dir (the probe itself is deferred to the purge section
     # so the happy path pays nothing).
     teardown_failed = False
     if job.container_id:
@@ -855,7 +851,7 @@ async def delete_service(
             # NOT a failure: "already gone" is the strongest confirmation there is
             # that nothing is writing to the data dir. The reconcile loop routinely
             # gets here first (this route sets desired_state=stopped before tearing
-            # down), and counting that as an unconfirmed teardown would arm the F12
+            # down), and counting that as an unconfirmed teardown would arm the purge
             # gate on a perfectly healthy delete and silently skip the purge.
             pass
         except ContainerRuntimeError:
@@ -976,7 +972,7 @@ async def delete_service(
     def _note_domains_removed(names: list[str]) -> None:
         removed_domains.extend(names)
 
-    # The secret file's claim (D-P39-6) is re-minted INSIDE the delete
+    # The secret file's claim is re-minted INSIDE the delete
     # transaction, never after it: post-commit, a stranger's fresh row could
     # land before the mint and launch with the old owner's values. Minted even
     # when `secrets` is being purged: the purge is best-effort, and the claim
@@ -1006,7 +1002,7 @@ async def delete_service(
                 on_secrets_reclaimed=reclaim,
             )
         if fresh_deps is None:
-            # (P29 review round-2, Codex 3803596881) The row was ALREADY GONE: this
+            # The row was ALREADY GONE: this
             # request deleted nothing, so it has earned no name-based side effect.
             # The shape is a stale delete — B stalled in the swallow-everything
             # teardown (up to a ~10 s docker stop grace) while A completed the same
@@ -1093,6 +1089,10 @@ async def delete_service(
                 proxy = getattr(request.app.state, "proxy_manager", None)
                 if proxy is not None:
                     await proxy.deregister(job.service_name)
+            # This path never reaches `_teardown_to_stopped`, so drop the
+            # controller's per-job memory here or it outlives the row.
+            if controller is not None:
+                controller.forget(job.id)
 
             # --- best-effort purge steps (each its own out-of-band audit row) ----
             purged: PurgeReport | None = None
@@ -1149,7 +1149,7 @@ async def delete_service(
                         # leaked tombstone is GC-reclaimable (its base row is gone).
                         purged.data = await _reap_tombstone(request, job, name, db_tombstone)
                     else:
-                        # F12 — never rmtree the bind-mounted data dir after an UNCONFIRMED
+                        # Never rmtree the bind-mounted data dir after an UNCONFIRMED
                         # teardown: the block above swallows ContainerRuntimeError, so a failed
                         # stop/kill/remove can leave the container alive and still writing. Probe
                         # only in that case; a container we cannot confirm gone means the rmtree is
@@ -1187,6 +1187,18 @@ async def delete_service(
                         # after the rmtree.
                         if skip_reason is None and unbound_cutover:
                             skip_reason = "cutover_unbound"
+                        # The tree is keyed by name alone: a same-name deploy that
+                        # landed after the commit owns it now. Only a ROW spares it —
+                        # a foreign claim does not, or the old owner's data would
+                        # pass to the claimant's first deploy.
+                        # ponytail: check-then-rmtree leaves the rmtree's own duration
+                        # as a window; upgrade = pre-commit tombstone rename as the
+                        # database C2 path does.
+                        if (
+                            skip_reason is None
+                            and await queries.get_service_by_name(name) is not None
+                        ):
+                            skip_reason = "name_retaken"
                         purged.data = await _purge_data(request, job, name, skip_reason=skip_reason)
                 # Only a plain service owns a per-app image worth removing; model
                 # and database rows share an upstream image (ollama/postgres) that other

@@ -11,6 +11,7 @@ from nerdit.daemon.schemas._base import StrictRequestModel
 from nerdit.daemon.schemas.exposure import PublicUrlEntry
 from nerdit.db.enums import ErrorClass, GpuVendor, JobKind, JobStatus
 from nerdit.db.rows import HealthCheck, ServiceEndpoint
+from nerdit.utils.names import DNS_LABEL_PATTERN
 
 
 class ServiceCreateRequest(StrictRequestModel):
@@ -20,7 +21,7 @@ class ServiceCreateRequest(StrictRequestModel):
     """
 
     name: str = Field(
-        pattern=r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+        pattern=DNS_LABEL_PATTERN,
         description="DNS-label service name (stable identity, lowercase, 1-63 chars)",
     )
     image: str = Field(description="Existing local image to run (required — register-only in P2)")

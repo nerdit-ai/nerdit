@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING
 
+from nerdit.utils.fs import fsync_dir
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
@@ -43,14 +45,9 @@ class AuditArchiveResult:
 
 def _fsync_dir(path: Path) -> None:
     """fsync a directory so a newly created entry within it is durable."""
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    except OSError:
-        # Some filesystems reject directory fsync; the file fsync already ran.
-        pass
-    finally:
-        os.close(fd)
+    # Some filesystems reject directory fsync; the file fsync already ran.
+    with contextlib.suppress(OSError):
+        fsync_dir(path)
 
 
 def _flush_and_fsync(fh: IO[bytes]) -> None:
@@ -67,11 +64,8 @@ def _flush_and_fsync(fh: IO[bytes]) -> None:
 
 def _sha256_file(path: Path) -> str:
     """Hash a closed file that will never be written again."""
-    h = hashlib.sha256()
     with open(path, "rb") as fh:
-        for block in iter(lambda: fh.read(1 << 16), b""):
-            h.update(block)
-    return h.hexdigest()
+        return hashlib.file_digest(fh, "sha256").hexdigest()
 
 
 async def archive_and_prune_audit(

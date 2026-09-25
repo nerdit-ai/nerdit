@@ -38,7 +38,7 @@ import json
 import logging
 import socket
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -60,7 +60,15 @@ from nerdit.core.runtime.protocol import (
 )
 from nerdit.core.sandbox import enforce_mount_allowlist, resolve_role
 from nerdit.core.volumes import VolumeSpecError, service_volumes
-from nerdit.db.enums import ErrorClass, GpuVendor, JobKind, JobStatus, LogStream, TokenRole
+from nerdit.db.enums import (
+    TERMINAL_STATUSES,
+    ErrorClass,
+    GpuVendor,
+    JobKind,
+    JobStatus,
+    LogStream,
+    TokenRole,
+)
 from nerdit.db.rows import Job
 
 if TYPE_CHECKING:  # pragma: no cover — import cycle (services imports this module)
@@ -86,7 +94,7 @@ _MONOTONIC = time.monotonic
 _POLL_INTERVAL_S = 1.0
 
 #: Label stamped on the green container so a crash settle can reap it by job id
-#: after the in-memory registry is gone. Deliberately DISJOINT from P20's
+#: after the in-memory registry is gone. Deliberately DISJOINT from the
 #: `nerdit-run` / `nerdit-job` pair: a run/release container can never
 #: appear in a `nerdit-cutover` listing, so the crash reap needs no
 #: abort-on-active-run belt (it needs — and has — the never-kill-the-row's-own
@@ -133,21 +141,26 @@ def _as_port(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def _reserve_ephemeral_port() -> int:
-    """An OS-assigned free loopback port for the green container.
+def _reserve_ephemeral_port(excluded: Collection[int] = ()) -> int:
+    """Choose a free port outside all persisted stable and cutover reservations.
 
-    Deliberately OUTSIDE `[services].service_port_range` and never persisted
-    as `host_port`: the green port is transient in identity (D-P24-4b's
-    narrowed anti-scope). The socket is closed immediately, so this is a hint,
-    not a reservation — a lost rebind race fails the cutover with blue
-    untouched and the next tick retries.
+    Hold rejected sockets until selection completes so the OS cannot repeatedly
+    return the same excluded port. This is still a hint: Docker detects a lost
+    external bind race and the cutover keeps blue unchanged.
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sockets: list[socket.socket] = []
     try:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+        for _ in range(32):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sockets.append(sock)
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+            if port not in excluded:
+                return port
+        raise OSError("No unreserved ephemeral port available for cutover")
     finally:
-        sock.close()
+        for sock in sockets:
+            sock.close()
 
 
 def cutover_skip_reason(
@@ -156,7 +169,7 @@ def cutover_skip_reason(
     """`None` when cutover-eligible; else the machine reason it is not.
 
     The reason vocabulary is pinned by D-P24-8: `proxy_off` | `gpu_bound` |
-    `no_verify_signal` | `disabled`. It exists because WP10's poller must
+    `no_verify_signal` | `disabled`. It exists because the GitWatch poller must
     *tell* the operator why an unattended redeploy refused to fire, and a bare
     predicate cannot carry that — `_eligible` is this function's boolean
     face, so the two can never disagree.
@@ -207,7 +220,7 @@ class CutoverManager:
 
     def __init__(self, controller: "ServiceController") -> None:
         self._c = controller
-        # Restart-required, exactly like the P20 trio: snapshot at construction
+        # Restart-required, like every `[services]` bound: snapshot at construction
         # so a config PUT only rewrites TOML until the daemon restarts.
         settings = controller._services_settings
         self._grace_s = settings.cutover_grace_s
@@ -234,7 +247,7 @@ class CutoverManager:
     def has_unbound(self, job_id: str) -> bool:
         """An in-flight verify whose green has no container id yet.
 
-        The `has_unbound_run` twin (PR #108 review): everything between the
+        The `has_unbound_run` twin: everything between the
         task spawn and `runtime.run()` returning — env resolution, volume
         materialization, the container create itself — is a window in which a
         cancel cannot kill anything (there is no id) yet the docker thread may
@@ -311,11 +324,6 @@ class CutoverManager:
 
     async def _arm(self, job: Job, cfg: dict) -> bool:
         """Stamp `verifying`, write the marker, spawn the verify task."""
-        # Deferred: `services` imports this module, so the pair cannot be
-        # bound at import time (the `LaunchEnvNotReady` precedent in
-        # `_verify`).
-        from nerdit.core.services import _TERMINAL_DESIRED_STATES
-
         version = cfg.get("build_version")
         assert isinstance(version, int)  # _eligible guarantees it
 
@@ -329,12 +337,12 @@ class CutoverManager:
         # `run_once` makes for the identical reason. Checked BEFORE the phase
         # stamp so a refused arm cannot leave a stopped row displaying a
         # `verifying` phase no verify ever ran.
-        if (row.desired_state or "running") in _TERMINAL_DESIRED_STATES:
+        if (row.desired_state or "running") in TERMINAL_STATUSES:
             return False
 
         # The ONLY site that stamps `verifying`: the launch inside
         # the verify task is provenance-only and must not re-stamp it.
-        # Best-effort, NOT a gate (architect ruling 5): on a manual restart
+        # Best-effort, NOT a gate: on a manual restart
         # the phase is typically `healthy`, the guard rejects the
         # write, and the cutover proceeds anyway — the marker write + its CAS is
         # the gate. The promotion/regression edges then no-op symmetrically.
@@ -345,12 +353,10 @@ class CutoverManager:
             phase="verifying",
         )
 
-        # Version-CAS'd guarded RMW, the exact mechanism
-        # `AppImageBuilder._arm_release_pending` uses and for the identical
-        # reason: read and write are two statements, and a redeploy committing
-        # between them would otherwise have a stale blob written over it.
-        # Re-read AFTER the stamp: the stamp writes into the same config blob,
-        # and an RMW seeded from the pre-stamp row would erase it.
+        # Version-CAS'd keyed write, as `AppImageBuilder._arm_release_pending`
+        # does: a redeploy committing between this read and the write mints a
+        # new build_version and the marker write misses instead of arming a
+        # generation that no longer owns the row.
         row = await self._c._queries.get_job(job.id)
         if row is None:
             return False
@@ -358,22 +364,17 @@ class CutoverManager:
         if fresh.get("build_version") != version:
             return False  # a newer generation owns the row
         # Record blue's OWN serving port beside its id: blue may itself be a
-        # cutover-promoted green on an ephemeral port (back-to-back cutovers —
-        # the P24b live run's composition find), and every unwind must restore
-        # THAT port, not clear to NULL: NULL means "the stable port", where in
-        # that composition nothing listens, and a degraded row never relaunches
-        # — a permanent 502.
+        # cutover-promoted green on an ephemeral port (back-to-back cutovers),
+        # and every unwind must restore THAT port, not clear to NULL: NULL means
+        # "the stable port", where in that composition nothing listens, and a
+        # degraded row never relaunches — a permanent 502.
         blue_port: int | None = None
         if job.service_name:
             ep = await self._c._queries.get_service_endpoint(job.service_name)
             blue_port = ep.active_host_port if ep is not None else None
-        fresh["cutover_pending"] = {
-            "version": version,
-            "blue": job.container_id,
-            "blue_port": blue_port,
-        }
-        if not await self._c._queries.update_job_config_guarded(
-            job.id, json.dumps(fresh), expect_build_version=version
+        marker = {"version": version, "blue": job.container_id, "blue_port": blue_port}
+        if not await self._c._queries.patch_job_config(
+            job.id, {"cutover_pending": marker}, expect_build_version=version
         ):
             return False  # CAS miss — supersession, hands off
 
@@ -421,8 +422,8 @@ class CutoverManager:
         name = job.service_name or ""
         container_port = int(cfg.get("port") or 8000)
 
-        # (a) resolve env. RETRY-NEXT-TICK, not terminal (the plan's explicit
-        # divergence from the release precedent): a binding wait is indefinite
+        # (a) resolve env. RETRY-NEXT-TICK, not terminal (unlike a release
+        # failure): a binding wait is indefinite
         # by design, so pop the marker, regress the phase and let the next tick
         # re-arm. Blue keeps serving throughout; nothing was launched.
         try:
@@ -444,7 +445,7 @@ class CutoverManager:
             await self._c._audit_shared_resolved(job, resolved.shared_keys, resolved.secret_env)
 
         # (b) a transient OS-assigned loopback port.
-        green_port = _reserve_ephemeral_port()
+        green_port = _reserve_ephemeral_port(await self._c._queries.get_reserved_service_ports())
 
         # (c) the green container config: the service's own shape on the green
         # port, the SAME named volumes blue is writing (a new generation must
@@ -457,7 +458,7 @@ class CutoverManager:
         except VolumeSpecError as exc:
             await self._settle_probe_failure(job, version, message=str(exc))
             return
-        # `_launch`'s companion check, mirrored (D-P14-4 / critique L2): a
+        # `_launch`'s companion check, mirrored (D-P14-4): a
         # named volume nesting with a Tier-B user mount shadows one of them.
         # The green becomes the live container on success, so `_launch`
         # never re-checks it — skipping it here would make a cutover the one
@@ -559,7 +560,7 @@ class CutoverManager:
             if start_period > 0:
                 budget = max(budget, start_period + self._grace_s)
         else:
-            # (PR #108 review) The same widening for the no-health-check
+            # The same widening for the no-health-check
             # fallback: nothing schema-validates grace <= verify budget, and a
             # `cutover_grace_s` above `cutover_verify_timeout_s` would
             # otherwise make every healthy no-spec redeploy deterministically
@@ -607,7 +608,7 @@ class CutoverManager:
         proxy = self._c._proxy
         assert proxy is not None  # _eligible required an available proxy
         # The ids only — `_route_id` / `_domain_route_id`, not
-        # `build_route`: since P25 the latter resolves secrets and can raise,
+        # `build_route`: the latter resolves secrets and can raise,
         # and this call needs nothing but the ids. The domain rows are read
         # here, at commit time, so a domain bound during the verify window is
         # included and one removed during it is not.
@@ -628,13 +629,11 @@ class CutoverManager:
             edge_auth=parse_job_config(job).get("edge_auth"),
             project_id=job.project_id,
             with_domains=True,
-            # (Codex round 1, P2 #3831777105) The SAME snapshot `caddy_ids`
-            # was derived from, never a second read: `register` used to
-            # re-read `service_domains` itself, so a `DELETE` landing
-            # between the two awaits left the removed id in the awaited set
-            # while nothing would ever write it — `_await_dials` then burned
-            # its whole budget and unwound a healthy green. The removed route
-            # is torn down by the next reconcile tick, as its docstring says.
+            # The SAME snapshot `caddy_ids` was derived from, never a second
+            # read: a `DELETE` landing between two reads would leave a removed
+            # id in the awaited set that nothing ever writes, and
+            # `_await_dials` would burn its whole budget and unwind a healthy
+            # green. The removed route is torn down by the next reconcile tick.
             domains=[r.domain for r in domain_rows],
         )
         if not await self._await_dials(caddy_ids, green_port):
@@ -733,7 +732,7 @@ class CutoverManager:
         success — it is the admin wrapper's "could not read" signal, distinct
         from `{}`.
 
-        (P26 D-P26-2) All-or-nothing across ONE live read: a partially converged
+        (D-P26-2) All-or-nothing across ONE live read: a partially converged
         set is a failure, not a partial success, and the ids must agree on the
         same snapshot rather than each being satisfied on a different poll —
         otherwise a route that flipped back between two reads would still count.
@@ -790,8 +789,7 @@ class CutoverManager:
         f1 already wrote `active_host_port`, so the unwind has one extra step
         and a strict order: the DB goes back to BLUE'S OWN serving port FIRST
         (the marker's `blue_port` — the stable port unless blue itself is a
-        cutover-promoted green on an ephemeral port, the composition the P24b
-        live run caught), then a bounded re-verify (proceed anyway if
+        cutover-promoted green on an ephemeral port), then a bounded re-verify (proceed anyway if
         unreadable — blue is listening there and the proxy reconcile converges
         on its own), and only then is the green destroyed. The marker stays
         armed until this completes, so a crash during the unwind is caught by
@@ -896,8 +894,8 @@ class CutoverManager:
         #    is the marker's `blue_port`, not NULL: blue may itself be a
         #    promoted green on an ephemeral port (back-to-back cutovers), and
         #    NULL would dial the stable port where nothing listens — the same
-        #    permanent 502 from the other direction. `blue_port` absent (a
-        #    pre-fix marker) degrades to NULL. Idempotent.
+        #    permanent 502 from the other direction. `blue_port` absent (an
+        #    older marker) degrades to NULL. Idempotent.
         if job.service_name:
             await self._c._queries.set_endpoint_active_port(
                 job.service_name, _as_port(pending.get("blue_port"))
@@ -1039,7 +1037,7 @@ class CutoverManager:
             raw = pending.get("version")
             version = raw if isinstance(raw, int) and not isinstance(raw, bool) else None
             await self._pop_marker(job_id, version)
-        # No marker => nothing owned to unwind (PR #108 review): the cutover
+        # No marker => nothing owned to unwind: the cutover
         # either never armed or ALREADY COMMITTED — and on a committed row the
         # pointer names the promoted green's live port, so "restoring" NULL
         # here would redirect the dial to the unused stable port and 502 the
@@ -1054,8 +1052,7 @@ class CutoverManager:
         """Read the armed marker's `blue_port` — the unwind restore target.
 
         `None` when the row/marker is gone, names another generation, or
-        predates the field (pre-fix markers): NULL = "the stable port", the
-        pre-composition behaviour.
+        predates the field: NULL = "the stable port".
         """
         row = await self._c._queries.get_job(job_id)
         if row is None:
@@ -1085,22 +1082,22 @@ class CutoverManager:
         # The identity guard keys on the MARKER's version, not the row's
         # current build_version: after the settle's revert branch the row is
         # back on the previous generation while the marker still names the
-        # failed one — that marker is settled and must pop (PR #108 /
-        # amendment 8). What must never pop is a marker naming a DIFFERENT
-        # version than the caller's: that one belongs to a newer generation.
+        # failed one — that marker is settled and must pop. What must never
+        # pop is a marker naming a DIFFERENT version than the caller's: that
+        # one belongs to a newer generation.
         if version is not None and pending.get("version") != version:
             return
-        cfg.pop("cutover_pending")
         current = cfg.get("build_version")
-        if isinstance(current, int) and not isinstance(current, bool):
-            # CAS on the row's CURRENT version: a redeploy landing between the
-            # read and this write mints a new build_version, misses the CAS,
-            # and its own write_redeploy pop owns the marker instead.
-            await self._c._queries.update_job_config_guarded(
-                job_id, json.dumps(cfg), expect_build_version=current
-            )
-            return
-        await self._c._queries.update_job_config(job_id, json.dumps(cfg))
+        # CAS on the row's CURRENT version: a redeploy landing between the
+        # read and this write mints a new build_version, misses the CAS, and
+        # its own write_redeploy pop owns the marker instead.
+        await self._c._queries.patch_job_config(
+            job_id,
+            remove=["cutover_pending"],
+            expect_build_version=(
+                current if isinstance(current, int) and not isinstance(current, bool) else None
+            ),
+        )
 
     async def _audit(self, action: str, job: Job, params: dict[str, object]) -> None:
         """Write one `principal='system'` audit row (the `_audit_settle` shape).

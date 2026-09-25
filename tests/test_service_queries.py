@@ -701,7 +701,9 @@ async def test_list_workload_configs_projects_service_and_model_rows(queries):
     import json
 
     await queries.create_job(
-        _service_job("web", config=json.dumps({"image": "nerdit-app/web:2", "port": 8000}))
+        _service_job(
+            "web", token="tok-web", config=json.dumps({"image": "nerdit-app/web:2", "port": 8000})
+        )
     )
     await queries.create_job(
         Job(
@@ -726,6 +728,7 @@ async def test_list_workload_configs_projects_service_and_model_rows(queries):
     assert by_name["ollama-x"]["kind"] == "model"
     assert by_name["ollama-x"]["config"]["model"] == "llama3.1:8b"
     assert by_name["web"]["status"] == "running"
+    assert by_name["web"]["submitted_by_token"] == "tok-web"
 
 
 async def test_list_workload_configs_tolerates_bad_config(queries):
@@ -796,8 +799,8 @@ async def test_patch_last_dump_field_skips_a_foreign_run(queries):
 
     job = _service_job("pg", config=json.dumps({"image": "postgres:16", "build_version": 3}))
     await queries.create_job(job)
-    await queries.set_last_dump(
-        job.id, json.dumps({"run_id": "runA", "kind": "dump", "dump": None, "reason": None})
+    await queries.patch_job_config(
+        job.id, {"last_dump": {"run_id": "runA", "kind": "dump", "dump": None, "reason": None}}
     )
 
     assert (
@@ -833,3 +836,52 @@ async def test_patch_last_dump_field_skips_a_foreign_run(queries):
         )
         is False
     )
+
+
+async def test_stable_port_allocator_excludes_retained_cutover_ports(queries):
+    old = await queries.create_job(_service_job("old", desired_state="stopped"))
+    await queries.acquire_service_port("old", old.id, 8000, (9400, 9400))
+    await queries.set_endpoint_active_port("old", 9410)
+    assert await queries.get_reserved_service_ports() == {9400, 9410}
+    new = await queries.create_job(_service_job("new"))
+    endpoint = await queries.acquire_service_port("new", new.id, 8000, (9410, 9411))
+    assert endpoint.host_port == 9411
+    assert await queries.get_reserved_service_ports() == {9400, 9410, 9411}
+
+
+async def test_held_stable_port_conflicting_with_another_cutover_is_reallocated(queries):
+    old = await queries.create_job(_service_job("old"))
+    other = await queries.create_job(_service_job("other"))
+    await queries.acquire_service_port("old", old.id, 8000, (9400, 9402))
+    await queries.acquire_service_port("other", other.id, 8000, (9400, 9402))
+    # An overlap left by a pre-P41 ephemeral allocator must not survive restart.
+    await queries.set_endpoint_active_port("other", 9400)
+    endpoint = await queries.acquire_service_port("old", old.id, 8000, (9400, 9402))
+    assert endpoint.host_port == 9402
+
+
+# --- keyed config patch ---------------------------------------------------------
+
+
+async def test_patch_job_config_is_keyed_and_guarded(queries):
+    """A patch sets and removes only its own keys over the row as it is NOW."""
+    import json
+
+    job = _service_job("svc-patch", config=json.dumps({"build_version": 2, "old": 1}))
+    await queries.create_job(job)
+    # A write landing after the caller's (stale) read must survive the patch.
+    await queries.update_job_config(job.id, json.dumps({"build_version": 2, "old": 1, "x": 7}))
+
+    assert await queries.patch_job_config(job.id, {"new": {"a": [1]}}, remove=["old"])
+    cfg = json.loads((await queries.get_job(job.id)).config)
+    assert cfg == {"build_version": 2, "x": 7, "new": {"a": [1]}}
+
+    assert await queries.patch_job_config(job.id, {"x": 0}, expect_build_version=1) is False
+    assert json.loads((await queries.get_job(job.id)).config)["x"] == 7
+
+    await queries.update_job_config(job.id, "not json")
+    assert await queries.patch_job_config(job.id, {"x": 0}) is False
+    assert (await queries.get_job(job.id)).config == "not json"
+
+    with pytest.raises(ValueError):
+        await queries.patch_job_config(job.id, {"a') --": 1})

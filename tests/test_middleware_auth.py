@@ -15,10 +15,7 @@ from fastapi.testclient import TestClient
 
 from nerdit.daemon.auth import current_principal, hash_token
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers
-from nerdit.daemon.middleware import (
-    BearerAuthMiddleware,
-    ScopedTokenAuthMiddleware,
-)
+from nerdit.daemon.middleware import ScopedTokenAuthMiddleware, _is_public
 from nerdit.db.models import ApiToken, TokenRole
 
 RAW = "rawtoken-value"
@@ -54,7 +51,6 @@ def _make_app(*, token: str | None = "secret", queries: AsyncMock | None = None)
             "name": p.name,
             "role": p.role.value,
             "token_id": p.token_id,
-            "is_legacy_admin": p.is_legacy_admin,
             "max_gpus": p.max_gpus,
         }
 
@@ -79,15 +75,25 @@ def _make_app(*, token: str | None = "secret", queries: AsyncMock | None = None)
 # --- bypass principals --------------------------------------------------------
 
 
-def test_bearer_alias_points_at_scoped_middleware():
-    assert BearerAuthMiddleware is ScopedTokenAuthMiddleware
-
-
 def test_no_token_configured_yields_local_principal():
-    client = TestClient(_make_app(token=None), raise_server_exceptions=False)
+    client = TestClient(
+        _make_app(token=None), base_url="http://127.0.0.1", raise_server_exceptions=False
+    )
     assert client.get("/whoami").json()["name"] == "local"
     # Local is admin → mutation passes too.
     assert client.post("/mutate").json()["role"] == "admin"
+
+
+def test_tokenless_rejects_non_loopback_host():
+    app = _make_app(token=None)
+    evil = TestClient(app, base_url="http://evil.example", raise_server_exceptions=False)
+    resp = evil.get("/whoami")
+    assert resp.status_code == 421
+    assert resp.json()["code"] == "invalid_host"
+    assert evil.get("/health").status_code == 200
+    for host in ("127.0.0.1", "localhost:9321", "[::1]:9321"):
+        resp = evil.get("/whoami", headers={"host": host})
+        assert resp.status_code == 200, host
 
 
 def test_legacy_global_token_yields_legacy_admin():
@@ -95,12 +101,14 @@ def test_legacy_global_token_yields_legacy_admin():
     body = client.get("/whoami", headers={"Authorization": "Bearer secret"}).json()
     assert body["name"] == "legacy-admin"
     assert body["role"] == "admin"
-    assert body["is_legacy_admin"] is True
 
 
 def test_public_path_skips_auth():
     client = TestClient(_make_app(queries=_queries()), raise_server_exceptions=False)
     assert client.get("/health").status_code == 200
+    # Only the mounted docs paths are public; the bare root ones never existed.
+    assert _is_public("/api/docs", "GET") and _is_public("/api/openapi.json", "GET")
+    assert not _is_public("/docs", "GET") and not _is_public("/openapi.json", "GET")
 
 
 # --- scoped token resolution + state propagation ------------------------------
@@ -182,8 +190,8 @@ def test_invalid_token_writes_denied_audit_row():
     denials = _denied_calls(q)
     assert len(denials) == 1
     assert denials[0]["status_code"] == 403
-    # Action templated to bounded cardinality.
-    assert denials[0]["action"] == "POST /mutate"
+    # Unauthenticated: constant action, no target.
+    assert denials[0]["action"] == "auth.denied"
 
 
 def test_missing_header_writes_denied_audit_row():
@@ -205,17 +213,18 @@ def test_readonly_gate_writes_denied_audit_row_with_principal():
     assert denials[0]["status_code"] == 403
     assert denials[0]["principal_id"] == "tok-1"
     assert denials[0]["principal_role"] == "readonly"
+    # A principal-bearing denial keeps its route-derived action.
+    assert denials[0]["action"] == "POST /mutate"
 
 
-def test_templated_action_strips_concrete_service_id():
-    # Denials share the S6 route→action map (derive_action), so a known route
-    # records its mapped action — never the concrete row id (bounded cardinality).
+def test_unauthenticated_denial_action_is_constant():
+    # The caller-chosen path never reaches the row: bounded cardinality.
     q = _queries(None)
     client = TestClient(_make_app(queries=q), raise_server_exceptions=False)
     client.post("/services/abc123def456/stop", headers={"Authorization": "Bearer bogus"})
     denials = _denied_calls(q)
-    assert denials[0]["action"] == "service.stop"
-    assert "abc123def456" not in denials[0]["action"]
+    assert denials[0]["action"] == "auth.denied"
+    assert denials[0]["target_id"] is None
 
 
 # --- throttled last_used_at ---------------------------------------------------
@@ -478,7 +487,9 @@ def test_legacy_global_token_passes_even_when_a_row_would_be_expired():
 
 
 def test_local_bypass_passes_with_no_queries_at_all():
-    client = TestClient(_make_app(token=None), raise_server_exceptions=False)
+    client = TestClient(
+        _make_app(token=None), base_url="http://127.0.0.1", raise_server_exceptions=False
+    )
     resp = client.post("/mutate")
     assert resp.status_code == 200
     assert resp.json()["name"] == "local"

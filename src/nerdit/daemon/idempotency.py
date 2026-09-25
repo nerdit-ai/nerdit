@@ -2,7 +2,7 @@
 
 Runs inside Auth and Audit so replays remain authenticated and audited.
 Keys combine principal, Idempotency-Key, method and concrete URL path;
-`/jobs` and `/api/jobs` therefore do not deduplicate across mounts.
+`/services` and `/api/services` therefore do not deduplicate across mounts.
 Never depend on `scope['route']`, which is unavailable before routing.
 
 Hash a request body only when Content-Length is present and bounded, the body
@@ -60,7 +60,7 @@ _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 # The mutating routes that actually honor a `?dry_run` query param — the ONLY
 # ones for which the dry-run idempotency bypass may fire. FastAPI silently
-# ignores an undeclared query param, so `POST /jobs?dry_run=true` (or any other
+# ignores an undeclared query param, so `POST /services?dry_run=true` (or any other
 # route without a `dry_run` handler arg) still performs the REAL write; the
 # bypass must not skip idempotency there or a retry would duplicate the mutation.
 # Patterns match the path **after** the optional `/api` prefix is stripped
@@ -75,7 +75,7 @@ _DRY_RUN_ROUTES: list[tuple[str, re.Pattern[str]]] = [
     # the caller's Idempotency-Key and poisons the later real deploy.
     ("POST", re.compile(r"^/workspaces/[^/]+/deploy$")),
     ("POST", re.compile(r"^/app-templates/[^/]+/deploy$")),
-    # (P40d) A dry-run apply writes nothing (D-P40-12), so it must not burn the
+    # A dry-run apply writes nothing (D-P40-12), so it must not burn the
     # key the real apply will carry.
     ("POST", re.compile(r"^/projects/[^/]+/apply$")),
     ("POST", re.compile(r"^/config/daemon/apply$")),
@@ -99,25 +99,25 @@ _IDEMPOTENCY_EXEMPT_PATHS: list[tuple[str, re.Pattern[str]]] = [
     # The GitHub installation-token push: set-by-value, ordered
     # by `issued_at` per installation, re-minted on a timer by the cloud.
     ("PUT", re.compile(r"^/link/github-token$")),
+    # Immutable assignment: the same value is a no-op, any different value conflicts.
+    ("PUT", re.compile(r"^/link/public-address$")),
 ]
+
+
+def _matches(rules: list[tuple[str, re.Pattern[str]]], method: str, path: str) -> bool:
+    """True iff `(method, path)` matches a rule, after stripping the `/api` prefix."""
+    stripped = _strip_api_prefix(path)
+    return any(m == method and p.match(stripped) is not None for m, p in rules)
 
 
 def is_idempotency_exempt(method: str, path: str) -> bool:
     """True iff `(method, path)` is a machine route that carries no key."""
-    stripped = _strip_api_prefix(path)
-    return any(
-        rule_method == method and pattern.match(stripped) is not None
-        for rule_method, pattern in _IDEMPOTENCY_EXEMPT_PATHS
-    )
+    return _matches(_IDEMPOTENCY_EXEMPT_PATHS, method, path)
 
 
 def _honors_dry_run(method: str, path: str) -> bool:
     """True iff `(method, path)` is a route that implements `?dry_run`."""
-    stripped = _strip_api_prefix(path)
-    return any(
-        rule_method == method and pattern.match(stripped) is not None
-        for rule_method, pattern in _DRY_RUN_ROUTES
-    )
+    return _matches(_DRY_RUN_ROUTES, method, path)
 
 
 # Retention for a stored idempotency key. Records older than this are swept.
@@ -150,7 +150,7 @@ NO_BODY_CACHE_ACTIONS = {
 # Link-claim responses are safe to cache; license responses contain customer IDs.
 NO_BODY_HASH_ACTIONS = {
     "secret.set",
-    "variable.set",  # (P40c) the same value map one noun up; its response is names only
+    "variable.set",  # the same value map one noun up; its response is names only
     "template.deploy",
     "service.run",
     "service.create",
@@ -159,7 +159,7 @@ NO_BODY_HASH_ACTIONS = {
 }
 
 # Upper bound on a body the middleware will buffer to digest it. Mirrors the
-# P13c `MAX_MCP_BODY_BYTES` posture: the declared `Content-Length` decides
+# MCP transport's body-cap posture: the declared `Content-Length` decides
 # up front (never cap-while-read), and an absent one skips hashing entirely.
 _MAX_HASH_BODY_BYTES = 1_048_576
 
@@ -208,6 +208,8 @@ def _principal_id(request: Request) -> str:
     is `None`) key off their distinct sentinel name, so they never collide.
     """
     principal = current_principal(request)
+    if principal.project_id is not None:
+        return f"{principal.token_id}:project:{principal.project_id}"
     if principal.token_id is not None:
         return principal.token_id
     return f"anon:{principal.name}"
@@ -310,11 +312,11 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
         if request.method not in _MUTATING_METHODS:
             return await call_next(request)
 
-        # (P13c §3) The MCP mount is bypassed entirely: this middleware drains
+        # The MCP mount is bypassed entirely: this middleware drains
         # body_iterator on a claim, which would buffer/corrupt an SSE-shaped MCP
         # response, and a stray Idempotency-Key would be claimed for the bare
         # path. Idempotency is enforced where it matters — the inner REST hop,
-        # where the write _impls mint keys as today.
+        # where the write _impls mint keys.
         if is_mcp_path(request.url.path):
             return await call_next(request)
 
@@ -335,7 +337,7 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
         # (2) the concrete `(method, path)` is a route that actually declares a
         # `dry_run` handler arg (`_DRY_RUN_ROUTES`). FastAPI ignores an
         # undeclared query param, so without guard (2) a stray `?dry_run=true` on
-        # any other mutating route (e.g. `POST /jobs`) would skip idempotency on a
+        # any other mutating route (e.g. `POST /services`) would skip idempotency on a
         # request that really executes — a retry could then duplicate the mutation.
         dry_run = (request.query_params.get("dry_run") or "").lower()
         if dry_run in {"1", "true", "yes", "on", "t", "y"} and _honors_dry_run(

@@ -7,7 +7,6 @@ phases themselves. Neither helper imports a controller.
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -83,8 +82,8 @@ async def stamp_last_deploy(
         and getattr(row.kind, "value", row.kind) == "service"
     ):
         new_ld["remediation_code"] = settle_remediation_code(cfg, new_ld)
-    cfg["last_deploy"] = new_ld
-    await queries.update_job_config(job_id, json.dumps(cfg))
+    if not await queries.patch_job_config(job_id, {"last_deploy": new_ld}):
+        return False
 
     # Durable settle event — STRICTLY after the real write, past
     # every no-op guard. Only a `service` row that settled to a terminal

@@ -13,17 +13,13 @@ import re
 import secrets
 from pathlib import Path
 
-from nerdit.config.project import _DNS_LABEL_RE
 from nerdit.utils.ids import _ID_LENGTH
-
-#: Volume names are DNS labels capped at 32 chars (docker named-volume norm).
-#: A `/` provably cannot appear, so a name can never encode a host path.
-_VOLNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
+from nerdit.utils.names import DNS_LABEL_RE, VOLUME_NAME_RE
 
 #: Tombstone dir grammar (C2): a service's data root is renamed away to
 #: `.trash-<name>-<nonce>` before a database delete commits, so a refused
 #: delete can rename it BACK (an O(1) reversible move, unlike an rmtree). The
-#: leading `.` is un-mintable as a service name (`_DNS_LABEL_RE` rejects a
+#: leading `.` is un-mintable as a service name (`DNS_LABEL_RE` rejects a
 #: leading dot) so a tombstone can never collide with or be resolved as a real
 #: `service_data_root`; the nonce keeps repeated deletes of one name distinct.
 _TOMBSTONE_PREFIX = ".trash-"
@@ -36,7 +32,7 @@ def make_tombstone_name(service_name: str) -> str:
     Re-validates `service_name` against the DNS-label grammar (defense in
     depth — a forged name must never reach the filesystem here).
     """
-    if not _DNS_LABEL_RE.fullmatch(service_name):
+    if not DNS_LABEL_RE.fullmatch(service_name):
         raise VolumeSpecError(f"invalid service name: {service_name!r}")
     return f"{_TOMBSTONE_PREFIX}{service_name}-{secrets.token_hex(4)}"
 
@@ -55,7 +51,7 @@ def tombstone_service_name(name: str) -> str | None:
     base, sep, nonce = rest.rpartition("-")
     if not sep or not _TOMBSTONE_NONCE_RE.fullmatch(nonce):
         return None
-    if not _DNS_LABEL_RE.fullmatch(base):
+    if not DNS_LABEL_RE.fullmatch(base):
         return None
     return base
 
@@ -80,7 +76,7 @@ def service_data_root(data_dir: Path, service_name: str) -> Path:
     is asserted to live under `<data_dir>/services` — defense-in-depth against
     a forged name reaching this seam from any producer.
     """
-    if not _DNS_LABEL_RE.fullmatch(service_name):
+    if not DNS_LABEL_RE.fullmatch(service_name):
         raise VolumeSpecError(f"invalid service name: {service_name!r}")
     # The daemon-owned levels (`services` and `services/<name>`) must be
     # real directories: `.resolve()` would otherwise adopt a symlink's target
@@ -199,7 +195,7 @@ def resolve_named_volumes(service_name: str, specs: list[str], data_dir: Path) -
             raise VolumeSpecError(f"volume spec missing ':': {spec!r}")
         if ":" in container_path:
             raise VolumeSpecError(f"volume spec has extra ':': {spec!r}")
-        if not _VOLNAME_RE.fullmatch(volname):
+        if not VOLUME_NAME_RE.fullmatch(volname):
             raise VolumeSpecError(f"invalid volume name: {volname!r}")
         container_path = _validate_container_path(container_path)
         if volname in seen_names:

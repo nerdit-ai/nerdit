@@ -903,6 +903,44 @@ async def test_workspace_orphan_sweep_removes_old_orphan(db, queries, tmp_path):
     assert (await _sweep_rows(db))[-1]["workspace_orphans_removed"] == 1
 
 
+async def test_workspace_orphan_sweep_spares_a_project_workspace(queries, tmp_path):
+    """A project row protects its workspace even with no service row named after it."""
+    data_dir = tmp_path / "data"
+    await queries.create_project("asso", None, admin=True)
+    _seed_ws(data_dir, "asso", age_days=40)
+    _seed_ws(data_dir, "ghost", age_days=40)
+
+    from nerdit.daemon.sweeps import _sweep_workspace_phase
+
+    swept = await _sweep_workspace_phase(queries, 30, data_dir, datetime.now(UTC))
+
+    assert swept == 1
+    assert (data_dir / "workspaces" / "asso" / "tree" / "main.py").is_file()
+    assert not (data_dir / "workspaces" / "ghost").exists()
+
+
+async def test_job_log_phase_failure_does_not_skip_later_phases(db, queries, tmp_path, monkeypatch):
+    """A failing job-log prune is logged; later phases and the summary row still run."""
+
+    async def boom(cutoff):  # noqa: ANN001, ANN202
+        raise RuntimeError("job_logs unavailable")
+
+    monkeypatch.setattr(queries, "sweep_job_logs", boom)
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    for i in range(2):
+        p = backups / f"nerdit-backup-{i}.tar.gz"
+        p.write_bytes(b"x")
+        os.utime(p, (1_000_000 + i, 1_000_000 + i))
+
+    await server_module._run_retention_sweep(
+        queries, _retention(job_log_days=1, backup_keep_last=1), tmp_path, None
+    )
+
+    assert [p.name for p in backups.glob("nerdit-backup-*.tar.gz")] == ["nerdit-backup-1.tar.gz"]
+    assert (await _sweep_rows(db))[-1]["backups_removed"] == 1
+
+
 async def test_live_service_workspace_never_swept_regardless_of_age(db, queries, tmp_path):
     """A workspace whose name matches ANY row is live — a *stopped* one included."""
     data_dir = tmp_path / "data"

@@ -103,6 +103,47 @@ async def test_u1_non_https_rejected_no_subprocess(monkeypatch, tmp_path, bad_ur
     assert calls == []  # never spawned a subprocess
 
 
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://github.com/o/r.git\n",
+        "https://github.com/o/r.git ",
+        "https://github.com/o/\tr.git",
+        "\x00https://github.com/o/r.git",
+    ],
+)
+async def test_whitespace_or_control_char_url_rejected_no_subprocess(
+    monkeypatch, tmp_path, bad_url
+):
+    # urlsplit would silently strip these; the raw string reaches argv.
+    calls = _install(monkeypatch, _success_handler())
+    with pytest.raises(GitSourceError) as exc:
+        await clone_source(
+            bad_url,
+            dest_dir=tmp_path / "d",
+            timeout_s=10,
+            max_bytes=10**9,
+            allowed_hosts=["github.com"],
+        )
+    assert exc.value.code == "deploy.git_url_invalid"
+    assert calls == []
+
+
+async def test_clone_never_follows_redirects(monkeypatch, tmp_path):
+    # The askpass helper answers any host, so a redirect must not be followed.
+    calls = _install(monkeypatch, _success_handler())
+    await clone_source(
+        "https://github.com/o/r.git",
+        dest_dir=tmp_path / "d",
+        timeout_s=10,
+        max_bytes=10**9,
+        allowed_hosts=["github.com"],
+    )
+    args = calls[0]["args"]
+    assert args[:5] == ["git", "-c", "credential.helper=", "-c", "http.followRedirects=false"]
+    assert args[5] == "clone"
+
+
 # --- U2: host allowlist ------------------------------------------------------
 
 
@@ -715,6 +756,8 @@ async def test_ls_remote_argv_is_exact(monkeypatch, tmp_path):
         "git",
         "-c",
         "credential.helper=",
+        "-c",
+        "http.followRedirects=false",
         "ls-remote",
         "--exit-code",
         "--",

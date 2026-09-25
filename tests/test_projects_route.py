@@ -37,7 +37,7 @@ from nerdit.daemon.routes.projects import router as projects_router
 from nerdit.daemon.routes.secrets import router as secrets_router
 from nerdit.daemon.routes.services import router as services_router
 from nerdit.db.database import Database
-from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, TokenRole
+from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, LogStream, TokenRole
 from nerdit.db.queries import Queries
 
 LEGACY = "legacy-global"  # → LEGACY_ADMIN, token_id None
@@ -493,6 +493,7 @@ async def test_delete_with_a_failing_purge_keeps_the_row_and_rerun_succeeds(env)
     env.app.state.service_controller = SimpleNamespace(
         has_active_run=lambda job_id: job_id in busy,
         has_active_cutover=lambda job_id: False,
+        forget=lambda job_id: None,
     )
     resp = await env.client.delete("/projects/asso", headers=_auth(A_RAW))
     assert resp.status_code == 409, resp.text
@@ -538,3 +539,227 @@ async def test_delete_validates_purge_before_touching_anything(env):
     resp = await env.client.delete("/projects/asso?purge=bogus", headers=_auth(A_RAW))
     assert resp.status_code == 422 and resp.json()["code"] == "service.invalid_purge"
     assert await env.queries.get_project_by_name("asso") is not None
+
+
+async def test_project_id_keeps_name_scope_and_never_resolves_a_replacement(env):
+    original = (await _create(env, "asso")).json()["id"]
+    foreign = (await _create(env, "blog", B_RAW)).json()["id"]
+    ok = await env.client.get(f"/projects/{original}", headers=_auth(SCOPED_RAW))
+    assert ok.status_code == 200 and ok.json()["name"] == "asso"
+    denied = await env.client.get(f"/projects/{foreign}", headers=_auth(SCOPED_RAW))
+    assert denied.status_code == 403
+    assert "blog" not in denied.text and foreign in denied.text
+    assert await env.queries.delete_project_checked(original) == []
+    replacement = (await _create(env, "asso")).json()["id"]
+    assert replacement != original
+    stale = await env.client.get(f"/projects/{original}", headers=_auth(A_RAW))
+    assert stale.status_code == 404
+    current = await env.client.get(f"/projects/{replacement}", headers=_auth(A_RAW))
+    assert current.status_code == 200 and current.json()["id"] == replacement
+
+
+async def test_project_logs_and_diagnose_resolve_membership_and_preserve_ownership(env):
+    project = (await _create(env, "asso")).json()["id"]
+    job = (await _svc(env, "asso", A_RAW)).json()["id"]
+    await env.queries.append_log(job, "project log", LogStream.stdout)
+    await _svc(env, "api--asso", B_RAW)  # a legacy literal label, NOT a member of asso
+    logs = await env.client.get(
+        f"/projects/{project}/services/web/logs?tail=1", headers=_auth(A_RAW)
+    )
+    assert logs.status_code == 200 and logs.json()[0]["message"] == "project log"
+    false_member = await env.client.get(
+        f"/projects/{project}/services/api/logs", headers=_auth(A_RAW)
+    )
+    assert false_member.status_code == 404
+    for project_ref in (project, "asso"):
+        diagnosis = await env.client.get(
+            f"/projects/{project_ref}/services/web/diagnose", headers=_auth(A_RAW)
+        )
+        assert diagnosis.status_code == 200, diagnosis.text
+        assert diagnosis.json()["service_name"] == "asso"
+        denied = await env.client.get(
+            f"/projects/{project_ref}/services/web/diagnose", headers=_auth(B_RAW)
+        )
+        assert denied.status_code == 403
+
+
+async def test_project_logs_never_fall_back_from_job_id_to_another_label(env, monkeypatch):
+    import nerdit.daemon.routes.projects as projects_mod
+
+    project = (await _create(env, "asso")).json()["id"]
+    original = (await _svc(env, "asso", A_RAW)).json()["id"]
+    await env.queries.append_log(original, "original", LogStream.stdout)
+    other = (await _svc(env, original, A_RAW)).json()["id"]
+    await env.queries.append_log(other, "unrelated", LogStream.stdout)
+    original_resolve = projects_mod._project_service
+
+    async def deleted_after_resolution(request, project, service):
+        job = await original_resolve(request, project, service)
+        assert await env.queries.delete_service_checked(job.id) == []
+        return job
+
+    monkeypatch.setattr(projects_mod, "_project_service", deleted_after_resolution)
+    result = await env.client.get(f"/projects/{project}/services/web/logs", headers=_auth(A_RAW))
+    assert result.status_code == 200
+    assert "unrelated" not in result.text
+
+
+@pytest.mark.parametrize("native_project", [False, True])
+async def test_diagnose_refuses_replaced_job_after_async_probe(env, monkeypatch, native_project):
+    import nerdit.daemon.routes.service_diagnose as diagnose_mod
+
+    project = (await _create(env, "asso")).json()["id"]
+    original = (await _svc(env, "asso", A_RAW)).json()["id"]
+
+    async def replace_during_probe(job, endpoint):
+        assert job.id == original
+        assert await env.queries.delete_service_checked(original) == []
+        replacement = await _svc(env, "asso", LEGACY)
+        assert replacement.status_code == 201
+        assert replacement.json()["id"] != original
+        env.app.state.secret_manager.set("asso", {"REPLACEMENT_ONLY_KEY": "not-returned"})
+
+    monkeypatch.setattr(diagnose_mod, "_fresh_health_probe", replace_during_probe)
+    path = (
+        f"/projects/{project}/services/web/diagnose"
+        if native_project
+        else "/services/asso/diagnose"
+    )
+    result = await env.client.get(path, headers=_auth(A_RAW))
+    assert result.status_code == 404, result.text
+    assert "REPLACEMENT_ONLY_KEY" not in result.text
+
+
+@pytest.mark.parametrize("retire_project", [False, True])
+async def test_project_variable_names_never_use_replaced_service_authority(
+    env, monkeypatch, retire_project
+):
+    project = (await _create(env, "asso")).json()["id"]
+    original = (await _svc(env, "asso", A_RAW)).json()["id"]
+    list_flags = env.queries.list_variable_flags
+
+    async def replace_during_flags(project_id):
+        flags = await list_flags(project_id)
+        assert await env.queries.delete_service_checked(original) == []
+        if retire_project:
+            assert await env.queries.delete_project_checked(project) == []
+            replacement_project = (await _create(env, "asso", B_RAW)).json()["id"]
+            assert replacement_project != project
+        replacement = await _svc(env, "asso", LEGACY)
+        assert replacement.status_code == 201
+        assert replacement.json()["id"] != original
+        env.app.state.secret_manager.set("asso", {"REPLACEMENT_ONLY_KEY": "not-returned"})
+        return flags
+
+    monkeypatch.setattr(env.queries, "list_variable_flags", replace_during_flags)
+    result = await env.client.get(f"/projects/{project}", headers=_auth(A_RAW))
+    assert result.status_code == 200, result.text
+    assert "REPLACEMENT_ONLY_KEY" not in result.text
+    assert result.json()["variables"] == []
+
+
+async def test_rename_preserves_namespace_services_and_variable_identity(env):
+    await _svc(env, "asso", A_RAW)
+    original = (await env.client.get("/projects/asso", headers=_auth(A_RAW))).json()
+    ident = original["id"]
+    await env.client.put(
+        f"/projects/{ident}/variables",
+        headers=_auth(A_RAW),
+        json={"values": {"RENAME_CANARY": "never-return-this"}, "secret": True},
+    )
+    before = await env.queries.get_project(ident)
+    response = await env.client.patch(
+        f"/projects/{ident}", headers=_auth(A_RAW), json={"name": "new-label"}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["name"] == "new-label"
+    assert response.json()["namespace"] == "asso"
+    assert response.json()["services"] == original["services"]
+    after = await env.queries.get_project(ident)
+    assert (after.id, after.name, after.submitted_by_token) == (before.id, "asso", "tok-a")
+    for selector in (ident, "asso"):
+        view = (await env.client.get(f"/projects/{selector}", headers=_auth(A_RAW))).json()
+        assert view["name"] == "new-label"
+        assert view["variables"] == [{"key": "RENAME_CANARY", "scope": "project", "plain": False}]
+        assert "never-return-this" not in json.dumps(view)
+    assert (await env.client.get("/projects/new-label", headers=_auth(A_RAW))).status_code == 404
+    assert (await env.client.get("/projects", headers=_auth(A_RAW))).json()["items"][0][
+        "name"
+    ] == "new-label"
+    assert len(await env.audit("project.rename")) == 1
+
+
+async def test_rename_validates_id_owner_role_and_name(env):
+    ident = (await _create(env, "asso")).json()["id"]
+    await _create(env, "taken")
+    for selector, raw, name, status in (
+        ("asso", A_RAW, "new", 422),
+        (ident, B_RAW, "new", 403),
+        (ident, RO_RAW, "new", 403),
+        (ident, A_RAW, "INVALID", 422),
+        (ident, A_RAW, "taken", 200),
+        (ident, A_RAW, "asso", 200),
+    ):
+        response = await env.client.patch(
+            f"/projects/{selector}", headers=_auth(raw), json={"name": name}
+        )
+        assert response.status_code == status, response.text
+    assert (await env.queries.get_project(ident)).label == "asso"
+
+
+async def test_renamed_project_keeps_legacy_token_scope(env):
+    ident = (await _create(env, "asso", SCOPED_RAW)).json()["id"]
+    renamed = await env.client.patch(
+        f"/projects/{ident}", headers=_auth(SCOPED_RAW), json={"name": "new-label"}
+    )
+    assert renamed.status_code == 200
+    visible = await env.client.get("/projects", headers=_auth(SCOPED_RAW))
+    assert [item["id"] for item in visible.json()["items"]] == [ident]
+    view = await env.client.get(f"/projects/{ident}", headers=_auth(SCOPED_RAW))
+    assert view.status_code == 200
+    assert view.json()["name"] == "new-label"
+    written = await env.client.put(
+        f"/projects/{ident}/variables",
+        headers=_auth(SCOPED_RAW),
+        json={"values": {"AFTER_RENAME": "secret-canary"}},
+    )
+    assert written.status_code == 200
+    assert "secret-canary" not in written.text
+
+
+async def test_display_labels_can_repeat_without_changing_name_selectors(env):
+    ident = (await _create(env, "original")).json()["id"]
+    renamed = await env.client.patch(
+        f"/projects/{ident}", headers=_auth(A_RAW), json={"name": "shared-label"}
+    )
+    assert renamed.status_code == 200
+    created = await _create(env, "shared-label")
+    assert created.status_code == 201
+    second = created.json()["id"]
+    assert second != ident
+    assert (await env.client.get("/projects/shared-label", headers=_auth(A_RAW))).json()[
+        "id"
+    ] == second
+    assert (await env.client.get(f"/projects/{ident}", headers=_auth(A_RAW))).json()[
+        "namespace"
+    ] == "original"
+
+
+async def test_list_loads_the_hosted_context_once_per_page(env, monkeypatch):
+    from nerdit.daemon.routes import projects as projects_route
+
+    for name in ("a", "b"):
+        await _create(env, name)
+        assert (await _svc(env, name, A_RAW)).status_code == 201
+    real = projects_route.load_hosted_context
+    calls = []
+
+    async def counting(request):
+        calls.append(1)
+        return await real(request)
+
+    monkeypatch.setattr(projects_route, "load_hosted_context", counting)
+    resp = await env.client.get("/projects", headers=_auth(A_RAW))
+    assert resp.status_code == 200, resp.text
+    assert [len(p["services"]) for p in resp.json()["items"]] == [1, 1]
+    assert len(calls) == 1

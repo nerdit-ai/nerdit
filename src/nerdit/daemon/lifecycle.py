@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -45,7 +44,11 @@ class DaemonLifecycle:
             pid = int(self._pid_file.read_text().strip())
             os.kill(pid, 0)  # Check if process exists
             return True
-        except (ValueError, ProcessLookupError, PermissionError):
+        except PermissionError:
+            # EPERM means the pid exists under another user: never unlink a
+            # pid file for a process that may still be our daemon.
+            return True
+        except (ValueError, ProcessLookupError):
             self._pid_file.unlink(missing_ok=True)
             return False
 
@@ -188,20 +191,6 @@ class DaemonLifecycle:
         finally:
             sock.close()
         return False
-
-    def stop(self) -> bool:
-        """Stop the daemon via SIGTERM. Returns True if stopped."""
-        if not self._pid_file.exists():
-            return False
-        try:
-            pid = int(self._pid_file.read_text().strip())
-            os.kill(pid, signal.SIGTERM)
-            self._pid_file.unlink(missing_ok=True)
-            logger.info("Daemon stopped (PID %d)", pid)
-            return True
-        except (ValueError, ProcessLookupError):
-            self._pid_file.unlink(missing_ok=True)
-            return False
 
     def wait_for_ready(self, timeout: float = 10.0, interval: float = 0.3) -> bool:
         """Poll /health until the daemon is ready. Returns True if ready."""

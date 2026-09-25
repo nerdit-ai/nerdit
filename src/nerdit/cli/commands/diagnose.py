@@ -11,7 +11,7 @@ import json
 
 import typer
 
-from nerdit.cli.display import console, render_client_error
+from nerdit.cli.display import call_or_exit, console
 from nerdit.cli.display import plain as _plain
 
 
@@ -47,11 +47,7 @@ async def _diagnose_async(name: str, log_tail: int) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        data = await client.diagnose_service(name, log_tail=log_tail)
-    except Exception as exc:  # noqa: BLE001 — surfaced as a structured client error
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    data = await call_or_exit(client.diagnose_service(name, log_tail=log_tail))
 
     svc = data.get("service_name", name)
     status = data.get("status", "?")
@@ -81,9 +77,10 @@ async def _diagnose_async(name: str, log_tail: int) -> None:
         )
 
     restarts = data.get("restarts") or {}
+    retry_in = restarts.get("next_retry_in_s")
     console.print(
         f"  restarts: {_plain(restarts.get('count'))}/{_plain(restarts.get('max_restarts'))}"
-        f"  next retry in: {_plain(restarts.get('next_retry_in_s'))}s"
+        f"  next retry in: {'-' if retry_in is None else f'{_plain(retry_in)}s'}"
     )
 
     bindings = data.get("bindings") or {}

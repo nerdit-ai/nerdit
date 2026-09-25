@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import subprocess
 import sys
 import tomllib
@@ -16,6 +15,7 @@ from nerdit.cli import checks
 from nerdit.cli.display import _plain, console
 from nerdit.config.defaults import NVIDIA_LIB_DIRS
 from nerdit.config.settings import generate_auth_token, load_settings
+from nerdit.utils.fs import atomic_write
 
 if TYPE_CHECKING:
     from nerdit.daemon.lifecycle import DaemonLifecycle
@@ -142,27 +142,10 @@ def _harden_secret_file(path: Path) -> None:
 
 
 def _replace_secret_file(path: Path, content: str) -> bool:
-    """Atomically write secret content without a world-readable interval.
-
-    Create an exclusive 0600 temporary file, then rename it into place.
-    """
-    tmp = path.with_name(path.name + ".tmp")
+    """Atomically write secret content at 0600; False when the write fails."""
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        try:
-            tmp.unlink()
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except OSError:
-            return False
+        atomic_write(path, content.encode("utf-8"))
     except OSError:
-        return False
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(content)
-        os.replace(tmp, path)
-    except OSError:
-        tmp.unlink(missing_ok=True)
         return False
     return True
 
@@ -376,11 +359,9 @@ async def _init_async() -> None:
         )
     elif not config_path.exists():
         config_text, token = _generate_default_config()
-        config_path.write_text(config_text)
-        try:
-            config_path.chmod(0o600)
-        except OSError:
-            pass
+        if not _replace_secret_file(config_path, config_text):
+            console.print("[red]Could not write the configuration file.[/red]")
+            raise typer.Exit(1)
         console.print(f"[green]Configuration created:[/green] {config_path}")
     else:
         console.print(f"[dim]Existing configuration:[/dim] {config_path}")
@@ -451,7 +432,7 @@ async def _init_async() -> None:
         console.print(f"  {token}")
         console.print()
         console.print("[dim]Use this token to connect a remote client:[/dim]")
-        console.print(f"  [cyan]nerdit connect <ip> --token {token}[/cyan]")
+        console.print("  [cyan]nerdit connect <ip>[/cyan] (it prompts for the token)")
 
     # Display GPU info
     client = NerditClient(host=host, port=daemon.port, token=daemon.auth_token)

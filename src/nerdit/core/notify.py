@@ -20,6 +20,7 @@ import hmac
 import json
 import logging
 import random
+import time
 import uuid
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -32,7 +33,6 @@ from nerdit.core.secrets import SHARED_SCOPE, SecretDecryptError, SecretManager
 from nerdit.db.rows import Event
 
 if TYPE_CHECKING:
-    from nerdit.core.events import EventBus
     from nerdit.db.queries import Queries
 
 logger = logging.getLogger(__name__)
@@ -70,8 +70,9 @@ class WebhookDispatcher:
     Lifecycle shape: built in the daemon lifespan (only when
     `[notifications].enabled` and at least one
     target is configured), `start` spawns the loop, `stop` cancels
-    it and closes the client. Each target drains independently; a target that
-    raises can never take the loop down.
+    it and closes the client. Each target drains in its own concurrent loop, so
+    a slow or dead target never delays another and one that raises never takes
+    the others down.
     """
 
     def __init__(
@@ -80,7 +81,6 @@ class WebhookDispatcher:
         settings: NotificationsSettings,
         secrets: SecretManager,
         *,
-        bus: EventBus | None = None,
         version: str,
         instance_id: str,
         transport: httpx.AsyncBaseTransport | None = None,
@@ -88,9 +88,6 @@ class WebhookDispatcher:
         self._queries = queries
         self._settings = settings
         self._secrets = secrets
-        # Reserved for the wake-up nudge (D-P24-6: the bus "may serve" as one).
-        # v1 polls only — the interval poll is the fallback AND the guarantee.
-        self._bus = bus
         self._version = version
         self._instance_id = instance_id
         self._transport = transport
@@ -125,15 +122,22 @@ class WebhookDispatcher:
     # -- drain -----------------------------------------------------------------
 
     async def _loop(self) -> None:
-        """Drain every target, then sleep. Cancellation is the only exit."""
+        """Run one drain loop per target; cancelling this task cancels them all.
+
+        Targets never share a cursor (duplicates are refused at validation), so
+        concurrent drains are safe.
+        """
+        await asyncio.gather(*(self._target_loop(t) for t in self._settings.targets))
+
+    async def _target_loop(self, target: NotificationTarget) -> None:
+        """Drain one target, then sleep. Cancellation is the only exit."""
         while True:
-            for target in self._settings.targets:
-                try:
-                    await self._drain_target(target)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 — one bad target never kills the loop
-                    logger.exception("Webhook drain failed for target %s", target.cursor_id())
+            try:
+                await self._drain_target(target)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — one bad target never kills its loop
+                logger.exception("Webhook drain failed for target %s", target.cursor_id())
             await asyncio.sleep(self._settings.poll_interval_s)
 
     async def _drain_target(self, target: NotificationTarget) -> None:
@@ -232,9 +236,13 @@ class WebhookDispatcher:
         if self._client is None:  # not started (or already stopped)
             return None
         raw = _build_payload(batch, instance_id=self._instance_id, version=self._version)
+        # Per attempt, so a retry is a distinct delivery for receiver dedupe.
+        timestamp = str(int(time.time()))
+        delivery = str(uuid.uuid4())
         headers = {
             "Content-Type": "application/json",
-            "X-Nerdit-Delivery": str(uuid.uuid4()),
+            "X-Nerdit-Delivery": delivery,
+            "X-Nerdit-Timestamp": timestamp,
             "X-Nerdit-Event-Count": str(len(batch)),
         }
         if target.secret_ref is not None or target.auth_header_ref is not None:
@@ -247,7 +255,12 @@ class WebhookDispatcher:
                 key = self._shared_value(shared, target.secret_ref)
                 if key is None:
                     return None
+                # V1 (body only) stays byte-identical for existing receivers
+                # but replays verbatim; V2 binds the timestamp and delivery id.
                 headers["X-Nerdit-Signature"] = _signature(key, raw)
+                headers["X-Nerdit-Signature-V2"] = _signature(
+                    key, f"{timestamp}.{delivery}.".encode() + raw
+                )
             if target.auth_header_ref is not None:
                 value = self._shared_value(shared, target.auth_header_ref)
                 if value is None:

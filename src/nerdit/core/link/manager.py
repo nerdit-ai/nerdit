@@ -187,7 +187,7 @@ class GithubTokenUpdate:
 
 @dataclass(frozen=True, slots=True)
 class GithubInstallation:
-    """One mirrored installation token (P33 D-GH-2). In memory only.
+    """One mirrored installation token (D-GH-2). In memory only.
 
     `repos` is the cloud's repo-filtered list for THIS node (§6 Q3), in
     canonical `owner/name` lower-case form; resolution is by repo
@@ -274,7 +274,10 @@ class LinkManager:
         events: EventRecorder | None = None,
         connector: Connector | None = None,
         mux_factory: Callable[[MuxContext], InboundStreamHandler] | None = None,
-        resolve_app: Callable[[str], Awaitable[AppTarget | None]] | None = None,
+        resolve_app: Callable[
+            [str, str | None, str | None, str | None], Awaitable[AppTarget | None]
+        ]
+        | None = None,
         clock: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         monotonic: Callable[[], float] | None = None,
@@ -346,9 +349,9 @@ class LinkManager:
         if self._task is not None:
             return
         if self._mux_factory is None:
-            # Lazy on purpose: `core.link.client`/`manager` must import
-            # cleanly without `mux` (parallel build), and a mux import error
-            # belongs to whoever asked for a tunnel, not to daemon boot.
+            # Lazy on purpose: `core.link.client`/`manager` import cleanly
+            # without `mux`, and a mux import error belongs to whoever asked
+            # for a tunnel, not to daemon boot.
             from nerdit.core.link.mux import StreamMux  # noqa: PLC0415
 
             self._mux_factory = StreamMux
@@ -388,7 +391,7 @@ class LinkManager:
     # -- surface -----------------------------------------------------------
 
     def now(self) -> datetime:
-        """This manager's notion of "now" (P32, review round 1).
+        """This manager's notion of "now".
 
         The entitlement seam has exactly one clock: `received_at`, the TTL and
         the ordering comparison in `set_hosted_public_entitled` all read
@@ -425,13 +428,13 @@ class LinkManager:
     # -- entitlement mirror -----------------------------------------
 
     def pro_mirror_state(self) -> ProMirrorState:
-        """The mirror read as one of four machine tokens (P34 D3, D-X16-37).
+        """The mirror read as one of four machine tokens (D-X16-37).
 
         `_hosted_public_effective` collapses four distinguishable facts
         into one bool, which is right for "may this node serve a public share"
         and wrong for anything that has to tell a user *why*. Splitting them
-        out here — rather than in the caller — keeps the whole design promise
-        of the P32 seam: `ENTITLEMENT_TTL_S` is evaluated in **exactly
+        out here — rather than in the caller — keeps the TTL on one clock:
+        `ENTITLEMENT_TTL_S` is evaluated in **exactly
         this method**, against `self._clock()`, the same injected clock that
         stamped `_entitlement_received_at` on receipt. A second reader that
         re-derived freshness from `LinkStatus.hosted_public_entitled_at` and
@@ -549,7 +552,7 @@ class LinkManager:
         """
         await self._record("link.entitlement", data={"hosted_public_entitled": value})
 
-    # -- GitHub installation-token mirror (P33 D-GH-2 / D-GH-3) -------------
+    # -- GitHub installation-token mirror (D-GH-2 / D-GH-3) -----------------
 
     def _live_github_installations(self) -> list[GithubInstallation]:
         """Every mirrored installation whose token has not expired, in
@@ -571,7 +574,7 @@ class LinkManager:
         )
 
     def github_mirror_held(self) -> tuple[int, datetime | None]:
-        """(P33 doctor D2) The doctor's overdue latch: the count of mirrored
+        """The doctor's overdue latch: the count of mirrored
         installations *regardless of expiry*, and the latest `expires_at`
         among them (`(0, None)` when the mirror is empty).
 
@@ -588,8 +591,8 @@ class LinkManager:
         `clear_github_tokens`), so a non-zero held count with nothing
         live means exactly "we held a token and the cloud let it lapse while
         the link stayed up". This read inspects what already lingers — it adds
-        no retention, so the F1 memory bound and the live-only resolution are
-        both untouched.
+        no retention, so the mirror's memory bound and the live-only resolution
+        are both untouched.
         """
         if not self._github_tokens:
             return 0, None
@@ -632,13 +635,13 @@ class LinkManager:
         live incumbent — it simply never reads as live — so `changed` stays
         honest about the effective view, and it is then garbage for the next
         accepted push's expiry sweep, exactly like an entry that expired while
-        mirrored. The one exception (D3): an already-expired push must NOT
+        mirrored. The one exception: an already-expired push must NOT
         evict a currently-live entry — that would silently blank a working
         token until the cloud's next re-mint — so it is refused as a no-op
         (`applied=False`) and the live entry is kept; a newer, still-valid
         token still replaces.
 
-        The mirror is bounded (security review F1): every accepted push first
+        The mirror is bounded: every accepted push first
         evicts entries whose `expires_at` has passed, then — only when the
         push introduces a NEW `installation_id` — enforces
         `GITHUB_INSTALLATION_MIRROR_MAX` by dropping the oldest
@@ -659,13 +662,7 @@ class LinkManager:
                 repos_count=before.repos_count if before is not None else 0,
             )
         now = self._clock()
-        # (D3) An incoming token already expired at `now` must not replace a
-        # currently-live entry: swapping a working token for a dead one would
-        # silently blank repo resolution until the cloud's next re-mint. Keep
-        # the live incumbent (no-op, applied=False, echoing its live summary).
-        # A first push that arrives already expired — no live incumbent — is
-        # still stored below, exactly like an entry that expired while
-        # mirrored; a newer, still-valid token still replaces.
+        # An already-expired push never replaces a live incumbent (see above).
         if expires_at <= now and previous is not None and previous.expires_at > now:
             return GithubTokenUpdate(
                 applied=False,
@@ -674,7 +671,7 @@ class LinkManager:
                 expires_at=before.expires_at if before is not None else expires_at,
                 repos_count=before.repos_count if before is not None else 0,
             )
-        # (Security review F1) Bound the mirror before the write: expired
+        # Bound the mirror before the write: expired
         # entries are dead weight the read path already filters, so evict them
         # here — the one write choke point — against the same injected clock.
         for expired_id in [
@@ -690,7 +687,7 @@ class LinkManager:
                 )
                 del self._github_tokens[oldest.installation_id]
         new_repos = tuple(sorted({repo.strip().lower() for repo in repos}))
-        # (D6) `changed` drives consumers, so it must track the EFFECTIVE read
+        # `changed` drives consumers, so it must track the EFFECTIVE read
         # — the live `(expires_at, repos)` pair — not merely presence. A
         # same-expiry push that only swaps the repo set (org/a → org/b, a
         # narrow or a widen) is a real change even though `repos_count` and

@@ -43,6 +43,9 @@ _REQUEST_TOKEN: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _REQUEST_ROLE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "nerdit_mcp_request_role", default=None
 )
+_REQUEST_PROJECT_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "nerdit_mcp_request_project_id", default=None
+)
 # A coroutine the ASGI wrapper builds from the scope, recording one
 # `result='denied'` audit row (and its admin `audit.*` bus frame) for a refusal
 # the tool body makes on its own. The two refusals below short-circuit BEFORE
@@ -115,7 +118,9 @@ def _request_client() -> NerditClient:
     """
     token = _REQUEST_TOKEN.get()
     if token is not None:
-        return NerditClient(host=_HTTP_HOST, port=_HTTP_PORT, token=token)
+        return NerditClient(
+            host=_HTTP_HOST, port=_HTTP_PORT, token=token, project_id=_REQUEST_PROJECT_ID.get()
+        )
     if _HTTP_MODE:
         raise McpHttpAuthError()
     return get_configured_client()
@@ -399,11 +404,68 @@ class _TransportGuard:
         role = _role_from_scope(scope)
         if role is not None:
             bound.append((_REQUEST_ROLE, _REQUEST_ROLE.set(role)))
+        principal = (scope.get("state") or {}).get("principal")
+        bound.append(
+            (_REQUEST_PROJECT_ID, _REQUEST_PROJECT_ID.set(getattr(principal, "project_id", None)))
+        )
         recorder = _denial_recorder(scope, request_id)
         recorder_ctx = _REQUEST_DENIAL.set(recorder)
         try:
+            receive = await self._project_receive(scope, receive, send, request_id)
+            if receive is None:
+                return
             await self._inner(scope, receive, send)
         finally:
             _REQUEST_DENIAL.reset(recorder_ctx)
             for var, ctx in reversed(bound):
                 var.reset(ctx)
+
+    async def _project_receive(self, scope, receive, send, request_id):
+        # A project endpoint has no resource/prompt/global protocol
+        # surface. Check framing before any registered handler runs.
+        if _REQUEST_PROJECT_ID.get() is None:
+            return receive
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                return None
+            body.extend(message.get("body", b""))
+            if len(body) > self._max_body_bytes:
+                await self._reject(413, "payload_too_large", "Request body too large.", request_id)(
+                    scope, receive, send
+                )
+                return None
+            if not message.get("more_body", False):
+                break
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        method = payload.get("method") if isinstance(payload, dict) else None
+        if not isinstance(method, str) or method not in {
+            "initialize",
+            "notifications/initialized",
+            "notifications/cancelled",
+            "ping",
+            "tools/list",
+            "tools/call",
+        }:
+            await _record_tool_denial("/api/project-mcp", 403)
+            await self._reject(
+                403,
+                "project.delegation_forbidden",
+                "This MCP method is not available under project-only delegation.",
+                request_id,
+            )(scope, receive, send)
+            return None
+        replayed = False
+
+        async def replay_receive() -> Any:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return await receive()
+
+        return replay_receive

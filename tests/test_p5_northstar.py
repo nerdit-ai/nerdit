@@ -221,7 +221,9 @@ async def scenario(queries, sample_gpus, tmp_path) -> Scenario:
     )
     secrets = SecretManager(tmp_path / "secrets")
     controller = _controller(queries, runtime, mc, secrets)
-    client = AsyncClient(transport=ASGITransport(app=_route_app(queries)), base_url="http://test")
+    client = AsyncClient(
+        transport=ASGITransport(app=_route_app(queries)), base_url="http://127.0.0.1"
+    )
 
     s = Scenario(
         queries=queries,

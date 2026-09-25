@@ -253,7 +253,7 @@ def _http_error(status: int, body: dict) -> Exception:
 def test_run_interrupted_prints_the_partial_output():
     """A 503 ``run.interrupted`` carries the ONLY surviving record of the run.
 
-    ``run_once`` raises before it reaches ``set_last_run``, so ``nerdit
+    ``run_once`` raises before it stamps ``last_run``, so ``nerdit
     diagnose`` shows the previous run, not this one — and ``render_client_error``
     prints message/detail/hint only. Without the special case the operator is
     told the command may have half-applied and shown nothing to judge it by.

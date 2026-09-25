@@ -29,13 +29,15 @@ def is_secret_key(key: str) -> bool:
 
 
 def redact_value(key: str, value: Any) -> Any:
-    """Mask `value` when `key` is secret and the value is actually set.
+    """Mask secret leaves and credentials embedded in URL values.
 
     `None` (an unset secret) is left as `None` so a redacted view does not
     falsely imply a secret exists.
     """
     if value is not None and is_secret_key(key):
         return REDACTED
+    if key.lower() in {"url", "base_url"}:
+        return redact_url_userinfo(value)
     return value
 
 
@@ -52,5 +54,5 @@ def redact_url_userinfo(value: Any) -> Any:
 
 
 def redact_section(values: dict[str, Any]) -> dict[str, Any]:
-    """Return a shallow copy of a config section with secret leaves masked."""
+    """Return a shallow copy of a config section with secrets masked."""
     return {key: redact_value(key, value) for key, value in values.items()}

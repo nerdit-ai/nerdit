@@ -175,6 +175,7 @@ _ROUTE_RULES: list[tuple[str, re.Pattern[str], str, str | None, int | None]] = [
     # mirror from outside the tunnel. Like the three rules above it, a literal
     # path whose node id the route stamps (see `_TARGET_STAMP_ALLOWED`).
     ("PUT", re.compile(r"^/link/entitlement$"), "link.entitlement", "link", None),
+    ("PUT", re.compile(r"^/link/public-address$"), "link.public_address", "link", None),
     # The cloud's GitHub installation-token push. Change-only like
     # the entitlement push; the row's params are the installation id, the
     # expiry and the repo COUNT — never the token, never the repo names.
@@ -194,6 +195,7 @@ _ROUTE_RULES: list[tuple[str, re.Pattern[str], str, str | None, int | None]] = [
     # the route stamps it (see `_TARGET_STAMP_ALLOWED`); the delete's rides
     # the path. Bodies carry names only — no `NO_BODY_HASH_ACTIONS` entry.
     ("POST", re.compile(r"^/projects$"), "project.create", "project", None),
+    ("PATCH", re.compile(r"^/projects/([^/]+)$"), "project.rename", "project", 1),
     ("DELETE", re.compile(r"^/projects/([^/]+)$"), "project.delete", "project", 1),
     # (P40d / D-P40-10) The declaration apply. Multipart, so never body-hashed
     # (the `deploy.create` treatment); `token_ref` is a reference name, so no
@@ -241,6 +243,7 @@ _TARGET_STAMP_ALLOWED: dict[str, str] = {
     # Same shape again: `/link/entitlement` is a literal path and the
     # node id comes off the live `LinkStatus`, so the route stamps it.
     "link.entitlement": "link",
+    "link.public_address": "link",
     # And again for the token push and the nudge.
     "link.github_token": "link",
     "gitwatch.nudge": "link",
@@ -302,12 +305,12 @@ def _strip_api_prefix(path: str) -> str:
 # The MCP transport mount (P13c §3). Boundary-exact on purpose: exactly the
 # mount root or a slash-separated descendant, never a bare startswith that
 # would also match a future /api/mcpX route.
-_MCP_MOUNT = "/api/mcp"
+_MCP_MOUNTS = ("/api/mcp", "/api/project-mcp")
 
 
 def is_mcp_path(path: str) -> bool:
     """True iff `path` is the MCP transport mount or lives under it."""
-    return path == _MCP_MOUNT or path.startswith(_MCP_MOUNT + "/")
+    return any(path == mount or path.startswith(mount + "/") for mount in _MCP_MOUNTS)
 
 
 def _templated_path(path: str) -> str:
@@ -385,7 +388,7 @@ def redact(value: Any) -> Any:
 
 
 def audit_params(model: Any) -> dict[str, Any]:
-    """Build a redacted params dict from a pydantic model (or plain dict).
+    """Build a redacted params dict from a pydantic model or a plain dict.
 
     Routes call this and assign the result to `request.state.audit_params`;
     the middleware serializes it into the `params_redacted` column. Secret
@@ -393,12 +396,7 @@ def audit_params(model: Any) -> dict[str, Any]:
     """
     if model is None:
         return {}
-    if hasattr(model, "model_dump"):
-        data = model.model_dump(mode="json")
-    elif isinstance(model, dict):
-        data = model
-    else:
-        data = {"value": model}
+    data = model.model_dump(mode="json") if hasattr(model, "model_dump") else model
     return redact(data)
 
 

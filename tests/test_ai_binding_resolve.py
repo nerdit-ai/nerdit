@@ -28,7 +28,6 @@ from nerdit.core.models.binding import (
 )
 from nerdit.core.secrets import SHARED_SCOPE, SecretManager, project_storage_name
 from nerdit.core.services import LaunchEnvNotReady, ServiceController
-from nerdit.daemon.routes.service_diagnose import _ai_env_key_names
 from nerdit.db.models import Job, JobKind, JobStatus
 
 pytestmark = pytest.mark.asyncio
@@ -125,9 +124,8 @@ async def test_inject_env_without_default_binding_has_no_openai_triplet():
 async def test_f7_env_key_names_match_inject_env():
     """F7-ENVGRAMMAR: names-only derivation must equal ``inject_env``'s keys.
 
-    The route's ``_ai_env_key_names`` and the ``inject_env_key_names`` companion
-    must both derive from the single ``inject_env`` grammar — no hand-mirrored
-    parallel list. Pin a two-binding spec (one of them ``default``).
+    ``inject_env_key_names`` must derive from the single ``inject_env`` grammar
+    — no hand-mirrored parallel list. Pin a two-binding spec (one of them ``default``).
     """
     ai_specs = {
         "default": {"provider": "ollama", "model": "llama3.1:8b"},
@@ -139,7 +137,6 @@ async def test_f7_env_key_names_match_inject_env():
     }
     expected = set(inject_env(real_resolved).keys())
     assert inject_env_key_names(ai_specs.keys()) == expected
-    assert _ai_env_key_names(ai_specs) == expected
 
 
 async def test_f7_env_key_names_no_default_has_no_openai():
@@ -376,7 +373,7 @@ class _FakeRuntime:
     async def inspect_state(self, cid):
         return None
 
-    async def logs(self, cid, follow=False, tail=None, max_bytes=None):
+    async def logs(self, cid, follow=False, tail=None, max_bytes=None, since=None):
         return
         yield  # pragma: no cover
 
@@ -630,7 +627,7 @@ async def test_resolved_launch_env_reports_the_injected_keys(queries, tmp_path):
     }
     # Same set the names-only projection reports for these binding names
     # (F7-ENVGRAMMAR: one grammar, two consumers).
-    assert resolved.injected_keys == _ai_env_key_names(cfg["ai"])
+    assert resolved.injected_keys == inject_env_key_names(cfg["ai"])
     # Every injected key is really in the env...
     assert resolved.injected_keys <= set(resolved.env)
     # ...and the set is *only* the injected surface: neither the plain secrets

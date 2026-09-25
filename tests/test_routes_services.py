@@ -2261,7 +2261,7 @@ def test_run_interrupted_is_distinguishable_from_a_runtime_that_never_started():
     # The message must not claim the run never happened.
     assert "PARTIALLY" in body["hint"]
     # And it must NOT send the operator to `last_run`: run_once raises before
-    # reaching set_last_run, so /diagnose still shows the PREVIOUS run. This
+    # stamping last_run, so /diagnose still shows the PREVIOUS run. This
     # envelope's log_tail is the only surviving record.
     assert "last_run" not in body["hint"]
 
@@ -2874,7 +2874,7 @@ def test_diagnose_last_run_is_null_when_absent_or_not_a_dict():
 def test_run_against_a_stopped_service_is_an_honest_409_not_a_404():
     """A stopped-but-listed service must not answer "No service".
 
-    ``_TERMINAL_DESIRED_STATES`` includes plain ``stopped``, and the controller
+    ``TERMINAL_STATUSES`` includes plain ``stopped``, and the controller
     refuses those as ``service_gone`` — which §1.2 maps to 404 for the DELETE
     race. Applied to a row the user merely stopped, that 404 is a lie the
     operator disproves in one command: the canonical maintenance flow

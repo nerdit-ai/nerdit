@@ -28,6 +28,7 @@ import pytest
 from nerdit.core.backup import (
     DUMP_MANIFEST_MAX_BYTES,
     DUMP_MANIFEST_NAME,
+    DUMP_TAR_GLOB,
     DUMP_TAR_RE,
     BackupError,
     DumpManifest,
@@ -45,9 +46,7 @@ from nerdit.core.volumes import (
 )
 from nerdit.daemon.routes.system import (
     _build_disk_report,
-    _walk_backups,
-    _walk_dumps,
-    _walk_volume_backups,
+    _walk_tars,
 )
 from nerdit.daemon.server import _prune_backups, _prune_dump_backups, _prune_volume_backups
 from nerdit.daemon.sweeps import _VOLUME_TAR_RE
@@ -214,7 +213,7 @@ def test_post_promotion_failure_removes_the_promoted_tar(tmp_path, monkeypatch):
     def _boom(_path):
         raise OSError(errno.EIO, "eio")
 
-    monkeypatch.setattr("nerdit.core.backup._fsync_dir", _boom)
+    monkeypatch.setattr("nerdit.core.backup.fsync_dir", _boom)
     staging = _staging(tmp_path)
     _seed_output(staging)
 
@@ -256,9 +255,9 @@ def test_dump_glob_is_disjoint_from_both_older_flavours(tmp_path):
 
     _touch_tar(backups, v1)
     _touch_tar(backups, v2)
-    assert _walk_dumps(backups)["count"] == 1
-    assert _walk_backups(backups)["count"] == 1
-    assert _walk_volume_backups(backups)["count"] == 1
+    assert _walk_tars(backups, DUMP_TAR_GLOB)["count"] == 1
+    assert _walk_tars(backups, "nerdit-backup-*.tar.gz")["count"] == 1
+    assert _walk_tars(backups, "nerdit-volumes-*.tar.gz")["count"] == 1
 
 
 # --------------------------------------------------------------------------- #

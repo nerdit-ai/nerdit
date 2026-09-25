@@ -313,3 +313,33 @@ async def test_migrate_legacy_gpu_schema(tmp_path):
     assert gpu.runtime_id == "GPU-legacy"
     assert gpu.schedulable is True
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_project_display_name_migration_preserves_namespace_and_identity(tmp_path):
+    path = tmp_path / "old-projects.sqlite3"
+    async with aiosqlite.connect(path) as conn:
+        await conn.executescript("""
+            CREATE TABLE projects (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                submitted_by_token TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO projects (id, name, submitted_by_token)
+            VALUES ('prj_old', 'original', 'owner');
+        """)
+        await conn.commit()
+    db = Database(str(path))
+    await db.connect()
+    try:
+        await db.init_schema()
+        queries = Queries(db)
+        original = await queries.get_project("prj_old")
+        assert original.label == original.name == "original"
+        await queries.rename_project(original.id, "new-label")
+        await db.init_schema()
+        renamed = await queries.get_project(original.id)
+        assert renamed.name == "original"
+        assert renamed.label == "new-label"
+        assert renamed.submitted_by_token == "owner"
+    finally:
+        await db.close()

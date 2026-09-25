@@ -40,7 +40,7 @@ async def _jid(queries: Any, name: str) -> str:
 
 async def test_get_returns_none_when_not_shared(queries):
     """The fail-closed default: absence of a row IS "not shared"."""
-    assert await queries.get_service_share("demo") is None
+    assert (await queries.list_service_shares()).get("demo") is None
 
 
 async def test_set_creates_the_row_and_returns_it(queries):
@@ -51,7 +51,7 @@ async def test_set_creates_the_row_and_returns_it(queries):
     assert isinstance(share, ServiceShare)
     assert (share.service_name, share.access) == ("demo", "private")
     assert share.created_at.tzinfo is not None  # normalized to aware UTC on read
-    assert await queries.get_service_share("demo") == share
+    assert (await queries.list_service_shares()).get("demo") == share
 
 
 async def test_set_upserts_access_and_preserves_created_at(db, queries):
@@ -80,7 +80,7 @@ async def test_set_refuses_an_access_outside_the_check_constraint(queries):
 
     with pytest.raises(sqlite3.IntegrityError):
         await queries.set_service_share("demo", "world", job_id=await _jid(queries, "demo"))
-    assert await queries.get_service_share("demo") is None
+    assert (await queries.list_service_shares()).get("demo") is None
 
 
 @pytest.mark.parametrize("existing", [None, "private", "public"])
@@ -91,7 +91,7 @@ async def test_preserve_existing_creates_only_missing_share(queries, existing):
         "demo", "private", job_id=job.id, preserve_existing=True
     )
     assert result.access == (existing or "private")
-    assert await queries.get_service_share("demo") == result
+    assert (await queries.list_service_shares()).get("demo") == result
     if first:
         assert result == first
     assert (
@@ -110,7 +110,7 @@ async def test_preview_cannot_overwrite_concurrent_public_share(queries, preview
         queries.set_service_share("demo", "public", job_id=job.id),
     ]
     await asyncio.gather(*(writes if preview_first else reversed(writes)))
-    assert (await queries.get_service_share("demo")).access == "public"
+    assert ((await queries.list_service_shares()).get("demo")).access == "public"
 
 
 async def test_list_is_one_read_keyed_by_name(queries):
@@ -146,7 +146,7 @@ async def test_set_refuses_a_name_no_live_service_owns(queries, kind):
         job_id = (await queries.create_job(_job("demo", kind=kind))).id
 
     assert await queries.set_service_share("demo", "private", job_id=job_id) is None
-    assert await queries.get_service_share("demo") is None
+    assert (await queries.list_service_shares()).get("demo") is None
 
 
 async def test_a_concurrent_delete_cannot_leave_an_orphan_row(queries):
@@ -162,7 +162,7 @@ async def test_a_concurrent_delete_cannot_leave_an_orphan_row(queries):
 
     await queries.delete_service_checked(job.id)
 
-    assert await queries.get_service_share("demo") is None
+    assert (await queries.list_service_shares()).get("demo") is None
     assert await queries.set_service_share("demo", "public", job_id=job.id) is None
 
 
@@ -180,7 +180,7 @@ async def test_a_same_name_recreate_cannot_inherit_an_authorized_write(queries):
     assert job2.id != job1.id
 
     assert await queries.set_service_share("demo", "private", job_id=job1.id) is None
-    assert await queries.get_service_share("demo") is None
+    assert (await queries.list_service_shares()).get("demo") is None
     # The live row's own id still writes — the predicate is not over-tight.
     assert await queries.set_service_share("demo", "private", job_id=job2.id) is not None
 
@@ -191,7 +191,7 @@ async def test_delete_reports_whether_a_row_was_there(queries):
 
     assert await queries.delete_service_share("demo") is True
     assert await queries.delete_service_share("demo") is False
-    assert await queries.get_service_share("demo") is None
+    assert (await queries.list_service_shares()).get("demo") is None
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +217,7 @@ async def test_delete_service_checked_takes_the_share_row(queries):
     await queries.set_service_share("demo", "public", job_id=await _jid(queries, "demo"))
 
     assert await queries.delete_service_checked(job.id) == []
-    assert await queries.get_service_share("demo") is None
+    assert (await queries.list_service_shares()).get("demo") is None
 
 
 async def test_delete_service_checked_leaves_other_shares_alone(queries):
@@ -228,7 +228,7 @@ async def test_delete_service_checked_leaves_other_shares_alone(queries):
 
     await queries.delete_service_checked(job.id)
 
-    assert await queries.get_service_share("other") is not None
+    assert (await queries.list_service_shares()).get("other") is not None
 
 
 async def test_a_refused_delete_keeps_the_share(queries):
@@ -242,7 +242,7 @@ async def test_a_refused_delete_keeps_the_share(queries):
     )
 
     assert refused == [{"service": "dep", "id": "s1", "binding": "default"}]
-    assert await queries.get_service_share("demo") is not None
+    assert (await queries.list_service_shares()).get("demo") is not None
 
 
 async def test_an_absent_row_deletes_no_share(queries):
@@ -252,7 +252,7 @@ async def test_an_absent_row_deletes_no_share(queries):
     await queries.set_service_share("demo", "private", job_id=await _jid(queries, "demo"))
 
     assert await queries.delete_service_checked("nope-nope-nope") is None
-    assert await queries.get_service_share("demo") is not None
+    assert (await queries.list_service_shares()).get("demo") is not None
 
 
 async def test_a_recreated_name_starts_unshared(queries):
@@ -262,7 +262,7 @@ async def test_a_recreated_name_starts_unshared(queries):
 
     await queries.create_job(_job("demo"))
 
-    assert await queries.get_service_share("demo") is None
+    assert (await queries.list_service_shares()).get("demo") is None
 
 
 async def test_the_transaction_reports_whether_it_took_a_share_row(queries):
@@ -297,7 +297,7 @@ async def test_a_refused_delete_never_reports_a_share_removal(queries):
     )
 
     assert seen == []
-    assert await queries.get_service_share("demo") is not None
+    assert (await queries.list_service_shares()).get("demo") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -351,17 +351,14 @@ def test_deleting_an_unshared_service_records_nothing(monkeypatch, tmp_path):
 def test_the_route_never_pre_reads_the_share_row(monkeypatch, tmp_path):
     """The fix for the pre-read race (PR review, P26 WP-H).
 
-    The route used to read ``get_service_share`` before entering the write
+    The route used to read the share row before entering the write
     lock, so a ``PUT …/share`` committing in the window was cascaded away with
     ``had_share=False`` — the row gone, the feed silent. The in-transaction
-    rowcount is now the only input, and this pins that no pre-read remains: the
-    event fires even though the read would have said "not shared".
+    rowcount is now the only input, and this pins that the event rides it.
     """
     app, queries, recorder = _delete_app(monkeypatch, tmp_path, had_share=True)
-    queries.get_service_share = AsyncMock(return_value=None)
 
     with TestClient(app) as client:
         assert client.delete("/services/a", headers=_auth()).status_code == 200
 
-    queries.get_service_share.assert_not_awaited()
     assert recorder.record.await_args.args == ("share.removed",)

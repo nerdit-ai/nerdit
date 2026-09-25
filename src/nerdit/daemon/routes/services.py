@@ -20,10 +20,12 @@ from nerdit.core.volumes import VolumeSpecError, service_data_root
 from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import (
     QuotaExceeded,
+    current_principal,
     require_owner_or_admin,
     require_role,
     require_service_scope,
 )
+from nerdit.daemon.deploy_pipeline import reject_apex_shadow
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.limits import _MAX_LOG_TAIL, valid_ts_filter
 from nerdit.daemon.routes.service_diagnose import router as diagnose_router
@@ -41,7 +43,7 @@ from nerdit.daemon.views.hosted import load_hosted_context
 from nerdit.daemon.views.service import (
     _not_found,
     _resolve_service,
-    _service_response,
+    service_view,
 )
 from nerdit.db.models import (
     Job,
@@ -91,11 +93,7 @@ router.include_router(run_router)
 
 # --- Helpers -----------------------------------------------------------------
 
-# _resolve_service / _not_found / _service_response all moved to
-# daemon.views.service (WP18 S4.2a, landing last on this ~450-line file).
-# Re-exported here (import above) for the direct-call import in
-# test_services_database_kind.py (re-export safe, test unmodified) and for
-# daemon.routes.deploy, which projects the same response (D-T-1).
+# `_resolve_service` is re-exported (import above) for test_services_database_kind.py.
 
 
 def reject_reserved_name(name: str) -> None:
@@ -144,6 +142,7 @@ async def create_service(request: Request, body: ServiceCreateRequest) -> Servic
     principal = require_role(request, TokenRole.submitter, TokenRole.admin)
     request.state.audit_params = audit_params(body)
     reject_reserved_name(body.name)
+    reject_apex_shadow(request, body.name)
     # (P25 D-P25-3 leg b) The request name IS the row name here, so the scope
     # check runs before the image probe and long before the row write.
     require_service_scope(request, body.name)
@@ -205,15 +204,13 @@ async def create_service(request: Request, body: ServiceCreateRequest) -> Servic
     except QuotaExceeded as exc:
         raise exc.to_error() from exc
 
-    endpoint = await queries.get_service_endpoint(body.name)
-    gpu_ids = await queries.get_job_gpus(job.id)
     # No hosted context here, deliberately: a service that was
     # just created cannot carry a share row. `PUT .../share` requires the
     # service to exist, and `delete_service_checked` drops the row inside the
     # delete transaction, so the name is share-free by construction and the
     # projection is byte-identical to the loaded one — one query saved on a
     # write path. Every OTHER service surface loads it.
-    return _service_response(request, job, gpu_ids, endpoint)
+    return await service_view(request, job)
 
 
 @router.post("/services/{ident}/stop", response_model=ServiceResponse, operation_id="stop_service")
@@ -229,10 +226,7 @@ async def stop_service(request: Request, ident: str) -> ServiceResponse:
 
     await queries.set_desired_state(job.id, "stopped")
     job = await queries.get_job(job.id) or job
-    endpoint = await queries.get_service_endpoint(job.service_name or "")
-    gpu_ids = await queries.get_job_gpus(job.id)
-    hosted = await load_hosted_context(request)
-    return _service_response(request, job, gpu_ids, endpoint, hosted=hosted)
+    return await service_view(request, job, hosted=await load_hosted_context(request))
 
 
 @router.post(
@@ -260,10 +254,7 @@ async def restart_service(request: Request, ident: str) -> ServiceResponse:
     await queries.update_job_status(job.id, JobStatus.restarting)
     await queries.bump_restart_count(job.id, 0, None)
     job = await queries.get_job(job.id) or job
-    endpoint = await queries.get_service_endpoint(job.service_name or "")
-    gpu_ids = await queries.get_job_gpus(job.id)
-    hosted = await load_hosted_context(request)
-    return _service_response(request, job, gpu_ids, endpoint, hosted=hosted)
+    return await service_view(request, job, hosted=await load_hosted_context(request))
 
 
 # --- Bounded reads -----------------------------------------------------------
@@ -291,11 +282,7 @@ async def list_services(
     # the loop: a per-row hosted lookup would put a query per service on the
     # hottest read path the daemon has.
     hosted = await load_hosted_context(request)
-    items: list[ServiceResponse] = []
-    for svc in services:
-        endpoint = await queries.get_service_endpoint(svc.service_name or "")
-        gpu_ids = await queries.get_job_gpus(svc.id)
-        items.append(_service_response(request, svc, gpu_ids, endpoint, hosted=hosted))
+    items = [await service_view(request, svc, hosted=hosted) for svc in services]
     return ServiceListPage(items=items, next_cursor=next_cursor)
 
 
@@ -309,13 +296,9 @@ async def get_service(request: Request, ident: str) -> ServiceResponse:
     job = await _resolve_service(queries, ident)
     if job is None:
         raise _not_found(ident)
-    endpoint = await queries.get_service_endpoint(job.service_name or "")
-    gpu_ids = await queries.get_job_gpus(job.id)
     data_dir_bytes = await _compute_data_dir_bytes(request, job)
     hosted = await load_hosted_context(request)
-    return _service_response(
-        request, job, gpu_ids, endpoint, data_dir_bytes=data_dir_bytes, hosted=hosted
-    )
+    return await service_view(request, job, hosted=hosted, data_dir_bytes=data_dir_bytes)
 
 
 #: Cache window for one service's data-dir size, seconds. Long enough that the
@@ -517,6 +500,24 @@ async def get_service_logs(  # noqa: PLR0913
     job = await _resolve_service(queries, ident)
     if job is None:
         raise _not_found(ident)
+    return await logs_for_job(
+        request, response, job, since_id=since_id, tail=tail, grep=grep, since=since, source=source
+    )
+
+
+async def logs_for_job(  # noqa: PLR0913 - the bounded log query
+    request: Request,
+    response: Response,
+    job: Job,
+    *,
+    since_id: int = 0,
+    tail: int | None = None,
+    grep: str | None = None,
+    since: str | None = None,
+    source: str = "all",
+) -> list[LogEntry]:
+    """Read bounded logs for an already resolved immutable job identity."""
+    queries = request.app.state.queries
     since_ts = valid_ts_filter(since, "since") if since is not None else None
     # `.get` on a str-guarded key, not `[source]`: FastAPI owns the
     # validation (the `Literal` 422s anything else before the body runs), so
@@ -530,7 +531,11 @@ async def get_service_logs(  # noqa: PLR0913
     # there. Captured BEFORE the scan — anything written after this read gets a
     # strictly larger id, which is what makes skipping to it safe.
     paged = (grep or since_ts) and not (tail is not None and tail > 0)
-    watermark = await queries.max_log_id() if paged else None
+    watermark = (
+        await queries.max_log_id()
+        if paged and current_principal(request).project_id is None
+        else None
+    )
     # The forward branch carries the SAME cap as `tail` (the tail branch ignores
     # `limit`): without one, a parameterless GET returns the whole retained
     # history of a chatty service — tens of MB materialized as `LogEntry` objects

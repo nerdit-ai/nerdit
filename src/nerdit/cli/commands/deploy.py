@@ -16,6 +16,7 @@ from rich.markup import escape
 
 from nerdit.cli.display import (
     _plain,
+    call_or_exit,
     console,
     display_deploy_result,
     display_wait_outcome,
@@ -147,6 +148,15 @@ def _render_dry_run(plan: dict) -> None:
     # ``display_deploy_result`` does for the response ``hints``.
     for warning in plan.get("warnings") or []:
         console.print(f"  [yellow]warning:[/yellow] {_plain(warning)}")
+
+
+def _note_skipped_secrets(skipped: list[str]) -> None:
+    """Say that `.env` files were left out of the archive."""
+    if skipped:
+        console.print(
+            "[yellow]Not uploaded: .env files[/yellow] [dim](use `nerdit secrets set` "
+            "or `nerdit vars set`).[/dim]"
+        )
 
 
 def _git_name_default(repo_url: str, subdir: str | None) -> str:
@@ -313,8 +323,8 @@ async def _deploy_async(
         effective_name = name or _git_name_default(repo, subdir)
         client = get_configured_client()
         console.print(f"[dim]Cloning {repo}...[/dim]")
-        try:
-            service = await client.deploy_git(
+        service = await call_or_exit(
+            client.deploy_git(
                 repo_url=repo,
                 name=effective_name,
                 ref=ref,
@@ -330,9 +340,7 @@ async def _deploy_async(
                 idempotency_key=uuid4().hex,
                 dry_run=dry_run,
             )
-        except Exception as exc:  # noqa: BLE001 — rendered for the user
-            render_client_error(exc)
-            raise typer.Exit(1) from exc
+        )
         if dry_run:
             _render_dry_run(service)
             return
@@ -381,11 +389,9 @@ async def _deploy_async(
     client = get_configured_client()
 
     if rollback:
-        try:
-            service = await client.rollback_deploy(effective_name, idempotency_key=uuid4().hex)
-        except Exception as exc:  # noqa: BLE001 — rendered for the user
-            render_client_error(exc)
-            raise typer.Exit(1) from exc
+        service = await call_or_exit(
+            client.rollback_deploy(effective_name, idempotency_key=uuid4().hex)
+        )
         display_deploy_result(service, heading="Rolled back", build_hint=False)
         await _maybe_wait(client, effective_name, service, wait, wait_timeout)
         return
@@ -401,22 +407,27 @@ async def _deploy_async(
         raise typer.Exit(1) from exc
 
     if build_settings is not None or (deploy_cfg and deploy_cfg.build_settings is not None):
-        try:
-            await client.require_build_settings_support(
+        await call_or_exit(
+            client.require_build_settings_support(
                 build_settings,
                 directory=directory,
             )
-        except Exception as exc:  # noqa: BLE001 — rendered for the user
-            render_client_error(exc)
-            raise typer.Exit(1) from exc
+        )
 
+    from nerdit.cli.client import upload_limit
     from nerdit.cli.upload import check_upload_size, create_dir_zip, warn_large_upload
+    from nerdit.config.defaults import DEFAULT_MAX_UPLOAD_BYTES
 
     console.print(f"[dim]Creating archive of {directory}...[/dim]")
-    zip_bytes = create_dir_zip(directory)
+    skipped_secrets: list[str] = []
+    zip_bytes = create_dir_zip(directory, skipped_secrets)
+    _note_skipped_secrets(skipped_secrets)
 
     try:
-        check_upload_size(zip_bytes)
+        # Ask the daemon for its cap only past the local default: an archive
+        # under it needs no extra round trip, and the daemon enforces anyway.
+        if len(zip_bytes) > DEFAULT_MAX_UPLOAD_BYTES:
+            check_upload_size(zip_bytes, await upload_limit(client))
     except ValueError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
@@ -428,8 +439,8 @@ async def _deploy_async(
     size_mb = len(zip_bytes) / (1024 * 1024)
     console.print(f"[dim]Uploading archive ({size_mb:.1f} MB)...[/dim]")
 
-    try:
-        service = await client.deploy(
+    service = await call_or_exit(
+        client.deploy(
             zip_bytes=zip_bytes,
             _build_settings_checked=True,
             name=effective_name,
@@ -443,9 +454,7 @@ async def _deploy_async(
             idempotency_key=uuid4().hex,
             dry_run=dry_run,
         )
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    )
 
     if dry_run:
         _render_dry_run(service)

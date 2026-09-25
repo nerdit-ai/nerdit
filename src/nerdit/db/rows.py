@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import AfterValidator, BaseModel, Field, field_serializer
 
 from nerdit.db.enums import (
     ErrorClass,
@@ -18,6 +18,15 @@ from nerdit.db.enums import (
     TokenRole,
 )
 from nerdit.utils.ids import generate_id
+from nerdit.utils.names import DNS_LABEL_PATTERN
+
+
+def _aware_utc(value: datetime) -> datetime:
+    """Attach UTC to naive stored timestamps so disk and live values serialize identically."""
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+UtcDatetime = Annotated[datetime, AfterValidator(_aware_utc)]
 
 # --- Core Models ---
 
@@ -86,7 +95,6 @@ class Job(BaseModel):
         default=None, description="Dashboard-friendly failure category"
     )
     error_message: str | None = Field(default=None, description="Raw technical failure message")
-    submitted_via: str = Field(default="cli", description="Always 'cli' today; see the API schema")
     submitted_by_token: str | None = Field(
         default=None,
         description="ID of the API token that submitted this job (None = legacy/local). "
@@ -149,19 +157,19 @@ class Project(BaseModel):
     """
 
     id: str = Field(description="``prj_`` + 16 base32 chars")
-    name: str = Field(description="Unique project name; a migrated row's legacy label")
+    name: str = Field(description="Immutable operational namespace; a legacy service label")
+    display_name: str | None = Field(default=None, description="Editable display label")
+
     submitted_by_token: str | None = Field(
         default=None, description="Owner token id, NULL = admin-only"
     )
-    created_at: datetime = Field(
+    created_at: UtcDatetime = Field(
         default_factory=lambda: datetime.now(UTC), description="When the project was created"
     )
 
-    @field_validator("created_at")
-    @classmethod
-    def _aware_utc(cls, value: datetime) -> datetime:
-        """Attach UTC to naive stored timestamps so disk and live values serialize identically."""
-        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+    @property
+    def label(self) -> str:
+        return self.display_name or self.name
 
 
 class ServiceEndpoint(BaseModel):
@@ -221,6 +229,33 @@ class ServiceEndpoint(BaseModel):
         return self.active_host_port or self.host_port
 
 
+class ServicePublicAddress(BaseModel):
+    """An immutable cloud assignment pinned to a node and service incarnation."""
+
+    node_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(pattern=r"^prj_[a-z2-7]{16}$")
+    job_id: str = Field(min_length=1, max_length=128)
+    service_name: str = Field(pattern=DNS_LABEL_PATTERN)
+    slug: str = Field(pattern=DNS_LABEL_PATTERN)
+
+
+class ActiveServicePublicAddress(ServicePublicAddress):
+    """A binding whose cloud routing activation survives link reconnects."""
+
+    active: bool = False
+
+
+class LinkedProjectService(BaseModel):
+    """Complete publication facts for one immutable service incarnation."""
+
+    job_id: str
+    service_name: str
+    environment: str
+    service: str
+    access: Literal["private", "public"] | None
+    has_endpoint: bool
+
+
 class ServiceShare(BaseModel):
     """Hosted-share intent keyed by service name; absence means unshared.
 
@@ -236,16 +271,10 @@ class ServiceShare(BaseModel):
             "'public' = world-reachable (entitlement + consent gated)"
         ),
     )
-    created_at: datetime = Field(
+    created_at: UtcDatetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="Timestamp when the share was first created (preserved across access changes)",
     )
-
-    @field_validator("created_at")
-    @classmethod
-    def _aware_utc(cls, value: datetime) -> datetime:
-        """Attach UTC to naive stored timestamps so disk and live values serialize identically."""
-        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
 class VariableFlag(BaseModel):
@@ -270,15 +299,9 @@ class SecretClaim(BaseModel):
 
     service_name: str = Field(description="Reserved service name")
     token_id: str | None = Field(default=None, description="Claimant token id, NULL = admin-only")
-    created_at: datetime = Field(
+    created_at: UtcDatetime = Field(
         default_factory=lambda: datetime.now(UTC), description="When the claim was minted"
     )
-
-    @field_validator("created_at")
-    @classmethod
-    def _aware_utc(cls, value: datetime) -> datetime:
-        """Attach UTC to naive stored timestamps so disk and live values serialize identically."""
-        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
 class ServiceDomain(BaseModel):
@@ -298,16 +321,10 @@ class ServiceDomain(BaseModel):
     kind: Literal["domain"] = Field(
         default="domain", description="Row discriminator; only 'domain' exists today"
     )
-    created_at: datetime = Field(
+    created_at: UtcDatetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description="Timestamp when the domain was bound to the service",
     )
-
-    @field_validator("created_at")
-    @classmethod
-    def _aware_utc(cls, value: datetime) -> datetime:
-        """Attach UTC to naive stored timestamps so disk and live values serialize identically."""
-        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
 class ActiveServiceRoute(BaseModel):
@@ -456,21 +473,13 @@ class Event(BaseModel):
     """
 
     id: int
-    ts: datetime | None = None
+    ts: UtcDatetime | None = None
     type: str
     kind: str | None = None
     service_name: str | None = None
     reason: str | None = None
     build_version: int | None = None
     data: dict[str, object] | None = None
-
-    @field_validator("ts")
-    @classmethod
-    def _aware_utc(cls, value: datetime | None) -> datetime | None:
-        """Attach UTC to naive stored timestamps so disk and live values serialize identically."""
-        if value is not None and value.tzinfo is None:
-            return value.replace(tzinfo=UTC)
-        return value
 
     @field_serializer("ts")
     def _serialize_ts(self, value: datetime | None) -> str | None:

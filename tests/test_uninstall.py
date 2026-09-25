@@ -1586,7 +1586,9 @@ class TestAdoptedConfigCannotDirectRootDeletion:
         self._adopt(monkeypatch, tmp_path)
         err = _unsafe_target("data dir", Path(target))
         assert err is not None, f"{target} must not be removable as root"
-        assert "outside the service user's home" in err
+        # On macOS tmp_path sits under /private/var, so /var is also refused
+        # as an ancestor of the adopted home — first reason wins.
+        assert "outside the service user's home" in err or "contains one" in err
 
     def test_the_adopted_home_itself_is_still_usable(self, monkeypatch, tmp_path):
         from nerdit.cli.commands.uninstall import _unsafe_target
@@ -1673,3 +1675,14 @@ def test_service_stop_drain_is_bounded(tmp_path, monkeypatch):
     assert "did not stop within" in detail
     assert sleeps == [0.2]
     assert unit.unit_path.exists()
+
+
+def test_unsafe_target_refuses_ancestors_of_home_and_cwd(monkeypatch, tmp_path):
+    from nerdit.cli.commands.uninstall import _unsafe_target
+
+    assert _unsafe_target("data dir", Path.home().parent) is not None
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    (tmp_path / "sibling").mkdir()
+    monkeypatch.chdir(tmp_path / "a" / "b")
+    assert _unsafe_target("data dir", tmp_path / "a") is not None
+    assert _unsafe_target("data dir", tmp_path / "sibling") is None

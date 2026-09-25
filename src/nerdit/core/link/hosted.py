@@ -11,7 +11,7 @@ from the link package.
 
 from __future__ import annotations
 
-import re
+from nerdit.utils.names import DNS_LABEL_RE
 
 #: The separator that keeps `<app>--<slug>` a single DNS label (D-P26-H5).
 HOSTED_SEPARATOR = "--"
@@ -19,12 +19,13 @@ HOSTED_SEPARATOR = "--"
 #: RFC 1035 label ceiling. The combined `<app>--<slug>` must fit in one.
 MAX_DNS_LABEL = 63
 
-#: The service-name grammar, character for character the one
-#: `ServiceCreateRequest.name` pins (`daemon/schemas/services.py`). Kept as a
-#: local literal rather than imported so this leaf stays free of any
-#: `daemon`-package import (a `core` → `daemon` edge would be a cycle);
-#: `tests/test_hosted_names.py` pins the two patterns equal.
-SERVICE_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+#: The cloud-assigned public-address zone: `https://<slug>.nerdit.app/`.
+PUBLIC_ADDRESS_DOMAIN = "nerdit.app"
+
+
+def public_address_url(slug: str) -> str:
+    """The canonical URL of a cloud-assigned public address."""
+    return f"https://{slug}.{PUBLIC_ADDRESS_DOMAIN}/"
 
 
 def is_service_name(value: str) -> bool:
@@ -35,7 +36,7 @@ def is_service_name(value: str) -> bool:
     service name cannot name a shared service, so it is refused without
     touching the DB.
     """
-    return SERVICE_NAME_RE.fullmatch(value) is not None
+    return DNS_LABEL_RE.fullmatch(value) is not None
 
 
 def hosted_label(service_name: str, slug: str) -> str:
@@ -46,8 +47,7 @@ def hosted_label(service_name: str, slug: str) -> str:
 def hosted_label_fits(service_name: str, slug: str) -> bool:
     """Does `<app>--<slug>` fit in one 63-octet DNS label?
 
-    Checked at share time, not at request time: a row whose name can never be
-    resolved would be a share that silently does not work.
+    An oversized legacy label stays pending until a generated address is activated.
     """
     return len(hosted_label(service_name, slug)) <= MAX_DNS_LABEL
 

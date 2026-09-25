@@ -579,7 +579,7 @@ def test_readonly_tools_list_succeeds():
     # 53 → 55 with set_variable/resolve_variables; (P40d) 55 → 57 with
     # write_project_files/apply_project; the authoritative ledger pin lives in
     # tests/test_mcp.py.
-    assert len(tools) == 57
+    assert len(tools) == 59
 
 
 def test_readonly_write_tool_gets_inner_403(monkeypatch):
@@ -625,7 +625,7 @@ def test_bare_and_slash_paths_both_served():
     # _McpMount serves both directly — no 307 to the slash form, no 404.
     for r in (r_bare, r_slash):
         assert r.status_code == 200
-        assert len(_sse_result(r)["result"]["tools"]) == 57
+        assert len(_sse_result(r)["result"]["tools"]) == 59
 
 
 # --- full-stack: audit + idempotency exemptions -------------------------------
@@ -643,7 +643,7 @@ def test_audit_excluded_but_denials_recorded():
         )
     ok_q.insert_audit_log.assert_not_called()
 
-    # An unauthenticated POST still leaves a denied row (action ``POST /mcp``).
+    # An unauthenticated POST still leaves a denied row (action ``auth.denied``).
     deny_q = _queries()
     app_deny = _build_app(_settings(), deny_q)
     with _client(app_deny) as c:
@@ -651,7 +651,7 @@ def test_audit_excluded_but_denials_recorded():
     deny_q.insert_audit_log.assert_called_once()
     kwargs = deny_q.insert_audit_log.call_args.kwargs
     assert kwargs["result"] == "denied"
-    assert kwargs["action"] == "POST /mcp"
+    assert kwargs["action"] == "auth.denied"
 
 
 def test_idempotency_key_ignored_on_mcp_path():

@@ -18,6 +18,29 @@ from pydantic import AwareDatetime, BaseModel, Field, ValidationError, field_val
 
 from nerdit.config.settings import LOOPBACK_HOSTS, LinkSettings
 from nerdit.daemon.schemas._base import StrictRequestModel
+from nerdit.db.rows import LinkedProjectService, ServicePublicAddress
+
+
+class PublicAddressPushRequest(ServicePublicAddress, StrictRequestModel):
+    """Install a binding; activate only after the cloud can serve its route."""
+
+    activate: bool = False
+
+
+class PublicAddressPushView(ServicePublicAddress):
+    """Stored assignment and durable, monotonic routing activation."""
+
+    url: str
+    changed: bool
+    active: bool
+
+
+class LinkedProjectView(BaseModel):
+    """Complete committed service discovery for allocation and retirement."""
+
+    id: str
+    name: str
+    services: list[LinkedProjectService]
 
 
 def _is_loopback(hostname: str) -> bool:

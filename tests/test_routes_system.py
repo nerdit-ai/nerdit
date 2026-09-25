@@ -179,6 +179,8 @@ def test_capabilities_admin_has_paths_and_admin_addr():
     }
     # Shared fields.
     assert body["version"]
+    assert body["features"]["public_address_bindings"] is True
+    assert body["features"]["public_address_routing"] is True
     assert body["uptime_s"] >= 0
     assert body["caller"]["role"] == "admin"
     assert body["proxy"]["url_shape"] == "https://nerd-box.local/<name>/"
@@ -234,6 +236,8 @@ def test_capabilities_admin_has_paths_and_admin_addr():
     # (P40b) Constant true on this build: `/api/projects` is a plain 404 on a
     # pre-P40b daemon, so the capability has to be readable.
     assert body["features"]["projects"] is True
+    assert body["features"]["project_ids"] is True
+    assert body["features"]["project_rename_v1"] is True
     # (P40c) Constant true: the variables routes are a plain 404 before P40c.
     assert body["features"]["variables"] is True
     # (P40d) Constant true: the apply route does not exist before P40d.
@@ -370,6 +374,14 @@ def test_capabilities_non_admin_omits_paths_and_admin_addr(headers, role):
 class _StubRuntimeMarker:
     """A stand-in for the real StubRuntime; the check uses isinstance so we
     patch the symbol the route imported instead of subclassing."""
+
+
+@pytest.fixture(autouse=True)
+def healthy_host_disk(monkeypatch):
+    """Keep doctor unit tests independent of the checkout host's free space."""
+    monkeypatch.setattr(
+        system_routes.shutil, "disk_usage", lambda _path: SimpleNamespace(total=100, free=80)
+    )
 
 
 def _doctor_app(*, auth_role: TokenRole | None = None, **state) -> TestClient:
@@ -2156,3 +2168,19 @@ def test_uvicorn_config_sets_graceful_shutdown_timeout():
     assert config.timeout_graceful_shutdown == server_module.GRACEFUL_SHUTDOWN_TIMEOUT_S == 30
     assert config.host == settings.daemon.host
     assert config.port == settings.daemon.port
+
+
+def test_doctor_proxy_warns_when_a_service_shadows_the_apex_dashboard():
+    """A pre-existing `api` row captures the apex dashboard's /api fetches."""
+    settings = _doctor_settings()
+    settings.proxy = SimpleNamespace(mdns=False, enabled=True, dashboard_apex=True, mode="path")
+
+    async def by_name(name):
+        return SimpleNamespace(service_name=name) if name == "api" else None
+
+    queries = SimpleNamespace(get_service_by_name=by_name)
+    body = _doctor_app(settings=settings, queries=queries).get("/api/doctor", headers=_ADMIN)
+    proxy = _check(body.json(), "proxy")
+    assert proxy["status"] == "warn"
+    assert "'api'" in proxy["detail"]
+    assert "dashboard_apex" in proxy["detail"]

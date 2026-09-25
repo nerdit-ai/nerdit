@@ -171,7 +171,7 @@ def _app(
         app.add_middleware(AuditMiddleware, get_queries=lambda: resolved)
     app.add_middleware(ScopedTokenAuthMiddleware, token=token, get_queries=lambda: resolved)
     app.add_middleware(RequestIdMiddleware)
-    return TestClient(app, raise_server_exceptions=False), resolved
+    return TestClient(app, base_url="http://127.0.0.1", raise_server_exceptions=False), resolved
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +321,7 @@ def test_local_mode_leaves_public_paths_reachable_with_a_stale_bearer() -> None:
     app.add_middleware(ScopedTokenAuthMiddleware, token=None, get_queries=lambda: _queries())
     app.add_middleware(RequestIdMiddleware)
 
-    client = TestClient(app, raise_server_exceptions=False)
+    client = TestClient(app, base_url="http://127.0.0.1", raise_server_exceptions=False)
     assert client.get("/api/health", headers=_TUNNEL).status_code == 200
 
 

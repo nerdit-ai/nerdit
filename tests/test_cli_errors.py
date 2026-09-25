@@ -226,3 +226,29 @@ def test_every_stream_style_is_markup_safe():
     out = _capture(display.display_logs, entries)
     for s in ("stdout", "stderr", "system"):
         assert f"[{s}] tag-ish [/x]" in out
+
+
+# --- call_or_exit ---
+
+
+def test_call_or_exit_renders_and_exits_on_failure():
+    import asyncio
+
+    async def boom():
+        raise httpx.ConnectError("refused", request=httpx.Request("GET", "http://gpu:9321/x"))
+
+    def run():
+        with pytest.raises(typer.Exit) as info:
+            asyncio.run(display.call_or_exit(boom()))
+        assert info.value.exit_code == 1
+
+    assert "Cannot reach the daemon" in _capture(run)
+
+
+def test_call_or_exit_returns_the_value():
+    import asyncio
+
+    async def ok():
+        return {"id": "x"}
+
+    assert asyncio.run(display.call_or_exit(ok())) == {"id": "x"}

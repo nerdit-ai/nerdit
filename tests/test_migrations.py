@@ -972,6 +972,7 @@ async def test_fresh_db_has_project_columns_table_and_index(db):
     assert {row[1] for row in await cursor.fetchall()} == {
         "id",
         "name",
+        "display_name",
         "submitted_by_token",
         "created_at",
     }

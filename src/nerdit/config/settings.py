@@ -65,7 +65,8 @@ from nerdit.config.defaults import (
     DEFAULT_VLLM_SHM_SIZE,
     default_bridge_binding,
 )
-from nerdit.config.project import _DNS_LABEL_RE, SECRET_REF_RE
+from nerdit.config.project import SECRET_REF_RE
+from nerdit.utils.names import DNS_LABEL_RE
 
 
 class DaemonSettings(BaseModel):
@@ -132,13 +133,17 @@ class ContainerSettings(BaseModel):
     allowed_mount_roots: list[str] = Field(
         default_factory=lambda: list(DEFAULT_ALLOWED_MOUNT_ROOTS)
     )
-    # Tier-A denylist: host paths no caller (admin included) may ever mount.
+    # Tier-A denylist: host paths no workload mount may use, whatever the
+    # caller's role. Admin config: setting the key replaces the defaults, so
+    # [] disables it.
     denied_mount_paths: list[str] = Field(default_factory=lambda: list(DEFAULT_DENIED_MOUNT_PATHS))
     # Capability / privilege hardening applied to every launched container.
     drop_all_caps: bool = True
     no_new_privileges: bool = True
     # Read-only rootfs is opt-in: app images may write to ``/`` (Open Q7).
     read_only_rootfs: bool = False
+    # Caps processes + threads per container (fork-bomb guard); None = unlimited.
+    pids_limit: int | None = Field(default=4096, ge=1)
 
 
 class MonitorSettings(BaseModel):
@@ -592,7 +597,7 @@ def _validate_dns_name(value: str, *, field_name: str) -> None:
     if len(value) > 253:
         raise ValueError(f"{field_name} '{value}' exceeds the 253-character DNS name limit.")
     for label in value.split("."):
-        if not _DNS_LABEL_RE.match(label):
+        if not DNS_LABEL_RE.fullmatch(label):
             raise ValueError(
                 f"{field_name} '{value}' has an invalid label '{label}' — DNS labels are "
                 "lowercase alphanumeric with internal hyphens only, 1-63 chars, no wildcards "
@@ -1395,14 +1400,42 @@ def get_client_config(
     Local dialing uses loopback and daemon.port; daemon.host is a bind address,
     which may be 0.0.0.0 and is not a valid local destination policy.
     """
-    settings = load_settings(config_path)
-    if settings.client.remote_host:
-        return (
-            settings.client.remote_host,
-            settings.client.remote_port,
-            settings.client.auth_token,
-        )
-    return (DEFAULT_HOST, settings.daemon.port, settings.daemon.auth_token)
+    # Only [client] and two [daemon] keys are read: a malformed daemon-side
+    # section must not break every CLI verb (and the stdio MCP server).
+    if config_path is None:
+        config_path = Path("~/.nerdit/config.toml").expanduser()
+    data: dict[str, Any] = {}
+    if config_path.exists():
+        with open(config_path, "rb") as f:
+            data = tomllib.load(f)
+    client = ClientSettings(**data.get("client", {}))
+    if client.remote_host:
+        return (client.remote_host, client.remote_port, client.auth_token)
+    daemon = data.get("daemon", {})
+    local = DaemonSettings.model_validate(
+        {k: daemon[k] for k in ("port", "auth_token") if k in daemon}
+    )
+    return (DEFAULT_HOST, local.port, local.auth_token)
+
+
+_SECTIONS = (
+    "daemon",
+    "containers",
+    "monitor",
+    "security",
+    "services",
+    "proxy",
+    "models",
+    "databases",
+    "git",
+    "notifications",
+    "mcp",
+    "link",
+    "license",
+    "retention",
+    "posthog",
+    "client",
+)
 
 
 def load_settings(config_path: Path | None = None) -> NerditSettings:
@@ -1416,49 +1449,11 @@ def load_settings(config_path: Path | None = None) -> NerditSettings:
     with open(config_path, "rb") as f:
         data = tomllib.load(f)
 
-    # Map top-level [nerdit] section
     nerdit_data = data.get("nerdit", {})
-    settings_dict: dict = {}
-    if "data_dir" in nerdit_data:
-        settings_dict["data_dir"] = nerdit_data["data_dir"]
-    if "log_level" in nerdit_data:
-        settings_dict["log_level"] = nerdit_data["log_level"]
-
-    # Map subsections. Explicit allow-list, so a section this build does not
-    # know is parsed and ignored rather than refused — the upgrade contract for
-    # a fielded config.toml that still carries a removed section (``[telemetry]``,
-    # deleted before the first public release).
-    if "daemon" in data:
-        settings_dict["daemon"] = data["daemon"]
-    if "containers" in data:
-        settings_dict["containers"] = data["containers"]
-    if "monitor" in data:
-        settings_dict["monitor"] = data["monitor"]
-    if "security" in data:
-        settings_dict["security"] = data["security"]
-    if "services" in data:
-        settings_dict["services"] = data["services"]
-    if "proxy" in data:
-        settings_dict["proxy"] = data["proxy"]
-    if "models" in data:
-        settings_dict["models"] = data["models"]
-    if "databases" in data:
-        settings_dict["databases"] = data["databases"]
-    if "git" in data:
-        settings_dict["git"] = data["git"]
-    if "notifications" in data:
-        settings_dict["notifications"] = data["notifications"]
-    if "mcp" in data:
-        settings_dict["mcp"] = data["mcp"]
-    if "link" in data:
-        settings_dict["link"] = data["link"]
-    if "license" in data:
-        settings_dict["license"] = data["license"]
-    if "retention" in data:
-        settings_dict["retention"] = data["retention"]
-    if "posthog" in data:
-        settings_dict["posthog"] = data["posthog"]
-    if "client" in data:
-        settings_dict["client"] = data["client"]
+    settings_dict: dict = {k: nerdit_data[k] for k in ("data_dir", "log_level") if k in nerdit_data}
+    # Explicit allow-list, so a section this build does not know is parsed and
+    # ignored rather than refused — the upgrade contract for a fielded
+    # config.toml that still carries a removed section (``[telemetry]``).
+    settings_dict.update({k: data[k] for k in _SECTIONS if k in data})
 
     return NerditSettings(**settings_dict)

@@ -10,7 +10,7 @@ import typer
 from rich.table import Table
 
 from nerdit.cli.commands.deploy import parse_env_pairs
-from nerdit.cli.display import console, display_deploy_result, render_client_error
+from nerdit.cli.display import call_or_exit, console, display_deploy_result
 
 store_app = typer.Typer(
     name="store",
@@ -29,11 +29,7 @@ async def _list_async() -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        templates = await client.list_app_templates()
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    templates = await call_or_exit(client.list_app_templates())
 
     if not templates:
         console.print("[dim]No templates.[/dim]")
@@ -66,11 +62,7 @@ async def _show_async(template_id: str) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
-    try:
-        tpl = await client.get_app_template(template_id)
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    tpl = await call_or_exit(client.get_app_template(template_id))
 
     console.print(f"[cyan]{tpl.get('id')}[/cyan] — {tpl.get('name')}")
     console.print(f"  Category:    {tpl.get('category')}")
@@ -176,8 +168,8 @@ async def _deploy_async(
 
     client = get_configured_client()
     console.print(f"[dim]Deploying template {template_id}...[/dim]")
-    try:
-        service = await client.deploy_template(
+    service = await call_or_exit(
+        client.deploy_template(
             template_id,
             name=name,
             env=env_values,
@@ -191,9 +183,7 @@ async def _deploy_async(
             vendor=vendor,
             idempotency_key=uuid4().hex,
         )
-    except Exception as exc:  # noqa: BLE001 — rendered for the user
-        render_client_error(exc)
-        raise typer.Exit(1) from exc
+    )
     if dry_run:
         from nerdit.cli.commands.deploy import _render_dry_run
 

@@ -19,18 +19,11 @@ from nerdit.cli.display import console
 # ---------------------------------------------------------------------------
 
 
-def _run_install(cmd: list[str], *, shell: bool = False) -> bool:
+def _run_install(cmd: list[str]) -> bool:
     """Run an install command with user-visible output. Returns success."""
     console.print(f"  [dim]Running: {' '.join(cmd)}[/dim]")
     try:
-        if shell:
-            result = subprocess.run(
-                " ".join(cmd),
-                shell=True,
-                timeout=300,  # noqa: S602
-            )
-        else:
-            result = subprocess.run(cmd, timeout=300)
+        result = subprocess.run(cmd, timeout=300)
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         console.print(f"  [red]Failed: {exc}[/red]")
@@ -88,17 +81,13 @@ def _install_nvidia_toolkit() -> bool:
 
 
 def _find_dockerfile() -> Path | None:
-    candidates = [
-        Path("docker/Dockerfile"),
-        Path.cwd() / "docker" / "Dockerfile",
-    ]
-    pkg_root = Path(__file__).resolve().parents[4]
-    candidates.append(pkg_root / "docker" / "Dockerfile")
-    for path in candidates:
-        resolved = path.resolve()
-        if resolved.is_file():
-            return resolved
-    return None
+    """The runtime Dockerfile shipped beside this package, never the CWD's.
+
+    A CWD lookup would build whatever repo the user happens to stand in and tag
+    it `nerdit-runtime:0.1`.
+    """
+    path = Path(__file__).resolve().parents[4] / "docker" / "Dockerfile"
+    return path if path.is_file() else None
 
 
 def _install_runtime_image() -> bool:
