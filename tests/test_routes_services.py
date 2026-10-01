@@ -555,6 +555,33 @@ def test_list_projects_zip_source():
     assert resp.json()["items"][0]["source"] == {"type": "zip"}
 
 
+PRJ_ID = "prj_" + "a" * 16
+
+
+def test_detail_carries_project_id():
+    svc = _service("tok-sub", project_id=PRJ_ID, project="demo")
+    resp = _client(_queries(svc)).get("/services/demo", headers=_auth(RO_RAW))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["project_id"] == PRJ_ID
+    assert resp.json()["project"] == "demo"
+
+
+def test_list_carries_project_id():
+    svc = _service("tok-sub", project_id=PRJ_ID, project="demo")
+    q = _queries(svc)
+    q.list_services = AsyncMock(return_value=([svc], None))
+    resp = _client(q).get("/services", headers=_auth(RO_RAW))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"][0]["project_id"] == PRJ_ID
+
+
+def test_detail_project_id_is_null_for_a_row_without_a_project():
+    """A row that predates the project noun answers null, never a made-up id."""
+    resp = _client(_queries(_service("tok-sub"))).get("/services/demo", headers=_auth(RO_RAW))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["project_id"] is None
+
+
 def test_detail_projects_full_git_source():
     src = {
         "type": "git",
@@ -1622,6 +1649,45 @@ def test_wait_converges_after_transition_mid_wait(monkeypatch):
     # The poll-refresh re-read is load-bearing: it took >=3 reads (2 building +
     # the healthy flip), so convergence came from a later poll, not iteration 0.
     assert q.get_job.await_count >= 3
+
+
+@pytest.mark.parametrize("before", [JobStatus.running, JobStatus.failed])
+def test_wait_after_stop_converges_only_once_actually_stopped(monkeypatch, before):
+    # Live run 2026-10-01: after ``stop_service`` the row reads
+    # ``desired_state=stopped`` but stays ``running``/``healthy`` until the
+    # reconciler's next tick. The wait must keep polling through that window and
+    # converge on the stop (pre-fix: ``converged`` at once on the old healthy
+    # phase, then ``failed`` on the very stop it was asked to wait for).
+    from nerdit.daemon.routes import service_wait as wait_mod
+
+    monkeypatch.setattr(wait_mod, "_WAIT_POLL_INTERVAL", 0.01)
+    cfg = json.dumps(_deploy_cfg(version=2, phase="healthy"))
+    stopping = _service(status=before, desired_state="stopped", config=cfg)
+    stopped = _service(status=JobStatus.stopped, desired_state="stopped", config=cfg)
+    q = _queries(stopping)
+    q.get_job = AsyncMock(side_effect=_driven_get_job([stopping, stopping, stopped]))
+    resp = _client(q).get("/services/demo/wait", params={"timeout": 5}, headers=_auth(RO_RAW))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["outcome"] == "converged"
+    assert body["status"] == "stopped"
+    assert body["diagnosis"] is None
+    assert q.get_job.await_count >= 3
+
+
+def test_versioned_wait_does_not_converge_on_a_concurrent_stop(monkeypatch):
+    # Codex on #227: `deploy --wait` passes its version; a stop landing before
+    # that version is healthy must not read as the deploy converging.
+    from nerdit.daemon.routes import service_wait as wait_mod
+
+    monkeypatch.setattr(wait_mod, "_WAIT_POLL_INTERVAL", 0.01)
+    cfg = json.dumps(_deploy_cfg(version=3, phase="building"))
+    stopped = _service(status=JobStatus.stopped, desired_state="stopped", config=cfg)
+    resp = _client(_queries(stopped)).get(
+        "/services/demo/wait", params={"timeout": 5, "version": 3}, headers=_auth(RO_RAW)
+    )
+    assert resp.status_code == 200
+    assert resp.json()["outcome"] == "failed"
 
 
 def test_wait_fails_after_transition_mid_wait(monkeypatch):

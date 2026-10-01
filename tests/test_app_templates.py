@@ -315,6 +315,37 @@ def test_t3_template_default_port_wins_over_repo_toml(tmp_path, monkeypatch):
     assert cfg["port"] == 5000
 
 
+PRJ_ID = "prj_" + "a" * 16
+
+
+async def _stamping_reserve(job, **kw):
+    """Mirror what `Queries._stamp_project` (workloads.py) sets on the Job inside
+    `reserve_service_for_token`. This pins the route's pass-through only; the real-DB
+    stamping proof is tests/test_service_queries.py (create_job / reserve stamping)."""
+    job.project_id = PRJ_ID
+    job.project = job.service_name
+    job.environment = "production"
+    job.service = "web"
+    return job
+
+
+def test_template_deploy_carries_the_project_id(tmp_path, monkeypatch):
+    """What reserve stamps on the Job reaches the 201 body (view pass-through)."""
+    _patch_catalog(monkeypatch, _synthetic_template())
+    ctx = _node_context(tmp_path, toml='[deploy]\nname = "demo"\nport = 8080\n')
+    _patch_clone(monkeypatch, ctx)
+    q = _queries()
+    q.reserve_service_for_token = AsyncMock(side_effect=_stamping_reserve)
+    resp = _client(q, tmp_path).post(
+        "/app-templates/synth/deploy",
+        json={"name": "demo", "env": {"API_URL": "u"}, "secrets": {"SERVICE_KEY": "k"}},
+        headers=_auth(SUB_RAW),
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["project_id"] == PRJ_ID
+    assert resp.json()["project"] == "demo"
+
+
 def test_t3_request_port_wins(tmp_path, monkeypatch):
     """An explicit body.port beats the template default."""
     _patch_catalog(monkeypatch, _synthetic_template())

@@ -791,6 +791,33 @@ def test_admin_fresh_deploy_of_admin_workspace_unchanged(tmp_path):
     assert q.reserve_service_for_token.call_args.args[0].submitted_by_token == "tok-admin"
 
 
+PRJ_ID = "prj_" + "a" * 16
+
+
+async def _stamping_reserve(job, **kw):
+    """Mirror what `Queries._stamp_project` (workloads.py) sets on the Job inside
+    `reserve_service_for_token`. This pins the route's pass-through only; the real-DB
+    stamping proof is tests/test_service_queries.py (create_job / reserve stamping)."""
+    job.project_id = PRJ_ID
+    job.project = job.service_name
+    job.environment = "production"
+    job.service = "web"
+    return job
+
+
+def test_workspace_deploy_carries_the_project_id(tmp_path):
+    """What reserve stamps on the Job reaches the 201 body (view pass-through)."""
+    q = _queries()
+    client = _client(q, tmp_path)
+    assert _write_app(client, ADMIN_RAW).status_code == 200
+    q.reserve_service_for_token = AsyncMock(side_effect=_stamping_reserve)
+
+    resp = client.post("/workspaces/demo/deploy", json={}, headers=_auth(ADMIN_RAW))
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["project_id"] == PRJ_ID
+    assert resp.json()["project"] == "demo"
+
+
 def test_null_owner_workspace_falls_back_to_the_acting_principal(tmp_path):
     """A NULL sidecar owner (only admins pass that gate) keeps today's behaviour."""
     q = _queries()

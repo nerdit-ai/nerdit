@@ -20,7 +20,6 @@ from nerdit.core.volumes import VolumeSpecError, service_data_root
 from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import (
     QuotaExceeded,
-    current_principal,
     require_owner_or_admin,
     require_role,
     require_service_scope,
@@ -531,11 +530,7 @@ async def logs_for_job(  # noqa: PLR0913 - the bounded log query
     # there. Captured BEFORE the scan — anything written after this read gets a
     # strictly larger id, which is what makes skipping to it safe.
     paged = (grep or since_ts) and not (tail is not None and tail > 0)
-    watermark = (
-        await queries.max_log_id()
-        if paged and current_principal(request).project_id is None
-        else None
-    )
+    watermark = await queries.max_log_id(job.id) if paged else None
     # The forward branch carries the SAME cap as `tail` (the tail branch ignores
     # `limit`): without one, a parameterless GET returns the whole retained
     # history of a chatty service — tens of MB materialized as `LogEntry` objects

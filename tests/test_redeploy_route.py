@@ -460,6 +460,19 @@ def test_recorded_token_ref_resolves_through_the_rows_project_scope(tmp_path, fa
     assert fake_clone.calls[-1]["token"] == "ghp-service"
 
 
+def test_redeploy_response_carries_the_rows_project_id(tmp_path, fake_clone):
+    """A redeploy re-reads the row (`write_redeploy`), so the 201 carries the
+    row's own project triple; the JOIN that fills it is pinned in test_service_queries."""
+    prj = "prj_" + "a" * 16
+    row = _git_row().model_copy(update={"project_id": prj, "project": "demo"})
+    q = _queries(row)
+    q.get_project = AsyncMock(return_value=SimpleNamespace(id=prj, submitted_by_token="tok-sub"))
+    resp = _post(_client(q, tmp_path))
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["project_id"] == prj
+    assert resp.json()["project"] == "demo"
+
+
 def test_an_owned_row_in_a_foreign_project_never_resolves_the_project_scope(tmp_path, fake_clone):
     """Row ownership proves the service scope only (plan §5 bounce: a row stamped into
     another token's project): that project's secret must not reach the caller's repo host."""

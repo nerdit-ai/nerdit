@@ -27,6 +27,7 @@
 #     sh install.sh --key-file /run/secrets/nerdit-key   # unattended
 #     curl -fsSL ... | NERDIT_AUTH_KEY_FILE=/run/... sh  # the same, piped
 #     sh install.sh --no-link                            # install only
+#     sh install.sh --template                           # fork-safe VM template (root)
 #
 # This script is the SOURCE OF TRUTH, versioned in the private development
 # repository at packaging/install.sh and deployed to get.nerdit.ai.  It is
@@ -170,6 +171,15 @@ LINK_KEY_FILE="${NERDIT_AUTH_KEY_FILE:-}"
 unset NERDIT_AUTH_KEY
 SKIP_LINK="${NERDIT_SKIP_LINK:-0}"
 LINK_TIMEOUT=600
+# --template (D-17 hosted pilot): build a VM template that is forked once per
+# customer. Everything the daemon mints (node key, Caddy CA, auth token, DB)
+# would be identical on every fork, so a template installs, proves health,
+# then stops, disables and wipes all per-node state. Each fork links itself.
+TEMPLATE="${NERDIT_TEMPLATE:-0}"
+case "$TEMPLATE" in
+0 | 1) ;;
+*) die "NERDIT_TEMPLATE takes 0 or 1." ;;
+esac
 # Is anything watching? Only the ATTENDED browser branch consults this — an
 # unattended install with a key still links, and skipping is still `--no-link`.
 # `CI` is the near-universal convention (GitHub Actions, GitLab, CircleCI,
@@ -212,6 +222,10 @@ while [ $# -gt 0 ]; do
 		SKIP_LINK=1
 		shift
 		;;
+	--template)
+		TEMPLATE=1
+		shift
+		;;
 	--link-timeout)
 		[ $# -ge 2 ] || die "--link-timeout needs a value"
 		case "$2" in
@@ -246,6 +260,11 @@ done
 # override, and the loop already cleared the source the flag replaced.)
 if [ "$KEY_FLAG" = 1 ] && [ "$KEY_FILE_FLAG" = 1 ]; then
 	die "--key and --key-file are mutually exclusive; pass exactly one."
+fi
+# Never echoes the key, only whether one was given (`[` is a builtin: no argv).
+if [ "$TEMPLATE" = 1 ] && { [ "$KEY_FLAG$KEY_FILE_FLAG" != 00 ] ||
+	[ -n "$LINK_KEY$LINK_KEY_FILE" ]; }; then
+	die "a template never links; each fork links after the fork (drop the pre-auth key)."
 fi
 
 # --------------------------------------------------------------------------
@@ -291,6 +310,11 @@ elif [ "${NERDIT_INSTALL_MODE:-}" = user ]; then
 	MODE=user
 else
 	die "installing nerdit on Linux needs root: rerun 'curl -fsSL https://get.nerdit.ai | sudo sh', or set NERDIT_INSTALL_MODE=user for a per-user install under \$HOME/.nerdit."
+fi
+# A template wipes $UNIT_HOME/.nerdit, which a user install uses as its ROOT.
+# The system layout keeps the install itself under /opt and /usr/local/bin.
+if [ "$TEMPLATE" = 1 ] && { [ "$OS" != linux ] || [ "$MODE" != system ]; }; then
+	die "--template needs a root systemd install (Linux, run as root)."
 fi
 
 PLIST_DST=""
@@ -447,6 +471,26 @@ if [ -e "$CURRENT_LINK" ] || [ -L "$CURRENT_LINK" ]; then
 		fi
 		;;
 	esac
+fi
+
+# (e2) a template starts from a clean image. Then the only config.toml is the
+#      one this run writes, so no data_dir / key_file / secrets_key_file /
+#      license file override can put state outside the tree the template wipes,
+#      and an operator's real node is never wiped by mistake.
+#      Every tree 12a deletes is checked, and so is a leftover unit or drop-in
+#      dir: section 8 would arm the cleanup trap's restart on it, and a stale
+#      drop-in can move User=/HOME= outside the wiped tree.
+if [ "$TEMPLATE" = 1 ] && { [ "$IS_UPDATE" = 1 ] || [ -e "$UNIT_HOME/.nerdit" ] ||
+	[ -e "$UNIT_HOME/.local/share/caddy" ] || [ -e "$UNIT_HOME/.config/caddy" ] ||
+	[ -e "$UNIT_DST" ] || [ -e "$UNIT_DST.d" ]; }; then
+	die "template needs a clean image: nerdit is already installed, a nerdit unit exists, or $UNIT_HOME/.nerdit, $UNIT_HOME/.local/share/caddy or $UNIT_HOME/.config/caddy exists."
+fi
+# (e3) a sealed template (fork-safe drop-in present, unit disabled) is never
+#      updated in place: the update would enable and start it, minting keys
+#      every fork would share. A started fork has the unit enabled and passes.
+if [ "$TEMPLATE" = 0 ] && [ "$IS_UPDATE" = 1 ] && [ -f "$UNIT_DST.d/10-fork-safe.conf" ] &&
+	! systemctl is-enabled --quiet nerdit.service 2>/dev/null; then
+	die "this is a sealed VM template; rebuild it from a clean image with NERDIT_TEMPLATE=1 NERDIT_VERSION=<new> instead of updating it."
 fi
 
 # (f) link inputs (P34 D2) — the last refusal, and still well before the first
@@ -627,6 +671,9 @@ cleanup() {
 		echo "error: restarting the nerdit service that was stopped for this install" >&2
 		start_unit || true
 	fi
+	if [ "$_rc" -ne 0 ] && [ "$TEMPLATE" = 1 ]; then
+		echo "error: template build failed; this image may hold per-node state and is NOT fork-safe. Discard it and start again from a clean image (a rerun here is refused)." >&2
+	fi
 	if [ -n "$STAGING" ]; then
 		rm -rf "$STAGING"
 	fi
@@ -798,6 +845,25 @@ if [ "$IS_UPDATE" = 0 ]; then
 	fi
 fi
 
+# Template only: every fork mints its OWN auth token before its first boot, and
+# a failed mint fails the start (no '-' prefix), so a fork never runs tokenless.
+# Idempotent: with a token present it only re-hardens config.toml to 0600. Not
+# applied to ordinary installs, where it would change a tokenless node's
+# behaviour -- which section 10b deliberately refuses to do.
+if [ "$TEMPLATE" = 1 ]; then
+	mkdir -p "$UNIT_DST.d"
+	printf '[Service]\nExecStartPre=%s init --auth-token-only\n' "$SHIM" >"$UNIT_DST.d/10-fork-safe.conf"
+	chmod 644 "$UNIT_DST.d/10-fork-safe.conf"
+	# A boat.dev image denies incoming under ufw, which drops a container's
+	# hop to a published port on the host bridge (managed databases, models,
+	# `nerdit db dump`). boat rewrites the ufw rules on every fork, so a rule
+	# baked into the template is lost; a drop-in survives and re-applies it at
+	# every start. '+' runs it as root despite User=, '-' tolerates a host
+	# without ufw. /usr/sbin/ufw is where Ubuntu's ufw package installs it.
+	printf '[Service]\n%s\n' 'ExecStartPre=+-/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/sbin/ufw allow in on docker0' >"$UNIT_DST.d/20-docker0.conf"
+	chmod 644 "$UNIT_DST.d/20-docker0.conf"
+fi
+
 start_unit
 if [ "$MODE" != system ] && [ "$OS" != macos ]; then
 	say "run 'loginctl enable-linger $UNIT_USER' so the daemon keeps running after you log out."
@@ -918,6 +984,36 @@ if [ "$HEALTHY" -eq 0 ]; then
 		die "the daemon did not answer http://127.0.0.1:$PROBE_PORT/health within 30s. The files are in place at $ROOT; check the service logs (systemctl status nerdit.service / journalctl -u nerdit.service, or ~/.nerdit/nerditd-launchd.log on macOS) and rerun once the cause is fixed."
 	fi
 	warn "daemon did not report healthy within 30s; check the service logs"
+fi
+
+# --------------------------------------------------------------------------
+# 12a. Template scrub (--template): the install has proved it boots; now stop
+#      it, DISABLE it (a template reboot before the snapshot must not re-mint
+#      anything) and delete every per-node byte, then exit before link/doctor.
+# --------------------------------------------------------------------------
+
+if [ "$TEMPLATE" = 1 ]; then
+	systemctl disable --now nerdit.service ||
+		die "could not stop and disable nerdit.service; the template is NOT fork-safe."
+	unit_active && die "the daemon is still active; the template is NOT fork-safe."
+	# Deny by default: the whole trees, not a list of files. Everything the
+	# daemon mints lives under ~/.nerdit (data_dir, config.toml, uploads; the
+	# Caddy storage root is data_dir/caddy, core/proxy/manager.py), plus Caddy's
+	# own app data and config dirs. tests/test_template_state_paths.py pins the
+	# daemon side of this list.
+	rm -rf "$UNIT_HOME/.nerdit" "$UNIT_HOME/.local/share/caddy" "$UNIT_HOME/.config/caddy"
+	[ -e "$UNIT_HOME/.nerdit" ] && die "$UNIT_HOME/.nerdit survived the scrub; the template is NOT fork-safe."
+	systemctl is-enabled --quiet nerdit.service && die "nerdit.service is still enabled; the template is NOT fork-safe."
+	say "template ready: nerdit installed, unit disabled and stopped, no per-node state"
+	# `nerdit link` only talks to a running daemon; the scrub left it disabled.
+	say "after each fork, start the daemon as root: systemctl enable --now nerdit.service, then wait for http://127.0.0.1:$PROBE_PORT/health"
+	# Minimal images often lack sudo: root building for root gets a direct line.
+	if [ "$UNIT_USER" = "$(id -un)" ]; then
+		say "after each fork, link as root: env HOME=$UNIT_HOME nerdit link --key-stdin --timeout 120"
+	else
+		say "after each fork, link as the unit user: sudo -u $UNIT_USER env HOME=$UNIT_HOME nerdit link --key-stdin --timeout 120"
+	fi
+	exit 0
 fi
 
 # --------------------------------------------------------------------------

@@ -11,6 +11,7 @@ file may survive until reboot. Escape dynamic Rich text.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import signal
@@ -691,6 +692,18 @@ def _remove_unit(unit: ServiceUnit) -> None:
     """Disable and remove the unit only after the data-dir lock proves the daemon is gone."""
     if unit.disable_argv != unit.stop_argv:  # launchd's bootout is both
         _run_unit_command(unit.disable_argv, note=" — continuing")
+    if unit.kind == "systemd-system":
+        # install.sh --template's drop-in; an operator's own overrides stay.
+        # Before the base unit: unit discovery needs the base unit file, so a
+        # drop-in that outlived it would be invisible to a retried uninstall.
+        drop_in_dir = unit.unit_path.with_name(unit.unit_path.name + ".d")
+        ours = [drop_in_dir / n for n in ("10-fork-safe.conf", "20-docker0.conf")]
+        if any(path_present(p) for p in ours):
+            for path in ours:
+                if path_present(path):
+                    _delete_path(path)
+            with contextlib.suppress(OSError):
+                drop_in_dir.rmdir()
     if path_present(unit.unit_path):
         _delete_path(unit.unit_path)
         console.print(f"[dim]Removed the service unit ({_plain(unit.unit_path)}).[/dim]")

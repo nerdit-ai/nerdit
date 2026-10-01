@@ -472,6 +472,9 @@ def display_wait_outcome(result: dict) -> None:
     outcome = result.get("outcome")
     name = _plain(result.get("service_name")) or "service"
     if outcome == "converged":
+        if result.get("status") == "stopped":  # a requested stop converged
+            console.print(f"[green]Converged:[/green] {name} is stopped")
+            return
         console.print(f"[green]Converged:[/green] {name} is healthy")
         url = result.get("public_url")
         if url:

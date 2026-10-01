@@ -56,6 +56,12 @@ def test_f4_markup_wait_outcome_timeout_escapes_phase():
     assert "[bold]building" in out
 
 
+def test_wait_outcome_names_a_converged_stop():
+    with console.capture() as cap:
+        display_wait_outcome({"outcome": "converged", "service_name": "app", "status": "stopped"})
+    assert "app is stopped" in cap.get() and "healthy" not in cap.get()
+
+
 def _make_client(handler) -> NerditClient:
     return NerditClient(
         host="localhost",

@@ -253,6 +253,9 @@ class ApplyResponse(BaseModel):
     """`POST /projects/{project}/apply`: what was planned, applied, or is still missing."""
 
     project: str
+    project_id: str | None = Field(
+        default=None, description="The project's immutable id; null when a dry run creates it"
+    )
     status: Literal["applied", "planned", "waiting_for_variables"]
     dry_run: bool
     services: list[ApplyServiceResult] = Field(default_factory=list)
@@ -1313,6 +1316,7 @@ async def apply_project(
         if missing:
             return ApplyResponse(
                 project=project,
+                project_id=row.id if row is not None else None,
                 status="waiting_for_variables",
                 dry_run=dry_run,
                 missing=missing,
@@ -1329,6 +1333,7 @@ async def apply_project(
         # awaited planning step just as the real deployment checks at reservation.
         if row is not None:
             await _judge_apply_project(request, row.id)
+            result.project_id = row.id
         return result
     finally:
         # `_finalize_deploy` adds masked `ai` / `db` members to the params it

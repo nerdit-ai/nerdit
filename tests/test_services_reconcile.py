@@ -22,7 +22,7 @@ from nerdit.core.launch import _RUN_LINE_MAX_BYTES, _RUN_TAIL_MAX_BYTES
 from nerdit.core.models.backend import ModelPullError, OllamaBackend, sanitize_model_name
 from nerdit.core.models.controller import ModelController
 from nerdit.core.runtime.protocol import ContainerNotFoundError
-from nerdit.core.services import RunPreconditionError, ServiceController
+from nerdit.core.services import _LOG_RESUME_LAG_S, RunPreconditionError, ServiceController
 from nerdit.core.sweeper import ZombieSweeper
 from nerdit.db.models import ErrorClass, Job, JobKind, JobStatus, LogStream, TokenRole
 
@@ -3781,9 +3781,14 @@ async def _readopt_follow_since(queries, *, seed_line: bool) -> tuple[int | None
 
 
 async def test_readopted_log_stream_resumes_at_newest_persisted_line(queries):
-    """B3: a re-adopted follow resumes at the last stored line, never replays history."""
+    """B3: a re-adopted follow resumes near the last stored line, never replays history.
+
+    It rewinds `_LOG_RESUME_LAG_S` because rows carry insert time and Docker's
+    `since` is emission time: a line emitted before the last insert but never
+    read must be replayed (and deduplicated), not lost.
+    """
     since, expected = await _readopt_follow_since(queries, seed_line=True)
-    assert expected is not None and since == expected
+    assert expected is not None and since == expected - _LOG_RESUME_LAG_S
 
 
 async def test_readopted_log_stream_skips_replayed_lines_of_resume_second(queries):

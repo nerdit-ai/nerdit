@@ -1133,6 +1133,41 @@ def test_unit_stopped_disabled_and_removed(fake_home, tmp_path, monkeypatch):
     assert not unit.unit_path.exists()
 
 
+def test_template_drop_in_is_removed_but_operator_overrides_stay(fake_home, tmp_path, monkeypatch):
+    unit = _unit(tmp_path)
+    drop_ins = unit.unit_path.with_name("nerdit.service.d")
+    drop_ins.mkdir()
+    (drop_ins / "10-fork-safe.conf").write_text("[Service]\n")
+    (drop_ins / "20-docker0.conf").write_text("[Service]\n")
+    monkeypatch.setattr("subprocess.run", _FakeRun())
+    uninstall_mod._remove_unit(unit)
+    assert not drop_ins.exists()
+
+    drop_ins.mkdir()
+    (drop_ins / "10-fork-safe.conf").write_text("[Service]\n")
+    (drop_ins / "override.conf").write_text("[Service]\n")
+    unit.unit_path.write_text("[Unit]\n")
+    uninstall_mod._remove_unit(unit)
+    assert sorted(p.name for p in drop_ins.iterdir()) == ["override.conf"]
+
+
+def test_template_drop_in_goes_before_the_base_unit(fake_home, tmp_path, monkeypatch):
+    """Unit discovery needs the base unit file, so the drop-in must not outlive it."""
+    unit = _unit(tmp_path)
+    drop_in = unit.unit_path.with_name("nerdit.service.d") / "10-fork-safe.conf"
+    drop_in.parent.mkdir()
+    drop_in.write_text("[Service]\n")
+    unit.unit_path.write_text("[Unit]\n")
+    monkeypatch.setattr("subprocess.run", _FakeRun())
+    order: list[str] = []
+    real_delete = uninstall_mod._delete_path
+    monkeypatch.setattr(
+        uninstall_mod, "_delete_path", lambda p: (order.append(p.name), real_delete(p))
+    )
+    uninstall_mod._remove_unit(unit)
+    assert order == ["10-fork-safe.conf", "nerdit.service"]
+
+
 def test_launchd_bootout_is_not_run_twice(fake_home, tmp_path, monkeypatch):
     """launchd's bootout IS the disable — running it twice just errors."""
     data_dir = tmp_path / "data"

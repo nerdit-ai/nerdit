@@ -346,7 +346,8 @@ async def wait_for_service(
 
         Blocks until the service converges (healthy) or fails, then returns
         ``{outcome: converged|failed|timeout|superseded, ...}`` — always, never
-        raising on a timeout.
+        raising on a timeout. After ``stop_service``, ``converged`` means the
+        service is actually stopped.
 
         On ``outcome: failed`` the response also carries ``diagnosis`` — the
         FULL ``diagnose_service`` bundle (``remediation.code`` + ``detail``,

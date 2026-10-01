@@ -4,6 +4,51 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.7.1 (2026-10-01)
+
+Reliability fixes for waits, logs and VM templates.
+
+### Fixes
+
+- **Waiting after a stop.** `nerdit services wait`, `wait_for_service` and
+  `GET /services/{name}/wait` now wait for a requested stop: after
+  `stop_service` they converge once the service is actually stopped. A wait
+  for an explicit version (`deploy --wait`) keeps that version as its target,
+  so a concurrent stop does not read as the deploy succeeding.
+- **Fewer lost log lines across a daemon restart.** The re-adopted log follow
+  rewinds 10 seconds and skips the lines already stored, so lines emitted just
+  before the restart are kept. A reader more than 10 seconds behind can still
+  lose its unread backlog.
+- **Filtered log reads return a cursor to delegated callers.** A forward read
+  with `grep` or `since` now returns `X-Nerdit-Scan-Watermark` to
+  project-delegated callers too, so a follower with no match does not rescan
+  the same history. As before, a full page omits it: continue from its last
+  row ID until a shorter page returns the watermark.
+
+### Agents and API
+
+- Every deploy response that creates or updates a service (not a
+  `?dry_run=true` plan) carries the service's `project`, `project_id` and
+  `service`, like `GET /services`. `POST /projects/{project}/apply` returns
+  the project's `project_id` (`null` on a dry run that would create it).
+
+### Installation
+
+- **VM templates.** `install.sh --template` (or `NERDIT_TEMPLATE=1`) builds a
+  fork-safe image: it installs the root service, proves `/health`, then
+  disables it and removes every per-machine file, so each clone mints its own
+  identity and admin token. Clones must cold-boot, or expose VMGenID; otherwise
+  reboot a clone before its first start. On each clone, run
+  `systemctl enable --now nerdit.service`, wait for `/health`, then run the
+  link command the installer printed: it sets the unit user and its `HOME`. On
+  hosts whose firewall denies incoming traffic by default, the template
+  re-allows container traffic on the Docker bridge at each start.
+  `nerdit uninstall` removes the template's unit drop-ins.
+- The GPU dependency is `nvidia-ml-py` instead of the deprecated `pynvml`
+  wrapper, which printed a `FutureWarning` on every Python start.
+- The wheel ships only the built dashboard, about 1 MB smaller, and CLI
+  commands start about 150 ms faster.
+
 ## 0.7.0 (2026-09-24)
 
 MCP in every installation, stable project IDs for agents, and a hardening pass

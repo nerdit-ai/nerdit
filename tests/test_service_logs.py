@@ -458,8 +458,8 @@ async def test_a_row_written_after_the_watermark_is_still_delivered(queries):
     inner = queries.max_log_id
     injected = {"done": False}
 
-    async def racing_max_log_id():
-        value = await inner()
+    async def racing_max_log_id(job_id):
+        value = await inner(job_id)
         if not injected["done"]:
             injected["done"] = True
             # Written strictly AFTER the watermark was read.
@@ -494,9 +494,9 @@ async def test_an_unfiltered_stream_never_reads_the_watermark(queries):
     calls = []
     inner = queries.max_log_id
 
-    async def spy():
+    async def spy(job_id):
         calls.append(1)
-        return await inner()
+        return await inner(job_id)
 
     queries.max_log_id = spy  # type: ignore[method-assign]
     try:
@@ -667,13 +667,35 @@ async def test_a_filtered_page_returns_the_pre_scan_watermark(queries, monkeypat
     )
     assert entries == []
     watermark = int(response.headers["X-Nerdit-Scan-Watermark"])
-    assert watermark == await queries.max_log_id() == 5
+    assert watermark == await queries.max_log_id(job.id) == 5
 
     # The follower resumes from it, so the second poll re-scans nothing old.
     await get_service_logs(
         request, Response(), "wm", since_id=watermark, tail=None, grep="nope", since=None
     )
     assert scanned == [0, 5]
+
+
+async def test_the_watermark_is_job_scoped(queries):
+    """Every caller gets it (project-delegated ones included), and it leaks no
+    other workload's log volume: it is this job's MAX(id), not the table's."""
+    from nerdit.daemon.routes.services import get_service_logs
+
+    request = _StubRequest()
+    request.app = _App()  # type: ignore[attr-defined]
+    request.app.state.queries = queries  # type: ignore[attr-defined]
+    job = await _service(queries, name="mine")
+    other = await _service(queries, name="theirs")
+    await queries.append_log(job.id, "line")
+    (mine,) = await queries.get_logs(job.id)
+    for i in range(3):
+        await queries.append_log(other.id, f"noise {i}")
+
+    response = Response()
+    await get_service_logs(
+        request, response, "mine", since_id=0, tail=None, grep="nope", since=None
+    )
+    assert int(response.headers["X-Nerdit-Scan-Watermark"]) == mine.id
 
 
 async def test_an_unfiltered_page_carries_no_watermark_header(queries):

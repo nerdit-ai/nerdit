@@ -45,7 +45,11 @@ _WAIT_TERMINAL_STATUSES = frozenset({JobStatus.failed, JobStatus.stopped, JobSta
 
 
 def _evaluate_wait(
-    job: Job, resolved_version: int | None, version_aware: bool
+    job: Job,
+    resolved_version: int | None,
+    version_aware: bool,
+    *,
+    explicit_version: bool = False,
 ) -> tuple[str | None, dict | None]:
     """Compute the wait outcome for a freshly-read row (or `None` = keep waiting).
 
@@ -62,6 +66,18 @@ def _evaluate_wait(
     if not isinstance(ld, dict):
         ld = None
     status = job.status
+
+    # A requested stop is its own target, for every kind: the row reads
+    # `desired_state=stopped` at once but keeps its live status (and any
+    # `healthy` phase) until the reconciler's next tick tears the container
+    # down, so converge only on `stopped` — never on the container still
+    # running, nor `failed` on the very stop the caller asked for: a `failed`
+    # or `cancelled` row is torn down to `stopped` by the same tick, and a
+    # teardown that never lands ends in an honest `timeout`. A wait for an
+    # explicit version (`deploy --wait`) keeps its target: a concurrent stop
+    # must not read as that version converging.
+    if job.desired_state == "stopped" and not explicit_version:
+        return ("converged" if status == JobStatus.stopped else None), ld
 
     # Model rows never carry a last_deploy phase machine
     # (ModelController._stamp_last_deploy_failed is a no-op for them), so
@@ -309,7 +325,9 @@ async def wait_for_service(
     async with _WAIT_SEMAPHORE:
         started = time.monotonic()
         while True:
-            outcome, ld = _evaluate_wait(job, resolved_version, version_aware)
+            outcome, ld = _evaluate_wait(
+                job, resolved_version, version_aware, explicit_version=requested_version is not None
+            )
             waited = time.monotonic() - started
             if outcome is not None:
                 endpoint = await _endpoint_for(job)

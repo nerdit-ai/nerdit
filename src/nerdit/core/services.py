@@ -25,7 +25,7 @@ import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
@@ -331,9 +331,15 @@ class RunPreconditionError(Exception):
 #: flushes a partial batch.
 _LOG_BATCH = 256
 _LOG_FLUSH_S = 0.25
-#: Stored rows of the resume second a re-adopted follow checks for replays.
-# ponytail: a busier resume second re-inserts its lines past this bound.
+#: Stored rows of the resume window a re-adopted follow checks for replays.
+# ponytail: a busier resume window re-inserts its lines past this bound.
 _LOG_RESUME_MAX = 4 * _LOG_BATCH
+#: Seconds a re-adopted follow rewinds behind the newest row's insert time.
+#: Docker's `since` is container emission time; rows carry insert time, which
+#: trails emission by the flush interval plus any reader backlog.
+# ponytail: a reader more than this far behind still loses its unread backlog;
+# persisting Docker's own line timestamps is the exact cursor.
+_LOG_RESUME_LAG_S = 10
 
 
 class RunInterruptedError(ContainerRuntimeError):
@@ -3054,16 +3060,20 @@ class ServiceController:
         """
         now = datetime.now(UTC)
         # Re-adopt the log stream if we are not already collecting it (reboot),
-        # resuming at the newest persisted row's second rather than replaying
-        # the container's whole log history into job_logs. Docker's `since` is
-        # inclusive and row timestamps are second-resolution insert times, so
-        # the rows already stored in that second are handed over as `seen`.
+        # resuming shortly before the newest persisted row rather than replaying
+        # the container's whole log history into job_logs. Row timestamps are
+        # second-resolution INSERT times while Docker's inclusive `since` is
+        # EMISSION time, so the follow rewinds `_LOG_RESUME_LAG_S` (a line
+        # emitted before the last insert but never read is not lost) and the
+        # rows stored since that point are handed over as `seen` to drop the
+        # replay. Any row emitted >= since was inserted >= since, so `seen`
+        # covers the whole replay.
         if job.container_id and job.container_id not in self._log_tasks:
             last = await self._queries.get_logs(job.id, tail=1, streams=[LogStream.stdout])
             since = None
             seen: list[str] = []
             if last:
-                ts = last[-1].timestamp
+                ts = last[-1].timestamp - timedelta(seconds=_LOG_RESUME_LAG_S)
                 since = int(ts.replace(tzinfo=UTC).timestamp())
                 rows = await self._queries.get_logs(
                     job.id,

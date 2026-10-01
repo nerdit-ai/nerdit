@@ -139,9 +139,15 @@ class LogQueries(QueriesBase):
             for r in rows
         ]
 
-    async def max_log_id(self) -> int:
-        """Return the maximum log ID, or zero; filtered followers use it as a scan watermark."""
-        cursor = await self._db.conn.execute("SELECT COALESCE(MAX(id), 0) FROM job_logs")
+    async def max_log_id(self, job_id: str) -> int:
+        """Return the job's maximum log ID, or zero; filtered followers use it as a scan watermark.
+
+        Job-scoped, so the header leaks nothing about other workloads' log volume
+        to a project-delegated caller (idx_job_logs_job keeps it one index probe).
+        """
+        cursor = await self._db.conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM job_logs WHERE job_id = ?", (job_id,)
+        )
         row = await cursor.fetchone()
         return int(row[0]) if row is not None else 0
 

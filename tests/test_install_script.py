@@ -22,8 +22,10 @@ import functools
 import hashlib
 import os
 import platform
+import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -162,7 +164,12 @@ class TestStatic:
             'launchctl kickstart -k "gui/$EUID_NOW/ai.nerdit.daemon"',
         ):
             assert cmd in text, f"missing canonical service command: {cmd}"
-        assert "systemctl enable --now" not in text
+        # Executed, never: the template scrub only PRINTS it for the fork.
+        assert not [
+            line
+            for line in text.splitlines()
+            if "systemctl enable --now" in line and not line.lstrip().startswith("say ")
+        ]
 
     def test_unit_templates_only_use_placeholders_the_installer_renders(self):
         """Cross-package pin: install.sh sed-renders exactly these three."""
@@ -1305,3 +1312,201 @@ class TestKeyFilePreflightGating:
         proc = _run(rig, "--no-link", NERDIT_AUTH_KEY_FILE=str(tmp_path / "gone"))
         assert proc.returncode == 0, proc.stderr
         assert _link_calls(rig) == []
+
+
+# ---------------------------------------------------------------------------
+# 4. --template (D-17 hosted pilot): a fork-safe VM template
+# ---------------------------------------------------------------------------
+
+_TKEY = "nk_TEMPLATEKEYTEMPLATEKEYTEMPLATE"
+_TEMPLATE_HEAD = 'if [ "$TEMPLATE" = 1 ]; then\n\tsystemctl disable --now nerdit.service'
+
+
+def _template_block() -> str:
+    """The script's own scrub block, verbatim (it runs after /opt is written,
+    which a non-root rehearsal cannot reach, so it is driven on its own)."""
+    text = _script_text()
+    start = text.index(_TEMPLATE_HEAD)
+    return text[start : text.index("\nfi\n", start) + 4]
+
+
+def _run_scrub(
+    tmp_path: Path, *, disable_works: bool = True, unit_user: str = "root"
+) -> tuple[subprocess.CompletedProcess, Path, Path]:
+    home = tmp_path / "home"
+    for rel in (
+        ".nerdit/config.toml",
+        ".nerdit/link/node.key",
+        ".nerdit/caddy/pki/authorities/local/root.key",
+        ".nerdit/secrets.key",
+        ".nerdit/nerdit.db-wal",
+        ".local/share/caddy/instance.uuid",
+        ".config/caddy/autosave.json",
+        ".profile",
+    ):
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text("x")
+    binn = tmp_path / "bin"
+    binn.mkdir()
+    log = tmp_path / "calls.log"
+    state = tmp_path / "disabled"
+    touch = f'touch "{state}"' if disable_works else ":"
+    # Stateful: `disable --now` flips is-active and is-enabled to false.
+    _write_exe(
+        binn / "systemctl",
+        "#!/bin/sh\n"
+        f'echo "systemctl $*" >> "{log}"\n'
+        'case "$1" in\n'
+        f"  disable) {touch} ;;\n"
+        f'  is-active|is-enabled) [ ! -f "{state}" ] ;;\n'
+        "esac\n",
+    )
+    prelude = (
+        "set -eu\n"
+        'say() { echo "$*"; }\n'
+        'die() { echo "error: $*" >&2; exit 1; }\n'
+        "unit_active() { systemctl is-active --quiet nerdit.service 2>/dev/null; }\n"
+        f"TEMPLATE=1\nUNIT_USER={unit_user}\nUNIT_HOME='{home}'\nPROBE_PORT=9321\n"
+    )
+    script = tmp_path / "scrub.sh"
+    script.write_text(prelude + _template_block() + "echo FELL-THROUGH\n")
+    proc = subprocess.run(
+        ["sh", str(script)],
+        env={"PATH": f"{binn}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+    return proc, home, log
+
+
+def _root_rig(tmp_path: Path) -> SimpleNamespace:
+    """A rig where `id -u` says root, so the installer picks the system mode,
+    and `getent` points the unit user's home at the rig's HOME. Only the
+    preflights are reachable: the first mutation would write /opt/nerdit."""
+    rig = _rig(tmp_path)
+    _write_exe(
+        rig.bin / "id",
+        '#!/bin/sh\n[ "$1" = -u ] && { echo 0; exit 0; }\nexec /usr/bin/id "$@"\n',
+    )
+    _write_exe(rig.bin / "getent", f'#!/bin/sh\necho "root:x:0:0::{rig.home}:/bin/sh"\n')
+    return rig
+
+
+class TestTemplate:
+    def test_order_drop_in_before_start_and_scrub_before_link(self):
+        text = _script_text()
+        # No '-' prefix: a failed mint fails the start.
+        assert "ExecStartPre=%s init --auth-token-only" in text
+        drop_in = text.index("10-fork-safe.conf")
+        assert drop_in < text.index("\nstart_unit\n")
+        block = text.index(_TEMPLATE_HEAD)
+        assert text.index("HEALTHY=0") < block < text.index("# 12b. Drive the link")
+        disable = text.index("systemctl disable --now", block)
+        wipe = text.index('rm -rf "$UNIT_HOME/.nerdit"', block)
+        assert disable < wipe < text.index("\texit 0\n", block)
+        # The clean-image refusal covers updates too, and precedes every mutation.
+        assert '[ "$TEMPLATE" = 1 ] && { [ "$IS_UPDATE" = 1 ]' in text
+        assert text.index("template needs a clean image") < text.index('mkdir -p "')
+        # So does the refusal to update a sealed template in place.
+        assert text.index("this is a sealed VM template") < text.index('mkdir -p "')
+
+    @pytest.mark.parametrize("template", ["0", "1"])
+    def test_docker0_drop_in_is_written_for_templates_only(self, tmp_path, template):
+        # The script's own drop-in block, run on its own: /etc is not reachable
+        # from a non-root rehearsal.
+        text = _script_text()
+        start = text.index('if [ "$TEMPLATE" = 1 ]; then\n\tmkdir -p "$UNIT_DST.d"')
+        block = text[start : text.index("\nfi\n", start) + 4]
+        unit = tmp_path / "nerdit.service"
+        script = tmp_path / "dropins.sh"
+        script.write_text(f"set -eu\nTEMPLATE={template}\nSHIM=nerdit\nUNIT_DST='{unit}'\n" + block)
+        proc = subprocess.run(["sh", str(script)], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        conf = tmp_path / "nerdit.service.d" / "20-docker0.conf"
+        if template == "0":
+            assert not conf.exists()
+            return
+        assert conf.read_text() == (
+            "[Service]\nExecStartPre=+-/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "
+            "/usr/sbin/ufw allow in on docker0\n"
+        )
+        assert stat.S_IMODE(conf.stat().st_mode) == 0o644
+
+    def test_scrub_prints_a_sudo_free_link_line_when_root_builds_for_root(self, tmp_path):
+        proc, home, _ = _run_scrub(tmp_path, unit_user=pwd.getpwuid(os.getuid()).pw_name)
+        assert proc.returncode == 0, proc.stderr
+        link_line = next(line for line in proc.stdout.splitlines() if "nerdit link" in line)
+        expected = f"link as root: env HOME={home} nerdit link --key-stdin --timeout 120"
+        assert link_line == f"after each fork, {expected}"
+
+    def test_scrub_wipes_per_node_state_and_disables_the_unit(self, tmp_path):
+        proc, home, log = _run_scrub(tmp_path)
+        assert proc.returncode == 0, proc.stderr
+        assert "template ready" in proc.stdout
+        # The rehearsal runs as a non-root user with UNIT_USER=root, so the
+        # sudo form is printed; the direct form is the root-builds-root case.
+        assert f"sudo -u root env HOME={home} nerdit link --key-stdin" in proc.stdout
+        # The scrub disabled the unit and `nerdit link` cannot start it, so the
+        # start line comes first (the cloud provisioner's fork → enable → link).
+        out = proc.stdout
+        assert out.index("systemctl enable --now nerdit.service") < out.index("nerdit link")
+        assert "FELL-THROUGH" not in proc.stdout  # exits before link/doctor/banner
+        assert not (home / ".nerdit").exists()
+        assert not (home / ".local" / "share" / "caddy").exists()
+        assert not (home / ".config" / "caddy").exists()
+        assert (home / ".profile").exists()  # deny-by-default is scoped to our trees
+        calls = log.read_text().splitlines()
+        assert calls[0] == "systemctl disable --now nerdit.service"
+        assert "systemctl is-enabled --quiet nerdit.service" in calls
+
+    def test_scrub_never_wipes_under_a_live_daemon(self, tmp_path):
+        proc, home, _ = _run_scrub(tmp_path, disable_works=False)
+        assert proc.returncode == 1
+        assert "NOT fork-safe" in proc.stderr
+        assert (home / ".nerdit" / "link" / "node.key").exists()
+
+    @_exec_only
+    @pytest.mark.parametrize(
+        ("args", "env", "message"),
+        [
+            # darwin is always a user install; Linux rehearsals force user mode.
+            (("--template",), {}, "--template needs a root systemd install"),
+            ((), {"NERDIT_TEMPLATE": "1"}, "--template needs a root systemd install"),
+            (("--template", "--key", _TKEY), {}, "never links"),
+            (("--template",), {"NERDIT_AUTH_KEY": _TKEY}, "never links"),
+            ((), {"NERDIT_TEMPLATE": "yes"}, "NERDIT_TEMPLATE takes 0 or 1"),
+        ],
+    )
+    def test_refusals_happen_before_any_download_or_write(self, tmp_path, args, env, message):
+        rig = _rig(tmp_path)
+        _publish(rig, "0.5.0")
+        proc = _run(rig, *args, **env)
+        assert proc.returncode == 1
+        assert message in proc.stderr
+        assert "TEMPLATEKEY" not in proc.stdout + proc.stderr
+        assert "curl" not in _calls(rig)
+        assert list(rig.home.iterdir()) == []
+
+    @_exec_only
+    @pytest.mark.skipif(sys.platform == "darwin", reason="system mode is Linux only")
+    def test_an_existing_node_is_never_turned_into_a_template(self, tmp_path):
+        rig = _root_rig(tmp_path)
+        _publish(rig, "0.5.0")
+        (rig.home / ".nerdit").mkdir()
+        (rig.home / ".nerdit" / "config.toml").write_text("[daemon]\n")
+        proc = _run(rig, "--template", NERDIT_INSTALL_MODE="")
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "template needs a clean image" in proc.stderr
+        assert "curl" not in _calls(rig)
+        assert (rig.home / ".nerdit" / "config.toml").exists()
+
+    @_exec_only
+    @pytest.mark.skipif(sys.platform == "darwin", reason="system mode is Linux only")
+    def test_a_foreign_caddy_config_is_never_wiped(self, tmp_path):
+        rig = _root_rig(tmp_path)
+        _publish(rig, "0.5.0")
+        (rig.home / ".config" / "caddy").mkdir(parents=True)
+        proc = _run(rig, "--template", NERDIT_INSTALL_MODE="")
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "template needs a clean image" in proc.stderr
+        assert (rig.home / ".config" / "caddy").exists()

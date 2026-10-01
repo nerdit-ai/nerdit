@@ -132,7 +132,7 @@ async def _log_frames(
         max id first is what makes skipping safe: anything written after this
         read gets a strictly larger id.
         """
-        pre_max = await queries.max_log_id() if filtered else 0
+        pre_max = await queries.max_log_id(job_id) if filtered else 0
         entries = await queries.get_logs(
             job_id, since_id=cursor, grep=grep, since_ts=since_ts, limit=_POLL_CHUNK
         )

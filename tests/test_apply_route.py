@@ -223,6 +223,7 @@ async def test_two_services_get_the_labels_and_the_project_triple(env):
         "api--asso": ("asso", "production", "api", "tok-a"),
     }
     assert await env.count("projects") == 1
+    assert body["project_id"] == (await env.queries.get_project_by_name("asso")).id
     assert env.extract.await_count == 2  # one context per service
     assert await env.audit("project.apply") == [
         (
@@ -304,6 +305,7 @@ async def test_dry_run_plans_both_and_writes_nothing(env):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["status"] == "planned" and body["dry_run"] is True
+    assert body.get("project_id") is None  # nothing was minted
     assert [s["label"] for s in body["services"]] == ["asso", "api--asso"]
     assert all(s["plan"]["action"] == "create" for s in body["services"])
     assert all(s.get("build_version") is None for s in body["services"])
@@ -362,6 +364,7 @@ async def test_owner_is_told_which_variables_are_missing(env, dry_run):
     body = resp.json()
     assert body["status"] == "waiting_for_variables" and body["missing"] == ["API_KEY"]
     assert "nerdit vars set asso --secret --prompt" in body["hint"]
+    assert body["project_id"] == (await env.queries.get_project_by_name("asso")).id
     assert body["services"] == [] and SECRET_VALUE not in resp.text
     env.untouched()
     assert await env.count("jobs") == 0

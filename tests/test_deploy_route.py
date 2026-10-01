@@ -494,6 +494,40 @@ def test_fresh_deploy_response_has_no_rollback(tmp_path):
     assert body["build_version"] == 1
 
 
+PRJ_ID = "prj_" + "a" * 16
+
+
+async def _stamping_reserve(job, **kw):
+    """Mirror what `Queries._stamp_project` (workloads.py) sets on the Job inside
+    `reserve_service_for_token`. This pins the route's pass-through only; the real-DB
+    stamping proof is tests/test_service_queries.py (create_job / reserve stamping)."""
+    job.project_id = PRJ_ID
+    job.project = job.service_name
+    job.environment = "production"
+    job.service = "web"
+    return job
+
+
+def test_fresh_deploy_response_carries_the_project_id(tmp_path):
+    """What reserve stamps on the Job reaches the 201 body (view pass-through)."""
+    q = _queries()
+    q.reserve_service_for_token = AsyncMock(side_effect=_stamping_reserve)
+    resp = _post(_client(q, tmp_path), _node_zip())
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["project_id"] == PRJ_ID
+    assert body["project"] == "demo"
+    assert body["service"] == "web"
+
+
+def test_dry_run_body_has_no_project_id(tmp_path):
+    """A dry run persists nothing, so no project exists yet and none is claimed."""
+    q = _queries()
+    resp = _dry_post(_client(q, tmp_path), _node_zip())
+    assert resp.status_code == 200, resp.text
+    assert "project_id" not in resp.json()
+
+
 def test_redeploy_response_exposes_rollback(tmp_path):
     """A redeploy surfaces rollback_available=True + the bumped build_version."""
     existing = Job(

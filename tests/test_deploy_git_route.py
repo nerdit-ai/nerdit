@@ -1210,6 +1210,29 @@ def _project(owner: str | None) -> Project:
     return Project(id=PRJ_ID, name="demo", submitted_by_token=owner)
 
 
+async def _stamping_reserve(job, **kw):
+    """Mirror what `Queries._stamp_project` (workloads.py) sets on the Job inside
+    `reserve_service_for_token`. This pins the route's pass-through only; the real-DB
+    stamping proof is tests/test_service_queries.py (create_job / reserve stamping)."""
+    job.project_id = PRJ_ID
+    job.project = job.service_name
+    job.environment = "production"
+    job.service = "web"
+    return job
+
+
+def test_fresh_git_deploy_carries_the_project_id(tmp_path, monkeypatch):
+    """What reserve stamps on the Job reaches the 201 body (view pass-through)."""
+    q = _queries()
+    q.reserve_service_for_token = AsyncMock(side_effect=_stamping_reserve)
+    resp = _post(_client(q, tmp_path), monkeypatch, _fake_clone())
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["project_id"] == PRJ_ID
+    assert body["project"] == "demo"
+    assert body["service"] == "web"
+
+
 def test_fresh_deploy_token_ref_resolves_from_the_callers_project_scope(tmp_path, monkeypatch):
     """The owner's project file backs a fresh label; a leftover service file stays unread."""
     q = _queries()
