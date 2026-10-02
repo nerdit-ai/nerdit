@@ -294,7 +294,8 @@ async def set_share(request: Request, name: str, body: ShareRequest) -> ShareVie
     recorder = get_recorder()
     if recorder is not None:
         # A PRIVATE hosted URL is not a bearer capability — the cloud edge still
-        # demands an owner session — so it is safe to carry. A PUBLIC one is
+        # demands a signed-in identity the owner allows (the owner, or a person
+        # allowed in the Nerdit App) — so it is safe to carry. A PUBLIC one is
         # omitted: this feed is POSTed verbatim to operator-configured webhook
         # hosts, and a world-reachable address does not need to travel there.
         data: dict[str, object] = {"access": share.access}

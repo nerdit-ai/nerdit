@@ -60,7 +60,9 @@ def share(
         False,
         "--public",
         help=(
-            "Make the URL world-reachable instead of owner-only. Needs an "
+            "Make the URL world-reachable instead of private (the owner of this "
+            "machine's Nerdit account and the people they allow in the Nerdit "
+            "App). Needs an "
             "active linked account AND either --consent or a \\[deploy].edge_auth "
             "block on the app."
         ),

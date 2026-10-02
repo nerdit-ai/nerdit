@@ -1139,6 +1139,7 @@ def test_template_drop_in_is_removed_but_operator_overrides_stay(fake_home, tmp_
     drop_ins.mkdir()
     (drop_ins / "10-fork-safe.conf").write_text("[Service]\n")
     (drop_ins / "20-docker0.conf").write_text("[Service]\n")
+    (drop_ins / "30-deny-inbound.conf").write_text("[Service]\n")
     monkeypatch.setattr("subprocess.run", _FakeRun())
     uninstall_mod._remove_unit(unit)
     assert not drop_ins.exists()

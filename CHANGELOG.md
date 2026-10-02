@@ -4,6 +4,36 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.7.2 (2026-10-02)
+
+VM templates close their own ports, and the texts say who can open a private
+share.
+
+### Installation
+
+- **VM templates close their own ports.** A template built with
+  `install.sh --template` now blocks connections from outside the machine to
+  Nerdit's HTTPS port (8443) and API port (9321), over TCP and UDP (HTTP/3),
+  IPv4 and IPv6, through the host's ufw firewall at every start. Apps stay
+  reachable through their hosted links, and containers still reach databases
+  and models. Machines cloned from an older template are unchanged until they
+  are recreated from a new one. The rule needs ufw to be active, so check from
+  outside the machine that both ports are closed, over TCP and UDP.
+  `nerdit uninstall` removes the template's new unit drop-in, but the firewall
+  rules it already added stay: on a machine that keeps running, remove them
+  with `ufw delete deny proto tcp to any port 8443,9321` and the same command
+  with `udp`.
+
+### Docs and help text
+
+- **Who can open a private share.** The `nerdit share --public` help, the
+  dashboard's share card, the `share_service` MCP tool description, the API
+  field descriptions and the README now describe a private hosted share as
+  open to the owner of the machine's Nerdit account and the people they allow
+  in the Nerdit App, where they used to say the machine's owners only. Nothing
+  changes in behaviour on the machine: no command, option, API field or
+  default changed, and who may come in is decided in the Nerdit App.
+
 ## 0.7.1 (2026-10-01)
 
 Reliability fixes for waits, logs and VM templates.

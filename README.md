@@ -205,8 +205,9 @@ your own PostHog project.
 - hosted URLs
 
 Your machine connects out to the cloud, so you open no inbound port. Hosted
-shares are private to you by default. Public access needs an explicit
-publication and follows the [Terms](https://nerdit.ai/terms).
+shares are private by default: only you and the people you allow in the Nerdit
+App can open them. Public access needs an explicit publication and follows the
+[Terms](https://nerdit.ai/terms).
 
 Questions or feedback: [feedback@nerdit.ai](mailto:feedback@nerdit.ai).
 

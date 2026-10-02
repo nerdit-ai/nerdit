@@ -267,7 +267,8 @@ class ServiceShare(BaseModel):
     access: Literal["private", "public"] = Field(
         default="private",
         description=(
-            "'private' = only signed-in owners of this node at the cloud edge; "
+            "'private' = only the owner of this machine's Nerdit account and the "
+            "people they allow in the Nerdit App, checked at the cloud edge; "
             "'public' = world-reachable (entitlement + consent gated)"
         ),
     )

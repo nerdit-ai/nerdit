@@ -184,7 +184,7 @@ export function ServiceShareCard({ endpoint }: { endpoint: ServiceEndpoint | nul
             trust.{" "}
             {isPublic
               ? "Anyone with the link can open it."
-              : "It opens for signed in owners of this node."}
+              : "It opens only for the owner of this machine's Nerdit account and the people they allow in the Nerdit App."}
           </>
         )}
       </p>

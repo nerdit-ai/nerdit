@@ -108,9 +108,10 @@ async def share_service(
         access: Annotated[
             str,
             Field(
-                description="Exposure mode: ``private`` (the default — signed-in owners "
-                "of this node only) or ``public`` (world-reachable). Any other value is "
-                "refused by the daemon with a 422."
+                description="Exposure mode: ``private`` (the default — only the owner of "
+                "this machine's Nerdit account and the people they allow in the Nerdit "
+                "App) or ``public`` (world-reachable). Any other value is refused by "
+                "the daemon with a 422."
             ),
         ] = "private",
         consent: Annotated[
@@ -127,9 +128,10 @@ async def share_service(
         """Use when: you need a URL you can open (public_url is LAN-only).
 
         Exposes the app at ``https://<name>--<slug>.<domain>/`` via the cloud
-        link. ``access='private'`` (default) opens only for signed-in owners of this
-        node in the Nerdit console — works on every linked node, nothing to
-        configure. ``access='public'`` makes the URL world-reachable: it needs an
+        link. ``access='private'`` (default) opens only for the owner of this
+        machine's Nerdit account, signed in to the Nerdit App, and the people they
+        allow there — works on every linked node, nothing to configure.
+        ``access='public'`` makes the URL world-reachable: it needs an
         account in good standing (free during the public beta; else 409
         ``share.not_entitled``) AND either a
         ``[deploy].edge_auth`` on the app or ``consent=true`` (else 409

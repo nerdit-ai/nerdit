@@ -71,8 +71,10 @@ class ShareRequest(StrictRequestModel):
     access: Literal["private", "public"] = Field(
         default="private",
         description=(
-            "'private' (default) opens only for signed-in owners of this node at "
-            "the cloud edge; 'public' is world-reachable"
+            "'private' (default) opens only for the owner of this machine's "
+            "Nerdit account and the people they allow in the Nerdit App, checked "
+            "at the cloud edge; "
+            "'public' is world-reachable"
         ),
     )
     consent: bool = Field(

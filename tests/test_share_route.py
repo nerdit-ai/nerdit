@@ -386,7 +386,7 @@ def test_sharing_privately_writes_the_row_and_computes_the_url(recorder: AsyncMo
     assert kwargs["service_name"] == "demo"
     assert kwargs["kind"] == "service"
     # A private hosted URL is not a bearer capability — the cloud edge still
-    # demands an owner session — so the feed may carry it.
+    # demands a signed-in identity the owner allows — so the feed may carry it.
     assert kwargs["data"] == {"access": "private", "url": HOSTED_URL}
     assert recorder.record.await_args_list[-1].args == ("share.ready",)
 

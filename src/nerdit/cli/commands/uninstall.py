@@ -693,11 +693,12 @@ def _remove_unit(unit: ServiceUnit) -> None:
     if unit.disable_argv != unit.stop_argv:  # launchd's bootout is both
         _run_unit_command(unit.disable_argv, note=" — continuing")
     if unit.kind == "systemd-system":
-        # install.sh --template's drop-in; an operator's own overrides stay.
+        # install.sh --template's drop-ins; an operator's own overrides stay.
         # Before the base unit: unit discovery needs the base unit file, so a
         # drop-in that outlived it would be invisible to a retried uninstall.
         drop_in_dir = unit.unit_path.with_name(unit.unit_path.name + ".d")
-        ours = [drop_in_dir / n for n in ("10-fork-safe.conf", "20-docker0.conf")]
+        names = ("10-fork-safe.conf", "20-docker0.conf", "30-deny-inbound.conf")
+        ours = [drop_in_dir / n for n in names]
         if any(path_present(p) for p in ours):
             for path in ours:
                 if path_present(path):

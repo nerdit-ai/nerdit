@@ -127,7 +127,7 @@ describe("ServiceShareCard", () => {
     render(<ServiceShareCard endpoint={endpoint([hosted])} />);
     expect(screen.queryByTestId("service-public")).toBeNull();
     expect(screen.getByTestId("service-address-note").textContent).toMatch(
-      /opens for signed in owners/i
+      /opens only for the owner of this machine's Nerdit account and the people they allow/i
     );
 
     cleanup();

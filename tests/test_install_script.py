@@ -30,12 +30,16 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+
+from nerdit.cli.commands.init import _INITIAL_PROXY_CONFIG
+from nerdit.config.defaults import DEFAULT_PORT
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "packaging" / "install.sh"
@@ -1411,7 +1415,7 @@ class TestTemplate:
         assert text.index("this is a sealed VM template") < text.index('mkdir -p "')
 
     @pytest.mark.parametrize("template", ["0", "1"])
-    def test_docker0_drop_in_is_written_for_templates_only(self, tmp_path, template):
+    def test_ufw_drop_ins_are_written_for_templates_only(self, tmp_path, template):
         # The script's own drop-in block, run on its own: /etc is not reachable
         # from a non-root rehearsal.
         text = _script_text()
@@ -1422,15 +1426,26 @@ class TestTemplate:
         script.write_text(f"set -eu\nTEMPLATE={template}\nSHIM=nerdit\nUNIT_DST='{unit}'\n" + block)
         proc = subprocess.run(["sh", str(script)], capture_output=True, text=True)
         assert proc.returncode == 0, proc.stderr
-        conf = tmp_path / "nerdit.service.d" / "20-docker0.conf"
-        if template == "0":
-            assert not conf.exists()
-            return
-        assert conf.read_text() == (
-            "[Service]\nExecStartPre=+-/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "
-            "/usr/sbin/ufw allow in on docker0\n"
-        )
-        assert stat.S_IMODE(conf.stat().st_mode) == 0o644
+        ufw = "ExecStartPre=+-/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/sbin/ufw"
+        # The ports a fork's daemon binds: the installer's fresh [proxy] and the
+        # default API port. Moving either default must move the deny with it.
+        # UDP too: Caddy serves HTTP/3 on the HTTPS port.
+        https_port = tomllib.loads(_INITIAL_PROXY_CONFIG)["proxy"]["https_port"]
+        ports = f"{https_port},{DEFAULT_PORT}"
+        expected = {
+            "20-docker0.conf": f"[Service]\n{ufw} allow in on docker0\n",
+            "30-deny-inbound.conf": (
+                f"[Service]\n{ufw} prepend deny proto tcp to any port {ports}\n"
+                f"{ufw} prepend deny proto udp to any port {ports}\n"
+            ),
+        }
+        for name, body in expected.items():
+            conf = tmp_path / "nerdit.service.d" / name
+            if template == "0":
+                assert not conf.exists()
+                continue
+            assert conf.read_text() == body
+            assert stat.S_IMODE(conf.stat().st_mode) == 0o644
 
     def test_scrub_prints_a_sudo_free_link_line_when_root_builds_for_root(self, tmp_path):
         proc, home, _ = _run_scrub(tmp_path, unit_user=pwd.getpwuid(os.getuid()).pw_name)

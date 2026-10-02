@@ -862,6 +862,21 @@ if [ "$TEMPLATE" = 1 ]; then
 	# without ufw. /usr/sbin/ufw is where Ubuntu's ufw package installs it.
 	printf '[Service]\n%s\n' 'ExecStartPre=+-/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/sbin/ufw allow in on docker0' >"$UNIT_DST.d/20-docker0.conf"
 	chmod 644 "$UNIT_DST.d/20-docker0.conf"
+	# The proxy listens on :8443 on every interface, IPv6 too, over TCP and
+	# over UDP (Caddy's default HTTP/3): a request to the box's own address
+	# would reach a private app past the cloud's access gate. Deny it and the
+	# API port (loopback-bound unless a config widens it) from outside, at
+	# every start like the rule above. Loopback (the tunnel, Caddy's
+	# upstreams) is accepted before user rules; containers use the service
+	# ports over docker0, not these. `prepend` lands above every allow in
+	# either drop-in order or after a fork rewrite, works on an empty rule set
+	# (`insert 1` does not) and skips an existing copy. ufw needs one protocol
+	# per port list, hence two lines; the list keeps each rule distinct from a
+	# host's single-port allow, which `prepend` would skip as a copy. '-': a
+	# failure leaves the host's own rules, and ufw exits 0 while inactive, so
+	# the status would prove nothing.
+	printf '[Service]\n%s\n%s\n' 'ExecStartPre=+-/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/sbin/ufw prepend deny proto tcp to any port 8443,9321' 'ExecStartPre=+-/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/sbin/ufw prepend deny proto udp to any port 8443,9321' >"$UNIT_DST.d/30-deny-inbound.conf"
+	chmod 644 "$UNIT_DST.d/30-deny-inbound.conf"
 fi
 
 start_unit

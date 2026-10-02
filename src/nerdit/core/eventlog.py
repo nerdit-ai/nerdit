@@ -98,9 +98,10 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # --- the owner's exposure decisions. `share.ready`: a share was set
         # or changed — `data` carries `{access}` and, for a PRIVATE share
         # only, `url`. A private hosted URL is not a bearer capability (the
-        # cloud edge still demands an owner session), while a PUBLIC one is
-        # world-reachable and this feed is POSTed to third-party webhook hosts,
-        # so the public URL is omitted. `share.removed`: the share was deleted
+        # cloud edge still demands a signed-in identity the owner allows),
+        # while a PUBLIC one is world-reachable and this feed is POSTed to
+        # third-party webhook hosts, so the public URL is omitted.
+        # `share.removed`: the share was deleted
         # (`reason` = `unshared` | `service_deleted`). Never the capability
         # token, never a navigation ticket.
         "share.ready",
