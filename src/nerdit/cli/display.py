@@ -223,6 +223,14 @@ def display_gpu_table(gpus: list[dict]) -> None:
     console.print(table)
 
 
+def _hosted_only(endpoint: dict) -> bool:
+    """(Lot 5) A locked app: no client shows its loopback ``endpoint.url``."""
+    return any(
+        isinstance(entry, dict) and entry.get("hosted_only") is True
+        for entry in endpoint.get("public_urls") or []
+    )
+
+
 def display_service_table(services: list[dict]) -> None:
     """Display a Rich table of services (name, status, restarts, GPUs, URL)."""
     table = Table(title="Services")
@@ -244,11 +252,14 @@ def display_service_table(services: list[dict]) -> None:
 
         endpoint = svc.get("endpoint") or {}
         host_port = endpoint.get("host_port")
-        url = (
-            endpoint.get("public_url")
-            or endpoint.get("url")
-            or (f"127.0.0.1:{host_port}" if host_port else "-")
-        )
+        if _hosted_only(endpoint):
+            url = endpoint.get("public_url") or "-"
+        else:
+            url = (
+                endpoint.get("public_url")
+                or endpoint.get("url")
+                or (f"127.0.0.1:{host_port}" if host_port else "-")
+            )
 
         table.add_row(
             _plain(svc.get("name", "")),
@@ -433,12 +444,13 @@ def display_service_submitted(service: dict) -> None:
     console.print(f"  Status:  {_plain(service.get('status'))}")
     endpoint = service.get("endpoint") or {}
     public_url = endpoint.get("public_url")
+    local = None if _hosted_only(endpoint) else endpoint.get("url")
     if public_url:
         console.print(f"  URL:     {_plain(public_url)}")
-        if endpoint.get("url"):
-            console.print(f"  Local:   {_plain(endpoint['url'])}")
-    elif endpoint.get("url"):
-        console.print(f"  URL:     {_plain(endpoint['url'])}")
+        if local:
+            console.print(f"  Local:   {_plain(local)}")
+    elif local:
+        console.print(f"  URL:     {_plain(local)}")
 
 
 def display_deploy_result(
@@ -452,7 +464,7 @@ def display_deploy_result(
     console.print(f"[green]{heading}:[/green] {name}")
     console.print(f"  Status:  {_plain(service.get('status'))}")
     endpoint = service.get("endpoint") or {}
-    url = endpoint.get("public_url") or endpoint.get("url")
+    url = endpoint.get("public_url") or (None if _hosted_only(endpoint) else endpoint.get("url"))
     if url:
         console.print(f"  URL:     {_plain(url)}")
     for hint in service.get("hints") or []:

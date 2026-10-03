@@ -37,7 +37,7 @@ from nerdit.daemon.middleware import ScopedTokenAuthMiddleware
 from nerdit.daemon.routes.domains import router as domains_router
 from nerdit.daemon.routes.proxy import router as proxy_router
 from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, ServiceEndpoint, TokenRole
-from nerdit.db.rows import ServiceDomain
+from nerdit.db.rows import ServiceDomain, ServiceShare
 from tests.test_delete_purge import FakeRuntime, _app
 from tests.test_delete_purge import _auth as _purge_auth
 from tests.test_delete_purge import _queries as _purge_queries
@@ -120,6 +120,7 @@ def _queries(*jobs: Job, domains: list[ServiceDomain] | None = None) -> AsyncMoc
     q.get_job = AsyncMock(return_value=None)
     q.get_service_by_name = AsyncMock(side_effect=lambda n: by_name.get(n))
     q.list_service_shares = AsyncMock(return_value={})
+    q.is_hosted_only = AsyncMock(return_value=False)
     q.list_service_domains = AsyncMock(
         side_effect=lambda: sorted(table.values(), key=lambda d: (d.service_name, d.domain))
     )
@@ -498,6 +499,20 @@ def test_an_edge_auth_withheld_service_reports_withheld_domains() -> None:
     promise a URL that answers 404."""
     q = _queries(_svc(), domains=[ServiceDomain(service_name="demo", domain=DOMAIN)])
     proxy = FakeProxy(withheld=frozenset({"demo"}))
+
+    body = _client(q, proxy=proxy).get("/api/services/demo/domains", headers=_auth()).json()
+
+    assert body["domains"][0]["state"] == "withheld"
+
+
+def test_a_locked_apps_domain_is_withheld_even_while_its_route_is_live() -> None:
+    """(Lot 5) A hosted-only app advertises no local URL, so its domain reads
+    withheld even in the D11 window where the Host route is still live."""
+    q = _queries(_svc(), domains=[ServiceDomain(service_name="demo", domain=DOMAIN)])
+    q.list_service_shares = AsyncMock(
+        return_value={"demo": ServiceShare(service_name="demo", access="private", hosted_only=True)}
+    )
+    proxy = FakeProxy(live=(DOMAIN,))
 
     body = _client(q, proxy=proxy).get("/api/services/demo/domains", headers=_auth()).json()
 
@@ -1581,3 +1596,29 @@ def test_proxy_status_domain_rows_carry_the_cert_state() -> None:
 # the capabilities harness already stands up the whole link/proxy state the
 # route reads — duplicating that harness here would be a second thing to keep
 # in step.
+
+
+def test_add_domain_refused_on_a_hosted_only_app() -> None:
+    """Lot 5 (D11): a domain is a local route, and a locked app has none."""
+    q = _queries(_svc())
+    # The insert refuses under its own write lock; the route only maps it.
+    q.add_service_domain = AsyncMock(return_value=("hosted_only", None))
+
+    response = _put(_client(q))
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "share.hosted_only_conflict"
+    assert "nerdit share demo --local-route" in response.json()["hint"]
+    q.add_service_domain.assert_awaited_once()
+
+
+def test_add_domain_on_a_hosted_only_app_still_validates_the_name_first() -> None:
+    """A malformed name gets its 422 before the lock is consulted (shape before conflicts)."""
+    q = _queries(_svc())
+    q.add_service_domain = AsyncMock(return_value=("hosted_only", None))
+
+    response = _put(_client(q), domain=quote("not a domain", safe=""))
+
+    assert response.status_code == 422, response.text
+    assert response.json()["code"] == "domain.invalid"
+    q.add_service_domain.assert_not_awaited()

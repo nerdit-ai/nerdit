@@ -291,3 +291,27 @@ def test_other_run_errors_print_no_partial_output_block():
 def test_plain_preserves_missing_values_and_markup(value, expected):
     assert display.plain(value) == expected
     assert display._plain(value) == ("" if value is None else expected)
+
+
+# --- Lot 5: a hosted-only app shows no loopback URL -------------------------------
+
+
+def test_a_hosted_only_app_shows_no_loopback_url():
+    """D14: ``endpoint.url`` stays on the wire, but no CLI surface prints it."""
+    endpoint = {
+        "url": "http://127.0.0.1:49152",
+        "host_port": 49152,
+        "public_url": None,
+        "public_urls": [{"kind": "hosted", "url": "https://app--n.example/", "hosted_only": True}],
+    }
+    service = {"name": "app", "status": "running", "restart_count": 0, "gpu_count": 0}
+    for func, arg in (
+        (display.display_service_table, [{**service, "endpoint": endpoint}]),
+        (display.display_deploy_result, {**service, "endpoint": endpoint}),
+        (display.display_service_submitted, {**service, "endpoint": endpoint}),
+    ):
+        assert "127.0.0.1" not in _capture(func, arg)
+    # The same endpoint without the lock still falls back to the loopback URL.
+    unlocked = {**endpoint, "public_urls": []}
+    out = _capture(display.display_service_table, [{**service, "endpoint": unlocked}])
+    assert "127.0.0.1:49152" in out

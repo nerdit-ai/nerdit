@@ -74,8 +74,10 @@ def new_workload_row(
 ) -> Job:
     """Build the shared `building`/`running` Job skeleton for a create route.
 
-    `restart_policy` is the fixed `"on-failure"` literal both routes pass
-    today (models.py:158, databases.py:176) — not exposed as a parameter.
+    `restart_policy` is the fixed `"on-failure"` literal, not exposed as a
+    parameter. For these kinds `ServiceController._handle_crash` restarts on a
+    clean exit too (a host shutdown stops Postgres with exit 0), so a managed
+    server never settles to `completed`.
     `submitted_by_token`/`idempotency_key` are read from `request` (the
     same principal `authorize_create` already validated, and the same
     `Idempotency-Key` header both routes read identically).

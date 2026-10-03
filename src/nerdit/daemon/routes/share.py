@@ -13,16 +13,18 @@ or stale entitlement fails closed. Mounted under /api only.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Request
 
+from nerdit.config.settings import LOOPBACK_HOSTS
 from nerdit.core.eventlog import get_recorder
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.core.link.hosted import hosted_host, hosted_label_fits
 from nerdit.core.proxy import EdgeAuthInvalid, load_edge_auth
 from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import require_owner_or_admin, require_role
+from nerdit.daemon.deploy_pipeline import apex_shadow_active
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.schemas.exposure import (
     ShareOrigin,
@@ -38,6 +40,7 @@ from nerdit.daemon.views.hosted import (
 )
 from nerdit.daemon.views.service import _not_found, _resolve_service
 from nerdit.db.models import Job, JobKind, JobStatus, TokenRole
+from nerdit.db.queries.shares import HostedOnlyConflictError
 from nerdit.db.rows import ServiceShare
 
 router = APIRouter()
@@ -146,7 +149,43 @@ def _origin(job: Job) -> ShareOrigin:
     )
 
 
-def _view(service_name: str, share: ServiceShare, hosted: HostedContext, job: Job) -> ShareView:
+def _exposed_without_token(settings: Any) -> bool:
+    """Whether a client off this machine can reach the daemon API with no token (lot 5).
+
+    Bound off loopback, or behind the path-mode dashboard apex: either way a
+    forged loopback Host gets admin, so a lock this daemon reports could be lifted
+    by anyone on the LAN. Reads `settings.daemon` directly: a missing section is
+    a harness bug, never "not exposed".
+    """
+    daemon = settings.daemon
+    return daemon.auth_token is None and (
+        daemon.host not in LOOPBACK_HOSTS or apex_shadow_active(settings)
+    )
+
+
+async def _local_routes(
+    request: Request, service_name: str
+) -> Literal["absent", "present", "unknown"]:
+    """Observe the app's local proxy routes; every doubt answers `unknown` (fail closed).
+
+    A token-less exposed daemon is `unknown` whatever the table says (D10), and
+    so is a daemon with no proxy manager to ask (D19).
+    """
+    if _exposed_without_token(request.app.state.settings):
+        return "unknown"
+    manager = getattr(request.app.state, "proxy_manager", None)
+    if manager is None:
+        return "unknown"
+    return await manager.local_route_state(service_name)
+
+
+def _view(
+    service_name: str,
+    share: ServiceShare,
+    hosted: HostedContext,
+    job: Job,
+    local_routes: Literal["absent", "present", "unknown"],
+) -> ShareView:
     """Project a stored row against the LIVE link — url and state are never stored.
 
     A row records intent; whether that intent is currently addressable is a fact
@@ -165,6 +204,8 @@ def _view(service_name: str, share: ServiceShare, hosted: HostedContext, job: Jo
         state=hosted_state(hosted, share),
         created_at=share.created_at,
         origin=_origin(job),
+        hosted_only=share.hosted_only,
+        local_routes=local_routes,
     )
 
 
@@ -197,7 +238,7 @@ async def get_share(request: Request, name: str) -> ShareView:
             f"Service '{service_name}' is not shared.",
             hint="Share it with `nerdit share <name>`.",
         )
-    return _view(service_name, share, hosted, job)
+    return _view(service_name, share, hosted, job, await _local_routes(request, service_name))
 
 
 @router.put(
@@ -212,10 +253,18 @@ async def set_share(request: Request, name: str, body: ShareRequest) -> ShareVie
     created_at. Validate identity, kind, link capability and entitlement/consent
     before upsert, in that order. Recheck row existence under the DB write lock to
     handle concurrent deletion. The idempotent write is audited as share.set.
+
+    hosted_only=true (lot 5) is refused on a token-less exposed daemon or while a
+    domain is bound; a stored lock drops the app's local routes inline.
     """
     require_role(request, TokenRole.submitter, TokenRole.admin)
     request.state.audit_params = audit_params(
-        {"service": name, "access": body.access, "consent": body.consent}
+        {
+            "service": name,
+            "access": body.access,
+            "consent": body.consent,
+            "hosted_only": body.hosted_only,
+        }
     )
     queries = request.app.state.queries
     job = await _resolve_service(queries, name)
@@ -265,18 +314,46 @@ async def set_share(request: Request, name: str, body: ShareRequest) -> ShareVie
                 ),
             )
 
-    share = await queries.set_service_share(
-        service_name,
-        body.access,
-        job_id=job.id,
-        alias_node_id=link.node_id,
-        alias_host=(
-            hosted_host(service_name, link.slug, link.nodes_base_domain)
-            if hosted_label_fits(service_name, link.slug)
-            else None
-        ),
-        preserve_existing=body.preserve_existing,
-    )
+    if body.hosted_only is True and _exposed_without_token(request.app.state.settings):
+        raise NerditError(
+            409,
+            "share.hosted_only_no_token",
+            "This daemon is reachable without a token, so a hosted-only lock "
+            "could be lifted by anyone who reaches it.",
+            hint=(
+                "Set `[daemon].auth_token` (`nerdit init --auth-token-only`) and "
+                "restart, or bind `[daemon].host` to 127.0.0.1 and turn off "
+                "`[proxy].dashboard_apex`."
+            ),
+        )
+
+    try:
+        share = await queries.set_service_share(
+            service_name,
+            body.access,
+            job_id=job.id,
+            alias_node_id=link.node_id,
+            alias_host=(
+                hosted_host(service_name, link.slug, link.nodes_base_domain)
+                if hosted_label_fits(service_name, link.slug)
+                else None
+            ),
+            preserve_existing=body.preserve_existing,
+            hosted_only=body.hosted_only,
+        )
+    except HostedOnlyConflictError as exc:
+        # A domain route is a local route: locking around it would leave a
+        # name that binds and never serves, with no reason given. Refused under
+        # the upsert's own write lock, so a domain cannot race in beside the lock.
+        raise NerditError(
+            409,
+            "share.hosted_only_conflict",
+            f"Service '{service_name}' has a bound domain, which is a local route.",
+            hint=(
+                f"Remove each bound domain first: `nerdit domains remove {service_name} <domain>`."
+            ),
+            domains=exc.domains,
+        ) from None
     if share is None:
         # The service was deleted between this route's resolve and the write
         # (the upsert re-checks under the DB write lock — see
@@ -286,10 +363,21 @@ async def set_share(request: Request, name: str, body: ShareRequest) -> ShareVie
         # expose the NEXT app deployed under it.
         raise _not_found(name)
     request.state.audit_params = audit_params(
-        {"service": name, "access": share.access, "consent": body.consent}
+        {
+            "service": name,
+            "access": share.access,
+            "consent": body.consent,
+            "hosted_only": share.hosted_only,
+        }
     )
+    proxy_manager = getattr(request.app.state, "proxy_manager", None)
+    if share.hosted_only and proxy_manager is not None:
+        # Inline, so the answer below can already read `absent`; it waits on the
+        # routes lock, so an in-flight register finishes (and is refused) first.
+        # Unlock needs nothing inline: the next reconcile restores the routes.
+        await proxy_manager.deregister(service_name)
     hosted = await load_hosted_context(request)
-    view = _view(service_name, share, hosted, job)
+    view = _view(service_name, share, hosted, job, await _local_routes(request, service_name))
 
     recorder = get_recorder()
     if recorder is not None:

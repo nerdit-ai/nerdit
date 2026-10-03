@@ -107,6 +107,11 @@ class HostedContext:
         """
         return bool(self.slug and self.nodes_base_domain)
 
+    def locked(self, service_name: str) -> bool:
+        """(Lot 5) Is this app's share locked to its hosted URL (no local route)?"""
+        share = self.shares.get(service_name)
+        return share is not None and share.hosted_only
+
 
 #: The "nothing is hosted" snapshot. The default for every projection argument,
 #: so a call site that has not (or cannot) load a context renders exactly what it
@@ -200,6 +205,16 @@ def _hosted_url(ctx: HostedContext, service_name: str) -> str | None:
     return None
 
 
+def local_public_url(ctx: HostedContext, service_name: str, url: str | None) -> str | None:
+    """(Lot 5) The proxy/LAN URL to advertise: none for a hosted-only app.
+
+    Every local-URL surface routes its `public_url_for` result through here, so
+    a locked app has a null `public_url`, no `default` entry and `withheld`
+    domains everywhere at once.
+    """
+    return None if ctx.locked(service_name) else url
+
+
 def hosted_state(ctx: HostedContext, share: ServiceShare) -> HostedState:
     """Project entitlement, address activation and current link reachability."""
     if share.access == "public" and not ctx.hosted_public_entitled:
@@ -222,6 +237,7 @@ def hosted_entry(ctx: HostedContext, service_name: str) -> PublicUrlEntry | None
         kind="hosted",
         state=hosted_state(ctx, share),
         access=share.access,
+        hosted_only=share.hosted_only,
     )
 
 

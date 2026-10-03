@@ -1923,3 +1923,106 @@ async def test_cutover_excludes_all_reserved_stable_and_active_ports(
     await controller.reconcile()
     await _drain_cutovers(controller)
     assert excluded_seen and endpoint.host_port in excluded_seen[0]
+
+
+# --- lot 5: a hosted-only app is promoted on its probe alone -------------------
+
+
+async def _lock(queries, job) -> None:
+    await queries.set_service_share(NAME, "private", job_id=job.id, hosted_only=True)
+
+
+def _count_live_reads(proxy) -> dict:
+    calls = {"n": 0}
+    orig = proxy.live_routes
+
+    async def live_routes():
+        calls["n"] += 1
+        return await orig()
+
+    proxy.live_routes = live_routes  # type: ignore[assignment]
+    return calls
+
+
+async def test_a_hosted_only_app_promotes_on_the_probe_without_a_route(queries, tmp_path):
+    events = RecordingEvents()
+    controller, runtime, proxy, fake, job, endpoint = await _full_setup(
+        queries, tmp_path, events=events
+    )
+    await _lock(queries, job)
+    _healthy(controller)
+    registered: list[str] = []
+
+    async def register(name, port, edge_auth=None, **kw):
+        registered.append(name)
+
+    proxy.register = register  # type: ignore[assignment]
+
+    await controller.reconcile()
+    await _drain_cutovers(controller)
+
+    assert registered == []
+    row = await queries.get_job(job.id)
+    assert row.status is JobStatus.running
+    assert row.container_id != BLUE, "f3 promoted the green"
+    assert BLUE not in runtime.live, "blue is destroyed"
+    ep = await queries.get_service_endpoint(NAME)
+    assert ep.active_host_port is not None, "f1 still points the hosted dial at the green"
+    assert _dials(fake) == []
+    assert events.types() == ["service.cutover_started", "service.cutover_succeeded"]
+
+
+async def test_a_hosted_only_app_promotes_with_an_unreadable_live_table(queries, tmp_path):
+    """The `_await_dials` guard line: no route, so an unreadable table costs nothing."""
+    controller, runtime, proxy, fake, job, endpoint = await _full_setup(queries, tmp_path)
+    await _lock(queries, job)
+    _healthy(controller)
+    fake.routes_status = 503
+    reads = _count_live_reads(proxy)
+
+    await controller.reconcile()
+    await _drain_cutovers(controller)
+
+    assert reads["n"] == 0, "no dial wait"
+    row = await queries.get_job(job.id)
+    assert row.container_id != BLUE
+    assert json.loads(row.config)["last_deploy"]["phase"] == "healthy"
+    assert BLUE not in runtime.live
+
+
+async def test_a_hosted_only_green_dying_before_promotion_unwinds_without_waiting(
+    queries, tmp_path
+):
+    events = RecordingEvents()
+    controller, runtime, proxy, fake, job, endpoint = await _full_setup(
+        queries, tmp_path, events=events
+    )
+    await _lock(queries, job)
+    _healthy(controller)
+    fake.routes_status = 503
+    reads = _count_live_reads(proxy)
+    orig_locked = queries.is_hosted_only
+
+    async def is_hosted_only(name):
+        # The green dies right after the probe passed, before f2b.
+        for cid in list(runtime.live):
+            if cid != BLUE:
+                runtime.live.pop(cid)
+        return await orig_locked(name)
+
+    queries.is_hosted_only = is_hosted_only  # type: ignore[assignment]
+
+    await controller.reconcile()
+    await _drain_cutovers(controller)
+
+    assert reads["n"] == 0, "neither f2 nor g'2 waits on a dial"
+    row = await queries.get_job(job.id)
+    cfg = json.loads(row.config)
+    assert row.container_id == BLUE
+    assert BLUE in runtime.live
+    assert cfg["last_deploy"]["reason"] == "cutover_failed"
+    ep = await queries.get_service_endpoint(NAME)
+    assert ep.active_host_port is None
+    items, _ = await queries.list_audit_log(action="service.cutover_failed", limit=10)
+    assert items and items[0].params_redacted["stage"] == "repoint"
+    assert events.count("service.cutover_succeeded") == 0

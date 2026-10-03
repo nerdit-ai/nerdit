@@ -419,3 +419,114 @@ async def test_share_escapes_a_hostile_origin_hint(monkeypatch, capsys):
     await _share_async("demo", public=False, consent=False, show=True)
 
     assert "[red]not markup" in capsys.readouterr().out
+
+
+# -- Lot 5: --hosted-only / --local-route ---------------------------------------------
+
+
+async def test_set_share_sends_hosted_only_and_preserve_existing_only_when_set():
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(httpx.Response(200, content=request.content).json())
+        return httpx.Response(200, json=_SHARE_OK)
+
+    client = NerditClient("localhost", 9321, token="t", transport=httpx.MockTransport(handler))
+    await client.set_share("demo", preserve_existing=True, hosted_only=True)
+    await client.set_share("demo", hosted_only=False)
+
+    assert seen == [
+        {"access": "private", "consent": False, "preserve_existing": True, "hosted_only": True},
+        {"access": "private", "consent": False, "hosted_only": False},
+    ]
+
+
+async def test_share_without_the_flag_sends_neither_field(fake_client):
+    await _share_async("demo", public=False, consent=False, show=False)
+
+    kwargs = fake_client.set_share.await_args.kwargs
+    assert kwargs["hosted_only"] is None
+    assert kwargs["preserve_existing"] is False
+
+
+@pytest.mark.parametrize("flag", [True, False])
+async def test_share_lock_flag_without_public_preserves_the_existing_share(fake_client, flag):
+    await _share_async("demo", public=False, consent=False, show=False, hosted_only=flag)
+
+    kwargs = fake_client.set_share.await_args.kwargs
+    assert kwargs["hosted_only"] is flag
+    assert kwargs["preserve_existing"] is True
+    assert kwargs["access"] == "private"
+
+
+async def test_share_hosted_only_with_public_sets_public(fake_client):
+    await _share_async("demo", public=True, consent=True, show=False, hosted_only=True)
+
+    kwargs = fake_client.set_share.await_args.kwargs
+    assert kwargs["access"] == "public"
+    assert kwargs["hosted_only"] is True
+    assert kwargs["preserve_existing"] is False
+
+
+def test_cli_share_argv_hosted_only_and_local_route(monkeypatch):
+    from nerdit.cli.app import app
+
+    client = _fake_client()
+    monkeypatch.setattr("nerdit.cli.client.get_configured_client", lambda: client)
+
+    assert _runner.invoke(app, ["share", "demo", "--hosted-only"]).exit_code == 0
+    assert client.set_share.await_args.kwargs["hosted_only"] is True
+    assert _runner.invoke(app, ["share", "demo", "--local-route"]).exit_code == 0
+    assert client.set_share.await_args.kwargs["hosted_only"] is False
+
+
+@pytest.mark.parametrize("flag", ["--hosted-only", "--local-route"])
+def test_cli_share_show_refuses_a_lock_flag(monkeypatch, flag):
+    from nerdit.cli.app import app
+
+    client = _fake_client()
+    monkeypatch.setattr("nerdit.cli.client.get_configured_client", lambda: client)
+
+    result = _runner.invoke(app, ["share", "demo", "--show", flag])
+    assert result.exit_code == 2
+    client.get_share.assert_not_awaited()
+    client.set_share.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("local_routes", "expected"),
+    [
+        ("absent", "local routes: absent (hosted only)"),
+        ("present", "purge pending, retry in a few seconds"),
+        ("unknown", "the daemon is reachable without a token (see nerdit doctor)"),
+    ],
+)
+async def test_share_show_renders_the_local_routes_line(
+    monkeypatch, capsys, local_routes, expected
+):
+    body = {**_SHARE_OK, "hosted_only": True, "local_routes": local_routes}
+    client = _fake_client(get_share=AsyncMock(return_value=body))
+    monkeypatch.setattr("nerdit.cli.client.get_configured_client", lambda: client)
+
+    await _share_async("demo", public=False, consent=False, show=True)
+
+    assert expected in " ".join(capsys.readouterr().out.split())
+
+
+async def test_share_prints_no_local_routes_line_for_an_unlocked_app(monkeypatch, capsys):
+    body = {**_SHARE_OK, "hosted_only": False, "local_routes": "present"}
+    client = _fake_client(get_share=AsyncMock(return_value=body))
+    monkeypatch.setattr("nerdit.cli.client.get_configured_client", lambda: client)
+
+    await _share_async("demo", public=False, consent=False, show=True)
+
+    assert "local routes" not in capsys.readouterr().out
+
+
+def test_routes_live_cell_names_a_hosted_only_app():
+    from nerdit.cli.commands.routes import _live_cell
+
+    assert _live_cell({"registered": False}, "hosted_only") == "hosted only"
+    assert "route still live" in _live_cell({"registered": True}, "hosted_only")
+    assert "unreadable" in _live_cell(None, "hosted_only")
+    assert _live_cell({"registered": True, "dial_matches": True}) == "ok"

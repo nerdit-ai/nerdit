@@ -88,6 +88,17 @@ describe("publicUrlState", () => {
       publicUrlState(endpoint({ route: "", public_url: "https://my-app.host.example/" }))
     ).toBe("routed");
   });
+
+  it("is 'hosted-only' for a locked share, checked before the null-means-proxy-off rule", () => {
+    const locked = { url: null, kind: "hosted", state: "link_down", access: "private" } as const;
+    expect(publicUrlState(endpoint({ public_urls: [{ ...locked, hosted_only: true }] }))).toBe(
+      "hosted-only"
+    );
+    // An unlocked share with a null public_url is still proxy-off.
+    expect(publicUrlState(endpoint({ public_urls: [{ ...locked, hosted_only: false }] }))).toBe(
+      "proxy-off"
+    );
+  });
 });
 
 const HOSTED_URL = "https://my-app--gpu-box.nodes.test/";

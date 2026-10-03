@@ -879,17 +879,26 @@ class NerditClient:
         *,
         access: str = "private",
         consent: bool = False,
+        preserve_existing: bool = False,
+        hosted_only: bool | None = None,
         idempotency_key: str | None = None,
     ) -> dict:
         """Share a service; requires an idempotency key.
 
         The daemon validates entitlement, consent, link state, service kind and
         label length. Send values unchanged so client validation cannot drift.
+        ``preserve_existing`` and ``hosted_only`` travel only when set, so an
+        older daemon (``extra="forbid"``) still accepts the plain body.
         """
+        body: dict[str, object] = {"access": access, "consent": consent}
+        if preserve_existing:
+            body["preserve_existing"] = True
+        if hosted_only is not None:
+            body["hosted_only"] = hosted_only
         return await self._request_json(
             "PUT",
             f"{self._base_url}/api/services/{self._segment(name)}/share",
-            json={"access": access, "consent": consent},
+            json=body,
             idempotency_key=idempotency_key,
             timeout=15.0,
         )

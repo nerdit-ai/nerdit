@@ -25,8 +25,15 @@ def _route_cell(route: object) -> str:
     return _plain(route)
 
 
-def _live_cell(live: object) -> str:
+def _live_cell(live: object, reason: object = None) -> str:
     """Render the live-Caddy annotation; `None` ⇒ `-` (unknown, not "no")."""
+    if reason == "hosted_only":
+        # `None` is still unknown here: the lock is an intent, and the proxy may
+        # keep serving a route the deregistration never reached.
+        if live is None:
+            return "hosted only [yellow](proxy table unreadable)[/yellow]"
+        still_live = isinstance(live, dict) and live.get("registered")
+        return "hosted only" + (" [yellow](route still live)[/yellow]" if still_live else "")
     if live is None:
         return "-"
     if not isinstance(live, dict):
@@ -75,7 +82,7 @@ async def _routes_async(*, limit: int, cursor: str | None) -> int:
             _route_cell(item.get("route")),
             _plain(item.get("public_url")),
             _plain(item.get("host_port")),
-            _live_cell(item.get("live")),
+            _live_cell(item.get("live"), item.get("reason")),
         )
     console.print(table)
 

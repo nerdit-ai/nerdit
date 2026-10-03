@@ -4,6 +4,40 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.8.0 (2026-10-03)
+
+A shared app can be locked to its hosted link, and managed databases and
+models come back after a reboot.
+
+### Sharing
+
+- **Hosted-only apps.** `nerdit share <app> --hosted-only` keeps an app
+  reachable through its hosted link only: this machine's proxy stops serving
+  it on the local network, and keeps it that way across restarts and
+  redeploys. `nerdit share <app> --local-route` brings the local address back
+  within a few seconds, and so does `nerdit unshare <app>` when the machine is
+  offline. `nerdit share <app> --show` says whether a local route is still
+  there. The lock is refused while a domain is bound to the app, and on a
+  machine whose API can be reached from the network without a token. Agents
+  get the same switch through the `share_service` tool, and the dashboard
+  shows a "Hosted only" badge. A machine downgraded to an older version
+  serves the app locally again until it is updated.
+
+### Fixes
+
+- **Databases and models survive a reboot.** A host shutdown stops their
+  container cleanly, and the machine used to leave them stopped on the next
+  boot. They now restart whatever the exit code. Apps are unchanged: with the
+  default `always` policy an app restarts too, and only an app deployed with
+  `on-failure` or `no` stays stopped after a clean exit. A database already
+  left stopped by an earlier version comes back with
+  `nerdit services restart <name>`, with its data.
+
+### Docs
+
+- A fresh install turns the HTTPS proxy and mDNS on, on port 8443; the
+  installation and proxy guides said otherwise.
+
 ## 0.7.2 (2026-10-02)
 
 VM templates close their own ports, and the texts say who can open a private

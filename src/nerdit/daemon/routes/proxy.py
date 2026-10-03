@@ -8,7 +8,7 @@ from fastapi import APIRouter, Request, Response
 
 from nerdit.core.proxy import _route_id, public_url_for
 from nerdit.daemon.errors import NerditError
-from nerdit.daemon.views.hosted import load_hosted_context, public_urls_for
+from nerdit.daemon.views.hosted import load_hosted_context, local_public_url, public_urls_for
 from nerdit.db.models import ProxyStatusResponse, RouteItem, RouteListPage
 from nerdit.utils.certs import ca_fingerprint
 
@@ -139,6 +139,7 @@ async def list_routes(
                 https_port=proxy_settings.https_port,
                 public_port=proxy_settings.public_port,
             )
+        public_url = local_public_url(hosted, endpoint.service_name, public_url)
         live: dict[str, object] | None = None
         if live_table == "readable" and manager is not None:
             # (P25, rev. 2 amendment 2) The id seam, NOT `build_route`: since
@@ -169,6 +170,7 @@ async def list_routes(
                 public_url=public_url,
                 public_urls=public_urls_for(hosted, endpoint.service_name, public_url),
                 live=live,
+                reason="hosted_only" if hosted.locked(endpoint.service_name) else None,
             )
         )
     return RouteListPage(items=items, next_cursor=next_cursor, live_table=live_table)

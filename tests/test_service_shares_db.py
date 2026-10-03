@@ -24,6 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nerdit.db.models import Job, JobKind, JobStatus, ServiceShare
+from nerdit.db.queries.shares import HostedOnlyConflictError
 from tests.test_delete_purge import FakeRuntime, _app, _auth, _queries, _svc
 
 # ---------------------------------------------------------------------------
@@ -100,6 +101,105 @@ async def test_preserve_existing_creates_only_missing_share(queries, existing):
         )
         is None
     )
+
+
+async def test_set_hosted_only_none_keeps_true_false_overwrites(queries):
+    job = await queries.create_job(_job("demo"))
+    assert (await queries.set_service_share("demo", "private", job_id=job.id)).hosted_only is False
+    assert (
+        await queries.set_service_share("demo", "private", job_id=job.id, hosted_only=True)
+    ).hosted_only is True
+    kept = await queries.set_service_share("demo", "public", job_id=job.id)
+    assert (kept.access, kept.hosted_only) == ("public", True)
+    assert await queries.is_hosted_only("demo") is True
+    cleared = await queries.set_service_share("demo", "public", job_id=job.id, hosted_only=False)
+    assert cleared.hosted_only is False
+    assert await queries.is_hosted_only("demo") is False
+
+
+async def test_preserve_existing_still_sets_hosted_only(queries):
+    """The lock has its own CASE: preserving access must not drop a lock request."""
+    job = await queries.create_job(_job("demo"))
+    await queries.set_service_share("demo", "public", job_id=job.id)
+    share = await queries.set_service_share(
+        "demo", "private", job_id=job.id, preserve_existing=True, hosted_only=True
+    )
+    assert (share.access, share.hosted_only) == ("public", True)
+
+
+async def test_hosted_only_check_rejects_2(db, queries):
+    job = await queries.create_job(_job("demo"))
+    await queries.set_service_share("demo", "private", job_id=job.id)
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.conn.execute(
+            "UPDATE service_shares SET hosted_only = 2 WHERE service_name = 'demo'"
+        )
+
+
+async def test_is_hosted_only_false_without_share(queries):
+    await queries.create_job(_job("demo"))
+    assert await queries.is_hosted_only("demo") is False
+    assert await queries.is_hosted_only("ghost") is False
+
+
+async def test_active_routes_exclude_hosted_only_apps(queries):
+    """A locked app with a share row is dropped; unlocked and unshared apps stay."""
+    for name in ("locked", "open", "bare"):
+        job = await queries.create_job(_job(name))
+        await queries.acquire_service_port(name, job.id, 8000, (9400, 9499))
+    await queries.set_service_share(
+        "locked", "private", job_id=await _jid(queries, "locked"), hosted_only=True
+    )
+    await queries.set_service_share(
+        "open", "private", job_id=await _jid(queries, "open"), hosted_only=False
+    )
+
+    routes = await queries.list_active_service_routes()
+
+    assert sorted(r.service_name for r in routes) == ["bare", "open"]
+
+
+async def test_lock_refused_under_the_write_lock_while_a_domain_is_bound(queries):
+    """The domain read and the share upsert share one BEGIN IMMEDIATE (Codex P2 on #238)."""
+    job = await queries.create_job(_job("demo"))
+    await queries.add_service_domain("demo", "app.example.com", acme=None, job_id=job.id)
+
+    with pytest.raises(HostedOnlyConflictError) as info:
+        await queries.set_service_share("demo", "private", job_id=job.id, hosted_only=True)
+
+    assert info.value.domains == ["app.example.com"]
+    assert (await queries.list_service_shares()).get("demo") is None
+    # The connection is usable again: the refusal rolled its transaction back.
+    await queries.set_service_share("demo", "private", job_id=job.id, hosted_only=False)
+
+
+async def test_domain_refused_under_the_write_lock_on_a_locked_app(queries):
+    job = await queries.create_job(_job("demo"))
+    await queries.set_service_share("demo", "private", job_id=job.id, hosted_only=True)
+
+    outcome, row = await queries.add_service_domain(
+        "demo", "app.example.com", acme=None, job_id=job.id
+    )
+
+    assert (outcome, row) == ("hosted_only", None)
+    assert await queries.get_service_domains("demo") == []
+
+
+@pytest.mark.parametrize("lock_first", [True, False])
+async def test_lock_and_domain_never_both_land(queries, lock_first):
+    """Both writers are serialized, so whichever commits second sees the first."""
+    job = await queries.create_job(_job("demo"))
+    writes = [
+        queries.set_service_share("demo", "private", job_id=job.id, hosted_only=True),
+        queries.add_service_domain("demo", "app.example.com", acme=None, job_id=job.id),
+    ]
+    results = await asyncio.gather(
+        *(writes if lock_first else reversed(writes)), return_exceptions=True
+    )
+
+    locked = await queries.is_hosted_only("demo")
+    bound = await queries.get_service_domains("demo")
+    assert not (locked and bound), results
 
 
 @pytest.mark.parametrize("preview_first", [True, False])

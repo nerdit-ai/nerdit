@@ -1153,3 +1153,45 @@ async def test_deleting_a_project_row_cascades_its_variable_flags(db):
         await db.conn.execute(
             "INSERT INTO variables (project_id, key, plain) VALUES ('prj_bbbbbbbbbbbbbbbb', 'Z', 2)"
         )
+
+
+# --- Lot 5 hosted-only shares ---
+
+_LEGACY_SERVICE_SHARES_DDL = """
+CREATE TABLE service_shares (
+    service_name TEXT PRIMARY KEY,
+    access       TEXT NOT NULL CHECK (access IN ('private', 'public')),
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
+
+@pytest.mark.asyncio
+async def test_legacy_service_shares_gains_hosted_only_default_0():
+    """A pre-lot-5 share row survives the ALTER and reads unlocked."""
+    db = Database(":memory:")
+    await db.connect()
+    await db.conn.execute(_LEGACY_SERVICE_SHARES_DDL)
+    await db.conn.execute(
+        "INSERT INTO service_shares (service_name, access) VALUES ('demo', 'public')"
+    )
+    await db.conn.commit()
+
+    await db.init_schema()
+
+    share = (await Queries(db).list_service_shares())["demo"]
+    assert (share.access, share.hosted_only) == ("public", False)
+    assert await Queries(db).is_hosted_only("demo") is False
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_only_column_added_once():
+    db = Database(":memory:")
+    await db.connect()
+    await db.init_schema()
+    await db.init_schema()
+
+    cursor = await db.conn.execute("PRAGMA table_info(service_shares)")
+    assert [row[1] for row in await cursor.fetchall()].count("hosted_only") == 1
+    await db.close()

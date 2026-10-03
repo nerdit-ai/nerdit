@@ -68,6 +68,7 @@ class ServiceQueries(QueriesBase):
         URLs while old containers serve during redeploy. Models remain unrouted.
         Use active_host_port when set, otherwise the stable reservation, so reconcile
         honors cutover. Include raw edge_auth for per-tick secret/repair convergence.
+        Exclude hosted_only shares in the WHERE so reconcile prunes all their routes.
         """
         cursor = await self._db.conn.execute(
             "SELECT j.service_name AS service_name, "
@@ -76,7 +77,9 @@ class ServiceQueries(QueriesBase):
             "j.project_id AS project_id FROM jobs j "
             "JOIN service_endpoints e ON e.service_name = j.service_name "
             "WHERE j.kind = 'service' "
-            "AND j.status IN ('running', 'degraded', 'restarting')"
+            "AND j.status IN ('running', 'degraded', 'restarting') "
+            "AND NOT EXISTS (SELECT 1 FROM service_shares s "
+            "WHERE s.service_name = j.service_name AND s.hosted_only = 1)"
         )
         rows = await cursor.fetchall()
         return [

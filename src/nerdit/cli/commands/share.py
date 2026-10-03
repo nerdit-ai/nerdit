@@ -30,6 +30,16 @@ _STATE_NOTES = {
     ),
 }
 
+#: (Lot 5) ``local_routes`` token → the line printed for a hosted-only share.
+_LOCAL_ROUTES_NOTES = {
+    "absent": "local routes: absent (hosted only)",
+    "present": "local routes: present: purge pending, retry in a few seconds",
+    "unknown": (
+        "local routes: unknown: proxy unreadable, or the daemon is reachable "
+        "without a token (see nerdit doctor)"
+    ),
+}
+
 
 def _render_share(name: str, result: Any, *, verb: str) -> None:
     """Print one share as `<verb> <name> (<access>): <url>` + any state note."""
@@ -52,6 +62,11 @@ def _render_share(name: str, result: Any, *, verb: str) -> None:
         hint = origin.get("hint")
         if isinstance(hint, str) and hint:
             console.print(f"[yellow]origin — {_plain(hint)}[/yellow]")
+    if result.get("hosted_only") is True:
+        routes = result.get("local_routes")
+        note = _LOCAL_ROUTES_NOTES.get(routes) if isinstance(routes, str) else None
+        line = note or f"local routes: {_plain(routes)}"
+        console.print(line if routes == "absent" else f"[yellow]{line}[/yellow]")
 
 
 def share(
@@ -77,12 +92,31 @@ def share(
         "--show",
         help="Print the current share instead of changing it.",
     ),
+    hosted_only: bool | None = typer.Option(
+        None,
+        "--hosted-only/--local-route",
+        help=(
+            "--hosted-only locks the app to its hosted URL: this machine's proxy "
+            "keeps no local route for it. --local-route unlocks and restores the "
+            "local routes (needs the link; offline, nerdit unshare <app> also "
+            "restores them). Without --public, an existing public share stays public."
+        ),
+    ),
 ) -> None:
     """Share a deployed app at a hosted URL through this node's cloud link."""
-    asyncio.run(_share_async(name, public=public, consent=consent, show=show))
+    if show and hosted_only is not None:
+        raise typer.BadParameter(
+            "--show prints the share; it cannot be combined with --hosted-only/--local-route",
+            param_hint="--show",
+        )
+    asyncio.run(
+        _share_async(name, public=public, consent=consent, show=show, hosted_only=hosted_only)
+    )
 
 
-async def _share_async(name: str, *, public: bool, consent: bool, show: bool) -> None:
+async def _share_async(
+    name: str, *, public: bool, consent: bool, show: bool, hosted_only: bool | None = None
+) -> None:
     from nerdit.cli.client import get_configured_client
 
     client = get_configured_client()
@@ -97,6 +131,9 @@ async def _share_async(name: str, *, public: bool, consent: bool, show: bool) ->
             name,
             access="public" if public else "private",
             consent=consent,
+            # (Lot 5) A lock flag alone must not downgrade a public share.
+            preserve_existing=hosted_only is not None and not public,
+            hosted_only=hosted_only,
             idempotency_key=uuid4().hex,
         )
     except Exception as exc:  # noqa: BLE001 — rendered for the user

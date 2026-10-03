@@ -43,6 +43,7 @@ from nerdit.daemon.views.hosted import (
     domain_cert_state,
     domain_state,
     load_hosted_context,
+    local_public_url,
 )
 from nerdit.daemon.views.service import _not_found, _resolve_service
 from nerdit.db.models import JobKind, TokenRole
@@ -186,7 +187,7 @@ async def _context(request: Request, service_name: str) -> tuple[HostedContext, 
     endpoint = await queries.get_service_endpoint(service_name)
     if endpoint is None:
         return hosted, None
-    return hosted, public_url_for(
+    url = public_url_for(
         endpoint.service_name,
         endpoint.route,
         mode=proxy.mode,
@@ -196,6 +197,7 @@ async def _context(request: Request, service_name: str) -> tuple[HostedContext, 
         https_port=proxy.https_port,
         public_port=proxy.public_port,
     )
+    return hosted, local_public_url(hosted, endpoint.service_name, url)
 
 
 @router.get(
@@ -312,7 +314,6 @@ async def add_domain(
             f"'{job.kind.value}' workloads cannot have a direct domain.",
             hint="Only deployed apps (kind 'service') can be served under a domain.",
         )
-
     try:
         validated = validate_domain(domain, reserved=_reserved(request))
         # Accepted: from here the canonical (folded) name is the resource, and
@@ -378,6 +379,16 @@ async def add_domain(
         # re-checks under the DB write lock). Nothing was written, so the honest
         # answer is the 404 the resolve would have given a moment later.
         raise _not_found(name)
+    if outcome == "hosted_only":
+        # Lot 5: a domain is a local route, and a locked app has none. Refused
+        # under the insert's own write lock, after the shape checks above, so
+        # a malformed name still gets its 422 and a lock cannot race in.
+        raise NerditError(
+            409,
+            "share.hosted_only_conflict",
+            f"Service '{service_name}' is hosted only: it has no local route.",
+            hint=f"Unlock it first: `nerdit share {service_name} --local-route`.",
+        )
     if outcome == "taken":
         # The message names the DOMAIN only. An owner-scoped principal must not
         # be able to enumerate another owner's app names by probing names it

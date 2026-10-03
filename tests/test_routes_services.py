@@ -54,6 +54,7 @@ from nerdit.db.models import (
     JobStatus,
     SecretClaim,
     ServiceEndpoint,
+    ServiceShare,
     TokenRole,
 )
 from nerdit.db.queries import ServiceNameClaimed, ServiceNameTaken
@@ -439,6 +440,53 @@ def test_get_service_returns_public_url():
     )
     assert resp.status_code == 200
     assert resp.json()["endpoint"]["public_url"] == "https://box/demo/"
+
+
+def _locked_app(**over) -> TestClient:
+    """(Lot 5) A routed app on a serving proxy whose share is hosted-only."""
+    from nerdit.config.settings import ProxySettings
+
+    q = _queries(_service("tok-sub", **over))
+    q.get_service_endpoint = AsyncMock(
+        return_value=ServiceEndpoint(
+            service_name="demo", job_id="svc-1", container_port=8000, host_port=9400, route="/demo"
+        )
+    )
+    q.list_service_shares = AsyncMock(
+        return_value={"demo": ServiceShare(service_name="demo", access="private", hosted_only=True)}
+    )
+    q.list_service_domains = AsyncMock(return_value=[])
+    app = _make_app(q)
+    app.state.settings.proxy = ProxySettings(enabled=True)
+    # Real link facts: MagicMock attributes would leak into the hosted URL.
+    app.state.settings.link = SimpleNamespace(
+        slug="gpu-box", nodes_base_domain="nodes.test", node_id=None
+    )
+    app.state.hostname = "box"
+    proxy = MagicMock()
+    proxy.available = True
+    app.state.proxy_manager = proxy
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_get_service_hides_public_url_for_a_hosted_only_app():
+    resp = _locked_app().get("/services/demo", headers=_auth(RO_RAW))
+    assert resp.status_code == 200, resp.text
+    endpoint = resp.json()["endpoint"]
+    assert endpoint["public_url"] is None
+    assert [e["kind"] for e in endpoint["public_urls"]] == ["hosted"]
+    assert endpoint["public_urls"][0]["hosted_only"] is True
+
+
+def test_wait_for_service_returns_no_local_url_for_a_hosted_only_app():
+    resp = _locked_app(status=JobStatus.running).get(
+        "/services/demo/wait?timeout=1", headers=_auth(RO_RAW)
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["outcome"] == "converged"
+    assert body["public_url"] is None
+    assert all(e["kind"] != "default" for e in body["public_urls"])
 
 
 def test_get_service_returns_public_url_subdomain_mode():

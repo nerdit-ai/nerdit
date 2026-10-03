@@ -151,6 +151,13 @@ export function ServiceShareCard({ endpoint }: { endpoint: ServiceEndpoint | nul
         </p>
       ) : null}
 
+      {publicUrlState(endpoint) === "hosted-only" ? (
+        <p className="px-4 py-3 text-12 text-muted-foreground" data-testid="service-hosted-only">
+          Hosted only: the local route is off. The routes table under Settings shows whether the
+          proxy still serves one.
+        </p>
+      ) : null}
+
       <p className="px-4 py-3 text-12 text-muted-foreground" data-testid="service-address-note">
         {!featured && !hosted ? (
           // The plain LAN address is served by this node's internal CA, so a

@@ -12,7 +12,12 @@ from nerdit.core.jobconfig import parse_job_config
 from nerdit.core.proxy import public_url_for
 from nerdit.daemon.auth import may_manage_job
 from nerdit.daemon.errors import NerditError
-from nerdit.daemon.views.hosted import EMPTY_HOSTED, HostedContext, public_urls_for
+from nerdit.daemon.views.hosted import (
+    EMPTY_HOSTED,
+    HostedContext,
+    local_public_url,
+    public_urls_for,
+)
 from nerdit.db.models import (
     MANAGED_KINDS,
     Job,
@@ -112,6 +117,7 @@ def _endpoint_view(
             https_port=proxy.https_port,
             public_port=proxy.public_port,
         )
+    public = local_public_url(hosted, endpoint.service_name, public)
     return ServiceEndpointView.from_endpoint(
         endpoint,
         public_url=public,

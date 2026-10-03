@@ -612,8 +612,18 @@ class CutoverManager:
         # and this call needs nothing but the ids. The domain rows are read
         # here, at commit time, so a domain bound during the verify window is
         # included and one removed during it is not.
+        # Lot 5: a hosted-only app has no local route, so there is no dial to
+        # repoint or verify; it is promoted on its probe alone (f1 still runs:
+        # the hosted resolver dials `active_host_port`). A lock landing after
+        # this read makes `register` refuse, the dial never converges, and the
+        # cutover settles `repoint_failure` with blue serving and no route.
+        locked = await queries.is_hosted_only(name)
         domain_rows = await queries.get_service_domains(name)
-        caddy_ids = (_route_id(name), *(_domain_route_id(name, r.domain) for r in domain_rows))
+        caddy_ids: tuple[str, ...] = (
+            ()
+            if locked
+            else (_route_id(name), *(_domain_route_id(name, r.domain) for r in domain_rows))
+        )
         # The repoint REBUILDS the whole route object,
         # so the row's `edge_auth` must ride along or every cutover commit of a
         # protected service would strip its auth handler — and `_await_dial`
@@ -623,19 +633,20 @@ class CutoverManager:
         # and the cutover settles `repoint_failure` with blue restored — the
         # route is then withheld until the secret resolves. Posture beats
         # availability.
-        await proxy.register(
-            name,
-            green_port,
-            edge_auth=parse_job_config(job).get("edge_auth"),
-            project_id=job.project_id,
-            with_domains=True,
-            # The SAME snapshot `caddy_ids` was derived from, never a second
-            # read: a `DELETE` landing between two reads would leave a removed
-            # id in the awaited set that nothing ever writes, and
-            # `_await_dials` would burn its whole budget and unwind a healthy
-            # green. The removed route is torn down by the next reconcile tick.
-            domains=[r.domain for r in domain_rows],
-        )
+        if not locked:
+            await proxy.register(
+                name,
+                green_port,
+                edge_auth=parse_job_config(job).get("edge_auth"),
+                project_id=job.project_id,
+                with_domains=True,
+                # The SAME snapshot `caddy_ids` was derived from, never a second
+                # read: a `DELETE` landing between two reads would leave a removed
+                # id in the awaited set that nothing ever writes, and
+                # `_await_dials` would burn its whole budget and unwind a healthy
+                # green. The removed route is torn down by the next reconcile tick.
+                domains=[r.domain for r in domain_rows],
+            )
         if not await self._await_dials(caddy_ids, green_port):
             await self._settle_repoint_failure(
                 job, version, green_id=green_id, name=name, caddy_ids=caddy_ids
@@ -739,6 +750,8 @@ class CutoverManager:
         One deadline covers the whole set (`cutover_repoint_timeout_s`), not
         one per id.
         """
+        if not caddy_ids:
+            return True  # lot 5: a hosted-only app has no route to verify
         proxy = self._c._proxy
         assert proxy is not None
         expected = f"127.0.0.1:{port}"

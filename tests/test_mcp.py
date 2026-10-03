@@ -2629,6 +2629,29 @@ async def test_share_service_impl_defaults_to_private_and_forwards_an_explicit_k
 
 
 @pytest.mark.asyncio
+async def test_share_service_forwards_hosted_only_and_preserves_public():
+    """(Lot 5, D16) A lock request with the default access must not downgrade a
+    public share: ``preserve_existing`` rides along; an explicit public does not."""
+    bodies: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"access": "private"})
+
+    await exposure_tools._share_service_impl(_client(handler), name="demo", hosted_only=True)
+    await exposure_tools._share_service_impl(_client(handler), name="demo", hosted_only=False)
+    await exposure_tools._share_service_impl(
+        _client(handler), name="demo", access="public", consent=True, hosted_only=True
+    )
+
+    assert bodies == [
+        {"access": "private", "consent": False, "preserve_existing": True, "hosted_only": True},
+        {"access": "private", "consent": False, "preserve_existing": True, "hosted_only": False},
+        {"access": "public", "consent": True, "hosted_only": True},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_unshare_service_impl_deletes_with_a_minted_key():
     seen: dict = {}
 

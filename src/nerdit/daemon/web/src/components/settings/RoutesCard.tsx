@@ -32,8 +32,24 @@ function RouteCell({ route }: { route: string | null }) {
   return <Mono className="text-foreground">{route}</Mono>;
 }
 
-/** The advisory live annotation; `null` ⇒ "–" (unknown), never "no". */
-function LiveCell({ live }: { live: RouteItem["live"] }) {
+/**
+ * The advisory live annotation; `null` ⇒ "–" (unknown), never "no". A
+ * hosted-only app (lot 5) reads "hosted only", plus "route still live" while
+ * Caddy has not purged it yet — the same text as `nerdit routes`.
+ */
+function LiveCell({ live, reason }: { live: RouteItem["live"]; reason: RouteItem["reason"] }) {
+  if (reason === "hosted_only") {
+    return (
+      <span className="text-muted-foreground">
+        hosted only
+        {live === null ? (
+          <span className="text-warning-foreground"> (proxy table unreadable)</span>
+        ) : live.registered ? (
+          <span className="text-warning-foreground"> (route still live)</span>
+        ) : null}
+      </span>
+    );
+  }
   if (live === null) return <span className="text-subtle-foreground">–</span>;
   if (!live.registered) return <span className="text-warning-foreground">missing</span>;
   if (!live.dial_matches) return <span className="text-warning-foreground">stale dial</span>;
@@ -134,7 +150,7 @@ export function RoutesCard() {
                     <Mono className="text-muted-foreground">{item.host_port}</Mono>
                   </td>
                   <td className="px-4 py-3">
-                    <LiveCell live={item.live} />
+                    <LiveCell live={item.live} reason={item.reason} />
                   </td>
                 </TableRow>
               ))}

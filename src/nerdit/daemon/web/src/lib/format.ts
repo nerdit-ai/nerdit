@@ -53,16 +53,23 @@ export type PublicUrlState =
   | "routed"
   /** An endpoint exists but the proxy is off/down — expected state, not an error. */
   | "proxy-off"
+  /** (Lot 5) Locked to its hosted URL: no local route, no LAN URL to show. */
+  | "hosted-only"
   /** No endpoint published yet (service not launched). */
   | "none";
 
 /**
  * Classify a service endpoint's public reachability. `public_url` being null
  * while an endpoint exists is an expected "proxy off" state (trap 8), never
- * an error; the loopback `endpoint.url` remains usable.
+ * an error; the loopback `endpoint.url` remains usable. A hosted-only lock is
+ * checked first: its null `public_url` is deliberate, and its loopback URL is
+ * not offered.
  */
 export function publicUrlState(endpoint: ServiceEndpoint | null | undefined): PublicUrlState {
   if (!endpoint) return "none";
+  if (endpoint.public_urls?.some((e) => e.kind === "hosted" && e.hosted_only === true)) {
+    return "hosted-only";
+  }
   return endpoint.public_url != null ? "routed" : "proxy-off";
 }
 

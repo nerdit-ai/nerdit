@@ -276,6 +276,10 @@ class ServiceShare(BaseModel):
         default_factory=lambda: datetime.now(UTC),
         description="Timestamp when the share was first created (preserved across access changes)",
     )
+    hosted_only: bool = Field(
+        default=False,
+        description="True when the app is reachable only through the cloud: no local Caddy route",
+    )
 
 
 class VariableFlag(BaseModel):

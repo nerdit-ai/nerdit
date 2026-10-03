@@ -141,6 +141,9 @@ class _NoAudit:
     async def get_service_domains(self, service_name: str) -> list:
         return [d for d in self.domains if d.service_name == service_name]
 
+    async def is_hosted_only(self, _n: str) -> bool:
+        return False
+
 
 class _FlipQueries(_NoAudit):
     """Queries stub for the flip smoke: a fixed desired set + recorded route writes."""

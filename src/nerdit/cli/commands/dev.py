@@ -19,6 +19,7 @@ import typer
 from rich.markup import escape
 
 from nerdit.cli.display import (
+    _hosted_only,
     _plain,
     console,
     display_deploy_result,
@@ -136,9 +137,12 @@ def _cutover_warning(name: str, service: dict | None, cutover: bool | None) -> l
         reason = "only apps (kind = service) are cutover-eligible"
     elif (service.get("gpu_count") or 0) > 0:
         reason = "GPU services keep the same-port swap (two containers cannot hold one GPU)"
-    elif service.get("status") in ("running", "degraded") and not (
-        service.get("endpoint") or {}
-    ).get("public_url"):
+    elif (
+        service.get("status") in ("running", "degraded")
+        and not (endpoint := service.get("endpoint") or {}).get("public_url")
+        # A locked app's null public_url is by design, not a missing route.
+        and not _hosted_only(endpoint)
+    ):
         reason = "no proxy route — zero-downtime redeploys need [proxy].enabled"
     else:
         return []

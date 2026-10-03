@@ -212,9 +212,9 @@ CREATE TABLE IF NOT EXISTS notification_cursors (
 -- edge decides WHO may reach it. No FK: ``jobs.service_name`` is only
 -- partially unique (see the index note below), so an FK to it raises
 -- ``foreign key mismatch`` -- the ``service_endpoints`` posture. The row is
--- deleted inside ``delete_service_checked``'s transaction instead. A wholly
--- new table, so it rides ``_SCHEMA`` unconditionally for the same reason
--- ``events``/``notification_cursors`` do -- no ``_migrate`` block.
+-- deleted inside ``delete_service_checked``'s transaction instead. The table
+-- rides ``_SCHEMA``; its later ``hosted_only`` column (lot 5) is added by
+-- ``_migrate`` only, so fresh and legacy databases take the same ALTER.
 CREATE TABLE IF NOT EXISTS service_shares (
     service_name TEXT PRIMARY KEY,
     access       TEXT NOT NULL CHECK (access IN ('private', 'public')),
@@ -373,6 +373,12 @@ class Database:
             await self._conn.execute(
                 "ALTER TABLE service_public_addresses ADD COLUMN active "
                 "INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1))"
+            )
+        share_info = await self._conn.execute("PRAGMA table_info(service_shares)")
+        if "hosted_only" not in {row[1] for row in await share_info.fetchall()}:
+            await self._conn.execute(
+                "ALTER TABLE service_shares ADD COLUMN hosted_only "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (hosted_only IN (0, 1))"
             )
         jobs_table_info = await self._get_jobs_table_info()
         existing = {row[1] for row in jobs_table_info}

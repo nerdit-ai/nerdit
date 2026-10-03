@@ -2488,6 +2488,19 @@
           "title": "Consent",
           "type": "boolean"
         },
+        "hosted_only": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "``true`` locks the app to its hosted URL: no local proxy route (409 ``share.hosted_only_conflict`` while a domain is bound, 409 ``share.hosted_only_no_token`` if the daemon is reachable without a token). ``false`` restores the LAN routes; omitted keeps the stored lock. With ``access='private'`` a lock request keeps an existing public share.",
+          "title": "Hosted Only"
+        },
         "idempotency_key": {
           "anyOf": [
             {

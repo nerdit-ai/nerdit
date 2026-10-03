@@ -116,6 +116,12 @@ export interface PublicUrlEntry {
    * other kind and on a pre-WP2 daemon.
    */
   cert_state?: "internal" | "disabled" | "pending" | "issued" | "expired" | null;
+  /**
+   * (Lot 5) Hosted entries only: true when the share is locked to its hosted
+   * URL, so this machine keeps no local route (`public_url` is null). The
+   * positive signal, distinct from the null that means proxy-off.
+   */
+  hosted_only?: boolean | null;
 }
 
 export interface ServiceEndpoint {
@@ -714,6 +720,8 @@ export interface RouteItem {
   /** (P26) Every advertised URL with its kind/state. Optional: a pre-P26 daemon omits it. */
   public_urls?: PublicUrlEntry[];
   live: { registered: boolean; dial_matches: boolean } | null;
+  /** (Lot 5) Why no local route is advertised; `live` still reports Caddy. */
+  reason?: "hosted_only" | null;
 }
 
 /** Cursor-paginated page of routes (`GET /routes`), DB-authoritative. */

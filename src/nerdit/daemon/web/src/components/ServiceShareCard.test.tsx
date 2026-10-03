@@ -144,4 +144,21 @@ describe("ServiceShareCard", () => {
     );
     expect(container.firstChild).toBeNull();
   });
+
+  it("features the hosted URL with the hosted-only caption for a locked app", () => {
+    // Lot 5: the daemon nulls public_url for a locked app; the LAN URL is gone.
+    render(
+      <ServiceShareCard
+        endpoint={{ ...endpoint([{ ...hosted, hosted_only: true }]), public_url: null }}
+      />
+    );
+    expect(featuredUrl()).toContain(HOSTED_URL);
+    expect(screen.getByTestId("service-hosted-only").textContent).toBe(
+      "Hosted only: the local route is off. The routes table under Settings shows whether the proxy still serves one."
+    );
+
+    cleanup();
+    render(<ServiceShareCard endpoint={endpoint([hosted])} />);
+    expect(screen.queryByTestId("service-hosted-only")).toBeNull();
+  });
 });

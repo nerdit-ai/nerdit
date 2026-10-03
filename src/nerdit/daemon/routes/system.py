@@ -517,6 +517,10 @@ async def get_capabilities(request: Request) -> dict[str, Any]:
             # on an older daemon, and a legacy deploy of a `[project]` file
             # answers `deploy.use_apply` only from this build on.
             "project_apply": True,
+            # Constant ``True``: an older daemon 422s `hosted_only` on PUT share
+            # (strict body) and reports no `local_routes`, so the cloud gates
+            # hosted-only rules on this flag.
+            "hosted_only_shares": True,
         },
     }
     if is_admin:

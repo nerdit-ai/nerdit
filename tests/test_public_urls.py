@@ -41,6 +41,7 @@ from nerdit.daemon.views.hosted import (
     hosted_entry,
     hosted_state,
     load_hosted_context,
+    local_public_url,
     public_urls_for,
 )
 from nerdit.db.models import (
@@ -593,6 +594,51 @@ def test_routes_reads_the_share_table_exactly_once_and_projects_it():
     assert q.list_service_shares.await_count == 1
     assert q.list_service_domains.await_count == 1
     assert q.get_service_domains.await_count == 0
+
+
+def test_hosted_only_has_no_default_entry_and_domains_withheld():
+    """(Lot 5) A locked app advertises no local URL: no default entry, its
+    domains read ``withheld`` even though their routes are live, and the hosted
+    entry carries the positive ``hosted_only`` signal (distinct from the null
+    that means proxy-off). An unlocked share keeps its LAN URL."""
+    locked = ServiceShare(service_name="demo", access="private", hosted_only=True)
+    ctx = _ctx(
+        shares={"demo": locked, "other": ServiceShare(service_name="other", access="private")},
+        domains={"demo": (_domain("app.example.com"),)},
+    )
+    public = local_public_url(ctx, "demo", LAN_URL)
+    assert public is None
+    entries = public_urls_for(ctx, "demo", public)
+    assert [(e.kind, e.state) for e in entries] == [("hosted", "ready"), ("domain", "withheld")]
+    assert entries[0].hosted_only is True
+    assert local_public_url(ctx, "other", LAN_URL) == LAN_URL
+    assert public_urls_for(ctx, "other", LAN_URL)[1].hosted_only is False
+    assert local_public_url(ctx, "no-share", LAN_URL) == LAN_URL
+
+
+def test_routes_carries_reason_hosted_only():
+    """(Lot 5) ``GET /routes`` nulls a locked app's ``public_url``, drops its
+    default entry and names why; an unlocked row has no reason."""
+    q = SimpleNamespace(
+        list_service_endpoints=AsyncMock(
+            return_value=([_route_endpoint("demo"), _route_endpoint("other")], None)
+        ),
+        list_service_shares=AsyncMock(
+            return_value={
+                "demo": ServiceShare(service_name="demo", access="private", hosted_only=True)
+            }
+        ),
+        list_service_domains=AsyncMock(return_value=[]),
+    )
+    resp = _routes_client(q).get("/api/routes", headers={"Authorization": "Bearer admin-raw-token"})
+    assert resp.status_code == 200, resp.text
+    items = {i["service_name"]: i for i in resp.json()["items"]}
+    assert items["demo"]["reason"] == "hosted_only"
+    assert items["demo"]["public_url"] is None
+    assert [e["kind"] for e in items["demo"]["public_urls"]] == ["hosted"]
+    assert items["demo"]["public_urls"][0]["hosted_only"] is True
+    assert items["other"]["reason"] is None
+    assert items["other"]["public_url"] == "https://box/other/"
 
 
 def test_routes_reads_the_domain_table_exactly_once_and_projects_it():

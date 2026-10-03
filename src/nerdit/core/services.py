@@ -2170,7 +2170,12 @@ class ServiceController:
 
         policy = job.restart_policy or "always"
         clean_exit = exit_code == 0
-        if policy == "no" or (policy == "on-failure" and clean_exit):
+        # A clean exit is a finished one-shot only for kind=service. A managed
+        # database or model is a long-running server: exit 0 means something
+        # stopped it (a host shutdown SIGTERMs Postgres, which exits 0), so it
+        # restarts whatever its persisted 'on-failure' policy says.
+        one_shot_done = clean_exit and job.kind is JobKind.service
+        if policy == "no" or (policy == "on-failure" and one_shot_done):
             final = JobStatus.completed if clean_exit else JobStatus.failed
             error_class = (
                 None if clean_exit else _classify_service_exit(exit_code, oom_killed, gpu_oom)

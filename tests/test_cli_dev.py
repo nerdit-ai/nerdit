@@ -401,6 +401,35 @@ def test_still_building_service_is_not_warned_about_its_route(tmp_path, monkeypa
     assert "not cutover-armed" not in result.output
 
 
+def test_hosted_only_service_is_not_warned_about_its_null_public_url(tmp_path, monkeypatch):
+    """(Lot 5) A locked app reports public_url null by design; it still cuts over."""
+    _app(tmp_path)
+    fake = _client(
+        resolve_service={
+            "return_value": _service(
+                status="running",
+                endpoint={
+                    "host_port": 30001,
+                    "url": "http://127.0.0.1:30001",
+                    "public_url": None,
+                    "public_urls": [
+                        {
+                            "kind": "hosted",
+                            "url": "https://app.nodes.nerdit.ai",
+                            "hosted_only": True,
+                        },
+                    ],
+                },
+            )
+        }
+    )
+    _install_loop(monkeypatch, [])
+
+    result = _invoke(tmp_path, fake)
+
+    assert "not cutover-armed" not in result.output
+
+
 def test_routed_cpu_service_is_not_warned(tmp_path, monkeypatch):
     _app(tmp_path)
     fake = _client(

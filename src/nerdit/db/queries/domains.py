@@ -19,7 +19,7 @@ from ._base import QueriesBase, _serialized
 
 #: Outcome of `DomainQueries.add_service_domain` — four distinct facts the
 #: route maps to four distinct answers (200 created / 200 idempotent / 409 / 404).
-AddDomainOutcome = Literal["inserted", "exists", "taken", "no_service"]
+AddDomainOutcome = Literal["inserted", "exists", "taken", "no_service", "hosted_only"]
 
 _SELECT = "SELECT domain, service_name, acme, kind, created_at FROM service_domains"
 
@@ -51,9 +51,10 @@ class DomainQueries(QueriesBase):
         on insertion, avoiding accidental certificate downgrade.
 
         Returns:
-            ("inserted", row), ("exists", row), ("taken", row), or
-            ("no_service", None). A taken response may name the domain, never the
-            other service; the returned row is for internal comparison only.
+            ("inserted", row), ("exists", row), ("taken", row),
+            ("no_service", None) or ("hosted_only", None). A taken response may
+            name the domain, never the other service; the returned row is for
+            internal comparison only.
         """
         await self._db.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -64,6 +65,16 @@ class DomainQueries(QueriesBase):
             if await cursor.fetchone() is None:
                 await self._db.conn.execute("ROLLBACK")
                 return "no_service", None
+            # Lot 5: a domain is a local route and a locked app has none. Read
+            # under the same BEGIN IMMEDIATE as the insert, so a lock racing in
+            # through `set_service_share` cannot land beside this domain.
+            cursor = await self._db.conn.execute(
+                "SELECT 1 FROM service_shares WHERE service_name = ? AND hosted_only = 1",
+                (service_name,),
+            )
+            if await cursor.fetchone() is not None:
+                await self._db.conn.execute("ROLLBACK")
+                return "hosted_only", None
 
             cursor = await self._db.conn.execute(f"{_SELECT} WHERE domain = ?", (domain,))
             row = await cursor.fetchone()

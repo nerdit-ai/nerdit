@@ -33,6 +33,7 @@ from nerdit.db.models import (
     JobStatus,
     RouteEndpoint,
     ServiceEndpoint,
+    ServiceShare,
     TokenRole,
 )
 
@@ -148,11 +149,13 @@ def _route_endpoint(active: int | None) -> RouteEndpoint:
     )
 
 
-def _routes_client(endpoint: RouteEndpoint, *, dial_port: int) -> TestClient:
+def _routes_client(
+    endpoint: RouteEndpoint, *, dial_port: int, shares: dict | None = None
+) -> TestClient:
     q = SimpleNamespace(
         list_service_endpoints=AsyncMock(return_value=([endpoint], None)),
         # (P26 D-P26-14) The one batched share read ``GET /routes`` makes.
-        list_service_shares=AsyncMock(return_value={}),
+        list_service_shares=AsyncMock(return_value=shares or {}),
     )
     mgr = SimpleNamespace(
         enabled=True,
@@ -214,6 +217,18 @@ def test_routes_is_byte_compatible_with_no_cutover():
     assert item["host_port"] == STABLE_PORT
     assert item["effective_host_port"] == STABLE_PORT
     assert item["live"] == {"registered": True, "dial_matches": True}
+
+
+def test_routes_keeps_live_and_adds_reason_for_a_hosted_only_app():
+    """(Lot 5, D12) ``live`` stays the observed Caddy fact (a route not purged
+    yet still reads registered), ``reason`` names the lock, no local URL."""
+    share = ServiceShare(service_name="demo", access="private", hosted_only=True)
+    client = _routes_client(_route_endpoint(None), dial_port=STABLE_PORT, shares={"demo": share})
+    item = client.get("/api/routes", headers=_AUTH).json()["items"][0]
+
+    assert item["live"] == {"registered": True, "dial_matches": True}
+    assert item["reason"] == "hosted_only"
+    assert item["public_url"] is None
 
 
 # --- /diagnose fresh probe -----------------------------------------------------

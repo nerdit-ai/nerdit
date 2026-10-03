@@ -22,7 +22,7 @@ import time
 from collections.abc import Callable, Sequence
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
 
 from nerdit.config.defaults import DEFAULT_HOST, DEFAULT_PORT
@@ -1089,6 +1089,11 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
             return
         new_dial = f"127.0.0.1:{host_port}"
         try:
+            # Lot 5: a hosted-only app has no local route. Inside the try, so a
+            # failed lock read writes nothing (fail closed).
+            if await self._queries.is_hosted_only(service_name):
+                await self._deregister_unlocked(service_name)
+                return
             try:
                 spec = await self._build_route_off_loop(
                     service_name, host_port, load_edge_auth(edge_auth), project_id
@@ -1239,6 +1244,23 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
                     )
         except Exception:
             logger.warning("[proxy] deregister failed for %s", service_name, exc_info=True)
+
+    async def local_route_state(self, service_name: str) -> Literal["absent", "present", "unknown"]:
+        """Observe whether Caddy's live table holds any route of `service_name`.
+
+        Asks the admin API even when the proxy is disabled: a leftover Caddy may
+        still serve. Unreadable is `unknown`, except a disabled proxy with no live
+        pid, which has nothing that could serve (`absent`).
+        """
+        if self.enabled and not self._available:
+            return "unknown"
+        try:
+            live = await self._admin.live_routes()
+        except Exception:
+            live = None
+        if live is None:
+            return "unknown" if self.enabled or self._pid_alive() else "absent"
+        return "present" if any(_split_route_id(r)[0] == service_name for r in live) else "absent"
 
     # -- reconcile (source of truth) -----------------------------------------
 

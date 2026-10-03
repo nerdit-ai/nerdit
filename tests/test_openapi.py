@@ -421,6 +421,19 @@ def test_p26_operation_ids_are_present(schema: dict) -> None:
     assert "/link/refresh" not in paths
 
 
+def test_lot5_hosted_only_fields_are_in_the_schema(schema: dict) -> None:
+    """Lot 5 is additive: new fields on existing models, no new operation."""
+    models = schema["components"]["schemas"]
+    assert "hosted_only" in models["ShareRequest"]["properties"]
+    assert {"hosted_only", "local_routes"} <= set(models["ShareView"]["required"])
+    assert models["ShareView"]["properties"]["local_routes"]["enum"] == [
+        "absent",
+        "present",
+        "unknown",
+    ]
+    assert "hosted_only" in models["PublicUrlEntry"]["properties"]
+
+
 def test_p26_wp1_domain_operations_are_present(schema: dict) -> None:
     """(P26 WP1) The custom-domain trio joins the SAME ``Exposure`` tag.
 

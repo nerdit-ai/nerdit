@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from nerdit.daemon.schemas.exposure import PublicUrlEntry
@@ -87,6 +89,13 @@ class RouteItem(BaseModel):
         ),
     )
     live: dict[str, object] | None = None
+    reason: Literal["hosted_only"] | None = Field(
+        default=None,
+        description=(
+            "(Lot 5) Why no local route is advertised: 'hosted_only' = the app is "
+            "locked to its hosted URL (public_url is null; `live` still reports Caddy)"
+        ),
+    )
 
 
 class RouteListPage(BaseModel):

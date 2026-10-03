@@ -16,6 +16,14 @@ from nerdit.db.rows import ActiveServicePublicAddress, ServicePublicAddress, Ser
 from ._base import QueriesBase, _serialized
 
 
+class HostedOnlyConflictError(Exception):
+    """A hosted-only lock was refused because direct domains are bound."""
+
+    def __init__(self, domains: list[str]) -> None:
+        super().__init__("hosted-only lock refused: direct domains are bound")
+        self.domains = domains
+
+
 class ShareQueries(QueriesBase):
     """Read / upsert / delete the `service_shares` rows."""
 
@@ -213,20 +221,21 @@ class ShareQueries(QueriesBase):
     async def list_service_shares(self) -> dict[str, ServiceShare]:
         """Return all shares keyed by service name in one unpaginated read for list projections."""
         cursor = await self._db.conn.execute(
-            "SELECT service_name, access, created_at FROM service_shares"
+            "SELECT service_name, access, hosted_only, created_at FROM service_shares"
         )
         rows = await cursor.fetchall()
         shares = [self._row_to_share(r) for r in rows]
         return {share.service_name: share for share in shares}
 
     @_serialized
-    async def set_service_share(
+    async def set_service_share(  # noqa: PLR0913 - one keyword per share column, all keyword-only
         self,
         service_name: str,
         access: str,
         *,
         job_id: str,
         preserve_existing: bool = False,
+        hosted_only: bool | None = None,
         alias_node_id: str | None = None,
         alias_host: str | None = None,
     ) -> ServiceShare | None:
@@ -236,16 +245,44 @@ class ShareQueries(QueriesBase):
         same-name replacement service must never inherit stale sharing intent. Return
         None when that job vanished; route validation and the column CHECK enforce access.
         preserve_existing retains access on conflict inside the same statement.
+        hosted_only None keeps the stored lock (0 on insert), independent of
+        preserve_existing, so a preserving write can still set the lock.
+
+        Raises:
+            HostedOnlyConflictError: ``hosted_only`` is True while a direct domain is
+                bound. Read under the same BEGIN IMMEDIATE as the upsert, so a
+                domain racing in through ``add_service_domain`` cannot land
+                beside the lock.
         """
+        await self._db.conn.execute("BEGIN IMMEDIATE")
+        if hosted_only:
+            cursor = await self._db.conn.execute(
+                "SELECT domain FROM service_domains WHERE service_name = ? ORDER BY domain",
+                (service_name,),
+            )
+            bound = [r[0] for r in await cursor.fetchall()]
+            if bound:
+                await self._db.conn.rollback()
+                raise HostedOnlyConflictError(bound)
         cursor = await self._db.conn.execute(
-            """INSERT INTO service_shares (service_name, access)
-               SELECT ?, ? WHERE EXISTS (
+            """INSERT INTO service_shares (service_name, access, hosted_only)
+               SELECT ?, ?, COALESCE(?, 0) WHERE EXISTS (
                    SELECT 1 FROM jobs
                    WHERE id = ? AND service_name = ? AND kind = 'service'
                )
                ON CONFLICT(service_name) DO UPDATE SET access =
-                   CASE WHEN ? THEN service_shares.access ELSE excluded.access END""",
-            (service_name, access, job_id, service_name, preserve_existing),
+                   CASE WHEN ? THEN service_shares.access ELSE excluded.access END,
+                   hosted_only = CASE WHEN ? IS NULL
+                       THEN service_shares.hosted_only ELSE excluded.hosted_only END""",
+            (
+                service_name,
+                access,
+                hosted_only,
+                job_id,
+                service_name,
+                preserve_existing,
+                hosted_only,
+            ),
         )
         wrote = (cursor.rowcount or 0) > 0
         if wrote and alias_node_id is not None and alias_host is not None:
@@ -258,13 +295,22 @@ class ShareQueries(QueriesBase):
             # write that never landed.
             return None
         cursor = await self._db.conn.execute(
-            "SELECT service_name, access, created_at FROM service_shares WHERE service_name = ?",
+            "SELECT service_name, access, hosted_only, created_at FROM service_shares "
+            "WHERE service_name = ?",
             (service_name,),
         )
         row = await cursor.fetchone()
         # Committed a moment ago under the write lock this method holds.
         assert row is not None
         return self._row_to_share(row)
+
+    async def is_hosted_only(self, service_name: str) -> bool:
+        """Point read of the lock; no share row means unlocked."""
+        cursor = await self._db.conn.execute(
+            "SELECT hosted_only FROM service_shares WHERE service_name = ?", (service_name,)
+        )
+        row = await cursor.fetchone()
+        return row is not None and bool(row["hosted_only"])
 
     @_serialized
     async def delete_service_share(self, service_name: str) -> bool:
@@ -286,5 +332,6 @@ class ShareQueries(QueriesBase):
         return ServiceShare(
             service_name=row["service_name"],
             access=row["access"],
+            hosted_only=bool(row["hosted_only"]),
             created_at=row["created_at"],
         )

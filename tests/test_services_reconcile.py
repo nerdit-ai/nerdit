@@ -490,6 +490,26 @@ async def test_clean_on_failure_exit_completes_without_relaunch(queries):
     await controller.shutdown()
 
 
+@pytest.mark.parametrize("kind", [JobKind.database, JobKind.model])
+async def test_managed_server_clean_exit_restarts_despite_on_failure(queries, kind):
+    # A host reboot SIGTERMs the container; Postgres/Ollama exit 0. On the next
+    # boot the row is still running with a dead container: a managed server must
+    # restart, not settle `completed` as a kind=service on-failure one does.
+    runtime = FakeRuntime()
+    runtime.exit_code = 0
+    controller = _controller(queries, runtime)
+    job = _svc("srv", status=JobStatus.running, restart_policy="on-failure", container_id="dead")
+    job.kind = kind
+    await queries.create_job(job)
+
+    await controller.reconcile()
+
+    job = await queries.get_service_by_name("srv")
+    assert job.status is JobStatus.restarting
+    assert job.desired_state == "running"
+    await controller.shutdown()
+
+
 # --- restart replaces a running container (Codex Comment 1) -------------------
 
 

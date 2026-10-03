@@ -53,13 +53,22 @@ async def _share_service_impl(
     name: str,
     access: str = "private",
     consent: bool = False,
+    hosted_only: bool | None = None,
     idempotency_key: str | None = None,
 ) -> Any:
     """Set an app's hosted share, auto-minting a key (the write-tool idiom)."""
     if not idempotency_key:
         idempotency_key = str(uuid.uuid4())
     return await _call(
-        client.set_share(name, access=access, consent=consent, idempotency_key=idempotency_key)
+        client.set_share(
+            name,
+            access=access,
+            consent=consent,
+            # (Lot 5) A lock request alone must not downgrade a public share.
+            preserve_existing=hosted_only is not None and access == "private",
+            hosted_only=hosted_only,
+            idempotency_key=idempotency_key,
+        )
     )
 
 
@@ -123,6 +132,17 @@ async def share_service(
                 "block; ignored for a private share."
             ),
         ] = False,
+        hosted_only: Annotated[
+            bool | None,
+            Field(
+                description="``true`` locks the app to its hosted URL: no local proxy "
+                "route (409 ``share.hosted_only_conflict`` while a domain is bound, 409 "
+                "``share.hosted_only_no_token`` if the daemon is reachable without a "
+                "token). ``false`` restores the LAN routes; omitted keeps the stored "
+                "lock. With ``access='private'`` a lock request keeps an existing public "
+                "share."
+            ),
+        ] = None,
         idempotency_key: IdempotencyKey = None,
     ) -> Any:
         """Use when: you need a URL you can open (public_url is LAN-only).
@@ -155,6 +175,7 @@ async def share_service(
             name=name,
             access=access,
             consent=consent,
+            hosted_only=hosted_only,
             idempotency_key=idempotency_key,
         )
 

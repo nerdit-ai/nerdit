@@ -11,6 +11,8 @@ import type { ServiceEndpoint } from "../api/types";
  *   `CopyField` form instead (the shareable-link affordance, P9)
  * - proxy-off → "Proxy off" badge + the always-usable loopback url (expected
  *   state when [proxy] is disabled — never an error; trap 8)
+ * - hosted-only → "Hosted only" badge and no URL (lot 5: no local route, and
+ *   the loopback url is not offered)
  * - none    → dash (no endpoint published yet)
  */
 export function ServicePublicUrl({
@@ -24,6 +26,14 @@ export function ServicePublicUrl({
 
   if (state === "none" || !endpoint) {
     return <span className="text-muted-foreground">–</span>;
+  }
+
+  if (state === "hosted-only") {
+    return (
+      <span className="inline-flex min-w-0 items-center gap-2" data-testid="public-url-hosted-only">
+        <Badge tone="muted">Hosted only</Badge>
+      </span>
+    );
   }
 
   if (state === "proxy-off") {

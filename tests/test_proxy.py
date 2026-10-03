@@ -9,6 +9,7 @@ self-heal adoption, graceful degradation, and audit de-dup.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -4977,3 +4978,167 @@ async def test_cert_states_keys_a_batch_by_domain(tmp_path):
         "b.example.com": CertStatus("internal"),
     }
     assert mgr.cert_states([]) == {}
+
+
+# -- lot 5: a hosted-only app is never routed ----------------------------------
+
+
+def _writes(fake) -> list[tuple[str, str]]:
+    """Every route upsert the fake saw (PATCH/POST by id, or an append)."""
+    return [
+        (m, p)
+        for m, p in fake.requests
+        if (p.startswith("/id/") and m in ("POST", "PATCH"))
+        or (p == "/config/apps/http/servers/nerdit/routes" and m == "POST")
+    ]
+
+
+async def _lock(queries, job, hosted_only: bool = True) -> None:
+    share = await queries.set_service_share(
+        job.service_name, "private", job_id=job.id, hosted_only=hosted_only
+    )
+    assert share is not None
+
+
+async def test_register_refuses_and_deregisters_a_hosted_only_app(queries):
+    fake = FakeCaddy()
+    mgr = _proxy(queries, fake)
+    job = await _seed_running(queries, "alpha")
+    fake.routes.append({"@id": "nerdit-route-alpha", "handle": []})
+    fake.routes.append({"@id": "nerdit-route-alpha@a.example.com", "handle": []})
+    await _lock(queries, job)
+
+    await mgr.register("alpha", 9400, with_domains=True)
+
+    assert _writes(fake) == []
+    assert _route_ids(fake) == []
+
+
+async def test_register_in_flight_then_lock_leaves_no_route(queries):
+    # The lock commits while a register is mid-write; the PUT's inline
+    # deregister waits on `_routes_lock` and removes what the register wrote.
+    fake = FakeCaddy()
+    mgr = _proxy(queries, fake)
+    job = await _seed_running(queries, "alpha")
+    real_upsert = mgr._admin.upsert_route
+    pending: list = []
+
+    async def upsert_then_lock(obj, **kw):
+        await real_upsert(obj, **kw)
+        if not pending:
+            await _lock(queries, job)
+            pending.append(asyncio.ensure_future(mgr.deregister("alpha")))
+
+    mgr._admin.upsert_route = upsert_then_lock  # type: ignore[method-assign]
+    await mgr.register("alpha", 9400)
+    await pending[0]
+    assert _route_ids(fake) == []
+    # A later launch or restart cannot bring it back.
+    await mgr.register("alpha", 9400)
+    assert _route_ids(fake) == []
+
+
+async def test_register_fails_closed_when_the_lock_read_raises(queries):
+    fake = FakeCaddy()
+    mgr = _proxy(queries, fake)
+    await _seed_running(queries, "alpha")
+
+    async def boom(_name):
+        raise RuntimeError("db down")
+
+    queries.is_hosted_only = boom
+    await mgr.register("alpha", 9400)
+    assert _writes(fake) == []
+    assert _route_ids(fake) == []
+
+
+@pytest.mark.parametrize("mode", ["path", "subdomain"])
+async def test_reconcile_prunes_every_route_of_a_hosted_only_app(queries, mode):
+    fake = FakeCaddy()
+    mgr = _proxy(queries, fake, mode=mode, base_domain="lan.local" if mode == "subdomain" else None)
+    job = await _seed_running(queries, "alpha")
+    await _seed_domain(queries, job, "a.example.com")
+    await mgr.reconcile()
+    assert set(_route_ids(fake)) == {"nerdit-route-alpha", "nerdit-route-alpha@a.example.com"}
+
+    # The writers refuse a lock beside a bound domain; the inconsistent state
+    # can still exist (an older daemon wrote the domain), so write the lock
+    # column directly: the reconcile must prune the @domain route anyway.
+    await queries._db.conn.execute(
+        "INSERT INTO service_shares (service_name, access, hosted_only) VALUES (?, 'private', 1)",
+        ("alpha",),
+    )
+    await queries._db.conn.commit()
+    await mgr.reconcile()
+    assert _route_ids(fake) == []
+    assert await mgr.local_route_state("alpha") == "absent"
+
+
+async def test_an_unlocked_app_is_routed_again_on_the_next_reconcile(queries):
+    fake = FakeCaddy()
+    mgr = _proxy(queries, fake)
+    job = await _seed_running(queries, "alpha")
+    await _lock(queries, job)
+    await mgr.reconcile()
+    assert _route_ids(fake) == []
+
+    await _lock(queries, job, hosted_only=False)
+    await mgr.reconcile()
+    assert _route_ids(fake) == ["nerdit-route-alpha"]
+
+
+async def test_deleting_a_hosted_only_share_restores_routes_on_next_reconcile(queries):
+    fake = FakeCaddy()
+    mgr = _proxy(queries, fake)
+    job = await _seed_running(queries, "alpha")
+    await _lock(queries, job)
+    await mgr.reconcile()
+    assert _route_ids(fake) == []
+
+    assert await queries.delete_service_share("alpha") is True
+    await mgr.reconcile()
+    assert _route_ids(fake) == ["nerdit-route-alpha"]
+    assert await mgr.local_route_state("alpha") == "present"
+
+
+@pytest.mark.parametrize(
+    ("case", "enabled", "available", "routes", "routes_status", "pid_alive", "expected"),
+    [
+        ("absent", True, True, [], 200, True, "absent"),
+        ("present_default", True, True, ["nerdit-route-alpha"], 200, True, "present"),
+        ("present_domain_only", True, True, ["nerdit-route-alpha@x.example"], 200, True, "present"),
+        ("unknown_unreadable", True, True, [], 503, True, "unknown"),
+        ("unknown_raises", True, True, [], None, True, "unknown"),
+        ("unknown_unavailable", True, False, [], 200, True, "unknown"),
+        (
+            "disabled_table_readable_present",
+            False,
+            False,
+            ["nerdit-route-alpha"],
+            200,
+            False,
+            "present",
+        ),
+        ("disabled_unreadable_no_pid", False, False, [], 503, False, "absent"),
+        ("disabled_unreadable_live_pid", False, False, [], 503, True, "unknown"),
+        ("prefix_neighbour_absent", True, True, ["nerdit-route-alphabet"], 200, True, "absent"),
+    ],
+)
+async def test_local_route_state(  # noqa: PLR0913 - one parameter per table column
+    queries, case, enabled, available, routes, routes_status, pid_alive, expected
+):
+    fake = FakeCaddy(routes_status=routes_status or 200)
+    fake.routes.extend({"@id": rid, "handle": []} for rid in routes)
+    mgr = _proxy(queries, fake)
+    if not enabled:
+        mgr._settings.enabled = False
+        mgr._binary = None
+    mgr._available = available
+    mgr._pid_alive = lambda: pid_alive  # type: ignore[method-assign]
+    if routes_status is None:
+
+        async def boom():
+            raise RuntimeError("admin down")
+
+        mgr._admin.live_routes = boom  # type: ignore[method-assign]
+    assert await mgr.local_route_state("alpha") == expected, case

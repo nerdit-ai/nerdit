@@ -1257,3 +1257,19 @@ async def test_shutdown_flag_blocks_a_finally_respawn(queries, tmp_path, fake_ls
     # No follow-up task was spawned, so shutdown cannot orphan one.
     assert controller._inflight == {}
     assert "svc-a" not in controller._renudge
+
+
+def test_cutover_skip_reason_vocabulary_is_frozen():
+    """D-P24-8: lot 5 adds no reason; a hosted-only app stays cutover-eligible."""
+    import ast
+    import inspect
+
+    from nerdit.core.cutover import cutover_skip_reason
+
+    tree = ast.parse(inspect.getsource(cutover_skip_reason))
+    returned = {
+        n.value.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Return) and isinstance(n.value, ast.Constant) and n.value.value
+    }
+    assert returned == {"proxy_off", "gpu_bound", "no_verify_signal", "disabled"}

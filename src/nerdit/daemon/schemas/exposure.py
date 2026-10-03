@@ -48,6 +48,13 @@ class PublicUrlEntry(BaseModel):
         default=None,
         description="Domain entries only: the bound name; null on every other kind",
     )
+    hosted_only: bool | None = Field(
+        default=None,
+        description=(
+            "Hosted entries only: true when the share is locked to its hosted URL "
+            "(no local route); null on every other kind"
+        ),
+    )
     # A bolt-on, exactly like `access` and `domain`: one more
     # orthogonal fact about a domain entry, never a widening of `state`.
     # `state` stays the ROUTE fact (does this node serve the name right now);
@@ -87,6 +94,17 @@ class ShareRequest(StrictRequestModel):
     preserve_existing: bool = Field(
         default=False,
         description="Create a missing share, preserving an existing share's access mode atomically",
+    )
+    hosted_only: bool | None = Field(
+        default=None,
+        description=(
+            "true = lock the app to its hosted URL: this machine's proxy keeps no "
+            "local route for it (409 share.hosted_only_conflict while a domain is "
+            "bound, 409 share.hosted_only_no_token when the daemon is reachable "
+            "without a token); false = unlock and restore the local routes; "
+            "omitted = keep the stored lock (unlocked on a new share). Any owner "
+            "token may unlock"
+        ),
     )
 
 
@@ -132,6 +150,15 @@ class ShareView(BaseModel):
             "(P34) The app behind the share: its live status and whether it is "
             "answering. 'ready' is about the LINK, this is about the ORIGIN"
         )
+    )
+    hosted_only: bool = Field(description="(Lot 5) Stored lock: no local proxy route for this app")
+    local_routes: Literal["absent", "present", "unknown"] = Field(
+        description=(
+            "(Lot 5) Observed from the proxy's live table, never inferred: absent = no "
+            "local route serves the app; present = one still does; unknown = the table "
+            "is unreadable, or the daemon is reachable without a token (always unknown "
+            "then)"
+        ),
     )
     # ticket_url: a WP-HC TODO. Minting a cloud navigation ticket needs an
     # authenticated daemon → cloud call that does not exist yet, so the field is

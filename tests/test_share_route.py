@@ -35,6 +35,7 @@ from nerdit.daemon.routes.link import router as link_router
 from nerdit.daemon.routes.share import router as share_router
 from nerdit.daemon.views.hosted import HostedContext, hosted_entry, load_hosted_context
 from nerdit.db.models import ApiToken, Job, JobKind, JobStatus, TokenRole
+from nerdit.db.queries.shares import HostedOnlyConflictError
 from nerdit.db.rows import ServiceShare
 
 LEGACY = "legacy-global"  # noqa: S105 - a test literal
@@ -139,12 +140,13 @@ def _queries(job: Job | None = None, shares: dict[str, ServiceShare] | None = No
     q.list_service_public_addresses = AsyncMock(return_value={})
     q.list_service_hosted_aliases = AsyncMock(return_value={})
 
-    async def _set(
+    async def _set(  # noqa: PLR0913 - mirrors the real keyword-per-column upsert
         name: str,
         access: str,
         *,
         job_id: str,
         preserve_existing: bool = False,
+        hosted_only: bool | None = None,
         alias_node_id: str | None = None,
         alias_host: str | None = None,
     ) -> ServiceShare:
@@ -152,6 +154,13 @@ def _queries(job: Job | None = None, shares: dict[str, ServiceShare] | None = No
         row = ServiceShare(
             service_name=name,
             access=existing.access if existing and preserve_existing else access,
+            # ``None`` keeps the stored lock (unlocked on insert), independent of
+            # ``preserve_existing`` — the real upsert's own CASE.
+            hosted_only=(
+                (existing.hosted_only if existing else False)
+                if hosted_only is None
+                else hosted_only
+            ),
             # The upsert preserves ``created_at`` — "shared since" is a fact
             # about the share, not about the last access flip.
             created_at=existing.created_at if existing else datetime.now(UTC),
@@ -163,6 +172,7 @@ def _queries(job: Job | None = None, shares: dict[str, ServiceShare] | None = No
         return table.pop(name, None) is not None
 
     q.set_service_share = AsyncMock(side_effect=_set)
+    q.get_service_domains = AsyncMock(return_value=[])
     q.delete_service_share = AsyncMock(side_effect=_delete)
     return q
 
@@ -219,13 +229,36 @@ def _link(
     return SimpleNamespace(node_id=node_id, slug=slug, nodes_base_domain=domain, enabled=enabled)
 
 
-def _make_app(
+def _daemon(*, auth_token: str | None = "t", host: str = "127.0.0.1") -> SimpleNamespace:  # noqa: S107 - a test literal
+    return SimpleNamespace(auth_token=auth_token, host=host)
+
+
+class FakeProxyManager:
+    """``app.state.proxy_manager`` as the share route sees it: a deregister log
+    and one canned ``local_route_state`` answer."""
+
+    def __init__(self, state: str = "absent") -> None:
+        self.state = state
+        self.deregistered: list[str] = []
+
+    async def deregister(self, name: str) -> None:
+        self.deregistered.append(name)
+        self.state = "absent"
+
+    async def local_route_state(self, name: str) -> str:
+        return self.state
+
+
+def _make_app(  # noqa: PLR0913 - a test harness knob per fact under test
     queries: AsyncMock,
     *,
     link: SimpleNamespace | None = None,
     manager: object | None = "default",
     with_audit: bool = False,
     with_idempotency: bool = False,
+    daemon: SimpleNamespace | None = None,
+    proxy: SimpleNamespace | None = None,
+    proxy_manager: object | None = None,
 ) -> FastAPI:
     app = FastAPI()
     register_error_handlers(app)
@@ -235,7 +268,13 @@ def _make_app(
     api.include_router(share_router)
     app.include_router(api)
     app.state.queries = queries
-    app.state.settings = SimpleNamespace(link=link if link is not None else _link())
+    app.state.settings = SimpleNamespace(
+        link=link if link is not None else _link(),
+        daemon=daemon if daemon is not None else _daemon(),
+        proxy=proxy,
+    )
+    if proxy_manager is not None:
+        app.state.proxy_manager = proxy_manager
     app.state.link_manager = FakeLinkManager() if manager == "default" else manager
     if with_idempotency:
         app.add_middleware(IdempotencyMiddleware, get_queries=lambda: queries)
@@ -316,6 +355,7 @@ def test_an_admin_may_share_someone_elses_app() -> None:
         "private",
         job_id="svc-1",
         preserve_existing=False,
+        hosted_only=None,
         alias_node_id="00000000-0000-4000-8000-00000000000a",
         alias_host=HOSTED_URL.removeprefix("https://").rstrip("/"),
     )
@@ -368,6 +408,7 @@ def test_sharing_privately_writes_the_row_and_computes_the_url(recorder: AsyncMo
         "private",
         job_id="svc-1",
         preserve_existing=False,
+        hosted_only=None,
         alias_node_id="00000000-0000-4000-8000-00000000000a",
         alias_host=HOSTED_URL.removeprefix("https://").rstrip("/"),
     )
@@ -380,6 +421,7 @@ def test_sharing_privately_writes_the_row_and_computes_the_url(recorder: AsyncMo
         "service": "demo",
         "access": "private",
         "consent": False,
+        "hosted_only": False,
     }
 
     ((_, kwargs),) = _events(recorder)
@@ -417,6 +459,7 @@ def test_private_preview_preserves_existing_access(existing, recorder: AsyncMock
         "private",
         job_id="svc-1",
         preserve_existing=True,
+        hosted_only=None,
         alias_node_id="00000000-0000-4000-8000-00000000000a",
         alias_host=HOSTED_URL.removeprefix("https://").rstrip("/"),
     )
@@ -715,6 +758,7 @@ def test_share_reads_go_dark_in_the_unlink_before_restart_window(tmp_path: Path)
     )
     app.state.config_store = ConfigStore(config_path)
     app.state.settings = SimpleNamespace(
+        daemon=_daemon(),
         data_dir=str(tmp_path / "data"),
         link=LinkSettings(
             enabled=True,
@@ -946,6 +990,223 @@ def test_origin_is_additive_and_leaves_every_pre_p34_field_intact() -> None:
         .json()
     )
 
-    assert set(body) == {"service_name", "access", "url", "state", "created_at", "origin"}
+    assert set(body) == {
+        "service_name",
+        "access",
+        "url",
+        "state",
+        "created_at",
+        "origin",
+        "hosted_only",
+        "local_routes",
+    }
     assert body["access"] == "public"
     assert body["state"] == "ready"
+
+
+# ---------------------------------------------------------------------------
+# lot 5 — hosted_only
+# ---------------------------------------------------------------------------
+
+
+def _locked(access: str = "private") -> dict[str, ServiceShare]:
+    return {"demo": ServiceShare(service_name="demo", access=access, hosted_only=True)}
+
+
+def test_put_hosted_only_deregisters_inline() -> None:
+    q = _queries(_svc())
+    pm = FakeProxyManager(state="present")
+
+    response = _put(_client(q, proxy_manager=pm), hosted_only=True)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["hosted_only"] is True
+    assert response.json()["local_routes"] == "absent"
+    assert pm.deregistered == ["demo"]
+    assert q.set_service_share.await_args.kwargs["hosted_only"] is True
+
+
+def test_hosted_only_none_keeps_the_stored_lock() -> None:
+    q = _queries(_svc(), shares=_locked())
+    pm = FakeProxyManager()
+
+    response = _put(_client(q, proxy_manager=pm))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["hosted_only"] is True
+    assert q.set_service_share.await_args.kwargs["hosted_only"] is None
+    # The stored lock still holds, so the inline purge runs again (idempotent).
+    assert pm.deregistered == ["demo"]
+
+
+def test_hosted_only_conflict_when_a_domain_is_bound() -> None:
+    q = _queries(_svc())
+    # The writer refuses under its own write lock; the route only maps it.
+    q.set_service_share = AsyncMock(side_effect=HostedOnlyConflictError(["app.example.com"]))
+
+    response = _put(_client(q), hosted_only=True)
+
+    assert response.status_code == 409, response.text
+    body = response.json()
+    assert body["code"] == "share.hosted_only_conflict"
+    assert body["domains"] == ["app.example.com"]
+    assert "nerdit domains remove demo" in body["hint"]
+    q.set_service_share.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("host", "proxy"),
+    [
+        ("0.0.0.0", None),  # noqa: S104 - the exposure under test
+        ("192.168.1.20", None),
+        ("127.0.0.1", SimpleNamespace(enabled=True, dashboard_apex=True, mode="path")),
+    ],
+    ids=["host_0.0.0.0", "host_lan_ip", "apex_path_mode"],
+)
+def test_hosted_only_refused_without_token(host: str, proxy: SimpleNamespace | None) -> None:
+    q = _queries(_svc())
+    client = _client(q, daemon=_daemon(auth_token=None, host=host), proxy=proxy)
+
+    response = _put(client, hosted_only=True)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "share.hosted_only_no_token"
+    assert "auth_token" in response.json()["hint"]
+    q.set_service_share.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [None, SimpleNamespace(enabled=True, dashboard_apex=True, mode="subdomain")],
+    ids=["loopback", "subdomain_apex"],
+)
+def test_hosted_only_allowed_without_token_on_loopback_or_subdomain_apex(
+    proxy: SimpleNamespace | None,
+) -> None:
+    q = _queries(_svc())
+    client = _client(
+        q,
+        daemon=_daemon(auth_token=None, host="127.0.0.1"),
+        proxy=proxy,
+        proxy_manager=FakeProxyManager(),
+    )
+
+    response = _put(client, hosted_only=True)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["local_routes"] == "absent"
+
+
+def test_hosted_only_allowed_with_a_token() -> None:
+    q = _queries(_svc())
+    apex = SimpleNamespace(enabled=True, dashboard_apex=True, mode="path")
+    client = _client(q, daemon=_daemon(host="0.0.0.0"), proxy=apex)  # noqa: S104
+
+    response = _put(client, hosted_only=True)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["hosted_only"] is True
+
+
+def test_token_less_exposure_reports_local_routes_unknown() -> None:
+    """D10: whatever Caddy says, a lock anyone can lift is not confirmed."""
+    q = _queries(_svc(), shares=_locked())
+    client = _client(
+        q,
+        daemon=_daemon(auth_token=None, host="0.0.0.0"),
+        proxy_manager=FakeProxyManager(),  # noqa: S104
+    )
+
+    body = client.get("/api/services/demo/share", headers=_auth()).json()
+
+    assert body["hosted_only"] is True
+    assert body["local_routes"] == "unknown"
+
+
+def test_get_share_reports_local_routes_present_while_caddy_serves() -> None:
+    q = _queries(_svc(), shares=_locked())
+    client = _client(q, proxy_manager=FakeProxyManager(state="present"))
+
+    body = client.get("/api/services/demo/share", headers=_auth()).json()
+
+    assert body["local_routes"] == "present"
+
+
+def test_put_lock_reports_unknown_when_the_live_table_is_unreadable() -> None:
+    class _Unreadable(FakeProxyManager):
+        async def deregister(self, name: str) -> None:
+            self.deregistered.append(name)  # the purge cannot confirm anything
+
+    q = _queries(_svc())
+    pm = _Unreadable(state="unknown")
+
+    response = _put(_client(q, proxy_manager=pm), hosted_only=True)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["local_routes"] == "unknown"
+    assert pm.deregistered == ["demo"]
+
+
+def test_local_routes_unknown_without_a_proxy_manager() -> None:
+    """D19: nothing to ask is never `absent` (fail closed)."""
+    q = _queries(_svc(), shares=_locked())
+
+    body = _client(q).get("/api/services/demo/share", headers=_auth()).json()
+
+    assert body["local_routes"] == "unknown"
+    assert _put(_client(q), hosted_only=True).json()["local_routes"] == "unknown"
+
+
+def test_local_route_unlock_reports_hosted_only_false() -> None:
+    q = _queries(_svc(), shares=_locked())
+    pm = FakeProxyManager()
+
+    response = _put(_client(q, proxy_manager=pm), hosted_only=False)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["hosted_only"] is False
+    # Unlock is not purged or routed inline: the next reconcile restores routes.
+    assert pm.deregistered == []
+
+
+def test_delete_share_of_a_locked_app_is_unchanged() -> None:
+    q = _queries(_svc(), shares=_locked())
+    pm = FakeProxyManager()
+
+    response = _client(q, proxy_manager=pm).delete("/api/services/demo/share", headers=_auth())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"service_name": "demo", "removed": True}
+    assert pm.deregistered == []
+
+
+def test_audit_params_carry_hosted_only_boolean_only() -> None:
+    q = _queries(_svc())
+
+    response = _put(_client(q, with_audit=True), hosted_only=True)
+
+    assert response.status_code == 200, response.text
+    params = json.loads(q.insert_audit_log.await_args.kwargs["params_redacted"])
+    assert params == {"service": "demo", "access": "private", "consent": False, "hosted_only": True}
+
+
+def test_hosted_only_refusals_carry_no_secret() -> None:
+    """Neither 409 body, hint nor audit row ever names a token value."""
+    q = _queries(_svc())
+    exposed = _client(q, with_audit=True, daemon=_daemon(auth_token=None, host="0.0.0.0"))  # noqa: S104
+    no_token = _put(exposed, hosted_only=True)
+
+    q2 = _queries(_svc())
+    q2.set_service_share = AsyncMock(side_effect=HostedOnlyConflictError(["app.example.com"]))
+    conflict = _put(
+        _client(q2, with_audit=True, daemon=_daemon(auth_token=LEGACY)), hosted_only=True
+    )
+
+    assert no_token.status_code == conflict.status_code == 409
+    audit_rows = [
+        c.kwargs["params_redacted"]
+        for c in (*q.insert_audit_log.await_args_list, *q2.insert_audit_log.await_args_list)
+    ]
+    for text in (no_token.text, conflict.text, *audit_rows):
+        for secret in (LEGACY, SUB_RAW):
+            assert secret not in text
