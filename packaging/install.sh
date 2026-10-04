@@ -478,12 +478,48 @@ fi
 #      license file override can put state outside the tree the template wipes,
 #      and an operator's real node is never wiped by mistake.
 #      Every tree 12a deletes is checked, and so is a leftover unit or drop-in
-#      dir: section 8 would arm the cleanup trap's restart on it, and a stale
-#      drop-in can move User=/HOME= outside the wiped tree.
-if [ "$TEMPLATE" = 1 ] && { [ "$IS_UPDATE" = 1 ] || [ -e "$UNIT_HOME/.nerdit" ] ||
+#      dir: a stale drop-in can move User=/HOME= outside the wiped tree.
+#      One exception, a sealed template moved to a new version: the fork-safe
+#      drop-in present, the unit a plain file (a masked one is a /dev/null
+#      link) neither enabled nor active, and only this
+#      installer's drop-ins (dotfiles counted), none of them nor their dir a
+#      link (section 10 writes through it as root). The state trees are checked
+#      either way. Inline systemctl: unit_active is defined further down.
+SEALED=0
+if [ "$TEMPLATE" = 1 ] && [ "$IS_UPDATE" = 1 ] && [ -f "$UNIT_DST.d/10-fork-safe.conf" ] &&
+	[ ! -L "$UNIT_DST.d" ] && [ -f "$UNIT_DST" ] && [ ! -L "$UNIT_DST" ] &&
+	! systemctl is-enabled --quiet nerdit.service 2>/dev/null &&
+	! systemctl is-active --quiet nerdit.service 2>/dev/null; then
+	SEALED=1
+	for _f in "$UNIT_DST.d"/* "$UNIT_DST.d"/.[!.]* "$UNIT_DST.d"/..?*; do
+		[ -e "$_f" ] || [ -L "$_f" ] || continue
+		[ -L "$_f" ] && SEALED=0
+		case "${_f##*/}" in
+		10-fork-safe.conf | 20-docker0.conf | 30-deny-inbound.conf) ;;
+		*) SEALED=0 ;;
+		esac
+	done
+fi
+# systemd's own view too, sealed or fresh: a unit or drop-in in another load
+# path (/run, /usr/lib, /usr/local/lib) can move HOME= just the same. A failed
+# query refuses.
+FOREIGN=0
+if [ "$TEMPLATE" = 1 ]; then
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	_f=$(systemctl show -p FragmentPath --value nerdit.service 2>/dev/null) || FOREIGN=1
+	[ -z "$_f" ] || [ "$_f" = "$UNIT_DST" ] || FOREIGN=1
+	_d=$(systemctl show -p DropInPaths --value nerdit.service 2>/dev/null) || FOREIGN=1
+	for _f in $_d; do
+		case "$_f" in
+		"$UNIT_DST.d"/*) ;;
+		*) FOREIGN=1 ;;
+		esac
+	done
+fi
+if [ "$TEMPLATE" = 1 ] && { [ "$FOREIGN" = 1 ] || [ -e "$UNIT_HOME/.nerdit" ] ||
 	[ -e "$UNIT_HOME/.local/share/caddy" ] || [ -e "$UNIT_HOME/.config/caddy" ] ||
-	[ -e "$UNIT_DST" ] || [ -e "$UNIT_DST.d" ]; }; then
-	die "template needs a clean image: nerdit is already installed, a nerdit unit exists, or $UNIT_HOME/.nerdit, $UNIT_HOME/.local/share/caddy or $UNIT_HOME/.config/caddy exists."
+	{ [ "$SEALED" = 0 ] && { [ "$IS_UPDATE" = 1 ] || [ -e "$UNIT_DST" ] || [ -e "$UNIT_DST.d" ]; }; }; }; then
+	die "template needs a clean image or a sealed template: nerdit is already installed, a nerdit unit exists, or $UNIT_HOME/.nerdit, $UNIT_HOME/.local/share/caddy or $UNIT_HOME/.config/caddy exists. A sealed template also needs its unit a plain file, disabled and inactive, and only this installer's drop-ins, none a link, in $UNIT_DST.d. systemd must load no nerdit unit or drop-in from any other path."
 fi
 # (e3) a sealed template (fork-safe drop-in present, unit disabled) is never
 #      updated in place: the update would enable and start it, minting keys
@@ -646,6 +682,7 @@ VDIR=""
 OLD_VDIR=""
 SERVICE_STOPPED=0
 SWAP_DONE=0
+UNIT_STARTED=0
 
 cleanup() {
 	_rc=$?
@@ -667,12 +704,17 @@ cleanup() {
 	# new one should. Several steps still fail AFTER SWAP_DONE=1 (a read-only
 	# /usr or /etc, a full disk, a tarball missing units/) and gating the
 	# restart on it left the daemon stopped with nothing said.
-	if [ "$_rc" -ne 0 ] && [ "$SERVICE_STOPPED" -eq 1 ]; then
+	# Never on a template: starting it there mints keys every fork would share.
+	if [ "$_rc" -ne 0 ] && [ "$SERVICE_STOPPED" -eq 1 ] && [ "$TEMPLATE" = 0 ]; then
 		echo "error: restarting the nerdit service that was stopped for this install" >&2
 		start_unit || true
 	fi
 	if [ "$_rc" -ne 0 ] && [ "$TEMPLATE" = 1 ]; then
-		echo "error: template build failed; this image may hold per-node state and is NOT fork-safe. Discard it and start again from a clean image (a rerun here is refused)." >&2
+		# The health proof enabled and started it; a failure after that must
+		# not leave it running (Restart=on-failure) or enabled at boot. Only
+		# then: before it, a unit systemd loads is not this run's to stop.
+		[ "$UNIT_STARTED" = 0 ] || systemctl disable --now nerdit.service >/dev/null 2>&1 || true
+		echo "error: template build failed; this image may hold per-node state and is NOT fork-safe. If a rerun is refused, rebuild from a clean image." >&2
 	fi
 	if [ -n "$STAGING" ]; then
 		rm -rf "$STAGING"
@@ -879,6 +921,7 @@ if [ "$TEMPLATE" = 1 ]; then
 	chmod 644 "$UNIT_DST.d/30-deny-inbound.conf"
 fi
 
+UNIT_STARTED=1
 start_unit
 if [ "$MODE" != system ] && [ "$OS" != macos ]; then
 	say "run 'loginctl enable-linger $UNIT_USER' so the daemon keeps running after you log out."

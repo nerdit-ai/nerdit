@@ -28,10 +28,10 @@ def _route_cell(route: object) -> str:
 def _live_cell(live: object, reason: object = None) -> str:
     """Render the live-Caddy annotation; `None` ⇒ `-` (unknown, not "no")."""
     if reason == "hosted_only":
-        # `None` is still unknown here: the lock is an intent, and the proxy may
-        # keep serving a route the deregistration never reached.
+        # `None` is still unknown here (table unreadable or proxy off): the lock
+        # is an intent, and a route the deregistration never reached may live on.
         if live is None:
-            return "hosted only [yellow](proxy table unreadable)[/yellow]"
+            return "hosted only [yellow](live state unknown)[/yellow]"
         still_live = isinstance(live, dict) and live.get("registered")
         return "hosted only" + (" [yellow](route still live)[/yellow]" if still_live else "")
     if live is None:

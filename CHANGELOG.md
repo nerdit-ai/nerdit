@@ -4,6 +4,24 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.8.1 (2026-10-04)
+
+A VM template can be moved to a new version without rebuilding it.
+
+### Install
+
+- **Reinstall on a sealed template.** `install.sh --template --version x.y.z`
+  now runs on a template that was sealed and never started, so the image keeps
+  its identity across versions. It is refused when the template was started,
+  holds machine state, or carries a unit or drop-in the installer did not
+  write. A plain update of a sealed template is still refused.
+
+### Fixes
+
+- **Locked apps in the routes table.** When the proxy's live table cannot be
+  read, or the proxy is off, a hosted-only app shows `hosted only (live state
+  unknown)` instead of reporting a read failure.
+
 ## 0.8.0 (2026-10-03)
 
 A shared app can be locked to its hosted link, and managed databases and

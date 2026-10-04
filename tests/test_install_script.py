@@ -1408,8 +1408,9 @@ class TestTemplate:
         disable = text.index("systemctl disable --now", block)
         wipe = text.index('rm -rf "$UNIT_HOME/.nerdit"', block)
         assert disable < wipe < text.index("\texit 0\n", block)
-        # The clean-image refusal covers updates too, and precedes every mutation.
-        assert '[ "$TEMPLATE" = 1 ] && { [ "$IS_UPDATE" = 1 ]' in text
+        # The clean-image refusal covers updates of all but a sealed template,
+        # and precedes every mutation.
+        assert '{ [ "$SEALED" = 0 ] && { [ "$IS_UPDATE" = 1 ]' in text
         assert text.index("template needs a clean image") < text.index('mkdir -p "')
         # So does the refusal to update a sealed template in place.
         assert text.index("this is a sealed VM template") < text.index('mkdir -p "')
@@ -1525,3 +1526,185 @@ class TestTemplate:
         assert proc.returncode == 1, proc.stdout + proc.stderr
         assert "template needs a clean image" in proc.stderr
         assert (rig.home / ".config" / "caddy").exists()
+
+
+# The sealed-template exception to e2 and the cleanup trap, driven on their own
+# like the scrub: a full template run writes /opt and /etc.
+_DROP_INS = ("10-fork-safe.conf", "20-docker0.conf", "30-deny-inbound.conf")
+
+
+def _between(start: str, end: str) -> str:
+    text = _script_text()
+    i = text.index(start)
+    return text[i : text.index(end, i)]
+
+
+def _systemctl_stub(binn: Path, log: Path, state: Path) -> None:
+    """is-enabled/is-active/show answer from marker files in `state`."""
+    _write_exe(
+        binn / "systemctl",
+        "#!/bin/sh\n"
+        f'echo "systemctl $*" >> "{log}"\n'
+        'case "$1" in\n'
+        f'  is-enabled) [ -f "{state}/enabled" ] ;;\n'
+        f'  is-active) [ -f "{state}/active" ] ;;\n'
+        f'  show) case "$*" in *FragmentPath*) cat "{state}/fragment" ;; '
+        f'*) cat "{state}/dropins" ;; esac ;;\n'
+        "esac\n",
+    )
+
+
+def _run_guards(  # noqa: PLR0913
+    tmp_path: Path,
+    *,
+    template: str = "1",
+    enabled: bool = False,
+    active: bool = False,
+    extra: tuple[str, ...] = (),
+    state_dir: str = "",
+    unit_state: str = "file",
+    link: str = "",
+    fragment: str = "",
+    foreign_drop_in: str = "",
+) -> subprocess.CompletedProcess:
+    """Guards e2 and e3 on a sealed, scrubbed template (an update)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    if state_dir:
+        (home / state_dir).mkdir(parents=True)
+    unit = tmp_path / "nerdit.service"
+    if unit_state == "file":
+        unit.write_text("[Service]\n")
+    elif unit_state == "masked":
+        unit.symlink_to("/dev/null")
+    drop_dir = tmp_path / ("other.d" if link == "dir" else "nerdit.service.d")
+    drop_dir.mkdir()
+    for name in (*_DROP_INS, *extra):
+        (drop_dir / name).write_text("[Service]\n")
+    if link == "dir":
+        (tmp_path / "nerdit.service.d").symlink_to(drop_dir)
+    elif link == "file":
+        (drop_dir / _DROP_INS[0]).rename(tmp_path / "target.conf")
+        (drop_dir / _DROP_INS[0]).symlink_to(tmp_path / "target.conf")
+    binn = tmp_path / "bin"
+    binn.mkdir()
+    for flag, name in ((enabled, "enabled"), (active, "active")):
+        if flag:
+            (tmp_path / name).touch()
+    if fragment != "unreadable":  # the stub's cat then fails, like a failed query
+        (tmp_path / "fragment").write_text(fragment or str(unit))
+    (tmp_path / "dropins").write_text(
+        " ".join([*(f"{tmp_path}/nerdit.service.d/{n}" for n in _DROP_INS), foreign_drop_in])
+    )
+    _systemctl_stub(binn, tmp_path / "calls.log", tmp_path)
+    script = tmp_path / "guards.sh"
+    script.write_text(
+        "set -eu\n"
+        'die() { echo "error: $*" >&2; exit 1; }\n'
+        f"TEMPLATE={template}\nIS_UPDATE=1\nUNIT_DST='{unit}'\nUNIT_HOME='{home}'\n"
+        + _between("SEALED=0\n", "# (f) link inputs")
+        + "echo PASSED\n"
+    )
+    return subprocess.run(
+        ["sh", str(script)],
+        env={"PATH": f"{binn}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+
+
+class TestSealedTemplateBump:
+    def test_a_sealed_scrubbed_template_passes_the_guards(self, tmp_path):
+        proc = _run_guards(tmp_path)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == "PASSED\n"
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"enabled": True},
+            {"active": True},
+            {"state_dir": ".nerdit"},
+            {"state_dir": ".local/share/caddy"},
+            {"state_dir": ".config/caddy"},
+            {"extra": ("40-user.conf",)},
+            {"extra": (".hidden.conf",)},
+        ],
+        ids=["enabled", "active", "nerdit", "caddy-data", "caddy-config", "drop-in", "dotfile"],
+    )
+    def test_anything_short_of_sealed_and_scrubbed_is_refused(self, tmp_path, kwargs):
+        proc = _run_guards(tmp_path, **kwargs)
+        assert proc.returncode == 1
+        assert "template needs a clean image" in proc.stderr
+        assert "A sealed template also needs its unit a plain file" in proc.stderr
+        assert "PASSED" not in proc.stdout
+
+    # A masked unit would have section 10 write and chmod /dev/null, and a
+    # missing one would rebuild the unit for the invoking user, not User=.
+    @pytest.mark.parametrize("unit_state", ["masked", "missing"])
+    def test_a_masked_or_missing_unit_file_is_refused(self, tmp_path, unit_state):
+        proc = _run_guards(tmp_path, unit_state=unit_state)
+        assert proc.returncode == 1
+        assert "template needs a clean image" in proc.stderr
+
+    # Section 10 writes the drop-ins as root through any link.
+    @pytest.mark.parametrize("link", ["dir", "file"])
+    def test_a_symlinked_drop_in_dir_or_file_is_refused(self, tmp_path, link):
+        proc = _run_guards(tmp_path, link=link)
+        assert proc.returncode == 1
+        assert "template needs a clean image" in proc.stderr
+
+    # systemd loads units and drop-ins from /run and /usr/lib too.
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"foreign_drop_in": "/run/systemd/system/nerdit.service.d/home.conf"},
+            {"fragment": "/usr/lib/systemd/system/nerdit.service"},
+        ],
+    )
+    def test_a_unit_or_drop_in_from_another_load_path_is_refused(self, tmp_path, kwargs):
+        proc = _run_guards(tmp_path, **kwargs)
+        assert proc.returncode == 1
+        assert "from any other path" in proc.stderr
+
+    def test_a_failed_systemd_query_is_refused(self, tmp_path):
+        proc = _run_guards(tmp_path, fragment="unreadable")
+        assert proc.returncode == 1
+
+    def test_a_plain_update_of_a_sealed_template_is_still_refused(self, tmp_path):
+        proc = _run_guards(tmp_path, template="0")
+        assert proc.returncode == 1
+        assert "this is a sealed VM template" in proc.stderr
+
+    @pytest.mark.parametrize(("template", "started"), [("0", "1"), ("1", "1"), ("1", "0")])
+    def test_a_failed_run_restarts_the_unit_except_on_a_template(self, tmp_path, template, started):
+        binn = tmp_path / "bin"
+        binn.mkdir()
+        log = tmp_path / "calls.log"
+        _systemctl_stub(binn, log, tmp_path)
+        script = tmp_path / "trap.sh"
+        script.write_text(
+            "set -eu\n"
+            "OS=linux\nMODE=system\nEUID_NOW=0\n"
+            f"TEMPLATE={template}\nSERVICE_STOPPED=1\nSWAP_DONE=1\nUNIT_STARTED={started}\n"
+            'OLD_VDIR=""\nVDIR=""\nSTAGING=""\nTMP=""\n'
+            + _between("stop_unit() {", "\n# Run ")
+            + _between("cleanup() {", "\ntrap cleanup EXIT")
+            + "\ntrap cleanup EXIT\nfalse\n"
+        )
+        proc = subprocess.run(
+            ["sh", str(script)],
+            env={"PATH": f"{binn}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 1
+        calls = log.read_text() if log.exists() else ""
+        if template == "0":
+            assert "systemctl restart nerdit.service" in calls
+            return
+        assert "systemctl enable" not in calls and "systemctl restart" not in calls
+        # A failure after the health proof's start_unit leaves no unit running.
+        # Before it, a unit systemd loads is not this run's to stop.
+        assert ("systemctl disable --now nerdit.service" in calls) == (started == "1")
+        assert "If a rerun is refused, rebuild from a clean image." in proc.stderr

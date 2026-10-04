@@ -528,5 +528,5 @@ def test_routes_live_cell_names_a_hosted_only_app():
 
     assert _live_cell({"registered": False}, "hosted_only") == "hosted only"
     assert "route still live" in _live_cell({"registered": True}, "hosted_only")
-    assert "unreadable" in _live_cell(None, "hosted_only")
+    assert "unknown" in _live_cell(None, "hosted_only")
     assert _live_cell({"registered": True, "dial_matches": True}) == "ok"

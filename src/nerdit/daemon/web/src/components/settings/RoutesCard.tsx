@@ -43,7 +43,7 @@ function LiveCell({ live, reason }: { live: RouteItem["live"]; reason: RouteItem
       <span className="text-muted-foreground">
         hosted only
         {live === null ? (
-          <span className="text-warning-foreground"> (proxy table unreadable)</span>
+          <span className="text-warning-foreground"> (live state unknown)</span>
         ) : live.registered ? (
           <span className="text-warning-foreground"> (route still live)</span>
         ) : null}
