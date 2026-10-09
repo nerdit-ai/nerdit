@@ -50,6 +50,8 @@ _EXPECTED_TAGS = {
     "Exposure",
     # (P40b / D-P40-10) The project noun, one tag, registered last.
     "Projects",
+    # The machine AI gateway: aliases, virtual keys, usage.
+    "AI Gateway",
 }
 
 
@@ -313,6 +315,7 @@ def test_p25_operation_ids_are_present(schema: dict) -> None:
     quartet takes it to 86; the P40c variable quartet to 90; P40d's
     ``apply_project`` to 91; P41b's discovery and address binding to 93;
     P41d's project logs and diagnosis to 95; P41e's rename to 96.
+    The AI gateway adds seven: 103.
     """
     op_ids = {op.get("operationId") for _, _, op in _operations(schema)}
     expected = {"get_self_token", "rotate_self_token"}
@@ -321,7 +324,7 @@ def test_p25_operation_ids_are_present(schema: dict) -> None:
     assert {"get_link_project", "push_link_public_address"} <= op_ids
     assert {"project_logs", "diagnose_project"} <= op_ids
     assert "rename_project" in op_ids
-    assert len(op_ids) == 96
+    assert len(op_ids) == 103  # + the seven AI gateway operations
 
 
 def test_p40b_operation_ids_are_present(schema: dict) -> None:
@@ -499,3 +502,19 @@ def test_batch_operation_ids_are_gone(schema: dict) -> None:
     op_ids = {op.get("operationId") for _, _, op in _operations(schema)}
     resurrected = op_ids & _REMOVED_BATCH_OPERATION_IDS
     assert not resurrected, f"Removed batch operationIds are back: {sorted(resurrected)}"
+
+
+def test_ai_gateway_operation_ids_are_present(schema: dict) -> None:
+    """The AI gateway's seven operations keep their pinned ids, under `AI Gateway`."""
+    expected = {
+        "get_ai_gateway",
+        "list_ai_routes",
+        "set_ai_route",
+        "remove_ai_route",
+        "list_ai_gateway_keys",
+        "revoke_ai_gateway_keys",
+        "get_ai_usage",
+    }
+    ops = {op.get("operationId"): op for _, _, op in _operations(schema)}
+    assert expected <= set(ops)
+    assert all(ops[op_id]["tags"] == ["AI Gateway"] for op_id in expected)

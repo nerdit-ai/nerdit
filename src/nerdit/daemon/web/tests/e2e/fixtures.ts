@@ -596,6 +596,7 @@ export interface MockOverrides {
   rollbackResponse?: { status: number; body: unknown };
   /** Role returned by GET /api/auth/check (drives admin-only UI). Default "admin". */
   authRole?: string;
+  authMode?: "token" | "local" | "tunnel";
   /** AppConfigView returned by GET /api/config/apps/:name (ETag from `.etag`). */
   appConfig?: any;
   /**
@@ -666,7 +667,7 @@ export interface MockHandle {
   projectCalls: string[];
 }
 
-const TOKEN = "test-token-1234567890abcdef";
+export const TOKEN = "test-token-1234567890abcdef";
 
 function json(route: Route, body: unknown, status = 200) {
   return route.fulfill({
@@ -734,9 +735,13 @@ export async function mockApi(page: Page, overrides: MockOverrides = {}): Promis
     });
   });
 
-  await page.route("**/api/auth/check", (route) =>
-    json(route, { ok: true, role: overrides.authRole ?? "admin" })
-  );
+  await page.route("**/api/auth/check", (route) => {
+    const mode = overrides.authMode ?? "token";
+    if (mode === "token" && !route.request().headers().authorization) {
+      return route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ code: "unauthenticated" }) });
+    }
+    return json(route, { ok: true, role: overrides.authRole ?? "admin", mode });
+  });
   await page.route("**/api/health", (route) =>
     json(route, { status: "ok", gpu_count: gpus.length, version: "0.3.0" })
   );
@@ -1301,10 +1306,7 @@ export async function loginAsToken(page: Page): Promise<void> {
   await page.goto("/login");
   await page.fill("#token-input", TOKEN);
   await page.getByRole("button", { name: /sign in/i }).click();
-  // Sign-in is async (await /auth/check → storeToken → redirect). Wait for the
-  // token to actually persist before returning, so a caller's immediate
-  // page.goto() to a protected route can't win the race and bounce to /login.
-  await page.waitForFunction(() =>
-    Boolean(sessionStorage.getItem("nerdit.token") || localStorage.getItem("nerdit.token"))
-  );
+  // The destination authenticates again before mounting its shell and keyboard
+  // handlers. Stored credentials alone do not mean the UI is ready to interact.
+  await page.getByRole("main").waitFor({ state: "visible" });
 }

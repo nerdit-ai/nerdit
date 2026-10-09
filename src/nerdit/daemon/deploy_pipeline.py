@@ -85,6 +85,7 @@ from nerdit.daemon.secret_scope import (
     name_taken_error,
     project_owned_by_caller,
     project_owned_error,
+    seat_taken_error,
 )
 from nerdit.daemon.views.hosted import load_hosted_context
 from nerdit.daemon.views.service import (
@@ -319,7 +320,9 @@ _DEPLOY_SHAPE_HINT = (
 #: the judged project row (`None` only on a dry run of a project that does not
 #: exist yet -- a dry run creates nothing), the service name inside it, and its
 #: already validated `[services.<svc>]` table. A tuple, not a model (D-P40-12).
-DeclaredService = tuple[Project | None, str, dict]
+#: A `None` table is a deploy that JOINS the project from an ordinary repo
+#: (deploy_into_project_v1): the triple is set, the repo's own `[deploy]` stands.
+DeclaredService = tuple[Project | None, str, dict | None]
 
 
 def use_apply_error() -> NerditError:
@@ -346,21 +349,26 @@ def reject_foreign_label(
     """
     if declared is None or existing is None:
         return
-    joined, service, _ = declared
+    joined, service, table = declared
+    if table is None:
+        # A join (deploy_into_project_v1) CREATES its seat: a row that appeared
+        # between the pre-clone check and this reread (a concurrent join under
+        # another idempotency key) is taken, never silently redeployed.
+        raise seat_taken_error(label)
     if joined is None or existing.project_id != joined.id or existing.service != service:
         raise name_taken_error(label)
 
 
-def _deploy_section_source(project: dict, declared: DeclaredService | None) -> dict:
+def _deploy_section_source(project: dict, table: dict | None) -> dict:
     """The parsed `nerdit.toml` a deploy reads its `[deploy]` defaults from (D-P40-12).
 
     Here, not per route: every legacy ingress (ZIP, git, workspace, template,
-    recorded-source redeploy) reads the file at this one seam, before any
-    write, and refuses a declaration. For `apply_project` the table the route
-    validated BEFORE this context existed stands in for `[deploy]`; `[ai.*]` /
-    `[db.*]` stay the file's own.
+    recorded-source redeploy) and a project join read the file at this one
+    seam, before any write, and refuse a declaration. For `apply_project` the
+    `table` the route validated BEFORE this context existed stands in for
+    `[deploy]`; `[ai.*]` / `[db.*]` stay the file's own.
     """
-    if declared is None:
+    if table is None:
         # ponytail: this also refuses `POST /deploy/{name}/redeploy` and the
         # GitWatch poll of a git-applied service (re-apply is its redeploy);
         # teach the recorded-source path to pick the row's own table if
@@ -370,11 +378,11 @@ def _deploy_section_source(project: dict, declared: DeclaredService | None) -> d
         return project
     return {
         key: value for key, value in project.items() if key not in ("project", "services", "vars")
-    } | {"deploy": declared[2]}
+    } | {"deploy": table}
 
 
 def _nested_project_toml(
-    selected: Path, declared: DeclaredService | None
+    selected: Path, table: dict | None
 ) -> tuple[dict, tomllib.TOMLDecodeError | UnicodeDecodeError | None]:
     """The `nerdit.toml` of a `build_settings.subdir` context, as far as it counts.
 
@@ -385,7 +393,7 @@ def _nested_project_toml(
     A legacy ingress keeps nested-wins, and its nested file goes through the
     same `deploy.use_apply` seam as the root one.
     """
-    if declared is not None:
+    if table is not None:
         return {}, None
     nested, error = _read_project_toml(selected)
     return _deploy_section_source(nested, None), error
@@ -1573,8 +1581,9 @@ async def _finalize_deploy(
 ) -> dict:
     """Validate a prepared build context and create or update its service row.
 
-    `declared` is set by `apply_project` only: the service's validated
-    `[services.<svc>]` table stands in for `[deploy]`, a fresh row is born with
+    `declared` is set by `apply_project` (the service's validated
+    `[services.<svc>]` table stands in for `[deploy]`) and by a project join
+    (`None` table: the repo's own `[deploy]` stands): a fresh row is born with
     the project triple, and a row on the label that is not this project's
     service is 409 `service.name_taken`. Every other ingress passes `None` and
     refuses a declaration file (422 `deploy.use_apply`) before any write.
@@ -1621,7 +1630,10 @@ async def _finalize_deploy(
         prev_failure = _failure_detail(existing) if existing is not None else None
 
         project, project_error = _read_project_toml(context_dir)
-        project = _deploy_section_source(project, declared)
+        # A join (`None` table) reads the repo like a legacy ingress: its own
+        # `[deploy]`, nested-wins, auto_deploy allowed (its redeploy re-clones).
+        table = declared[2] if declared is not None else None
+        project = _deploy_section_source(project, table)
         zip_deploy, unknown_deploy_keys = _parse_deploy_defaults(project, name)
         # Legacy explicit start is also a request override; nested membership wins,
         # including null reset. Clients must not promote repository defaults here.
@@ -1634,7 +1646,7 @@ async def _finalize_deploy(
         if selected != context_dir:
             root_settings = zip_deploy.get("build_settings") or {}
             context_dir = selected
-            nested, nested_error = _nested_project_toml(context_dir, declared)
+            nested, nested_error = _nested_project_toml(context_dir, table)
             project_error = project_error or nested_error
             # Preserve root auth, bindings and deployment defaults. The selected
             # app may explicitly replace sections or override deploy keys.
@@ -1656,7 +1668,7 @@ async def _finalize_deploy(
             # A declared service can never auto-deploy (its recorded-source
             # redeploy answers `deploy.use_apply`), so converting a legacy git
             # row must not carry the flag forward and leave GitWatch polling it.
-            zip_deploy=zip_deploy if declared is None else {**zip_deploy, "auto_deploy": False},
+            zip_deploy=zip_deploy if table is None else {**zip_deploy, "auto_deploy": False},
             existing=existing,
             prev_cfg=prev_cfg,
         )

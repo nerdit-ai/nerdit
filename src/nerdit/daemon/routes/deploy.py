@@ -29,6 +29,7 @@ from nerdit.core.gitsource import (
     git_source_meta,
 )
 from nerdit.core.jobconfig import parse_job_config
+from nerdit.core.project_identity import PRODUCTION, SERVICE_NAME_RE, service_label
 from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import (
     current_principal,
@@ -50,10 +51,14 @@ from nerdit.daemon.deploy_pipeline import (
 )
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.routes.services import reject_reserved_name
+from nerdit.daemon.schemas.deploy import ServiceTarget
 from nerdit.daemon.secret_scope import (
     claim_owned_by_caller,
+    lookup_project,
     project_owned_by_caller,
+    project_owned_error,
     reject_foreign_claim,
+    seat_taken_error,
 )
 from nerdit.daemon.uploads import extract_upload
 from nerdit.daemon.views.hosted import load_hosted_context
@@ -62,7 +67,7 @@ from nerdit.daemon.views.service import (
     _run_in_progress_error,
     service_view,
 )
-from nerdit.db.models import GitDeployRequest, JobStatus, TokenRole
+from nerdit.db.models import GitDeployRequest, Job, JobStatus, Project, TokenRole
 from nerdit.utils.ids import generate_id
 
 logger = logging.getLogger(__name__)
@@ -85,6 +90,78 @@ def _parse_env(env: str | None) -> dict[str, str | None] | None:
     if not isinstance(decoded, dict):
         raise NerditError(400, "deploy.invalid", "env must be a JSON object {KEY: value}.")
     return {str(k): (None if v is None else str(v)) for k, v in decoded.items()}
+
+
+def _row_project(existing: Job | None) -> str | None:
+    """The project name that widens a row's service scope (D-P40-7), if any."""
+    return existing.project if existing is not None else None
+
+
+def project_service_label(project: str, service: str) -> str:
+    """The service's label inside the project, or a 422 before any lookup."""
+    if not SERVICE_NAME_RE.fullmatch(service):
+        raise NerditError(
+            422,
+            "project.invalid_service",
+            f"Invalid service name '{service}'.",
+            hint="Service names are lowercase DNS labels of at most 20 characters, no '--'.",
+        )
+    # A legacy project literally named `shared` must never reach the secrets
+    # surface's shared-scope branch through its `web` label.
+    reject_reserved_name(project)
+    try:
+        return service_label(project, PRODUCTION, service)
+    except ValueError as exc:
+        raise NerditError(
+            422,
+            "project.label_too_long",
+            f"Service '{service}' of project '{project}' has no valid label.",
+            hint="The composed `<service>--<project>` label must be a DNS label of at most "
+            "63 characters.",
+        ) from exc
+
+
+async def resolve_service_target(
+    request: Request, body: ServiceTarget
+) -> tuple[str, tuple[Project, str] | None]:
+    """The label a deploy body targets, and the `(project, service)` seat it joins.
+
+    (deploy_into_project_v1) A bare `name` is the legacy identity (`None`
+    seat). With `project` + `service` the project must exist (404
+    `project.not_found`) and be the caller's (409 `project.owned`); the label is
+    composed by the label rule and `name`, when sent, must repeat it (422
+    `deploy.name_conflicts_with_project`). `(*seat, None)` is the
+    `DeclaredService` for `_finalize_deploy`: no table, the repo's own
+    `[deploy]` stands.
+    """
+    if body.project is None or body.service is None:
+        assert body.name is not None  # ServiceTarget's validator
+        return body.name, None
+    try:
+        project: Project | None = await lookup_project(request, body.project)
+    except NerditError as exc:  # an absent `prj_` id: the same contract as an absent name
+        if exc.code != "not_found":
+            raise
+        project = None
+    if project is None:
+        raise NerditError(
+            404,
+            "project.not_found",
+            f"No project '{body.project}'.",
+            hint="Create it first with `nerdit projects create`, or deploy without `project`.",
+        )
+    if not project_owned_by_caller(request, project):
+        raise project_owned_error(project.name)
+    label = project_service_label(project.name, body.service)
+    if body.name is not None and body.name != label:
+        raise NerditError(
+            422,
+            "deploy.name_conflicts_with_project",
+            f"name '{body.name}' is not the label of service '{body.service}' "
+            f"in project '{project.name}' ('{label}').",
+            hint="Omit `name` when deploying into a project; the label is composed.",
+        )
+    return label, (project, body.service)
 
 
 @router.post("/deploy", status_code=201, operation_id="deploy_app")
@@ -356,13 +433,18 @@ async def deploy_git(
     token_ref = validate_git_request(
         request, body.repo_url, ref=body.ref, subdir=body.subdir, token_ref=body.token_ref
     )
+    # The project seat is judged BEFORE the clone and the token resolution, like
+    # the row owner gate below: a foreign project must cost nothing.
+    name, seat = await resolve_service_target(request, body)
 
     request.state.audit_params = audit_params(
         {
             "repo_url": body.repo_url,
             "ref": body.ref,
             "subdir": body.subdir,
-            "name": body.name,
+            "name": name,
+            "project": body.project,
+            "service": body.service,
             "port": body.port,
             "gpus": body.gpus,
             "start": body.start,
@@ -370,27 +452,33 @@ async def deploy_git(
             "token_ref": token_ref,
         }
     )
-    reject_reserved_name(body.name)
-    # Attribute the audit row to the validated app name (body.name is already
-    # DNS-label-pinned by pydantic); the path rules leave the target null.
-    request.state.audit_target = body.name
+    reject_reserved_name(name)
+    # Attribute the audit row to the validated app name (DNS-label-pinned by
+    # pydantic, or composed by the label rule); the path rules leave the target null.
+    request.state.audit_target = name
     queries = request.app.state.queries
 
-    existing = await queries.get_service_by_name(body.name)
+    existing = await queries.get_service_by_name(name)
+    # A join creates a seat; the label already held by any row is taken.
+    if seat is not None and existing is not None:
+        raise seat_taken_error(name)
     # A model row is not a redeploy target (fast path — rejects before clone).
-    reject_non_service_row(existing, body.name)
+    reject_non_service_row(existing, name)
     # Authorize before `_resolve_token_ref`, not merely pre-clone: an
     # unauthorized caller must not consume clone timeout/bytes or resolve a
     # credential, and a shared-scope hit there writes a
     # `secret.shared_referenced` audit row. Scope first (widened by the row's
-    # project, D-P40-7): one scope 403 with or without a row.
-    require_service_scope(request, body.name, project=existing.project if existing else None)
+    # project, or the joined one, D-P40-7): one scope 403 with or without a row.
+    joined = seat[0] if seat is not None else None
+    require_service_scope(
+        request, name, project=joined.name if joined is not None else _row_project(existing)
+    )
     if existing is not None:
         require_owner_or_admin(request, existing)
     # A name another token reserved by setting its secrets is refused before
     # the clone; the row transaction re-checks it.
     if existing is None:
-        await reject_foreign_claim(request, body.name)
+        await reject_foreign_claim(request, name)
 
     # Resolve the private-repo token server-side. It exists only as a local from
     # here on — never in the body, audit params, config, argv, logs, or response.
@@ -399,11 +487,15 @@ async def deploy_git(
     # claim it owns (D-P39-4), never a leftover file of a reused name.
     token = await _resolve_token_ref(
         request,
-        body.name,
+        name,
         token_ref,
         service_owned=existing is not None,
         repo_url=body.repo_url,
-        project_id=existing.project_id if existing is not None else None,
+        project_id=existing.project_id
+        if existing is not None
+        else joined.id
+        if joined is not None
+        else None,
     )
 
     info, dest_dir = await clone_for_request(
@@ -424,7 +516,7 @@ async def deploy_git(
     result = await _finalize_deploy(
         request,
         info.context_dir,
-        name=body.name,
+        name=name,
         port=body.port,
         gpus=body.gpus,
         start=body.start,
@@ -437,6 +529,7 @@ async def deploy_git(
         source_meta=source_meta,
         context_root=dest_dir,
         dry_run=dry_run,
+        declared=(*seat, None) if seat is not None else None,
     )
     if dry_run:
         return JSONResponse(status_code=200, content=result)

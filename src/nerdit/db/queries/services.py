@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from nerdit.core.jobconfig import parse_job_config
@@ -361,6 +361,14 @@ class ServiceQueries(QueriesBase):
                 "DELETE FROM service_domains WHERE service_name = "
                 "(SELECT service_name FROM jobs WHERE id = ?)",
                 (job_id,),
+            )
+            # A deleted app's AI gateway keys die with it: a same-name successor
+            # (or a leaked key) must not keep spending the machine's provider keys.
+            await self._db.conn.execute(
+                "UPDATE ai_gateway_keys SET revoked_at = ? "
+                "WHERE service_name = (SELECT service_name FROM jobs WHERE id = ?) "
+                "AND revoked_at IS NULL",
+                (datetime.now(UTC).isoformat(), job_id),
             )
             await self._db.conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
             secrets_reclaimed = False

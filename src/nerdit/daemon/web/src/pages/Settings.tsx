@@ -34,6 +34,8 @@ export function Settings() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const isAdmin = auth.data?.role === "admin";
+  const mode = auth.data?.mode;
+  const tokenSession = auth.data && (!mode || mode === "token");
 
   function onSignOut() {
     queryClient.clear();
@@ -45,9 +47,11 @@ export function Settings() {
     ["API endpoint", window.location.origin],
     ["Hostname", info.data?.hostname ?? "…"],
     ["Daemon version", info.data?.version ?? stats.data?.daemon_version ?? "…"],
-    ["Uptime", info.data ? formatUptime(info.data.uptime_seconds) : "…"],
-    ["Token storage", isRememberingToken() ? "this device" : "this tab only"]
+    ["Uptime", info.data ? formatUptime(info.data.uptime_seconds) : "…"]
   ];
+  if (tokenSession) {
+    connection.push(["Token storage", isRememberingToken() ? "this device" : "this tab only"]);
+  }
 
   return (
     <div className="mx-auto max-w-content space-y-7">
@@ -93,11 +97,13 @@ export function Settings() {
       <Panel title="Session" data-testid="session-card">
         <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-4">
           <p className="text-14 text-muted-foreground">
-            Signing out clears the stored token from this browser.
+            {mode === "tunnel" ? "Connected through Nerdit Cloud."
+              : mode === "local" ? "Connected locally."
+                : "Signing out clears the stored token from this browser."}
           </p>
-          <Button data-testid="sign-out" onClick={onSignOut}>
-            Sign out
-          </Button>
+          {tokenSession && (
+            <Button data-testid="sign-out" onClick={onSignOut}>Sign out</Button>
+          )}
         </div>
       </Panel>
     </div>

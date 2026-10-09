@@ -356,6 +356,7 @@ def build_controllers(
         data_dir=str(Path(settings.data_dir).expanduser()),
         retention_settings=getattr(settings, "retention", None),
         events=event_recorder,
+        ai_gateway=settings.ai_gateway,
     )
     workload_manager = WorkloadManager(
         service_controller,

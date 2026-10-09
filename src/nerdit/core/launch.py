@@ -14,6 +14,7 @@ and log byte caps live here so core callers need no daemon imports.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from collections.abc import Iterable
 from datetime import datetime
@@ -69,6 +70,8 @@ _RUN_LINE_MAX_BYTES = 2048
 # verbatim, readable by any authenticated principal.
 _SCRUB_MIN_VALUE_LEN = 6
 
+_VIRTUAL_KEY_RE = re.compile(r"nk_[0-9a-f]{32}")
+
 
 def scrub_secret_values(lines: list[str], values: Iterable[str]) -> list[str]:
     """Mask every nonempty sensitive value, longest first, before line truncation.
@@ -88,14 +91,14 @@ def scrub_secret_values(lines: list[str], values: Iterable[str]) -> list[str]:
         {value for value in values if value},
         key=lambda value: (-len(value), value),
     )
-    if not targets:
-        return list(lines)
     scrubbed: list[str] = []
     for line in lines:
         masked = line
         for value in targets:
             masked = masked.replace(value, "***")
-        scrubbed.append(masked)
+        # AI gateway virtual keys are stored hashed, so no caller can hand the
+        # plaintext in: mask them by their fixed shape.
+        scrubbed.append(_VIRTUAL_KEY_RE.sub("***", masked))
     return scrubbed
 
 

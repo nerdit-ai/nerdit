@@ -1388,3 +1388,161 @@ def test_vars_shared_token_ref_resolves_the_shared_scope(tmp_path, monkeypatch):
     )
     assert resp.status_code == 201, resp.text
     assert clone.await_args.kwargs["token"] == "sh-value"
+
+
+# --- deploy_into_project_v1: `project` + `service` join an existing project ------
+
+
+def _fake_clone_with_toml(toml: str) -> AsyncMock:
+    """`_fake_clone` plus a root `nerdit.toml`, to prove the repo's own [deploy] is read."""
+    inner = _fake_clone()
+
+    async def _run(repo_url, **kw) -> GitSourceInfo:
+        info = await inner(repo_url, **kw)
+        (info.context_dir / "nerdit.toml").write_text(toml)
+        return info
+
+    return AsyncMock(side_effect=_run)
+
+
+def _join(q: AsyncMock, tmp_path, monkeypatch, clone: AsyncMock | None = None, **body):
+    """POST a join body (no `name` unless given) against a project row named `demo`."""
+    payload = {"name": None, "project": "demo", "service": "api"}
+    payload.update(body)
+    return _post(_client(q, tmp_path), monkeypatch, clone or _fake_clone(), **payload)
+
+
+def test_join_creates_the_seat_with_the_repos_own_deploy_table(tmp_path, monkeypatch):
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-sub"))
+    clone = _fake_clone_with_toml("[deploy]\nport = 4321\n")
+    resp = _join(q, tmp_path, monkeypatch, clone)
+    assert resp.status_code == 201, resp.text
+    job = q.reserve_service_for_token.call_args.args[0]
+    assert (job.service_name, job.project_id, job.environment, job.service) == (
+        "api--demo",
+        PRJ_ID,
+        "production",
+        "api",
+    )
+    assert json.loads(job.config)["port"] == 4321  # the repo's [deploy] stands (no table)
+    body = resp.json()
+    assert body["name"] == "api--demo"
+    assert (body["project_id"], body["project"], body["service"]) == (PRJ_ID, "demo", "api")
+
+
+def test_join_accepts_name_equal_to_the_composed_label(tmp_path, monkeypatch):
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-sub"))
+    resp = _join(q, tmp_path, monkeypatch, name="api--demo")
+    assert resp.status_code == 201, resp.text
+
+
+def test_join_name_mismatch_is_422(tmp_path, monkeypatch):
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-sub"))
+    clone = _fake_clone()
+    resp = _join(q, tmp_path, monkeypatch, clone, name="demo")
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "deploy.name_conflicts_with_project"
+    clone.assert_not_awaited()
+
+
+def test_join_onto_a_held_label_is_409_name_taken(tmp_path, monkeypatch):
+    """`web` of a project whose `(production, web)` row exists: the label is taken."""
+    q = _queries(_existing())  # the row `demo` IS (demo, production, web)
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-sub"))
+    clone = _fake_clone()
+    resp = _join(q, tmp_path, monkeypatch, clone, service="web")
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["code"] == "service.name_taken"
+    assert "nerdit services redeploy demo" in resp.json()["hint"]
+    clone.assert_not_awaited()
+
+
+def test_join_whose_seat_appears_during_the_clone_is_409_not_a_redeploy(tmp_path, monkeypatch):
+    """Two joins under distinct idempotency keys: the loser must not overwrite the winner."""
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-sub"))
+    winner = _existing().model_copy(
+        update={
+            "service_name": "api--demo",
+            "name": "api--demo",
+            "project_id": PRJ_ID,
+            "environment": "production",
+            "service": "api",
+        }
+    )
+    q.get_service_by_name = AsyncMock(side_effect=[None, winner, winner])
+    resp = _join(q, tmp_path, monkeypatch)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["code"] == "service.name_taken"
+    q.update_service_config_guarded.assert_not_awaited()  # no redeploy of the winner
+
+
+def test_join_unknown_project_is_404(tmp_path, monkeypatch):
+    q = _queries()
+    clone = _fake_clone()
+    resp = _join(q, tmp_path, monkeypatch, clone)
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["code"] == "project.not_found"
+    clone.assert_not_awaited()
+
+
+def test_join_absent_project_id_is_404_project_not_found(tmp_path, monkeypatch):
+    """An absent `prj_` id carries the same machine code as an absent name."""
+    q = _queries()
+    q.get_project = AsyncMock(return_value=None)
+    clone = _fake_clone()
+    resp = _join(q, tmp_path, monkeypatch, clone, project="prj_" + "b" * 16)
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["code"] == "project.not_found"
+    clone.assert_not_awaited()
+
+
+def test_join_foreign_project_is_409_owned(tmp_path, monkeypatch):
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-other"))
+    clone = _fake_clone()
+    resp = _join(q, tmp_path, monkeypatch, clone)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["code"] == "project.owned"
+    clone.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"name": None, "project": "demo"},
+        {"name": "demo", "service": "api"},
+        {"name": None},
+    ],
+    ids=["project-without-service", "service-without-project", "nothing"],
+)
+def test_half_a_seat_or_no_target_is_422(tmp_path, monkeypatch, body):
+    q = _queries()
+    clone = _fake_clone()
+    resp = _post(_client(q, tmp_path), monkeypatch, clone, **body)
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "validation_error"
+    clone.assert_not_awaited()
+
+
+def test_join_service_grammar_is_the_projects(tmp_path, monkeypatch):
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-sub"))
+    resp = _join(q, tmp_path, monkeypatch, service="a--b")
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "project.invalid_service"
+
+
+def test_join_by_prj_id_is_judged_by_the_projects_owner(tmp_path, monkeypatch):
+    """The `prj_` form resolves the row first; ownership is judged on it, not skipped."""
+    q = _queries()
+    q.get_project = AsyncMock(return_value=_project("tok-other"))
+    clone = _fake_clone()
+    resp = _join(q, tmp_path, monkeypatch, clone, project=PRJ_ID)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["code"] == "project.owned"
+    q.get_project.assert_awaited_once_with(PRJ_ID)
+    clone.assert_not_awaited()

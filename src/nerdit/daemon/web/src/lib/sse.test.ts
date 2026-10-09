@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { backoffDelay, parseEventBlock, streamEvents, type StreamEvent } from "./sse";
+import { SESSION_ENDED_EVENT, setSessionMode } from "./auth";
 
 function memoryStorage(): Storage {
   const values = new Map<string, string>();
@@ -60,6 +61,7 @@ describe("streamEvents", () => {
   });
 
   afterEach(() => {
+    setSessionMode(undefined);
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -90,7 +92,7 @@ describe("streamEvents", () => {
   });
 
   it("stops permanently on 401 without retrying", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ status: 401, ok: false, body: null });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 401 }));
     vi.stubGlobal("fetch", fetchMock);
 
     const outcome = await streamEvents("/audit/stream", { onEvent: () => {} });
@@ -100,7 +102,7 @@ describe("streamEvents", () => {
   });
 
   it("stops permanently on 403 without retrying", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ status: 403, ok: false, body: null });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 403 }));
     vi.stubGlobal("fetch", fetchMock);
 
     const outcome = await streamEvents("/audit/stream", { onEvent: () => {} });
@@ -126,22 +128,35 @@ describe("streamEvents", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("cancels the response body on a forbidden response", async () => {
-    const cancel = vi.fn().mockResolvedValue(undefined);
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue({ status: 403, ok: false, body: { cancel } });
+  it("consumes the error body and preserves a live session on role denial", async () => {
+    const response = new Response(JSON.stringify({ code: "forbidden" }), { status: 403 });
+    const dispatchEvent = vi.fn();
+    vi.stubGlobal("window", { dispatchEvent });
+    setSessionMode("tunnel");
+    const fetchMock = vi.fn().mockResolvedValue(response);
     vi.stubGlobal("fetch", fetchMock);
 
     const outcome = await streamEvents("/audit/stream", { onEvent: () => {} });
 
     expect(outcome).toBe("forbidden");
-    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(response.bodyUsed).toBe(true);
+    expect(dispatchEvent).not.toHaveBeenCalled();
+  });
+
+  it.each([401, 403])("signals Cloud session recovery on nested proxy error %s", async (status) => {
+    const dispatchEvent = vi.fn();
+    vi.stubGlobal("window", { dispatchEvent });
+    setSessionMode("tunnel");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      error: { code: "proxy_session_expired", message: "The session expired", status }
+    }), { status })));
+    expect(await streamEvents("/events/stream", { onEvent: () => {} })).toBe("forbidden");
+    expect(dispatchEvent.mock.calls[0][0].type).toBe(SESSION_ENDED_EVENT);
   });
 
   it("attaches the stored bearer token to the stream request", async () => {
     sessionStorage.setItem("nerdit.token", "stream-token");
-    const fetchMock = vi.fn().mockResolvedValue({ status: 403, ok: false, body: null });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 403 }));
     vi.stubGlobal("fetch", fetchMock);
 
     await streamEvents("/audit/stream", { onEvent: () => {} });

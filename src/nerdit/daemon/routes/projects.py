@@ -34,7 +34,6 @@ from nerdit.core.project_identity import (
     PRODUCTION,
     PROJECT_ID_RE,
     PROJECT_NAME_RE,
-    SERVICE_NAME_RE,
     service_label,
 )
 from nerdit.core.secrets import SecretDecryptError, project_storage_name
@@ -61,6 +60,7 @@ from nerdit.daemon.project_delegation import require_live_project_jobs
 from nerdit.daemon.routes.deploy import (
     _resolve_token_ref,
     clone_for_request,
+    project_service_label,
     validate_git_request,
 )
 from nerdit.daemon.routes.service_diagnose import diagnose_job
@@ -513,7 +513,7 @@ async def rename_project(
 async def _project_service(request: Request, project: str, service: str) -> Job:
     """Resolve membership from stored IDs, never by parsing or guessing a label."""
     row = await _lookup(request, project)
-    _label(row.name, service)
+    project_service_label(row.name, service)
     for job in await request.app.state.queries.list_project_services(row.id):
         if job.kind is JobKind.service and job.environment == PRODUCTION and job.service == service:
             return job
@@ -626,30 +626,6 @@ def _check_new_name(name: str) -> None:
     reject_reserved_name(name)
 
 
-def _label(project: str, service: str) -> str:
-    """The service's label inside the project, or a 422 before any lookup."""
-    if not SERVICE_NAME_RE.fullmatch(service):
-        raise NerditError(
-            422,
-            "project.invalid_service",
-            f"Invalid service name '{service}'.",
-            hint="Service names are lowercase DNS labels of at most 20 characters, no '--'.",
-        )
-    # A legacy project literally named `shared` must never reach the secrets
-    # surface's shared-scope branch through its `web` label.
-    reject_reserved_name(project)
-    try:
-        return service_label(project, PRODUCTION, service)
-    except ValueError as exc:
-        raise NerditError(
-            422,
-            "project.label_too_long",
-            f"Service '{service}' of project '{project}' has no valid label.",
-            hint="The composed `<service>--<project>` label must be a DNS label of at most "
-            "63 characters.",
-        ) from exc
-
-
 async def _owned(request: Request, name: str) -> Project:
     """Scope, then the row or a 404, then owner-or-admin (D-P40-15 reads and unset)."""
     row = await _lookup(request, name)
@@ -676,11 +652,11 @@ async def resolve_variables(
     scope joins only when the caller may read it.
     """
     if not project.startswith("prj_"):
-        _label(project, service)
+        project_service_label(project, service)
     async with variable_write_lock(request.app):
         row = await _owned(request, project)
         project = row.name
-        label = _label(project, service)
+        label = project_service_label(project, service)
         await require_service_in_project(request, row, project, service, label)
         include_service = await service_scope_readable(request, label, project=project)
         _, winners = await secret_io(
@@ -723,7 +699,7 @@ async def list_variables(
     non-owner gets the row 403. A secret value is never returned.
     """
     if service is not None and not project.startswith("prj_"):
-        _label(project, service)
+        project_service_label(project, service)
     # One scope at a time, still through the merged reader (the only caller
     # of `SecretManager.load` outside the store): the other half is excluded.
     mgr = secret_manager(request)
@@ -734,7 +710,7 @@ async def list_variables(
     async with variable_write_lock(request.app):
         row = await _owned(request, project)
         project = row.name
-        label = _label(project, service) if service is not None else None
+        label = project_service_label(project, service) if service is not None else None
         if label is None or service is None:
             env, _ = await secret_io(lambda: load_scoped(mgr, None, row.id))
         else:
@@ -795,7 +771,7 @@ async def set_variables(
         )
     else:
         name = (await _lookup(request, project)).name if project.startswith("prj_") else project
-        _label(name, service)
+        project_service_label(name, service)
         name, keys = await set_service_values(
             request, project, service, body.values, plain, check_new_name=_check_new_name
         )
@@ -822,11 +798,11 @@ async def delete_variable(
         {"project": project, "scope": scope, "service": service, "keys": [key]}
     )
     if service is not None and not project.startswith("prj_"):
-        _label(project, service)
+        project_service_label(project, service)
     async with variable_write_lock(request.app):  # verdict and delete are one section
         row = await _owned(request, project)
         project = row.name
-        label = _label(project, service) if service is not None else None
+        label = project_service_label(project, service) if service is not None else None
         if label is None or service is None:
             storage = project_storage_name(row.id)
         else:

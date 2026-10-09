@@ -681,6 +681,23 @@ class ModelsSettings(BaseModel):
         return self.bridge_host
 
 
+class AiGatewaySettings(BaseModel):
+    """The machine's AI gateway: one OpenAI-compatible listener for app containers.
+
+    Off by default; when on, the daemon serves it on the models bridge (never
+    ``0.0.0.0``: the host comes from ``[models].bridge_host``, not from here) at
+    ``port``. Apps reach it through ``[ai.*] provider = "gateway"`` with a
+    per-service virtual key; provider keys stay on the machine. Every field is
+    captured at startup and requires a restart.
+    """
+
+    enabled: bool = False
+    port: int = Field(default=9330, ge=1024, le=65535)
+    upstream_timeout_s: int = Field(default=120, ge=1)
+    stream_timeout_s: int = Field(default=600, ge=1)
+    max_body_bytes: int = Field(default=10 * 1024 * 1024, ge=1)
+
+
 class DatabasesSettings(BaseModel):
     """Managed database backends, images and readiness limits.
 
@@ -1376,6 +1393,7 @@ class NerditSettings(BaseModel):
     services: ServicesSettings = ServicesSettings()
     proxy: ProxySettings = ProxySettings()
     models: ModelsSettings = ModelsSettings()
+    ai_gateway: AiGatewaySettings = AiGatewaySettings()
     databases: DatabasesSettings = DatabasesSettings()
     git: GitSettings = GitSettings()
     notifications: NotificationsSettings = NotificationsSettings()
@@ -1426,6 +1444,7 @@ _SECTIONS = (
     "services",
     "proxy",
     "models",
+    "ai_gateway",
     "databases",
     "git",
     "notifications",

@@ -2346,6 +2346,10 @@ async def test_build_server_registers_all_tools():
         "apply_project",
         "project_logs",
         "diagnose_project",
+        "list_ai_routes",
+        "set_ai_route",
+        "remove_ai_route",
+        "get_ai_usage",
     }
     # The tool set is a public contract for external agents: pin the count so a
     # tool cannot be added or dropped without an explicit CHANGELOG decision.
@@ -2356,8 +2360,10 @@ async def test_build_server_registers_all_tools():
     # with set_variable/resolve_variables — deliberately no list/unset tool: a
     # plain value is read by its owner through the CLI/REST, not an agent;
     # (P40d) 55 → 57 with write_project_files/apply_project (the declaration).
-    # P41d adds project_logs/diagnose_project, bringing the set to 59.
-    assert len(names) == 59
+    # P41d adds project_logs/diagnose_project, bringing the set to 59; the AI
+    # gateway adds list/set/remove_ai_route + get_ai_usage (63) — deliberately no
+    # key tool: revoking an app's key stays on the CLI/REST.
+    assert len(names) == 63
 
 
 _MCP_TOOLS_GOLDEN_PATH = Path(__file__).parent / "data" / "mcp_tools_golden.json"

@@ -531,3 +531,40 @@ class IdempotencyRecord(BaseModel):
     body_hash: str | None = None
     created_at: str | None = None
     expires_at: str | None = None
+
+
+class AiGatewayRoute(BaseModel):
+    """A machine-level AI gateway alias: what an app's ``model`` maps to upstream.
+
+    ``api_key_ref`` is a ``${secrets[.shared].KEY}`` reference (a name), never a
+    value; ``base_url`` is ``None`` for an ``ollama`` route (served locally).
+    """
+
+    alias: str
+    provider: Literal["api", "ollama"]
+    base_url: str | None = None
+    model: str
+    api_key_ref: str | None = None
+    services: list[str] | None = None
+    created_at: str
+    updated_at: str
+
+
+class AiGatewayKey(BaseModel):
+    """One virtual key's metadata; the key itself is never stored, only its hash."""
+
+    service_name: str
+    created_at: str
+    revoked_at: str | None = None
+
+
+class AiGatewayUsage(BaseModel):
+    """Gateway usage for one (UTC day, service, alias)."""
+
+    day: str
+    service_name: str
+    alias: str
+    requests: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    upstream_errors: int = 0

@@ -49,6 +49,8 @@ _EXPECTED_TAG_ORDER = [
     "Exposure",
     # (P40b / D-P40-10) The project noun, now the last router.
     "Projects",
+    # The machine AI gateway, registered after Projects.
+    "AI Gateway",
 ]
 
 # The pinned {operation_id: (path, sorted methods)} table under /api.
@@ -161,6 +163,14 @@ _EXPECTED_OPERATIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     "apply_project": ("/api/projects/{project}/apply", ("POST",)),
     "project_logs": ("/api/projects/{project}/services/{service}/logs", ("GET",)),
     "diagnose_project": ("/api/projects/{project}/services/{service}/diagnose", ("GET",)),
+    # The AI gateway, tag AI Gateway, `/api` only.
+    "get_ai_gateway": ("/api/ai-gateway", ("GET",)),
+    "list_ai_routes": ("/api/ai-gateway/routes", ("GET",)),
+    "set_ai_route": ("/api/ai-gateway/routes/{alias}", ("PUT",)),
+    "remove_ai_route": ("/api/ai-gateway/routes/{alias}", ("DELETE",)),
+    "list_ai_gateway_keys": ("/api/ai-gateway/keys", ("GET",)),
+    "revoke_ai_gateway_keys": ("/api/ai-gateway/keys/{service}", ("DELETE",)),
+    "get_ai_usage": ("/api/ai-gateway/usage", ("GET",)),
 }
 
 
@@ -226,8 +236,9 @@ def test_api_router_and_tag_table(app):
     # create_project, get_project, delete_project, tag Projects) to 86; the
     # P40c variable quartet (same tag) to 90; P40d's apply_project to 91;
     # P41b's project identity lookup and public address binding to 93;
-    # P41d's project logs and diagnosis to 95; P41e's rename to 96.
-    assert len(ids) == len(set(ids)) == 96, "operation_id set drifted from 96"
+    # P41d's project logs and diagnosis to 95; P41e's rename to 96; the AI
+    # gateway's seven (tag AI Gateway) to 103.
+    assert len(ids) == len(set(ids)) == 103, "operation_id set drifted from 103"
 
     found = {r.operation_id: (path, tuple(sorted(r.methods))) for path, r in routes}
     assert found == _EXPECTED_OPERATIONS

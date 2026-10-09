@@ -521,6 +521,12 @@ async def get_capabilities(request: Request) -> dict[str, Any]:
             # (strict body) and reports no `local_routes`, so the cloud gates
             # hosted-only rules on this flag.
             "hosted_only_shares": True,
+            # Constant ``True``: an older daemon 422s `project` / `service` on
+            # `POST /deploy/git` and the template deploy (strict bodies).
+            "deploy_into_project_v1": True,
+            # Constant ``True``: `/ai-gateway/*` is a plain 404 on an older
+            # daemon; whether the gateway listens is `GET /ai-gateway`'s `enabled`.
+            "ai_gateway_v1": True,
         },
     }
     if is_admin:

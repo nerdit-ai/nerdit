@@ -27,8 +27,9 @@ if TYPE_CHECKING:
 
 # The [ai.*] shape hint returned with every ``deploy.invalid_ai`` envelope.
 AI_SHAPE_HINT = (
-    "Each [ai.<name>] table needs provider = 'ollama' | 'api' and model = '<ref>'; "
-    "provider 'api' also requires base_url and api_key = '${secrets.KEY}'."
+    "Each [ai.<name>] table needs provider = 'ollama' | 'api' | 'gateway' and model = '<ref>'; "
+    "provider 'api' also requires base_url and api_key = '${secrets.KEY}'; "
+    "'gateway' takes a machine alias as model and forbids base_url and api_key."
 )
 
 # The [db.*] shape hint returned with a ``deploy.invalid_db`` /

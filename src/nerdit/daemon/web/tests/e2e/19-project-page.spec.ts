@@ -576,6 +576,8 @@ test("switching scope or leaving the page drops a typed, unsaved secret", async 
   await secretInput.fill(SECRET);
   await page.getByTestId("project-services").getByTestId("app-row-api").click();
   await expect(page).toHaveURL("/projects/asso/services/api");
+  await expect(page.getByRole("heading", { name: "api", level: 1 })).toBeVisible();
+  await expect(panel).toHaveCount(0);
   await page.goBack();
   await expect(panel.getByTestId("variable-secret-form").getByLabel("Secret value")).toHaveValue("");
   expect(api.variablePuts).toEqual([]);

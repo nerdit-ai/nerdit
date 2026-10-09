@@ -1,4 +1,4 @@
-import { clearStoredToken, getStoredToken } from "../lib/auth";
+import { authErrorCode, clearStoredToken, getStoredToken, handleAuthFailure, isDeadBearer } from "../lib/auth";
 
 export function apiUrl(path: string): string {
   return `/api${path}`;
@@ -42,6 +42,9 @@ export interface ApiResult<T> {
 export async function apiRaw<T>(path: string, init?: RequestInit): Promise<ApiResult<T>> {
   const isFormData = init?.body instanceof FormData;
   const headers = new Headers(init?.headers);
+  // An explicit bearer belongs to the caller (e.g. a candidate on Login),
+  // not necessarily the current session. Its rejection must stay with that caller.
+  const callerAuth = headers.has("Authorization");
   if (!isFormData && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
@@ -54,13 +57,11 @@ export async function apiRaw<T>(path: string, init?: RequestInit): Promise<ApiRe
     headers
   });
   if (!response.ok) {
-    if (response.status === 401) {
-      clearStoredToken();
-      if (typeof window !== "undefined") {
-        window.location.assign("/login");
-      }
-    }
     const body = await response.json().catch(() => null);
+    if (!callerAuth && isDeadBearer(response.status, authErrorCode(body))) {
+      clearStoredToken();
+      handleAuthFailure();
+    }
     throw errorFromEnvelope(body, response);
   }
   const etag = response.headers.get("ETag");
@@ -73,7 +74,8 @@ export async function apiRaw<T>(path: string, init?: RequestInit): Promise<ApiRe
 
 /** Build an `ApiError` from a parsed error body (P1 envelope or legacy `detail`). */
 function errorFromEnvelope(body: unknown, response: Response): ApiError {
-  const env = (body ?? {}) as {
+  const envelope = (body ?? {}) as { error?: object };
+  const env = (envelope.error ?? envelope) as {
     code?: string;
     message?: string;
     hint?: string;

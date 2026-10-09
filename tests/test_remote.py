@@ -141,7 +141,26 @@ class TestBearerAuth:
         assert resp.status_code == 200
         # The legacy global token maps to an admin principal (P8: role exposed
         # so the dashboard can gate write UI up front).
-        assert resp.json() == {"ok": True, "role": "admin"}
+        assert resp.json() == {"ok": True, "role": "admin", "mode": "token"}
+
+    def test_api_auth_check_local_mode(self, mock_queries):
+        app = _make_app(mock_queries, token=None)
+        client = TestClient(app, base_url="http://127.0.0.1")
+        assert client.get("/api/auth/check").json() == {
+            "ok": True,
+            "role": "admin",
+            "mode": "local",
+        }
+
+    def test_api_auth_check_tunnel_mode_never_returns_a_credential(self, mock_queries):
+        from tests.test_link_surface import CAPABILITY, FakeLinkManager
+
+        app = _make_app(mock_queries, token="secret")
+        app.state.link_manager = FakeLinkManager()
+        client = TestClient(app, base_url="http://127.0.0.1")
+        response = client.get("/api/auth/check", headers={"Authorization": f"Bearer {CAPABILITY}"})
+        assert response.json() == {"ok": True, "role": "submitter", "mode": "tunnel"}
+        assert CAPABILITY not in response.text
 
     def test_shell_and_login_public_get_routes(self, mock_queries):
         """Dashboard shell routes stay reachable without auth token."""

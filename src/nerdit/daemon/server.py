@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 import uvicorn
 from fastapi import FastAPI
 
@@ -27,6 +28,8 @@ from nerdit.config.settings import (
     load_settings,
 )
 from nerdit.config.store import ConfigStore
+from nerdit.core.ai_gateway.app import GatewayServer
+from nerdit.core.ai_gateway.proxy import Gateway
 from nerdit.core.backup import sweep_staging_orphans
 from nerdit.core.cutover import cutover_skip_reason
 from nerdit.core.dns import MdnsAdvertiser
@@ -548,6 +551,22 @@ async def lifespan(app: FastAPI):
             _retention_sweep_loop(queries, retention_settings, Path(settings.data_dir).expanduser())
         )
 
+    # The AI gateway: a second listener on the models bridge, off by default.
+    ai_gateway: GatewayServer | None = None
+    if settings.ai_gateway.enabled:
+        ai_gateway = GatewayServer(
+            Gateway(queries, secret_manager, settings.ai_gateway, httpx.AsyncClient()),
+            # Never all interfaces: the bridge bind IP (Linux), else loopback
+            # (Docker Desktop forwards host.docker.internal there).
+            settings.models.bridge_bind_ip or "127.0.0.1",
+            settings.ai_gateway.port,
+        )
+        if not await ai_gateway.start():
+            # Apps keep waiting on their gateway binding instead of launching
+            # against an unreachable OPENAI_BASE_URL; the routes report it too.
+            service_controller.mark_ai_gateway_down()
+    app.state.ai_gateway_listening = ai_gateway is not None and ai_gateway.listening
+
     # Store in app state
     app.state.db = db
     app.state.queries = queries
@@ -655,6 +674,8 @@ async def lifespan(app: FastAPI):
             await retention_task
     with contextlib.suppress(asyncio.CancelledError):
         await proxy_task
+    if ai_gateway is not None:
+        await ai_gateway.stop()
     await workload_manager.stop()
     # Cancel in-flight model pull/ensure tasks; containers are left running
     # (same survive-a-reboot posture as ServiceController.shutdown).

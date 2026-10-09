@@ -1477,6 +1477,85 @@ class NerditClient:
             timeout=30.0,
         )
 
+    # --- AI gateway --------------------------------------------------------------
+    # Aliases name a `${secrets.shared.KEY}` reference, never a key; key reads
+    # carry metadata only (the virtual key lives in the container env alone).
+
+    async def get_ai_gateway(self) -> dict:
+        """The gateway's state via `GET /api/ai-gateway`."""
+        return await self._request_json("GET", f"{self._base_url}/api/ai-gateway", timeout=5.0)
+
+    async def list_ai_routes(self) -> dict:
+        """Every alias via `GET /api/ai-gateway/routes`."""
+        return await self._request_json(
+            "GET", f"{self._base_url}/api/ai-gateway/routes", timeout=5.0
+        )
+
+    async def set_ai_route(  # noqa: PLR0913 - one wire field per keyword
+        self,
+        alias: str,
+        *,
+        provider: str,
+        model: str,
+        base_url: str | None = None,
+        api_key_ref: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        """Create or replace an alias via `PUT /api/ai-gateway/routes/{alias}`."""
+        body: dict[str, str] = {"provider": provider, "model": model}
+        if base_url is not None:
+            body["base_url"] = base_url
+        if api_key_ref is not None:
+            body["api_key_ref"] = api_key_ref
+        return await self._request_json(
+            "PUT",
+            f"{self._base_url}/api/ai-gateway/routes/{_encode_dot_segment(alias)}",
+            json=body,
+            idempotency_key=idempotency_key,
+            timeout=15.0,
+        )
+
+    async def remove_ai_route(
+        self, alias: str, *, force: bool = False, idempotency_key: str | None = None
+    ) -> dict:
+        """Remove an alias via `DELETE /api/ai-gateway/routes/{alias}`."""
+        return await self._request_json(
+            "DELETE",
+            f"{self._base_url}/api/ai-gateway/routes/{_encode_dot_segment(alias)}",
+            params={"force": "true"} if force else None,
+            idempotency_key=idempotency_key,
+            timeout=10.0,
+        )
+
+    async def list_ai_gateway_keys(self, *, include_revoked: bool = False) -> dict:
+        """Virtual-key metadata via `GET /api/ai-gateway/keys` (never a key)."""
+        return await self._request_json(
+            "GET",
+            f"{self._base_url}/api/ai-gateway/keys",
+            params={"include_revoked": "true"} if include_revoked else None,
+            timeout=5.0,
+        )
+
+    async def revoke_ai_gateway_keys(
+        self, service: str, *, idempotency_key: str | None = None
+    ) -> dict:
+        """Revoke a service's virtual keys via `DELETE /api/ai-gateway/keys/{service}`."""
+        return await self._request_json(
+            "DELETE",
+            f"{self._base_url}/api/ai-gateway/keys/{self._segment(service)}",
+            idempotency_key=idempotency_key,
+            timeout=10.0,
+        )
+
+    async def get_ai_usage(self, *, service: str | None = None, days: int = 7) -> dict:
+        """Usage aggregates via `GET /api/ai-gateway/usage`."""
+        params: dict[str, str | int] = {"days": days}
+        if service:
+            params["service"] = self.wire_name(service)
+        return await self._request_json(
+            "GET", f"{self._base_url}/api/ai-gateway/usage", params=params, timeout=10.0
+        )
+
     # --- Projects (P40b) --------------------------------------------------------
     #
     # ``/projects`` is mounted under ``/api`` only. A project is the grouping a

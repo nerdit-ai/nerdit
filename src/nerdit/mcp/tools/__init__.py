@@ -14,6 +14,7 @@ build_server` to register in one loop.
 from __future__ import annotations
 
 from nerdit.mcp.tools import (
+    ai_gateway,
     cluster,
     config,
     databases,
@@ -37,6 +38,7 @@ ALL_TOOLS = (
     *exposure.TOOLS,
     *projects.TOOLS,
     *secrets.TOOLS,
+    *ai_gateway.TOOLS,
     *config.TOOLS,
     *system.TOOLS,
 )

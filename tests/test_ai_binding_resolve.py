@@ -14,7 +14,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from nerdit.config.settings import ServicesSettings
+from nerdit.config.settings import AiGatewaySettings, ModelsSettings, ServicesSettings
+from nerdit.core.ai_gateway.keys import service_for_key
 from nerdit.core.app_build import _sensitive_env_values
 from nerdit.core.models.backend import sanitize_model_name
 from nerdit.core.models.binding import (
@@ -741,3 +742,155 @@ async def test_an_undecryptable_project_scope_defers_the_launch(queries, tmp_pat
     with pytest.raises(LaunchEnvNotReady) as excinfo:
         await controller._resolve_launch_env(job, {"port": 8000}, 8000, None, None)
     assert excinfo.value.kind == "secrets"
+
+
+# --- provider='gateway' (machine AI gateway) -----------------------------------
+
+GATEWAY_SPEC = {"provider": "gateway", "model": "fast"}
+
+
+def _gateway_controller(queries, secrets, *, enabled: bool = True) -> ServiceController:
+    return ServiceController(
+        queries=queries,
+        runtime=_FakeRuntime(),
+        services_settings=ServicesSettings(service_port_range="9400-9499"),
+        secrets=secrets,
+        ai_gateway=AiGatewaySettings(enabled=enabled, port=9330),
+    )
+
+
+async def _add_fast_alias(queries) -> None:
+    await queries.upsert_ai_route(
+        "fast",
+        provider="api",
+        model="gpt-4o-mini",
+        base_url="https://api.example.com/v1",
+        api_key_ref="${secrets.shared.OPENAI_KEY}",
+    )
+
+
+async def test_gateway_disabled_is_not_ready(queries):
+    await _add_fast_alias(queries)
+    for settings in (None, AiGatewaySettings(enabled=False)):
+        with pytest.raises(BindingNotReady, match=r"enable \[ai_gateway\] in config.toml"):
+            await resolve_binding(
+                "default", GATEWAY_SPEC, queries, {}, BRIDGE_HOST, gateway=settings
+            )
+
+
+async def test_gateway_unknown_alias_is_not_ready(queries):
+    with pytest.raises(BindingNotReady, match="'fast'"):
+        await resolve_binding(
+            "default",
+            GATEWAY_SPEC,
+            queries,
+            {},
+            BRIDGE_HOST,
+            gateway=AiGatewaySettings(enabled=True),
+        )
+
+
+async def test_gateway_launch_injects_the_frozen_env_names(queries, tmp_path):
+    await _add_fast_alias(queries)
+    controller = _gateway_controller(queries, SecretManager(tmp_path / "secrets"))
+    job = _svc_job("app", ai={"default": GATEWAY_SPEC, "judge": GATEWAY_SPEC})
+    await queries.create_job(job)
+    cfg = json.loads(job.config)
+
+    resolved = await controller._resolve_launch_env(
+        job, cfg, 8000, cfg["ai"], None, gateway_key="rotate"
+    )
+
+    env = resolved.env
+    # The gateway on the advertised bridge host, at [ai_gateway].port.
+    assert env["OPENAI_BASE_URL"] == f"http://{ModelsSettings().bridge_advertise_host}:9330/v1"
+    assert env["OPENAI_MODEL"] == "fast"  # the alias, never the provider model
+    key = env["OPENAI_API_KEY"]
+    assert key.startswith("nk_") and len(key) == 35
+    # One key per launch, shared by every gateway binding of the service.
+    assert env["NERDIT_AI_DEFAULT_KEY"] == env["NERDIT_AI_JUDGE_KEY"] == key
+    assert env["NERDIT_AI_JUDGE_URL"] == env["OPENAI_BASE_URL"]
+    assert resolved.injected_keys == inject_env_key_names(cfg["ai"])
+    # The provider key reference never reaches the container.
+    assert not any("secrets" in value for value in env.values())
+    assert await service_for_key(queries, key) == "app"
+
+
+async def test_gateway_relaunch_revokes_the_old_key(queries, tmp_path):
+    await _add_fast_alias(queries)
+    controller = _gateway_controller(queries, SecretManager(tmp_path / "secrets"))
+    job = _svc_job("app", ai={"default": GATEWAY_SPEC})
+    await queries.create_job(job)
+    cfg = json.loads(job.config)
+
+    async def launch_key(mode):
+        resolved = await controller._resolve_launch_env(
+            job, cfg, 8000, cfg["ai"], None, gateway_key=mode
+        )
+        return resolved.env["OPENAI_API_KEY"]
+
+    first = await launch_key("rotate")
+    side = await launch_key("extra")  # a one-off run keeps the serving key valid
+    assert await service_for_key(queries, first) == "app"
+    assert await service_for_key(queries, side) == "app"
+    second = await launch_key("rotate")
+    assert second != first
+    assert await service_for_key(queries, first) is None
+    assert await service_for_key(queries, side) is None
+    assert await service_for_key(queries, second) == "app"
+    # Forensics never mints.
+    before = await queries.list_ai_gateway_keys(include_revoked=True)
+    assert (await launch_key(None)) == ""
+    assert await queries.list_ai_gateway_keys(include_revoked=True) == before
+
+
+async def test_gateway_not_listening_is_not_ready(queries, tmp_path):
+    await _add_fast_alias(queries)
+    with pytest.raises(BindingNotReady, match="failed to start"):
+        await resolve_binding(
+            "default",
+            GATEWAY_SPEC,
+            queries,
+            {},
+            "172.17.0.1",
+            gateway=AiGatewaySettings(enabled=True),
+            gateway_listening=False,
+        )
+    controller = _gateway_controller(queries, SecretManager(tmp_path / "secrets"))
+    controller.mark_ai_gateway_down()
+    job = _svc_job("app", ai={"default": GATEWAY_SPEC})
+    await queries.create_job(job)
+    cfg = json.loads(job.config)
+    with pytest.raises(LaunchEnvNotReady, match="failed to start"):
+        await controller._resolve_launch_env(job, cfg, 8000, cfg["ai"], None)
+
+
+async def test_launch_mints_only_once_preconditions_pass(queries, tmp_path):
+    """A launch waiting on a GPU retries every tick: it must not mint (nor rotate)."""
+    await _add_fast_alias(queries)
+    controller = _gateway_controller(queries, SecretManager(tmp_path / "secrets"))
+    job = _svc_job("app", ai={"default": GATEWAY_SPEC})
+    job.gpu_count = 1  # no GPU rows exist: placement defers the launch
+    await queries.create_job(job)
+    await controller._launch(job)
+    assert await queries.list_ai_gateway_keys(include_revoked=True) == []
+    # Keyless resolve, then the mint that _launch performs after the preconditions.
+    cfg = json.loads(job.config)
+    resolved = await controller._resolve_launch_env(
+        job, cfg, 8000, cfg["ai"], None, gateway_key=None
+    )
+    assert resolved.env["OPENAI_API_KEY"] == ""
+    env = await controller._mint_gateway_env(job, cfg["ai"], resolved)
+    assert env["OPENAI_API_KEY"].startswith("nk_")
+    assert await service_for_key(queries, env["OPENAI_API_KEY"]) == "app"
+    assert env["OPENAI_BASE_URL"] == resolved.env["OPENAI_BASE_URL"]
+
+
+async def test_gateway_wait_never_mints(queries, tmp_path):
+    controller = _gateway_controller(queries, SecretManager(tmp_path / "secrets"))
+    job = _svc_job("app", ai={"default": GATEWAY_SPEC})
+    await queries.create_job(job)
+    cfg = json.loads(job.config)
+    with pytest.raises(LaunchEnvNotReady):
+        await controller._resolve_launch_env(job, cfg, 8000, cfg["ai"], None, gateway_key="rotate")
+    assert await queries.list_ai_gateway_keys(include_revoked=True) == []

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, api, apiRaw } from "./client";
+import { SESSION_ENDED_EVENT, setSessionMode } from "../lib/auth";
 
 function memoryStorage(): Storage {
   const values = new Map<string, string>();
@@ -34,6 +35,7 @@ describe("api request headers", () => {
   });
 
   afterEach(() => {
+    setSessionMode(undefined);
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -98,7 +100,7 @@ describe("api request headers", () => {
     expect(headers.get("Content-Type")).toBe("application/json");
   });
 
-  it("clears stored credentials and redirects on 401", async () => {
+  it.each([401, 403])("clears rejected session credentials and redirects on %s", async (status) => {
     sessionStorage.setItem("nerdit.token", "session-token");
     localStorage.setItem("nerdit.token", "persistent-token");
     localStorage.setItem("nerdit.token.persist", "1");
@@ -107,8 +109,8 @@ describe("api request headers", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ detail: "Invalid token" }), {
-          status: 401,
+        new Response(JSON.stringify({ code: "invalid_token", message: "Invalid token" }), {
+          status,
           headers: { "Content-Type": "application/json" }
         })
       )
@@ -120,6 +122,23 @@ describe("api request headers", () => {
     expect(localStorage.getItem("nerdit.token")).toBeNull();
     expect(localStorage.getItem("nerdit.token.persist")).toBeNull();
     expect(assign).toHaveBeenCalledWith("/login");
+  });
+
+  it.each([401, 403])("leaves candidate bearer failure %s with its caller", async (status) => {
+    sessionStorage.setItem("nerdit.token", "existing-session-token");
+    const assign = vi.fn();
+    const dispatchEvent = vi.fn();
+    vi.stubGlobal("window", { location: { assign }, dispatchEvent });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: "invalid_token", message: "Invalid token"
+    }), { status })));
+
+    await expect(api("/auth/check", {
+      headers: { Authorization: "Bearer candidate-token" }
+    })).rejects.toMatchObject({ status, code: "invalid_token", message: "Invalid token" });
+    expect(sessionStorage.getItem("nerdit.token")).toBe("existing-session-token");
+    expect(assign).not.toHaveBeenCalled();
+    expect(dispatchEvent).not.toHaveBeenCalled();
   });
 
   it("surfaces the P1 error envelope code and hint on ApiError", async () => {
@@ -145,6 +164,20 @@ describe("api request headers", () => {
     expect(err.code).toBe("config.stale");
     expect(err.message).toBe("The app config changed since you last read it.");
     expect(err.hint).toBe("Re-read it (GET) and retry with the new ETag.");
+  });
+
+  it.each([401, 403])("keeps nested Cloud auth error %s in the loaded dashboard", async (status) => {
+    const dispatchEvent = vi.fn();
+    const assign = vi.fn();
+    vi.stubGlobal("window", { dispatchEvent, location: { assign } });
+    setSessionMode("tunnel");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      error: { code: "proxy_session_expired", message: "The session expired", status }
+    }), { status })));
+    const error = await api("/services").catch((err: ApiError) => err);
+    expect(error).toMatchObject({ code: "proxy_session_expired", message: "The session expired", status });
+    expect(dispatchEvent.mock.calls[0][0].type).toBe(SESSION_ENDED_EVENT);
+    expect(assign).not.toHaveBeenCalled();
   });
 
   it("falls back to legacy `detail` when there is no envelope code", async () => {

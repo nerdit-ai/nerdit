@@ -212,6 +212,17 @@ _ROUTE_RULES: list[tuple[str, re.Pattern[str], str, str | None, int | None]] = [
         "project",
         1,
     ),
+    # The AI gateway. Params are hand-built by the routes: alias, provider,
+    # model, the base_url HOST and the secret-ref NAME, never a value.
+    ("PUT", re.compile(r"^/ai-gateway/routes/([^/]+)$"), "ai_gateway.route_set", "ai_route", 1),
+    (
+        "DELETE",
+        re.compile(r"^/ai-gateway/routes/([^/]+)$"),
+        "ai_gateway.route_removed",
+        "ai_route",
+        1,
+    ),
+    ("DELETE", re.compile(r"^/ai-gateway/keys/([^/]+)$"), "ai_gateway.key_revoked", "service", 1),
 ]
 
 # Actions whose target the route may stamp via `request.state.audit_target`

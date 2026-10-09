@@ -115,7 +115,7 @@ function SidebarFooter({
   showSearch
 }: {
   onSearch?: () => void;
-  onSignOut: () => void;
+  onSignOut?: () => void;
   showSearch: boolean;
 }) {
   const rowCls =
@@ -138,10 +138,12 @@ function SidebarFooter({
           <span className="block text-12">feedback@nerdit.ai</span>
         </span>
       </a>
-      <button type="button" onClick={onSignOut} className={rowCls}>
-        <LogOut size={16} aria-hidden="true" />
-        Sign out
-      </button>
+      {onSignOut && (
+        <button type="button" onClick={onSignOut} className={rowCls}>
+          <LogOut size={16} aria-hidden="true" />
+          Sign out
+        </button>
+      )}
     </footer>
   );
 }
@@ -165,6 +167,7 @@ export function AppShell() {
   // when the daemon ships no key (inert dashboard).
   const { data: clusterInfo } = useClusterInfo();
   const { data: authRole } = useAuthRole();
+  const canSignOut = authRole && (!authRole.mode || authRole.mode === "token");
   const [analyticsReady, setAnalyticsReady] = useState(false);
 
   useEffect(() => {
@@ -208,6 +211,7 @@ export function AppShell() {
 
   useEffect(() => {
     function onStorage(event: StorageEvent) {
+      if (!canSignOut) return;
       if (event.key !== "nerdit.token" && event.key !== "nerdit.token.persist") {
         return;
       }
@@ -218,7 +222,7 @@ export function AppShell() {
     }
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
-  }, [navigate, queryClient]);
+  }, [navigate, queryClient, canSignOut]);
 
   // Route changes close the drawer even when navigation happened outside it.
   useEffect(() => {
@@ -323,7 +327,7 @@ export function AppShell() {
           <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4">
             <DashboardNavigation pathname={location.pathname} />
           </div>
-          <SidebarFooter showSearch onSearch={() => setPaletteOpen(true)} onSignOut={onSignOut} />
+          <SidebarFooter showSearch onSearch={() => setPaletteOpen(true)} onSignOut={canSignOut ? onSignOut : undefined} />
         </aside>
 
         <main className="min-w-0 flex-1 px-4 py-6 lg:px-8 lg:py-8">
@@ -367,7 +371,7 @@ export function AppShell() {
                 onNavigate={() => setMobileNavOpen(false)}
               />
             </div>
-            <SidebarFooter showSearch={false} onSignOut={onSignOut} />
+            <SidebarFooter showSearch={false} onSignOut={canSignOut ? onSignOut : undefined} />
           </aside>
         </>
       )}

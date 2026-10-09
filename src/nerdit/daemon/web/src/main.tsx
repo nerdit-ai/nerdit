@@ -15,17 +15,10 @@ import Models from "./pages/Models";
 import Databases from "./pages/Databases";
 import Audit from "./pages/Audit";
 import Tokens from "./pages/Tokens";
-import { getStoredToken } from "./lib/auth";
+import { AuthGate } from "./components/AuthGate";
 import { initTheme } from "./lib/theme";
 
 const queryClient = new QueryClient();
-
-function RequireAuth({ children }: { children: React.ReactNode }) {
-  if (!getStoredToken()) {
-    return <Navigate to="/login" replace />;
-  }
-  return <>{children}</>;
-}
 
 // The route map of design guidelines §2. Two rules govern it:
 //
@@ -43,13 +36,13 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
 // The Hardware and Store PAGES are gone (folded into Settings, and into the
 // New app flow, respectively) and their files are deleted.
 const router = createBrowserRouter([
-  { path: "/login", element: <Login /> },
+  { path: "/login", element: <AuthGate login><Login /></AuthGate> },
   {
     path: "/",
     element: (
-      <RequireAuth>
+      <AuthGate>
         <AppShell />
-      </RequireAuth>
+      </AuthGate>
     ),
     children: [
       { index: true, element: <Projects /> },

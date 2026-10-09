@@ -11,8 +11,21 @@ from nerdit.db.models import Gpu, Job, JobKind, JobStatus
 from nerdit.db.queries import Queries
 
 
+@pytest.fixture(scope="session")
+def _mcp_transport_defaults() -> tuple[bool, str, int]:
+    """Snapshot ``nerdit.mcp.transport``'s globals before any fixture can flip them.
+
+    Session-scoped on purpose: a module-scoped ``create_app()`` fixture (e.g.
+    ``tests/test_openapi.py``) runs before a function-scoped snapshot would,
+    so the snapshot would already hold the flipped values and restore them.
+    """
+    from nerdit.mcp import transport
+
+    return (transport._HTTP_MODE, transport._HTTP_HOST, transport._HTTP_PORT)
+
+
 @pytest.fixture(autouse=True)
-def _isolate_mcp_transport_mode():
+def _isolate_mcp_transport_mode(_mcp_transport_defaults):
     """Keep ``nerdit.mcp.transport``'s process globals from leaking between tests.
 
     ``build_http_app()`` flips them and never resets — correct for a daemon
@@ -24,9 +37,8 @@ def _isolate_mcp_transport_mode():
     """
     from nerdit.mcp import transport
 
-    saved = (transport._HTTP_MODE, transport._HTTP_HOST, transport._HTTP_PORT)
     yield
-    transport._HTTP_MODE, transport._HTTP_HOST, transport._HTTP_PORT = saved
+    transport._HTTP_MODE, transport._HTTP_HOST, transport._HTTP_PORT = _mcp_transport_defaults
 
 
 @pytest.fixture

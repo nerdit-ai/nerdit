@@ -15,7 +15,7 @@ import {
   TableRow,
   type BadgeTone
 } from "../components/ui";
-import { clearStoredToken, getStoredToken, isDeadBearer } from "../lib/auth";
+import { authErrorCode, clearStoredToken, getStoredToken, handleAuthFailure, isDeadBearer } from "../lib/auth";
 import type { AuditLogEntry } from "../api/types";
 
 // The Activity page (the audit record, in the product's words).
@@ -74,12 +74,12 @@ async function probeAuditAccess(): Promise<AuditAccess> {
     code?: unknown;
     detail?: unknown;
   } | null;
-  const code = typeof body?.code === "string" ? body.code : null;
+  const code = authErrorCode(body);
 
   if (isDeadBearer(response.status, code)) {
     // Mirror api/client.ts: stale token, back to login.
     clearStoredToken();
-    if (typeof window !== "undefined") window.location.assign("/login");
+    handleAuthFailure();
     return "forbidden";
   }
   if (response.status === 403) return "forbidden";

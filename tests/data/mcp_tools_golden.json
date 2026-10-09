@@ -1032,6 +1032,34 @@
       "type": "object"
     }
   },
+  "get_ai_usage": {
+    "description": "AI gateway usage per (UTC day, app, alias): requests, prompt and\ncompletion tokens, upstream errors. No cost estimate, no prompt trace.",
+    "inputSchema": {
+      "properties": {
+        "days": {
+          "default": 7,
+          "description": "UTC days back, today included (1-90).",
+          "title": "Days",
+          "type": "integer"
+        },
+        "service": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Only this app's usage; omit for every app.",
+          "title": "Service"
+        }
+      },
+      "title": "get_ai_usageArguments",
+      "type": "object"
+    }
+  },
   "get_app_config": {
     "description": "Read a deployed app's daemon-persisted config (deploy fields + ai bindings).\n\nSecret values are never returned \u2014 only ``${secrets.X}`` refs and env\nkey names. Each ``[ai.<name>]`` binding shown here is injected into the\napp at launch as ``NERDIT_AI_<NAME>_URL/_KEY/_MODEL``, and the\n``default`` binding also sets ``OPENAI_BASE_URL/OPENAI_API_KEY/\nOPENAI_MODEL`` (drop-in OpenAI SDK).\n\n``deploy.release`` is the command run once inside the new image before\ntraffic moves (a failure aborts the deploy and reverts the image,\nnever the data \u2014 write idempotent migrations); ``deploy.cutover`` null =\nzero-downtime swap when eligible, false = same-port swap. ``env_keys``\nare literal runtime env names; secret refs are accepted only by\n``ai.*.api_key``, ``db.*.password``, ``edge_auth.password`` and a git\n``token_ref`` \u2014 a ``${secrets.shared.KEY}`` there resolves at launch for\nany owner, so a human can place the secret and the agent only names it.\n",
     "inputSchema": {
@@ -1301,6 +1329,14 @@
         "name"
       ],
       "title": "get_serviceArguments",
+      "type": "object"
+    }
+  },
+  "list_ai_routes": {
+    "description": "List the machine AI gateway's aliases and whether the gateway is enabled.\n\nEach alias shows its provider, provider model, base_url and the\n``${secrets.shared.KEY}`` reference of its key: never a key value.\n",
+    "inputSchema": {
+      "properties": {},
+      "title": "list_ai_routesArguments",
       "type": "object"
     }
   },
@@ -1676,6 +1712,42 @@
         "name"
       ],
       "title": "redeploy_serviceArguments",
+      "type": "object"
+    }
+  },
+  "remove_ai_route": {
+    "description": "Remove a machine AI gateway alias (admin).\n\nRefused with 409 ``ai_gateway.alias_in_use`` (naming the apps) while a\nrunning app's ``[ai.*]`` uses it, unless ``force``.\n",
+    "inputSchema": {
+      "properties": {
+        "alias": {
+          "description": "Machine alias an app names in ``[ai.<name>] model`` with ``provider = \"gateway\"``: a lowercase letter, then up to 31 of a-z, 0-9, '_' or '-'.",
+          "title": "Alias",
+          "type": "string"
+        },
+        "force": {
+          "default": false,
+          "description": "true = remove even while a running app uses the alias (its AI calls then fail with 404 ``alias_not_found``).",
+          "title": "Force",
+          "type": "boolean"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
+          "title": "Idempotency Key"
+        }
+      },
+      "required": [
+        "alias"
+      ],
+      "title": "remove_ai_routeArguments",
       "type": "object"
     }
   },
@@ -2241,6 +2313,74 @@
         "name"
       ],
       "title": "service_statsArguments",
+      "type": "object"
+    }
+  },
+  "set_ai_route": {
+    "description": "Create or replace a machine AI gateway alias (admin).\n\nApps then declare ``[ai.default] provider = \"gateway\"`` and\n``model = \"<alias>\"``: the daemon injects the gateway URL and a per-app\nvirtual key, and the provider key never enters a container. Answers\n``enabled: false`` while ``[ai_gateway]`` is off (the alias is stored\nand serves once it is enabled). Refusals: 422 ``ai_gateway.alias_invalid``,\n``ai_gateway.base_url_invalid`` (not https, private address, userinfo),\n``ai_gateway.secret_ref_invalid``.\n",
+    "inputSchema": {
+      "properties": {
+        "alias": {
+          "description": "Machine alias an app names in ``[ai.<name>] model`` with ``provider = \"gateway\"``: a lowercase letter, then up to 31 of a-z, 0-9, '_' or '-'.",
+          "title": "Alias",
+          "type": "string"
+        },
+        "api_key_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Provider ``api`` only: a ``${secrets.shared.KEY}`` reference to the provider key, set beforehand with ``set_secret`` on scope ``shared``. Never the key itself.",
+          "title": "Api Key Ref"
+        },
+        "base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Provider ``api`` only: OpenAI-compatible base URL, usually ending in ``/v1``; https to a public host, or http to loopback or the models bridge.",
+          "title": "Base Url"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Caller-chosen key: a retry with the same key replays the first result instead of acting twice. Omit and a fresh key is minted per call, so each call acts.",
+          "title": "Idempotency Key"
+        },
+        "model": {
+          "description": "Provider model the alias maps to (an ollama model name for provider 'ollama').",
+          "title": "Model",
+          "type": "string"
+        },
+        "provider": {
+          "default": "api",
+          "description": "``api`` (an OpenAI-compatible provider) or ``ollama`` (a model served on this machine).",
+          "title": "Provider",
+          "type": "string"
+        }
+      },
+      "required": [
+        "alias",
+        "model"
+      ],
+      "title": "set_ai_routeArguments",
       "type": "object"
     }
   },

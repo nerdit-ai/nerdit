@@ -104,7 +104,7 @@ _SINGLE_FILE_READS = {
 # Receivers whose `.load` is not a `SecretManager` read. The secrets route and
 # `daemon/secret_scope.py` are absent on purpose: they address one scope file
 # through `list_keys`/`set`/`delete*` and never call `load`.
-_FOREIGN_RECEIVERS = {"json", "tomllib", "tomli", "_admin"}
+_FOREIGN_RECEIVERS = {"json", "tomllib", "tomli", "_admin", "uvicorn_config"}
 
 
 def _bare_secret_loads() -> list[tuple[str, str, int]]:

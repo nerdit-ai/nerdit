@@ -162,6 +162,29 @@ def test_ollama_with_shared_api_key_rejected():
         )
 
 
+def test_gateway_binding_names_an_alias_only():
+    binding = AiBindingConfig(provider="gateway", model="fast")
+    assert (binding.base_url, binding.api_key) == (None, None)
+
+
+@pytest.mark.parametrize("alias", ["Fast", " fast", "a" * 33, "1st", "fast model"])
+def test_gateway_alias_follows_the_route_grammar(alias):
+    """A deploy cannot wait forever on an alias `nerdit ai routes set` can never create."""
+    with pytest.raises(ValidationError) as exc:
+        AiBindingConfig(provider="gateway", model=alias)
+    assert "machine alias" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("base_url", "https://api.example.com/v1"), ("api_key", "${secrets.shared.OPENAI_KEY}")],
+)
+def test_gateway_forbids_base_url_and_api_key(field, value):
+    """The daemon composes the gateway URL and mints the per-app virtual key."""
+    with pytest.raises(ValidationError, match=f"provider 'gateway' forbids '{field}'"):
+        AiBindingConfig(provider="gateway", model="fast", **{field: value})
+
+
 def test_unknown_provider_rejected():
     with pytest.raises(ValidationError):
         AiBindingConfig(provider="vllm", model="llama3.1:8b")

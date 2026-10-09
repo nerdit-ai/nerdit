@@ -878,3 +878,125 @@ def test_foreign_claim_refuses_the_template_deploy_before_the_clone(tmp_path, mo
     assert resp.json()["code"] == "service.name_claimed"
     clone_mock.assert_not_awaited()
     q.reserve_service_for_token.assert_not_awaited()
+
+
+# --- deploy_into_project_v1: a template deploy joins an existing project -------
+
+
+def _project(owner: str | None):
+    from nerdit.db.models import Project
+
+    return Project(id=PRJ_ID, name="demo", submitted_by_token=owner)
+
+
+def test_template_join_creates_the_seat_and_scopes_secrets_to_the_label(tmp_path, monkeypatch):
+    _patch_catalog(monkeypatch, _synthetic_template())
+    _patch_clone(monkeypatch, _node_context(tmp_path, toml="[deploy]\nport = 8080\n"))
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-sub"))
+    client = _client(q, tmp_path)
+    resp = client.post(
+        "/app-templates/synth/deploy",
+        json={
+            "project": "demo",
+            "service": "api",
+            "env": {"API_URL": "u"},
+            "secrets": {"SERVICE_KEY": "k"},
+        },
+        headers=_auth(SUB_RAW),
+    )
+    assert resp.status_code == 201, resp.text
+    job = q.reserve_service_for_token.call_args.args[0]
+    assert (job.service_name, job.project_id, job.environment, job.service) == (
+        "api--demo",
+        PRJ_ID,
+        "production",
+        "api",
+    )
+    assert json.loads(job.config)["port"] == 5000  # template default still beats the repo
+    assert client.app.state.secret_manager.set.call_args.args[0] == "api--demo"
+    assert resp.json()["service"] == "api"
+
+
+def test_template_join_by_a_project_scoped_token_writes_the_secrets(tmp_path, monkeypatch):
+    """A token scoped to `demo` (not to the label) deploys a template with secrets into it."""
+    scoped_raw = "scoped-raw"
+    monkeypatch.setitem(
+        _TOKENS,
+        hash_token(scoped_raw),
+        ApiToken(
+            id="tok-sub",
+            name="p",
+            role=TokenRole.submitter,
+            token_hash=hash_token(scoped_raw),
+            scope_services=["demo"],
+        ),
+    )
+    _patch_catalog(monkeypatch, _synthetic_template())
+    _patch_clone(monkeypatch, _node_context(tmp_path))
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-sub"))
+    client = _client(q, tmp_path)
+    resp = client.post(
+        "/app-templates/synth/deploy",
+        json={
+            "project": "demo",
+            "service": "api",
+            "env": {"API_URL": "u"},
+            "secrets": {"SERVICE_KEY": "k"},
+        },
+        headers=_auth(scoped_raw),
+    )
+    assert resp.status_code == 201, resp.text
+    assert client.app.state.secret_manager.set.call_args.args[0] == "api--demo"
+
+
+def test_template_join_onto_a_held_label_is_409(tmp_path, monkeypatch):
+    _patch_catalog(monkeypatch, _synthetic_template())
+    clone_mock, _ = _patch_clone(monkeypatch, _node_context(tmp_path))
+    existing = Job(
+        id="svc-1",
+        service_name="demo",
+        name="demo",
+        kind=JobKind.service,
+        gpu_count=0,
+        submitted_by_token="tok-sub",
+        config=json.dumps({"image": "nerdit-app/demo:1", "build_version": 1, "max_version": 1}),
+    )
+    q = _queries(existing)
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-sub"))
+    resp = _client(q, tmp_path).post(
+        "/app-templates/synth/deploy",
+        json={
+            "project": "demo",
+            "service": "web",
+            "env": {"API_URL": "u"},
+            "secrets": {"SERVICE_KEY": "k"},
+        },
+        headers=_auth(SUB_RAW),
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["code"] == "service.name_taken"
+    clone_mock.assert_not_awaited()
+
+
+def test_template_join_foreign_project_is_409_before_any_secret_write(tmp_path, monkeypatch):
+    _patch_catalog(monkeypatch, _synthetic_template())
+    clone_mock, _ = _patch_clone(monkeypatch, _node_context(tmp_path))
+    q = _queries()
+    q.get_project_by_name = AsyncMock(return_value=_project("tok-other"))
+    client = _client(q, tmp_path)
+    resp = client.post(
+        "/app-templates/synth/deploy",
+        json={
+            "project": "demo",
+            "service": "api",
+            "env": {"API_URL": "u"},
+            "secrets": {"SERVICE_KEY": "k"},
+        },
+        headers=_auth(SUB_RAW),
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["code"] == "project.owned"
+    client.app.state.secret_manager.set.assert_not_called()
+    clone_mock.assert_not_awaited()

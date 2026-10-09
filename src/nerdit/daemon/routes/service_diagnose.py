@@ -303,6 +303,7 @@ async def _classify_bindings(request: Request, job: Job, cfg: dict) -> BindingWa
                 secret_env,
                 bridge_host,
                 shared_env=shared_env,
+                gateway=getattr(getattr(request.app.state, "settings", None), "ai_gateway", None),
             )
         except BindingNotReady as exc:
             messages.append(str(exc))

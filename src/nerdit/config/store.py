@@ -19,6 +19,7 @@ from pydantic import BaseModel, ValidationError
 from nerdit.config.defaults import DEFAULT_DATA_DIR, DEFAULT_LOG_LEVEL
 from nerdit.config.redaction import is_secret_key, redact_section, redact_value
 from nerdit.config.settings import (
+    AiGatewaySettings,
     ClientSettings,
     ContainerSettings,
     DaemonSettings,
@@ -83,6 +84,7 @@ _SECTION_MODELS: dict[str, type[BaseModel]] = {
     "services": ServicesSettings,
     "proxy": ProxySettings,
     "models": ModelsSettings,
+    "ai_gateway": AiGatewaySettings,
     "databases": DatabasesSettings,
     "git": GitSettings,
     "notifications": NotificationsSettings,
@@ -338,6 +340,12 @@ _RESTART_KEYS: dict[str, frozenset[str]] = {
     # a restart (and a dashboard reload) is needed to pick the change up. Whole-
     # section frozenset, the ``[git]``/``[mcp]``/``[retention]`` precedent.
     "posthog": frozenset({"enabled", "project_key", "host"}),
+    # ``[ai_gateway]``: the listener is started (or not) once in the lifespan
+    # and the ServiceController captures the section at construction, so every
+    # key is restart-required. Whole-section frozenset, the ``[git]`` precedent.
+    "ai_gateway": frozenset(
+        {"enabled", "port", "upstream_timeout_s", "stream_timeout_s", "max_body_bytes"}
+    ),
     # ``[client]`` is deliberately absent and must stay absent: its only
     # consumer is ``get_client_config()``, re-read on every CLI invocation, so
     # ``requires_restart: false`` is already the truthful answer.

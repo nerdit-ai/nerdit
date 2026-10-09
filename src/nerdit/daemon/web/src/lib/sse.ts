@@ -1,5 +1,5 @@
 import { apiUrl } from "../api/client";
-import { getStoredToken } from "./auth";
+import { authErrorCode, clearStoredToken, getStoredToken, handleAuthFailure, isDeadBearer } from "./auth";
 
 /**
  * Authenticated fetch-streaming for `text/event-stream` endpoints (P12 §1.3).
@@ -156,8 +156,11 @@ export async function streamEvents(path: string, opts: StreamOptions): Promise<S
       if (token) headers.set("Authorization", `Bearer ${token}`);
       const response = await fetch(apiUrl(path), { headers, signal });
       if (response.status === 401 || response.status === 403) {
-        // Drain the unused body so the connection is released, not leaked.
-        await response.body?.cancel();
+        const body = await response.json().catch(() => null);
+        if (isDeadBearer(response.status, authErrorCode(body))) {
+          clearStoredToken();
+          handleAuthFailure();
+        }
         return "forbidden";
       }
       if (!response.ok || !response.body) {

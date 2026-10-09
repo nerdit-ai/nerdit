@@ -28,11 +28,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
 from nerdit.config.project import shared_secret_keys_for
 from nerdit.config.settings import (
+    AiGatewaySettings,
     ContainerSettings,
     ModelsSettings,
     RetentionSettings,
@@ -81,6 +83,7 @@ from nerdit.core.models.binding import (
     BindingNotReady,
     ResolvedBinding,
     inject_env,
+    mint_gateway_key,
     resolve_bindings,
 )
 from nerdit.core.models.controller import ModelController
@@ -285,6 +288,9 @@ class ResolvedLaunchEnv:
     secret_env: dict[str, str] = field(default_factory=dict)
     shared_keys: list[str] = field(default_factory=list)
     injected_keys: set[str] = field(default_factory=set)
+    #: The resolved `[ai.*]` bindings; `gateway` ones are keyless when the caller
+    #: asked for no key (`_launch` mints once every launch precondition passed).
+    resolved_ai: dict[str, ResolvedBinding] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -654,8 +660,13 @@ class ServiceController:
         data_dir: str | None = None,
         retention_settings: RetentionSettings | None = None,
         events: EventRecorder | None = None,
+        ai_gateway: AiGatewaySettings | None = None,
     ) -> None:
         self._queries = queries
+        # `[ai_gateway]` for `provider = "gateway"` bindings; None reads as off.
+        self._ai_gateway = ai_gateway
+        # Flipped by the lifespan when the gateway listener failed to bind.
+        self._ai_gateway_listening = True
         self._runtime = runtime
         self._event_bus = event_bus
         # Durable event feed. Optional so a bare-constructed
@@ -2075,7 +2086,9 @@ class ServiceController:
             is_data = job.kind is JobKind.database and self._data is not None
             ai_specs = cfg.get("ai") if not (is_model or is_data) else None
             db_specs = cfg.get("db") if not (is_model or is_data) else None
-            resolved = await self._resolve_launch_env(job, cfg, container_port, ai_specs, db_specs)
+            resolved = await self._resolve_launch_env(
+                job, cfg, container_port, ai_specs, db_specs, gateway_key=None
+            )
         except Exception:  # noqa: BLE001 - forensics must never break the crash path
             return None
         return _sensitive_env_values(resolved)
@@ -2383,8 +2396,15 @@ class ServiceController:
         container_port: int,
         ai_specs: object,
         db_specs: object,
+        *,
+        gateway_key: Literal["rotate", "extra"] | None = "extra",
     ) -> ResolvedLaunchEnv:
         """Acquire the full launch env or raise `LaunchEnvNotReady`.
+
+        `gateway_key` says how `[ai.*] provider = "gateway"` bindings get their
+        virtual key once everything resolved: `"rotate"` (a main-container
+        launch: mint, revoke the service's other keys), `"extra"` (a run,
+        release or cutover green: mint alongside) or `None` (no key: forensics).
 
         Pure of audit side effects: the caller owns the wait-log and
         shared-resolved audit. Loads the scoped variables (project < service,
@@ -2444,7 +2464,13 @@ class ServiceController:
             try:
                 if ai_dict:
                     resolved_ai = await resolve_bindings(
-                        ai_dict, self._queries, secret_env, self._bridge_host, shared_env=shared_env
+                        ai_dict,
+                        self._queries,
+                        secret_env,
+                        self._bridge_host,
+                        shared_env=shared_env,
+                        gateway=self._ai_gateway,
+                        gateway_listening=self._ai_gateway_listening,
                     )
                 if db_dict:
                     if self._data is None or self._secrets is None:
@@ -2464,6 +2490,14 @@ class ServiceController:
                     )
             except BindingNotReady as exc:
                 raise LaunchEnvNotReady("binding", str(exc)) from exc
+            if resolved_ai and gateway_key is not None and job.service_name:
+                resolved_ai = await mint_gateway_key(
+                    resolved_ai,
+                    ai_dict,
+                    self._queries,
+                    job.service_name,
+                    rotate=gateway_key == "rotate",
+                )
 
         # Env: config env first, then per-service secrets override it so a
         # rotated/removed secret takes effect on the next launch without the app
@@ -2506,7 +2540,32 @@ class ServiceController:
             secret_env=secret_env,
             shared_keys=shared_keys,
             injected_keys=set(injected),
+            resolved_ai=resolved_ai,
         )
+
+    def mark_ai_gateway_down(self) -> None:
+        """The gateway listener failed to bind: gateway bindings wait, nothing launches."""
+        self._ai_gateway_listening = False
+
+    async def _mint_gateway_env(
+        self, job: Job, ai_specs: object, resolved_env: ResolvedLaunchEnv
+    ) -> dict[str, str]:
+        """The launch env with the service's rotated virtual key filled in.
+
+        Called by `_launch` only once GPUs and the host port are acquired: a
+        service waiting on a precondition retries every tick, and minting
+        earlier would grow `ai_gateway_keys` and revoke the serving key for
+        nothing.
+        """
+        env = resolved_env.env
+        if not (resolved_env.resolved_ai and isinstance(ai_specs, dict) and job.service_name):
+            return env
+        filled = await mint_gateway_key(
+            resolved_env.resolved_ai, ai_specs, self._queries, job.service_name, rotate=True
+        )
+        if filled is resolved_env.resolved_ai:
+            return env  # no gateway binding
+        return {**env, **inject_env(filled)}
 
     async def _launch(self, job: Job) -> None:
         """Resolve env and mounts, allocate resources, and launch a service container.
@@ -2539,8 +2598,10 @@ class ServiceController:
         # reboot's resource-before-app ordering converges on its own. Never a
         # terminal failure.
         try:
+            # Keyless here: the virtual key is minted (and the previous one revoked)
+            # by _mint_gateway_env below, after GPUs and the host port are acquired.
             resolved_env = await self._resolve_launch_env(
-                job, cfg, container_port, ai_specs, db_specs
+                job, cfg, container_port, ai_specs, db_specs, gateway_key=None
             )
         except LaunchEnvNotReady as exc:
             if exc.kind == "binding":
@@ -2645,8 +2706,9 @@ class ServiceController:
 
         # The container env was fully assembled by _resolve_launch_env
         # above (config env ⊕ per-service secrets ⊕ injected [ai.*] ⊕ PORT
-        # default). Secret values never touch logs or the audit row.
-        env = resolved_env.env
+        # default); only the gateway virtual key is minted now, every
+        # precondition having passed. Secret values never touch logs or the audit row.
+        env = await self._mint_gateway_env(job, ai_specs, resolved_env)
 
         if is_model:
             assert self._models is not None  # is_model implies a controller

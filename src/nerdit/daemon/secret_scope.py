@@ -316,18 +316,21 @@ async def _landed_is_callers(request: Request, principal: Principal, service: st
     raise owner_denial()
 
 
-async def set_secret_values(request: Request, service: str, values: dict[str, str]) -> list[str]:
+async def set_secret_values(
+    request: Request, service: str, values: dict[str, str], *, project: str | None = None
+) -> list[str]:
     """Validate, authorize (minting a claim on a rowless name) and merge `values`.
 
     Returns the resulting key names. Validation runs before authorization so a
-    bad item never mints a claim.
+    bad item never mints a claim. `project` widens the scope check to the project
+    the caller already judged (a join, D-P40-7); the secrets route passes none.
     """
     secret_call(validate_secret_items, values)
     # Authorize INSIDE the lock: a verdict reached while waiting (a backup holds
     # it for minutes) could outlive the claim it judged — the owner deletes the
     # scope, a stranger claims the name, and the stale write lands in their file.
     async with variable_write_lock(request.app):
-        await authorize_secret_scope(request, service, write=True, mint=True)
+        await authorize_secret_scope(request, service, write=True, mint=True, project=project)
         await demote_flags(request, service, values)
         return await secret_io(secret_manager(request).set, storage_name(service), values)
 
@@ -367,6 +370,16 @@ def name_taken_error(name: str) -> NerditError:
         "service.name_taken",
         f"A service named '{name}' already exists.",
         hint="Choose a different name, or ask that service's owner (or an admin) to remove it.",
+    )
+
+
+def seat_taken_error(name: str) -> NerditError:
+    """The 409 a join (deploy_into_project_v1) meets when the composed label already has a row."""
+    return NerditError(
+        409,
+        "service.name_taken",
+        f"A service named '{name}' already exists.",
+        hint=f"Update it with `nerdit services redeploy {name}`, or pick another service name.",
     )
 
 

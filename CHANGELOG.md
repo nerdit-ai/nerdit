@@ -4,6 +4,52 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.8.2 (2026-10-09)
+
+Applications can talk to AI providers through the machine's own gateway, and a
+Git deployment can join an existing project.
+
+### AI gateway (off by default)
+
+- **One endpoint per machine.** With `[ai_gateway] enabled = true` in
+  `config.toml`, the Engine serves an OpenAI-compatible endpoint on the Docker
+  bridge (port 9330 by default). Applications bind to it with
+  `provider = "gateway"` and a model **alias** such as `fast`; the binding
+  injects the same variables as the other providers (`OPENAI_BASE_URL`,
+  `OPENAI_API_KEY` and `OPENAI_MODEL` for `[ai.default]`,
+  `NERDIT_AI_<NAME>_URL`/`_KEY`/`_MODEL` for a named binding), so application
+  code does not change.
+- **Provider keys stay on the machine.** An alias maps to a provider model, a
+  base URL and a reference to a shared secret. Containers only ever receive a
+  per-application virtual key, re-minted on every launch and revocable with
+  `nerdit ai keys revoke APP`. An alias can also point at a model this machine
+  serves with Ollama.
+- **Usage per application.** `nerdit ai usage` reports requests, prompt and
+  completion tokens and upstream errors per application, alias and day;
+  streamed answers are counted too.
+- **Control surface.** `nerdit ai routes list|set|rm`, `nerdit ai keys`,
+  `nerdit ai usage`; `/api/ai-gateway/*`; MCP tools `list_ai_routes`,
+  `set_ai_route`, `remove_ai_route`, `get_ai_usage`; capability
+  `ai_gateway_v1`. If the gateway is off, could not start, or an alias is
+  missing, the application waits and its logs say why.
+
+### Deploy
+
+- **Add a service to an existing project.** `POST /api/deploy/git` and the
+  store deploy take `project` and `service` together; the service is created
+  in the project's `production` environment and redeploys like any Git-sourced
+  application. Capability `deploy_into_project_v1`.
+
+### Fixes
+
+- **Dashboard opened from Nerdit Cloud.** It no longer asks for a local token
+  when the console session already authenticates it, and it recovers an
+  expired session in place instead of signing you out.
+- **Hardening from review.** A deploy joining a project re-checks its seat
+  after the clone, so two concurrent joins cannot overwrite each other; a
+  gateway alias URL must be printable; usage counters are bounded so an
+  out-of-range provider value cannot fail a request or the usage report.
+
 ## 0.8.1 (2026-10-04)
 
 A VM template can be moved to a new version without rebuilding it.

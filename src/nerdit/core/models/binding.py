@@ -9,11 +9,13 @@ The default binding injects `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from pydantic import ValidationError
 
 from nerdit.config.project import AiBindingConfig
+from nerdit.config.settings import AiGatewaySettings
+from nerdit.core.ai_gateway.keys import mint_key
 
 # Re-export the shared error for existing callers; secretref stays an import leaf.
 from nerdit.core.bindings.secretref import BindingNotReady, resolve_secret_ref
@@ -38,13 +40,16 @@ class ResolvedBinding:
     model: str
 
 
-async def resolve_binding(
+async def resolve_binding(  # noqa: PLR0913 - launch inputs + keyword-only gateway
     name: str,
     spec: dict,
     queries: Queries,
     secrets: dict[str, str],
     bridge_host: str,
     shared_env: dict[str, str] | None = None,
+    *,
+    gateway: AiGatewaySettings | None = None,
+    gateway_listening: bool = True,
 ) -> ResolvedBinding:
     """Resolve one persisted `config['ai'][name]` spec dict to concrete values.
 
@@ -53,6 +58,9 @@ async def resolve_binding(
     shared secret store — loaded lazily by the caller, and consulted only
     for `${secrets.shared.KEY}` refs. *bridge_host* is the docker bridge
     gateway IP local model endpoints are reachable on from app containers.
+    *gateway* is the `[ai_gateway]` section (`None` reads as disabled). A
+    `gateway` binding comes back with an empty `api_key`: only
+    `resolve_bindings` mints virtual keys.
     """
     try:
         cfg = AiBindingConfig(**spec)
@@ -65,7 +73,42 @@ async def resolve_binding(
         ) from exc
     if cfg.provider == "api":
         return _resolve_api(name, cfg, secrets, shared_env or {})
+    if cfg.provider == "gateway":
+        return await _resolve_gateway(name, cfg, queries, gateway, bridge_host, gateway_listening)
     return await _resolve_ollama(name, cfg, queries, bridge_host)
+
+
+async def _resolve_gateway(
+    name: str,
+    cfg: AiBindingConfig,
+    queries: Queries,
+    settings: AiGatewaySettings | None,
+    bridge_host: str,
+    listening: bool = True,
+) -> ResolvedBinding:
+    """`provider='gateway'`: readiness, then the machine's gateway URL and the alias.
+
+    The provider key never enters the container: the gateway resolves it per
+    request. The virtual key is filled in by `resolve_bindings`.
+    """
+    if settings is None or not settings.enabled:
+        raise BindingNotReady(
+            f"[ai.{name}] uses the AI gateway, which is off on this machine — "
+            f"enable [ai_gateway] in config.toml and restart the daemon"
+        )
+    if not listening:
+        raise BindingNotReady(
+            f"[ai.{name}] uses the AI gateway, which failed to start on this machine "
+            f"(its port may be in use) — see the daemon log, then restart the daemon"
+        )
+    if await queries.get_ai_route(cfg.model) is None:
+        raise BindingNotReady(
+            f"[ai.{name}] model alias '{cfg.model}' is not defined on this machine — "
+            f"run: nerdit ai routes set {cfg.model} ..."
+        )
+    return ResolvedBinding(
+        base_url=f"http://{bridge_host}:{settings.port}/v1", api_key="", model=cfg.model
+    )
 
 
 def _resolve_api(
@@ -129,18 +172,23 @@ async def _resolve_ollama(
     )
 
 
-async def resolve_bindings(
+async def resolve_bindings(  # noqa: PLR0913 - launch inputs + keyword-only gateway
     specs: dict,
     queries: Queries,
     secrets: dict[str, str],
     bridge_host: str,
     shared_env: dict[str, str] | None = None,
+    *,
+    gateway: AiGatewaySettings | None = None,
+    gateway_listening: bool = True,
 ) -> dict[str, ResolvedBinding]:
     """Resolve every binding in a persisted `config['ai']` table.
 
     All-or-nothing: the first `BindingNotReady` propagates, so an app is
     never launched with a partially wired AI env. Names are iterated sorted for
     a deterministic first error message (log dedupe keys on the message).
+    *gateway* is the `[ai_gateway]` section; `gateway` bindings come back
+    keyless — `mint_gateway_key` fills them once the whole launch env resolved.
     """
     resolved: dict[str, ResolvedBinding] = {}
     for name in sorted(specs):
@@ -152,8 +200,41 @@ async def resolve_bindings(
             secrets,
             bridge_host,
             shared_env=shared_env,
+            gateway=gateway,
+            gateway_listening=gateway_listening,
         )
     return resolved
+
+
+async def mint_gateway_key(
+    resolved: dict[str, ResolvedBinding],
+    specs: dict,
+    queries: Queries,
+    service_name: str,
+    *,
+    rotate: bool,
+) -> dict[str, ResolvedBinding]:
+    """Fill every `gateway` binding with one freshly minted virtual key for the service.
+
+    Called once the whole launch env resolved, so a binding wait never mints
+    (nor rotates) a key. *rotate* revokes the service's other keys: set by a
+    main-container launch; a one-off run, a release or a cutover green mints
+    alongside so the serving container keeps its key.
+    ponytail: revoked rows (and the side keys of runs/greens until the next
+    main launch) are never swept; prune on `revoked_at` if the table grows.
+    """
+    names = [
+        name
+        for name, spec in specs.items()
+        if isinstance(spec, dict) and spec.get("provider") == "gateway" and name in resolved
+    ]
+    if not names:
+        return resolved
+    key = await mint_key(queries, service_name, revoke_others=rotate)
+    return {
+        name: replace(binding, api_key=key) if name in names else binding
+        for name, binding in resolved.items()
+    }
 
 
 def inject_env(resolved: dict[str, ResolvedBinding]) -> dict[str, str]:

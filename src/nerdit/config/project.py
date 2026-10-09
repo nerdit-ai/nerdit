@@ -47,6 +47,12 @@ _EDGE_AUTH_USER_RE = re.compile(r"^(?=[\x20-\x7e]*[\x21-\x39\x3b-\x7e])[\x20-\x3
 # contract-freeze review (tests/test_ai_binding_schema.py pins these).
 # Binding names map to NERDIT_AI_<NAME>_* env vars.
 AI_BINDING_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+#: A machine AI gateway alias (`[ai.*] provider = "gateway"` puts one in `model`;
+#: `PUT /ai-gateway/routes/{alias}` creates one). One grammar, two gates.
+AI_GATEWAY_ALIAS_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+AI_GATEWAY_ALIAS_HINT = (
+    "An alias is 1-32 characters: a lowercase letter, then a-z, 0-9, '_' or '-'."
+)
 # api_key must be a SecretManager reference — literal keys never live in TOML.
 # Two groups (P8): (scope | None, KEY). The only scope is the literal 'shared'
 # — ``${secrets.shared.KEY}`` resolves the per-service KEY first (override
@@ -334,7 +340,9 @@ class AiBindingConfig(BaseModel):
     """An AI binding resolved into OpenAI-compatible environment variables at launch.
 
     Ollama bindings name a served model and forbid base_url/api_key; the daemon
-    composes the endpoint and placeholder key. API bindings require base_url and
+    composes the endpoint and placeholder key. Gateway bindings name a machine
+    alias of the AI gateway and forbid base_url/api_key; the daemon composes the
+    gateway endpoint and mints a per-service virtual key. API bindings require base_url and
     a service/shared secret reference for api_key, never a literal credential.
     Inject OPENAI_BASE_URL/OPENAI_API_KEY and NERDIT_AI_<NAME>_* variables.
     Reject unknown fields and hide validation inputs to prevent credential leaks.
@@ -342,7 +350,7 @@ class AiBindingConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    provider: Literal["ollama", "api"]
+    provider: Literal["ollama", "api", "gateway"]
     model: str = Field(min_length=1)
     base_url: str | None = None
     api_key: str | None = None
@@ -374,7 +382,7 @@ class AiBindingConfig(BaseModel):
                 raise ValueError(
                     "[ai] provider 'api' requires 'api_key' (a '${secrets.KEY}' reference)."
                 )
-        else:  # provider == "ollama"
+        elif self.provider == "ollama":
             if self.base_url is not None:
                 raise ValueError(
                     "[ai] provider 'ollama' forbids 'base_url': "
@@ -384,6 +392,24 @@ class AiBindingConfig(BaseModel):
                 raise ValueError(
                     "[ai] provider 'ollama' forbids 'api_key': "
                     "the daemon injects a placeholder key."
+                )
+        else:  # provider == "gateway"
+            if not AI_GATEWAY_ALIAS_RE.fullmatch(self.model):
+                # The value is not echoed (hide_input_in_errors applies to the input,
+                # not to a validator's own message).
+                raise ValueError(
+                    "[ai] provider 'gateway' takes a machine alias as 'model'. "
+                    + AI_GATEWAY_ALIAS_HINT
+                )
+            if self.base_url is not None:
+                raise ValueError(
+                    "[ai] provider 'gateway' forbids 'base_url': "
+                    "the daemon composes the AI gateway endpoint."
+                )
+            if self.api_key is not None:
+                raise ValueError(
+                    "[ai] provider 'gateway' forbids 'api_key': "
+                    "the daemon injects a per-app virtual key."
                 )
         return self
 

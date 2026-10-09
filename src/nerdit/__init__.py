@@ -1,3 +1,3 @@
 """Nerdit — Le moteur de l'IA locale."""
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"

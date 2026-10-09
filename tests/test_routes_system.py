@@ -244,6 +244,10 @@ def test_capabilities_admin_has_paths_and_admin_addr():
     assert body["features"]["project_apply"] is True
     # (Lot 5) Constant true: an older daemon 422s `hosted_only` on PUT share.
     assert body["features"]["hosted_only_shares"] is True
+    # Constant true: `project` / `service` on a deploy body 422 before this build.
+    assert body["features"]["deploy_into_project_v1"] is True
+    # Constant true: `/ai-gateway/*` is a plain 404 before this build.
+    assert body["features"]["ai_gateway_v1"] is True
 
 
 def test_capabilities_projects_the_container_sandbox():

@@ -266,6 +266,10 @@ _SECRET_INPUT_FIELDS = frozenset(
         # rides an error body; the `loc` still names the offending path. No
         # other request model binds a `files` field.
         "files",
+        # `AiRouteSetRequest`: a provider key pasted where its reference
+        # belongs is the likely mistake, and a base_url may carry userinfo.
+        "api_key_ref",
+        "base_url",
     }
 )
 

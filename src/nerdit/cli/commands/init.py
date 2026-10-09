@@ -180,7 +180,7 @@ NERDIT_TOML_TEMPLATE = """\
 
 # Declare the AI the app needs; Nerdit wires it to a local model or an API.
 # [ai.default]
-# provider = "ollama"          # or "api"
+# provider = "ollama"          # or "api", or "gateway" (model = a machine alias)
 # model = "llama3.1:8b"
 # base_url = "https://api.openai.com/v1"   # provider = "api" only
 # api_key = "${secrets.OPENAI_API_KEY}"    # secret references only

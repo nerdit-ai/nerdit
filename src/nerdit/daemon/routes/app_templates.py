@@ -24,8 +24,14 @@ from nerdit.daemon.deploy_pipeline import (
     reject_non_service_row,
 )
 from nerdit.daemon.errors import NerditError
+from nerdit.daemon.routes.deploy import resolve_service_target
 from nerdit.daemon.routes.services import reject_reserved_name
-from nerdit.daemon.secret_scope import reject_foreign_claim, secret_call, set_secret_values
+from nerdit.daemon.secret_scope import (
+    reject_foreign_claim,
+    seat_taken_error,
+    secret_call,
+    set_secret_values,
+)
 from nerdit.db.models import AppTemplate, TemplateDeployRequest, TokenRole
 
 router = APIRouter()
@@ -90,17 +96,21 @@ async def deploy_app_template(
     if template is None:
         raise NerditError(404, "not_found", f"No app template '{template_id}'.")
 
-    reject_reserved_name(body.name)
-    # (P25 D-P25-3 leg b) `body.name` is the resolved service name (never
+    # (deploy_into_project_v1) The label is the body's name, or composed from
+    # the joined project's seat; the project is judged here, before any write.
+    name, seat = await resolve_service_target(request, body)
+    reject_reserved_name(name)
+    # (P25 D-P25-3 leg b) `name` is the resolved service name (never
     # template-derived), so the scope check runs before the clone and before any
     # SecretManager write.
     # (D-P40-7) Label-only: scope is judged before any lookup, so there is no row
-    # whose project could widen it (the ceiling is named at `rollback`).
-    require_service_scope(request, body.name)
+    # whose project could widen it (the ceiling is named at `rollback`); a join
+    # is widened by the project it joins.
+    require_service_scope(request, name, project=seat[0].name if seat is not None else None)
     # Re-point the audit target from the path-derived template id to the deployed
     # service name (the template id stays in the event params) so store-created
     # projects are visible to GET /audit?target=<app>.
-    request.state.audit_target = body.name
+    request.state.audit_target = name
 
     # env_schema enforcement: every required input must be present in the channel
     # its `secret` flag dictates (secret → body.secrets, else body.env). A
@@ -126,7 +136,9 @@ async def deploy_app_template(
     request.state.audit_params = audit_params(
         {
             "template_id": template_id,
-            "name": body.name,
+            "name": name,
+            "project": body.project,
+            "service": body.service,
             "port": body.port,
             "gpus": body.gpus,
             "start": body.start,
@@ -136,9 +148,12 @@ async def deploy_app_template(
     )
 
     queries = request.app.state.queries
-    existing = await queries.get_service_by_name(body.name)
+    existing = await queries.get_service_by_name(name)
+    # A join creates a seat; the label already held by any row is taken.
+    if seat is not None and existing is not None:
+        raise seat_taken_error(name)
     # A model row is not a redeploy target (fast path — rejects before clone).
-    reject_non_service_row(existing, body.name)
+    reject_non_service_row(existing, name)
     # Authorize a redeploy against the existing row PRE-CLONE — an unauthorized
     # attempt must be rejected before it consumes clone timeout/bytes.
     if existing is not None:
@@ -146,7 +161,7 @@ async def deploy_app_template(
     else:
         # (P39) A name another token reserved by setting its secrets is
         # refused before the clone; the row transaction re-checks it.
-        await reject_foreign_claim(request, body.name)
+        await reject_foreign_claim(request, name)
 
     # Secrets first, deploy second (D-P39-5). The claim insert is the atomic
     # authorization point for a fresh name's secret scope: a principal that
@@ -160,7 +175,9 @@ async def deploy_app_template(
         if dry_run:
             secret_call(validate_secret_items, secrets)
         else:
-            await set_secret_values(request, body.name, secrets)
+            await set_secret_values(
+                request, name, secrets, project=seat[0].name if seat is not None else None
+            )
 
     try:
         info, dest_dir = await clone_into_uploads(
@@ -191,7 +208,7 @@ async def deploy_app_template(
     resp = await _finalize_deploy(
         request,
         info.context_dir,
-        name=body.name,
+        name=name,
         port=eff_port,
         gpus=eff_gpus,
         start=eff_start,
@@ -206,6 +223,7 @@ async def deploy_app_template(
         source_meta=source_meta,
         context_root=dest_dir,
         dry_run=dry_run,
+        declared=(*seat, None) if seat is not None else None,
     )
     if dry_run:
         return JSONResponse(status_code=200, content=resp)

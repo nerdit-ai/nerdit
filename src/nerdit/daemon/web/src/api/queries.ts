@@ -8,6 +8,7 @@ import {
 import { api, apiRaw, ApiError } from "./client";
 import { capture } from "../lib/analytics";
 import { toastApiError } from "../lib/apiErrors";
+import type { AuthSession } from "../lib/auth";
 import type {
   AppConfigView,
   AppConfigWriteResponse,
@@ -104,7 +105,7 @@ export function useDaemonStatus(): { status: DaemonStatus; lastSeen: Date | null
 export function useAuthRole() {
   return useQuery({
     queryKey: ["auth", "role"],
-    queryFn: () => api<{ ok: boolean; role: string }>("/auth/check"),
+    queryFn: () => api<AuthSession>("/auth/check"),
     staleTime: Infinity
   });
 }

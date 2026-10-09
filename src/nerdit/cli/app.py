@@ -39,6 +39,7 @@ def main_callback(
 # PLR0915: one deferred import + one registration per verb — the list IS the CLI
 # surface, so it grows one statement per shipped verb by construction.
 def _register_commands() -> None:  # noqa: PLR0915
+    from nerdit.cli.commands.ai import ai_app  # noqa: F811
     from nerdit.cli.commands.apply import apply  # noqa: F811
     from nerdit.cli.commands.backup import backup, restore  # noqa: F811
     from nerdit.cli.commands.capabilities import capabilities  # noqa: F811
@@ -114,6 +115,8 @@ def _register_commands() -> None:  # noqa: PLR0915
     # `nerdit secrets` stays an alias surface forever (D-P40-1).
     app.add_typer(vars_app, name="vars")
     app.add_typer(models_app, name="models")
+    # The machine AI gateway: aliases, per-app virtual keys, usage.
+    app.add_typer(ai_app, name="ai")
     app.add_typer(db_app, name="db")
     app.add_typer(store_app, name="store")
     app.add_typer(proxy_app, name="proxy")

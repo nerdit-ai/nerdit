@@ -311,6 +311,45 @@ CREATE TABLE IF NOT EXISTS variables (
     updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (project_id, environment, service, key)
 );
+
+-- AI gateway (machine-level aliases, per-service virtual keys, daily usage).
+-- Wholly new tables, so they ride ``_SCHEMA`` with no ``_migrate`` block.
+-- ``api_key_ref`` holds a ``${secrets[.shared].KEY}`` reference, never a
+-- value; ``services`` is reserved for per-service alias visibility (NULL =
+-- every service; always NULL in V1).
+CREATE TABLE IF NOT EXISTS ai_gateway_routes (
+    alias       TEXT PRIMARY KEY,
+    provider    TEXT NOT NULL CHECK (provider IN ('api', 'ollama')),
+    base_url    TEXT,
+    model       TEXT NOT NULL,
+    api_key_ref TEXT,
+    services    TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+-- Virtual keys are stored as SHA-256 hashes only. Keyed on the hash (not the
+-- service) so a one-off run, a release or a cutover green can hold its own
+-- key while the serving container keeps its own; a main-container launch
+-- revokes every other key of the service.
+CREATE TABLE IF NOT EXISTS ai_gateway_keys (
+    key_hash     TEXT PRIMARY KEY,
+    service_name TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    revoked_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ai_gateway_keys_service ON ai_gateway_keys(service_name);
+
+CREATE TABLE IF NOT EXISTS ai_gateway_usage (
+    day               TEXT NOT NULL,
+    service_name      TEXT NOT NULL,
+    alias             TEXT NOT NULL,
+    requests          INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    upstream_errors   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, service_name, alias)
+);
 """
 
 

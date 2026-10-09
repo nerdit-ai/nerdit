@@ -27,6 +27,7 @@ from nerdit.daemon.bodylimit import BodyLimitMiddleware
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers
 from nerdit.daemon.idempotency import IdempotencyMiddleware
 from nerdit.daemon.middleware import ScopedTokenAuthMiddleware
+from nerdit.daemon.routes.ai_gateway import router as ai_gateway_router
 from nerdit.daemon.routes.app_config import router as app_config_router
 from nerdit.daemon.routes.app_templates import router as app_templates_router
 from nerdit.daemon.routes.audit import router as audit_router
@@ -250,6 +251,8 @@ def build_app(
         # (P40b / D-P40-10) The project noun, registered LAST, `/api` only —
         # a brand-new surface with no legacy CLI to serve.
         (projects_router, "Projects"),
+        # The machine AI gateway's aliases, virtual keys and usage, `/api` only.
+        (ai_gateway_router, "AI Gateway"),
     ):
         api_router.include_router(router, tags=[tag])
     app.include_router(api_router)

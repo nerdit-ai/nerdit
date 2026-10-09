@@ -1012,3 +1012,26 @@ async def test_saved_public_env_survives_a_redeploy_from_source(tmp_path, fake_c
     cfg = json.loads(q.update_service_config_guarded.call_args.args[1])
     assert cfg["public_env"] == {"VITE_API": "https://api.example.com"}
     assert result["build"]["public_env"] == {"VITE_API": "https://api.example.com"}
+
+
+def test_a_joined_row_redeploys_from_its_recorded_source(tmp_path, fake_clone):
+    """(deploy_into_project_v1) A seat created from an ordinary repo is a plain git
+    row to the redeploy seam: not a declaration, and its triple survives."""
+    prj = "prj_" + "a" * 16
+    row = _git_row().model_copy(
+        update={
+            "service_name": "api--demo",
+            "name": "api--demo",
+            "project_id": prj,
+            "project": "demo",
+            "service": "api",
+        }
+    )
+    q = _queries(row)
+    q.get_project = AsyncMock(return_value=SimpleNamespace(id=prj, submitted_by_token="tok-sub"))
+    resp = _client(q, tmp_path).post("/deploy/api--demo/redeploy", headers=_auth(SUB_RAW))
+    assert resp.status_code == 201, resp.text
+    assert len(fake_clone.calls) == 1
+    q.update_service_config_guarded.assert_awaited_once()
+    body = resp.json()
+    assert (body["name"], body["project_id"], body["service"]) == ("api--demo", prj, "api")

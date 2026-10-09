@@ -203,7 +203,7 @@ async def test_mcp_list_exposes_only_the_reviewed_surface(delegated):
         json=_rpc("tools/list"),
         headers={**_MCP_HEADERS, "Authorization": f"Bearer {LINK}"},
     )
-    assert len(_sse_result(node)["result"]["tools"]) == 59
+    assert len(_sse_result(node)["result"]["tools"]) == 63
 
 
 @pytest.mark.parametrize(

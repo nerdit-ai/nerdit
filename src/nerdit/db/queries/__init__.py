@@ -10,6 +10,7 @@ from ._base import (
     ServiceNameTaken,
     _serialized,
 )
+from .ai_gateway import AiGatewayQueries
 from .audit import AuditQueries
 from .domains import DomainQueries
 from .endpoints import EndpointQueries
@@ -51,6 +52,7 @@ class Queries(
     DomainQueries,
     SecretClaimQueries,
     ProjectQueries,
+    AiGatewayQueries,
 ):
     """Async query interface shared by routes and scheduling.
 
