@@ -4,6 +4,13 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.8.4 (2026-10-09)
+
+- **Shared secrets from the console.** Setting a machine-wide (`shared`) secret,
+  which is where the AI gateway's provider keys live, now accepts the
+  `submitter` role, so a hosted box's console can add a provider key. Deleting a
+  shared secret still requires `admin`.
+
 ## 0.8.3 (2026-10-09)
 
 The AI gateway is on by default, and a hosted box can manage its own aliases.

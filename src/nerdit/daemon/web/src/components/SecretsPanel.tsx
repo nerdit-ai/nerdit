@@ -15,6 +15,11 @@ export interface SecretsPanelProps {
    * below still catches ownership denials the caller cannot predict.
    */
   canWrite?: boolean;
+  /**
+   * Whether the delete controls render. The shared scope splits the two
+   * since 0.8.4: a submitter sets values, only an admin deletes them.
+   */
+  canDelete?: boolean;
 }
 
 /** True for a 403 from the API client — the role gate, not a transient failure. */
@@ -37,7 +42,11 @@ function isForbidden(error: unknown): boolean {
  * mutations' own `onError` in `api/queries.ts` — these local handlers add the
  * role flip and nothing else, so a denial is never announced twice.
  */
-export function SecretsPanel({ service, canWrite = true }: SecretsPanelProps) {
+export function SecretsPanel({
+  service,
+  canWrite = true,
+  canDelete = true,
+}: SecretsPanelProps) {
   const names = useSecretNames(service);
   const setSecrets = useSetSecrets(service);
   const deleteSecret = useDeleteSecret(service);
@@ -49,6 +58,7 @@ export function SecretsPanel({ service, canWrite = true }: SecretsPanelProps) {
   const [pendingDeleteAll, setPendingDeleteAll] = useState(false);
   const [forbidden, setForbidden] = useState(false);
   const readOnly = forbidden || !canWrite;
+  const showDelete = !readOnly && canDelete;
 
   const keys = names.data?.keys ?? [];
   const trimmedKey = newKey.trim();
@@ -131,7 +141,7 @@ export function SecretsPanel({ service, canWrite = true }: SecretsPanelProps) {
                 <span className="truncate">{key}</span>
                 <span className="text-subtle-foreground">= ••••••</span>
               </Mono>
-              {!readOnly && (
+              {showDelete && (
                 <Button
                   variant="ghost"
                   size="sm"
@@ -181,7 +191,7 @@ export function SecretsPanel({ service, canWrite = true }: SecretsPanelProps) {
         </div>
       )}
 
-      {!readOnly && keys.length > 0 && (
+      {showDelete && keys.length > 0 && (
         <div className="flex justify-end">
           <Button
             variant="ghost"

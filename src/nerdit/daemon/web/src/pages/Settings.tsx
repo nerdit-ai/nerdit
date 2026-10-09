@@ -77,10 +77,14 @@ export function Settings() {
             Referenced with <Mono>{"${secrets.shared.KEY}"}</Mono>, never injected on their own.
             An app&rsquo;s own secret of the same name wins.
           </p>
-          {/* Shared writes are admin-only server-side; hide the form up front.
-              Defaults to writable until the role loads, and the panel's 403
-              fallback still covers that window. */}
-          <SecretsPanel service="shared" canWrite={(auth.data?.role ?? "admin") === "admin"} />
+          {/* Server-side rule since 0.8.4: a submitter sets shared values, only
+              an admin deletes them; mirror it up front. Defaults to admin until
+              the role loads, and the panel's 403 fallback covers that window. */}
+          <SecretsPanel
+            service="shared"
+            canWrite={(auth.data?.role ?? "admin") !== "readonly"}
+            canDelete={(auth.data?.role ?? "admin") === "admin"}
+          />
         </div>
       </Panel>
 

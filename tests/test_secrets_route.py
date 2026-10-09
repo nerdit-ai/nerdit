@@ -754,14 +754,18 @@ def test_decrypt_failure_maps_to_structured_500_on_crud(tmp_path):
 # --- shared scope (P8) ---------------------------------------------------------
 
 
-def test_shared_write_is_admin_only(tmp_path):
+def test_shared_write_takes_submitter_or_admin_not_readonly(tmp_path):
+    # 0.8.4 (D-P31-5): a hosted box's console writes AI gateway keys through the
+    # submitter-capped tunnel; a shared value is what every deploy already receives.
     c = _client(tmp_path)
-    resp = c.post("/secrets/shared", json={"values": {"K": "v"}}, headers=_auth(SUB_RAW))
+    resp = c.post("/secrets/shared", json={"values": {"K": "v"}}, headers=_auth(RO_RAW))
     assert resp.status_code == 403
     assert resp.json()["code"] == "forbidden"
-    ok = c.post("/secrets/shared", json={"values": {"K": "v"}}, headers=_auth(ADMIN_RAW))
-    assert ok.status_code == 200
+    ok = c.post("/secrets/shared", json={"values": {"K": "v"}}, headers=_auth(SUB_RAW))
+    assert ok.status_code == 200, ok.text
     assert ok.json() == {"service": "shared", "keys": ["K"]}
+    ok = c.post("/secrets/shared", json={"values": {"L": "w"}}, headers=_auth(ADMIN_RAW))
+    assert ok.json()["keys"] == ["K", "L"]
 
 
 def test_shared_delete_is_admin_only(tmp_path):

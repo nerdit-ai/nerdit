@@ -20,10 +20,9 @@ _SecretsScopeWrite = Annotated[
     Field(
         description="Service (app, model or database) whose secrets this call modifies — "
         "need not exist yet: a set on an undeployed name reserves it for this token until "
-        "deployed — or ``shared`` for the global scope: admin-only to write, read by a "
-        "service only where a ``${secrets.shared.KEY}`` reference is honoured "
-        "(``ai``/``db``/``edge_auth`` refs, a git ``token_ref``), never through ``env``, "
-        "which stays literal."
+        "deployed — or ``shared`` for the global scope (set: submitter or admin; delete: "
+        "admin), read by a service only where a ``${secrets.shared.KEY}`` reference is "
+        "honoured (``ai``/``db``/``edge_auth`` refs, a git ``token_ref``), never via ``env``."
     ),
 ]
 _SecretsScopeRead = Annotated[

@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { loginAsToken, mockApi, SAMPLE_SERVICES, SAMPLE_SERVICES_WITH_ASSO } from "./fixtures";
 
 // Command palette: ⌘K jumps to any app and carries per-app quick actions (logs,
@@ -8,12 +8,22 @@ import { loginAsToken, mockApi, SAMPLE_SERVICES, SAMPLE_SERVICES_WITH_ASSO } fro
 // still jumps by service LABEL (scope guard); a label inside a multi-service
 // project resolves to its nested page through the row's project/service fields.
 
+// ⌘K is a window listener `AppShell` attaches in an effect; under CI load the
+// main region can be visible before it is, and a chord sent into the gap is
+// lost. Repeat the chord until the palette's input shows.
+async function openPalette(page: Page): Promise<void> {
+  await expect(async () => {
+    await page.keyboard.press("Control+k");
+    await expect(page.getByPlaceholder("Jump to…")).toBeVisible({ timeout: 1000 });
+  }).toPass();
+}
+
 test("⌘K jumps to an app page", async ({ page }) => {
   await mockApi(page);
   await loginAsToken(page);
   await expect(page).toHaveURL("/");
 
-  await page.keyboard.press("Control+k");
+  await openPalette(page);
   await page.getByPlaceholder("Jump to…").fill("my-app");
   // The plain jump item is the only one carrying the /projects/my-app suffix
   // (the quick actions show "logs" / "redeploy" instead).
@@ -26,7 +36,7 @@ test("⌘K logs quick action lands on the app logs tab", async ({ page }) => {
   await mockApi(page);
   await loginAsToken(page);
 
-  await page.keyboard.press("Control+k");
+  await openPalette(page);
   await page.getByPlaceholder("Jump to…").fill("my-app logs");
   await page.getByRole("option", { name: /logs/ }).first().click();
   await expect(page).toHaveURL("/projects/my-app/logs");
@@ -38,7 +48,7 @@ test("⌘K redeploy quick action takes the app's own deploy path, cleared on rel
   await mockApi(page);
   await loginAsToken(page);
 
-  await page.keyboard.press("Control+k");
+  await openPalette(page);
   await page.getByPlaceholder("Jump to…").fill("my-app redeploy");
   await page.getByRole("option", { name: /redeploy/ }).first().click();
 
@@ -65,7 +75,7 @@ test("⌘K on a multi-service project's service lands on its nested page, tab an
   await mockApi(page, { services: SAMPLE_SERVICES_WITH_ASSO });
   await loginAsToken(page);
 
-  await page.keyboard.press("Control+k");
+  await openPalette(page);
   await page.getByPlaceholder("Jump to…").fill("api--asso logs");
   await page.getByRole("option", { name: /logs/ }).first().click();
   await expect(page).toHaveURL("/projects/asso/services/api/logs");
@@ -73,7 +83,7 @@ test("⌘K on a multi-service project's service lands on its nested page, tab an
 
   // The home service's label IS the project name: its quick action still means
   // the SERVICE, not the project page.
-  await page.keyboard.press("Control+k");
+  await openPalette(page);
   await page.getByPlaceholder("Jump to…").fill("asso logs");
   await page.getByRole("option", { name: /^asso\s*logs$/ }).click();
   await expect(page).toHaveURL("/projects/asso/services/web/logs");
@@ -88,7 +98,7 @@ test("⌘K redeploy survives the label redirect into a multi-service project", a
     ["api--asso", "/projects/asso/services/api"],
     ["asso", "/projects/asso/services/web"]
   ]) {
-    await page.keyboard.press("Control+k");
+    await openPalette(page);
     await page.getByPlaceholder("Jump to…").fill(`${label} redeploy`);
     await page.getByRole("option", { name: new RegExp(`^${label}\\s*redeploy$`) }).click();
     await expect(page).toHaveURL(url);
@@ -103,7 +113,7 @@ test("⌘K still reaches static nav entries", async ({ page }) => {
   await mockApi(page);
   await loginAsToken(page);
 
-  await page.keyboard.press("Control+k");
+  await openPalette(page);
   await page.getByPlaceholder("Jump to…").fill("Activity");
   await page.getByRole("option", { name: /Activity/ }).first().click();
   await expect(page).toHaveURL("/activity");
@@ -123,7 +133,7 @@ test("⌘K Apps group excludes non-service kinds", async ({ page }) => {
   });
   await loginAsToken(page);
 
-  await page.keyboard.press("Control+k");
+  await openPalette(page);
   // First prove the Apps group renders at all in this very session (a broken
   // fetch would also yield zero options below, vacuously).
   await page.getByPlaceholder("Jump to…").fill("my-app");

@@ -221,8 +221,12 @@ async def authorize_secret_scope(
     for the caller — unless an orphan secrets file is present, which a non-admin
     may not adopt (409 `secret.orphaned_scope`) — and a read or delete is a
     404 for non-admins. `write` is the mutation gate on `shared`, which skips
-    row lookup: admins write, any authenticated caller reads names; refuse all
-    shared operations if a legacy service owns that name.
+    row lookup: a set (`mint`) takes submitter or admin (0.8.4, D-P31-5: a
+    shared value is what every deploy already receives, and a hosted box's
+    console writes its AI gateway keys here through the submitter-capped
+    tunnel), a delete removes what other apps use and stays admin, any
+    authenticated caller reads names; refuse all shared operations if a legacy
+    service owns that name.
     """
     guard_name(service)
     if service == _SHARED_PUBLIC:
@@ -234,8 +238,8 @@ async def authorize_secret_scope(
                 "shared-scope secrets are disabled.",
                 hint="Rename or delete that service, then restart the daemon.",
             )
-        if write:
-            require_role(request, TokenRole.admin)
+        if write:  # a set (`mint`) is submitter-or-admin; a delete stays admin
+            require_role(request, *((TokenRole.submitter,) if mint else ()), TokenRole.admin)
         return
     # `/secrets/{service}` passes no `project` (label-only); the variables
     # routes pass the project they already judged (D-P40-7).
