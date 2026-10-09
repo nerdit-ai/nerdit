@@ -1716,7 +1716,7 @@
     }
   },
   "remove_ai_route": {
-    "description": "Remove a machine AI gateway alias (admin).\n\nRefused with 409 ``ai_gateway.alias_in_use`` (naming the apps) while a\nrunning app's ``[ai.*]`` uses it, unless ``force``.\n",
+    "description": "Remove a machine AI gateway alias (submitter or admin).\n\nRefused with 409 ``ai_gateway.alias_in_use`` (naming the apps) while a\nrunning app's ``[ai.*]`` uses it, unless ``force``.\n",
     "inputSchema": {
       "properties": {
         "alias": {
@@ -2317,7 +2317,7 @@
     }
   },
   "set_ai_route": {
-    "description": "Create or replace a machine AI gateway alias (admin).\n\nApps then declare ``[ai.default] provider = \"gateway\"`` and\n``model = \"<alias>\"``: the daemon injects the gateway URL and a per-app\nvirtual key, and the provider key never enters a container. Answers\n``enabled: false`` while ``[ai_gateway]`` is off (the alias is stored\nand serves once it is enabled). Refusals: 422 ``ai_gateway.alias_invalid``,\n``ai_gateway.base_url_invalid`` (not https, private address, userinfo),\n``ai_gateway.secret_ref_invalid``.\n",
+    "description": "Create or replace a machine AI gateway alias (submitter or admin).\n\nApps then declare ``[ai.default] provider = \"gateway\"`` and\n``model = \"<alias>\"``: the daemon injects the gateway URL and a per-app\nvirtual key, and the provider key never enters a container. Answers\n``enabled: false`` while ``[ai_gateway]`` is off (the alias is stored\nand serves once it is enabled). Refusals: 422 ``ai_gateway.alias_invalid``,\n``ai_gateway.base_url_invalid`` (not https, private address, userinfo),\n``ai_gateway.secret_ref_invalid``.\n",
     "inputSchema": {
       "properties": {
         "alias": {

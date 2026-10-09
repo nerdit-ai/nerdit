@@ -4,6 +4,22 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.8.3 (2026-10-09)
+
+The AI gateway is on by default, and a hosted box can manage its own aliases.
+
+### AI gateway
+
+- **On by default.** The gateway listens as soon as the Engine starts, on the
+  Docker bridge address only, and answers 401 without a virtual key. A machine
+  upgrading from 0.8.2 opens port 9330 on its bridge at the next restart; set
+  `[ai_gateway] enabled = false` and restart to turn it off.
+- **Aliases from the console or an agent.** Creating and removing aliases and
+  revoking an application's virtual key now accept the `submitter` role, which
+  is what a hosted box's connection carries (a submitter revokes the keys of
+  its own applications only). Changing the gateway's settings
+  or turning it off still requires `admin`.
+
 ## 0.8.2 (2026-10-09)
 
 Applications can talk to AI providers through the machine's own gateway, and a

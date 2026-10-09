@@ -7,8 +7,10 @@ only read and write its SQLite rows, so they answer while the gateway is off
 * Reads (any authenticated principal): the state view, the aliases, the key
   metadata and the usage aggregates. No view carries a secret value, a
   virtual key or its hash: an alias shows its `api_key_ref` (a name).
-* Writes are admin-only: an alias is machine-wide and spends the machine's
-  provider keys. `PUT` needs an `Idempotency-Key`. Audit params carry the
+* Writes take submitter or admin (0.8.3, D-P31-5): an alias only references a
+  shared secret a submitter's own deploy already receives, and a hosted box's
+  tunnel principal is submitter-capped. Daemon config stays admin. `PUT` needs
+  an `Idempotency-Key`. Audit params carry the
   alias, provider, model, the base_url HOST and the ref name, never a value.
 * `base_url` is the anti-SSRF gate: https to a host that resolves to public
   addresses only, or plain http to loopback / the models bridge (a local
@@ -29,7 +31,7 @@ from pydantic import BaseModel, Field
 from nerdit.config.project import AI_GATEWAY_ALIAS_HINT, AI_GATEWAY_ALIAS_RE, SECRET_REF_RE
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.daemon.audit import audit_params
-from nerdit.daemon.auth import require_role
+from nerdit.daemon.auth import require_owner_or_admin, require_role
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.schemas._base import StrictRequestModel
 from nerdit.db.enums import JobKind
@@ -271,12 +273,12 @@ async def list_ai_routes(request: Request) -> AiRouteList:
 async def set_ai_route(
     request: Request, alias: str, body: AiRouteSetRequest
 ) -> AiRouteWriteResponse:
-    """Create or replace an alias (admin; `Idempotency-Key` required).
+    """Create or replace an alias (submitter or admin; `Idempotency-Key` required).
 
     Answers 200 with `enabled: false` while the gateway is off: the alias is
     stored and serves once `[ai_gateway]` is enabled.
     """
-    require_role(request, TokenRole.admin)
+    require_role(request, TokenRole.submitter, TokenRole.admin)
     _check_alias(alias)
     host: str | None = None
     ref_key: str | None = None
@@ -336,8 +338,11 @@ async def remove_ai_route(
     alias: str,
     force: bool = Query(False, description="Remove even if a running app uses the alias."),
 ) -> dict:
-    """Remove an alias (admin). 409 while a running app's `[ai.*]` uses it, unless `force`."""
-    require_role(request, TokenRole.admin)
+    """Remove an alias (submitter or admin).
+
+    409 while a running app's `[ai.*]` uses it, unless `force`.
+    """
+    require_role(request, TokenRole.submitter, TokenRole.admin)
     _check_alias(alias)
     request.state.audit_params = audit_params({"alias": alias, "force": force})
     queries = request.app.state.queries
@@ -373,13 +378,20 @@ async def list_ai_gateway_keys(
     operation_id="revoke_ai_gateway_keys",
 )
 async def revoke_ai_gateway_keys(request: Request, service: str) -> AiKeyRevokeResponse:
-    """Revoke a service's virtual keys (admin); the app gets a new one when it restarts."""
-    require_role(request, TokenRole.admin)
+    """Revoke a service's virtual keys (its owner or admin).
+
+    The app gets a new one when it restarts.
+    """
+    require_role(request, TokenRole.submitter, TokenRole.admin)
     queries = request.app.state.queries
     # The path value reaches the audit row and the response only once it names a
     # real service: a pasted key or a typo must not be stored or echoed.
-    if await queries.get_service_by_name(service) is None:
+    job = await queries.get_service_by_name(service)
+    if job is None:
         raise NerditError(404, "not_found", "No such service.", hint="nerdit ai keys list")
+    # A submitter revokes its own apps' keys only (a revoked app answers 401 until
+    # it restarts); NULL-owner rows stay admin-only, like every service verb.
+    require_owner_or_admin(request, job)
     request.state.audit_params = audit_params({"service": service})
     revoked = await queries.revoke_ai_gateway_keys(service)
     return AiKeyRevokeResponse(service=service, revoked=revoked)

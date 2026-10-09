@@ -30,10 +30,10 @@ UPSTREAM = "https://api.example.com/v1"
 # --- settings -------------------------------------------------------------------
 
 
-def test_settings_default_off_on_9330():
+def test_settings_default_on_since_0_8_3_on_9330():
     gw = NerditSettings().ai_gateway
     assert (gw.enabled, gw.port, gw.upstream_timeout_s, gw.stream_timeout_s) == (
-        False,
+        True,
         9330,
         120,
         600,
@@ -57,7 +57,7 @@ def test_settings_bad_port_refused(port):
 def test_settings_section_known_and_restart_required(tmp_path):
     store = ConfigStore(tmp_path / "config.toml")
     assert "ai_gateway" in store.known_sections()
-    assert store.stage("ai_gateway", {"enabled": True}).requires_restart is True
+    assert store.stage("ai_gateway", {"enabled": False}).requires_restart is True
 
 
 # --- fixtures ---------------------------------------------------------------------

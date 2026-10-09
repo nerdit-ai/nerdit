@@ -684,14 +684,15 @@ class ModelsSettings(BaseModel):
 class AiGatewaySettings(BaseModel):
     """The machine's AI gateway: one OpenAI-compatible listener for app containers.
 
-    Off by default; when on, the daemon serves it on the models bridge (never
-    ``0.0.0.0``: the host comes from ``[models].bridge_host``, not from here) at
-    ``port``. Apps reach it through ``[ai.*] provider = "gateway"`` with a
-    per-service virtual key; provider keys stay on the machine. Every field is
-    captured at startup and requires a restart.
+    On by default since 0.8.3 (a hosted box has no admin principal to turn it
+    on; ``enabled = false`` is the opt-out). The daemon serves it on the models
+    bridge (never ``0.0.0.0``: the host comes from ``[models].bridge_host``, not
+    from here) at ``port`` and answers 401 without a virtual key. Apps reach it
+    through ``[ai.*] provider = "gateway"``; provider keys stay on the machine.
+    Every field is captured at startup and requires a restart.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     port: int = Field(default=9330, ge=1024, le=65535)
     upstream_timeout_s: int = Field(default=120, ge=1)
     stream_timeout_s: int = Field(default=600, ge=1)

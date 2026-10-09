@@ -72,7 +72,7 @@ async def env(monkeypatch):
     app.state.queries = queries
     app.state.settings = SimpleNamespace(
         models=ModelsSettings(bridge_host="172.17.0.1"),
-        ai_gateway=AiGatewaySettings(),
+        ai_gateway=AiGatewaySettings(enabled=False),  # the "stored while off" shape
         daemon=DaemonSettings(),
         proxy=ProxySettings(),
     )
@@ -136,13 +136,17 @@ async def test_admin_creates_then_replaces_an_alias_and_reads_see_it(env):
     )
 
 
-async def test_writes_are_admin_only_and_put_needs_an_idempotency_key(env):
-    for raw in (A_RAW, RO_RAW):
-        assert (await _put(env, "fast", _API, raw=raw)).status_code == 403
-        resp = await env.client.delete("/ai-gateway/keys/web", headers=_auth(raw))
-        assert resp.status_code == 403
+async def test_writes_take_submitter_refuse_readonly_and_put_needs_an_idempotency_key(env):
+    assert (await _put(env, "fast", _API, raw=RO_RAW)).status_code == 403
+    resp = await env.client.delete("/ai-gateway/keys/web", headers=_auth(RO_RAW))
+    assert resp.status_code == 403
     resp = await _put(env, "fast", _API, idem=None)
     assert resp.status_code == 400 and resp.json()["code"] == "idempotency_key_required"
+    assert await env.queries.get_ai_route("fast") is None
+    # 0.8.3 (D-P31-5): a submitter -- a hosted box's tunnel principal -- writes aliases.
+    assert (await _put(env, "fast", _API, raw=A_RAW)).status_code == 200
+    resp = await env.client.delete("/ai-gateway/routes/fast", headers=_auth(A_RAW))
+    assert resp.status_code == 200, resp.text
     assert await env.queries.get_ai_route("fast") is None
 
 
@@ -241,7 +245,9 @@ async def test_no_secret_shaped_input_reaches_a_response_or_the_audit(env):
     assert all(SENTINEL not in (row[0] or "") for row in await cursor.fetchall())
 
 
-async def _gateway_app(env, name: str, alias: str, desired: str = "running") -> None:
+async def _gateway_app(
+    env, name: str, alias: str, desired: str = "running", owner: str | None = None
+) -> None:
     job = Job(
         id=f"job-{name}"[:12],
         name=name,
@@ -251,6 +257,7 @@ async def _gateway_app(env, name: str, alias: str, desired: str = "running") -> 
         status=JobStatus.running,
         desired_state=desired,
         restart_policy="always",
+        submitted_by_token=owner,
         config=json.dumps(
             {"image": "demo:1", "ai": {"default": {"provider": "gateway", "model": alias}}}
         ),
@@ -271,6 +278,19 @@ async def test_delete_refuses_an_alias_a_running_app_uses_unless_forced(env):
     resp = await env.client.delete("/ai-gateway/routes/fast", headers=_auth(LEGACY))
     assert resp.status_code == 404
     assert (await env.audit("ai_gateway.route_removed"))[0][0] == "fast"
+
+
+async def test_a_submitter_revokes_only_its_own_apps_keys(env):
+    await _gateway_app(env, "mine", "fast", owner="tok-a")
+    await _gateway_app(env, "theirs", "fast")  # NULL owner: admin-only, like every service verb
+    for name in ("mine", "theirs"):
+        await env.queries.insert_ai_gateway_key(name, name[0] * 64, revoke_others=True)
+    resp = await env.client.delete("/ai-gateway/keys/theirs", headers=_auth(A_RAW))
+    assert resp.status_code == 403, resp.text
+    keys = {k.service_name: k for k in await env.queries.list_ai_gateway_keys()}
+    assert keys["theirs"].revoked_at is None
+    resp = await env.client.delete("/ai-gateway/keys/mine", headers=_auth(A_RAW))
+    assert resp.status_code == 200 and resp.json()["revoked"] == 1
 
 
 async def test_keys_show_metadata_only_and_revoke(env):

@@ -111,7 +111,7 @@ async def set_ai_route(
         ] = None,
         idempotency_key: IdempotencyKey = None,
     ) -> Any:
-        """Create or replace a machine AI gateway alias (admin).
+        """Create or replace a machine AI gateway alias (submitter or admin).
 
         Apps then declare ``[ai.default] provider = "gateway"`` and
         ``model = "<alias>"``: the daemon injects the gateway URL and a per-app
@@ -140,7 +140,7 @@ async def remove_ai_route(
         ] = False,
         idempotency_key: IdempotencyKey = None,
     ) -> Any:
-        """Remove a machine AI gateway alias (admin).
+        """Remove a machine AI gateway alias (submitter or admin).
 
         Refused with 409 ``ai_gateway.alias_in_use`` (naming the apps) while a
         running app's ``[ai.*]`` uses it, unless ``force``.

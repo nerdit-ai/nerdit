@@ -2,7 +2,8 @@
 
 An alias names a provider model and a `${secrets.shared.KEY}` reference to its
 key; the key itself is set with `nerdit secrets set --shared` and never passes
-through these commands. Writes are admin-only and mint an idempotency key.
+through these commands. Writes take a submitter or admin token and mint an
+idempotency key; a submitter revokes the keys of its own apps only.
 """
 
 from __future__ import annotations
@@ -74,7 +75,7 @@ def routes_set(
         "never the key itself.",
     ),
 ) -> None:
-    """Create or replace an alias (admin).
+    """Create or replace an alias (submitter or admin).
 
     Example: nerdit ai routes set fast --model openai/gpt-4o-mini
     --base-url https://openrouter.ai/api/v1 --key-ref '${secrets.shared.OPENROUTER_API_KEY}'
@@ -101,7 +102,7 @@ def routes_rm(
     alias: str = typer.Argument(..., help="Alias to remove."),
     force: bool = typer.Option(False, "--force", help="Remove even if a running app uses it."),
 ) -> None:
-    """Remove an alias (admin). Refused while a running app uses it, unless --force."""
+    """Remove an alias (submitter or admin). Refused while a running app uses it, unless --force."""
     asyncio.run(
         call_or_exit(_client().remove_ai_route(alias, force=force, idempotency_key=uuid4().hex))
     )
@@ -128,7 +129,7 @@ def keys_list(
 
 @keys_app.command("revoke")
 def keys_revoke(service: str = typer.Argument(..., help="App whose keys to revoke.")) -> None:
-    """Revoke an app's virtual keys (admin); it gets a new one when it restarts."""
+    """Revoke an app's virtual keys (its owner or admin); it gets a new one when it restarts."""
     result = asyncio.run(
         call_or_exit(_client().revoke_ai_gateway_keys(service, idempotency_key=uuid4().hex))
     )
