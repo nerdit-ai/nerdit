@@ -16,6 +16,7 @@ from .domains import DomainQueries
 from .endpoints import EndpointQueries
 from .events import EventQueries
 from .gpus import GpuQueries
+from .hooks import HookQueries
 from .idempotency import IdempotencyQueries
 from .logs import LogQueries
 from .projects import ProjectQueries
@@ -50,6 +51,7 @@ class Queries(
     ServiceConfigQueries,
     ShareQueries,
     DomainQueries,
+    HookQueries,
     SecretClaimQueries,
     ProjectQueries,
     AiGatewayQueries,

@@ -332,6 +332,20 @@ class ServiceDomain(BaseModel):
     )
 
 
+class Hook(BaseModel):
+    """A live inbound webhook of one service; `hook_id` is the capability in its address."""
+
+    hook_id: str
+    service_name: str
+    name: str
+    sender: str
+    path: str
+    header: str | None = None
+    prefix: str | None = None
+    secret_ref: str | None = None
+    created_at: str
+
+
 class ActiveServiceRoute(BaseModel):
     """A routable service and its effective loopback upstream for proxy reconciliation.
 

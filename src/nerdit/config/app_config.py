@@ -13,9 +13,11 @@ from nerdit.config.project import (
     AiBindingConfig,
     DbBindingConfig,
     DeployConfig,
+    HookConfig,
     ProjectConfig,
     parse_ai_bindings,
     parse_db_bindings,
+    parse_hooks,
 )
 from nerdit.daemon.auth import current_principal, require_service_scope
 from nerdit.daemon.errors import NerditError
@@ -174,6 +176,25 @@ def validate_db_section(
             hint=DB_SHAPE_HINT,
         ) from exc
     return bindings
+
+
+# The [hooks.*] shape hint returned with every ``deploy.invalid_hooks`` envelope.
+HOOKS_SHAPE_HINT = (
+    "Each [hooks.<name>] table needs sender = 'stripe' | 'github' | 'slack' | 'hmac' | 'none' "
+    "and path = '/<app path>'; 'hmac' also requires header (and takes an optional prefix); "
+    "secret = '${secrets.KEY}' is optional and forbidden with 'none'."
+)
+
+
+def validate_hooks_section(section: object, *, source: str | None = None) -> dict[str, HookConfig]:
+    """Validate `[hooks.*]` tables; the message never carries a value (inputs are hidden)."""
+    try:
+        return parse_hooks(section)
+    except (ValueError, ValidationError) as exc:
+        where = f" in {source}" if source else ""
+        raise NerditError(
+            422, "deploy.invalid_hooks", f"Invalid [hooks.*]{where}: {exc}", hint=HOOKS_SHAPE_HINT
+        ) from exc
 
 
 def _require_bindable_database(

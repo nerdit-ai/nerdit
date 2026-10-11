@@ -21,6 +21,7 @@ from nerdit.core.bindings.secretref import BindingNotReady, resolve_secret_ref
 from nerdit.core.data import DataController, PostgresBackend, RedisBackend
 from nerdit.core.dns import default_local_hostname
 from nerdit.core.eventlog import EventRecorder, set_recorder
+from nerdit.core.hooks import HookGate
 from nerdit.core.license import (
     REASON_MALFORMED,
     STATE_INVALID,
@@ -357,6 +358,7 @@ def build_controllers(
         retention_settings=getattr(settings, "retention", None),
         events=event_recorder,
         ai_gateway=settings.ai_gateway,
+        link=settings.link,
     )
     workload_manager = WorkloadManager(
         service_controller,
@@ -434,12 +436,14 @@ async def build_link_manager(
     event_recorder: EventRecorder,
     *,
     queries: Queries | None = None,
+    resolve_secret: Callable[[str, str | None, str], str | None] | None = None,
 ) -> LinkManager | None:
     """Build a tunnel manager when enabled, relay_url and node_id are all set.
 
     Unclaimed configuration warns; missing/corrupt keys log an error. Neither aborts
     boot, and doctor reports the failure. Without queries, slug or hosted domain,
-    app streams have no resolver and fail closed with 404.
+    app streams have no resolver and fail closed with 404. Without queries and
+    `resolve_secret` (`build_edge_auth_resolver`), hook streams fail closed with 404.
     """
     link = settings.link
     if not link.enabled:
@@ -489,6 +493,11 @@ async def build_link_manager(
             slug=link.slug,
             nodes_base_domain=link.nodes_base_domain,
         ).resolve
+    admit_hook = (
+        HookGate(queries, resolve_secret).admit
+        if queries is not None and resolve_secret is not None
+        else None
+    )
     from nerdit import __version__  # noqa: PLC0415 - avoids a package-import cycle
 
     logger.info(
@@ -505,4 +514,5 @@ async def build_link_manager(
         loopback_base_url=_loopback_base_url(settings.daemon),
         events=event_recorder,
         resolve_app=resolve_app,
+        admit_hook=admit_hook,
     )

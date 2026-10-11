@@ -148,6 +148,11 @@ _EXPECTED_OPERATIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     # ``:path`` so a pasted URL reaches the validator (422 not_bare), not a 404.
     "add_domain": ("/api/services/{name}/domains/{domain:path}", ("PUT",)),
     "remove_domain": ("/api/services/{name}/domains/{domain:path}", ("DELETE",)),
+    # Inbound webhooks, same Exposure tag; the signing secret rides the
+    # existing set_service_secrets, so there is no /secret route.
+    "list_hooks": ("/api/services/{name}/hooks", ("GET",)),
+    "add_hook": ("/api/services/{name}/hooks", ("POST",)),
+    "remove_hook": ("/api/services/{name}/hooks/{hook}", ("DELETE",)),
     # (P40b) The project quartet, tag Projects, `/api` only.
     "list_projects": ("/api/projects", ("GET",)),
     "rename_project": ("/api/projects/{project}", ("PATCH",)),
@@ -166,6 +171,7 @@ _EXPECTED_OPERATIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     # The AI gateway, tag AI Gateway, `/api` only.
     "get_ai_gateway": ("/api/ai-gateway", ("GET",)),
     "list_ai_routes": ("/api/ai-gateway/routes", ("GET",)),
+    "list_ai_provider_models": ("/api/ai-gateway/providers/models", ("POST",)),
     "set_ai_route": ("/api/ai-gateway/routes/{alias}", ("PUT",)),
     "remove_ai_route": ("/api/ai-gateway/routes/{alias}", ("DELETE",)),
     "list_ai_gateway_keys": ("/api/ai-gateway/keys", ("GET",)),
@@ -237,8 +243,10 @@ def test_api_router_and_tag_table(app):
     # P40c variable quartet (same tag) to 90; P40d's apply_project to 91;
     # P41b's project identity lookup and public address binding to 93;
     # P41d's project logs and diagnosis to 95; P41e's rename to 96; the AI
-    # gateway's seven (tag AI Gateway) to 103.
-    assert len(ids) == len(set(ids)) == 103, "operation_id set drifted from 103"
+    # gateway's seven (tag AI Gateway) to 103; list_ai_provider_models (0.8.5) to 104;
+    # the webhook trio (list_hooks, add_hook, remove_hook, tag Exposure) to 107;
+    # the secret rides the existing set_service_secrets.
+    assert len(ids) == len(set(ids)) == 107, "operation_id set drifted from 107"
 
     found = {r.operation_id: (path, tuple(sorted(r.methods))) for path, r in routes}
     assert found == _EXPECTED_OPERATIONS

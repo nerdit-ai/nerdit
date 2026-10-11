@@ -78,8 +78,9 @@ _CREDENTIAL_KEY_SUFFIXES = ("KEY", "PWD")
 def _is_credential_key(key: str) -> bool:
     """Identify credential-bearing env keys case-insensitively.
 
-    Cover credential name fragments, managed-DB aliases, and NERDIT_DB_*_URL DSNs
-    across the entire env, including plain deploy overrides. Prefer over-masking
+    Cover credential name fragments, managed-DB aliases, NERDIT_DB_*_URL DSNs and
+    NERDIT_HOOK_*_URL capabilities across the entire env, including plain deploy
+    overrides. Prefer over-masking
     to leaking; the caller applies a minimum length only to heuristic matches.
     """
     key = key.upper()
@@ -88,6 +89,8 @@ def _is_credential_key(key: str) -> bool:
         or key.endswith(_CREDENTIAL_KEY_SUFFIXES)
         or key in _SCRUB_URL_KEYS
         or (key.startswith("NERDIT_DB_") and key.endswith("_URL"))
+        # A hook URL is a capability: it alone opens a 'none' hook.
+        or (key.startswith("NERDIT_HOOK_") and key.endswith("_URL"))
     )
 
 

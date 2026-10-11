@@ -315,7 +315,8 @@ def test_p25_operation_ids_are_present(schema: dict) -> None:
     quartet takes it to 86; the P40c variable quartet to 90; P40d's
     ``apply_project`` to 91; P41b's discovery and address binding to 93;
     P41d's project logs and diagnosis to 95; P41e's rename to 96.
-    The AI gateway adds seven: 103.
+    The AI gateway adds seven: 103; list_ai_provider_models: 104; the webhook
+    trio (list_hooks, add_hook, remove_hook): 107.
     """
     op_ids = {op.get("operationId") for _, _, op in _operations(schema)}
     expected = {"get_self_token", "rotate_self_token"}
@@ -324,7 +325,7 @@ def test_p25_operation_ids_are_present(schema: dict) -> None:
     assert {"get_link_project", "push_link_public_address"} <= op_ids
     assert {"project_logs", "diagnose_project"} <= op_ids
     assert "rename_project" in op_ids
-    assert len(op_ids) == 103  # + the seven AI gateway operations
+    assert len(op_ids) == 107  # + the eight AI gateway operations + the webhook trio
 
 
 def test_p40b_operation_ids_are_present(schema: dict) -> None:
@@ -458,6 +459,26 @@ def test_p26_wp1_domain_operations_are_present(schema: dict) -> None:
     assert "/services/{name}/domains/{domain}" not in paths
 
 
+def test_webhook_operations_are_present(schema: dict) -> None:
+    """The inbound webhook trio joins the ``Exposure`` tag, ``/api`` only.
+
+    The hook name is the item id; the signing secret has no route of its own
+    (it rides ``set_service_secrets``).
+    """
+    paths = schema["paths"]
+    collection = paths["/api/services/{name}/hooks"]
+    item = paths["/api/services/{name}/hooks/{hook}"]
+    assert set(collection) == {"get", "post"}
+    assert set(item) == {"delete"}
+    assert collection["get"]["operationId"] == "list_hooks"
+    assert collection["post"]["operationId"] == "add_hook"
+    assert item["delete"]["operationId"] == "remove_hook"
+    for op in (collection["get"], collection["post"], item["delete"]):
+        assert op["tags"] == ["Exposure"]
+    assert "/services/{name}/hooks" not in paths
+    assert "/services/{name}/hooks/{hook}" not in paths
+
+
 def test_legacy_bare_root_aliases_are_hidden_from_the_schema(schema: dict) -> None:
     """The legacy v0.2 root mounts stay functional but undocumented.
 
@@ -505,10 +526,11 @@ def test_batch_operation_ids_are_gone(schema: dict) -> None:
 
 
 def test_ai_gateway_operation_ids_are_present(schema: dict) -> None:
-    """The AI gateway's seven operations keep their pinned ids, under `AI Gateway`."""
+    """The AI gateway's eight operations keep their pinned ids, under `AI Gateway`."""
     expected = {
         "get_ai_gateway",
         "list_ai_routes",
+        "list_ai_provider_models",
         "set_ai_route",
         "remove_ai_route",
         "list_ai_gateway_keys",

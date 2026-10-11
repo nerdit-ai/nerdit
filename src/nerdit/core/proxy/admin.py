@@ -13,6 +13,7 @@ from .routing import (
     _extract_auth_fingerprint,
     _extract_dial,
     _route_shape,
+    _strips_hook_carriers,
 )
 
 
@@ -214,7 +215,8 @@ class CaddyAdmin:
             prev = result.get(rid)
             result[rid] = LiveRoute(
                 index=idx,
-                dial=_extract_dial(route_obj),
+                # A route missing the hook-carrier delete reads as drift.
+                dial=_extract_dial(route_obj) if _strips_hook_carriers(route_obj) else None,
                 shape=_route_shape(route_obj),
                 count=prev.count + 1 if prev else 1,
                 # The auth dimension is read here or nowhere: the

@@ -1,9 +1,9 @@
 """AI gateway MCP tools: machine aliases and their usage.
 
-Thin loopback projections of ``/api/ai-gateway/routes`` and
-``/api/ai-gateway/usage`` (Invariant #3): every refusal (role, alias grammar,
-base_url SSRF gate, secret-ref grammar, alias in use) is the daemon's
-structured envelope. No tool takes or returns a key: an alias names a
+Thin loopback projections of ``/api/ai-gateway/routes``,
+``/api/ai-gateway/providers/models`` and ``/api/ai-gateway/usage`` (Invariant
+#3): every refusal (role, alias grammar, base_url SSRF gate, secret-ref grammar,
+alias in use) is the daemon's structured envelope. No tool takes or returns a key: an alias names a
 ``${secrets.shared.KEY}`` reference, and virtual keys exist only in app envs.
 """
 
@@ -31,6 +31,12 @@ _Alias = Annotated[
 
 async def _list_ai_routes_impl(client: NerditClient) -> Any:
     return await _call(client.list_ai_routes())
+
+
+async def _list_ai_provider_models_impl(
+    client: NerditClient, *, base_url: str, api_key_ref: str
+) -> Any:
+    return await _call(client.list_ai_provider_models(base_url, api_key_ref))
 
 
 async def _set_ai_route_impl(  # noqa: PLR0913 - one wire field per keyword
@@ -84,6 +90,32 @@ async def list_ai_routes() -> Any:
         ``${secrets.shared.KEY}`` reference of its key: never a key value.
         """
         return await _list_ai_routes_impl(_request_client())
+
+async def list_ai_provider_models(
+        base_url: Annotated[
+            str,
+            Field(description="OpenAI-compatible base URL, usually ending in ``/v1``; https to "
+                  "a public host, or http to loopback or the models bridge."),
+        ],
+        api_key_ref: Annotated[
+            str,
+            Field(description="A ``${secrets.shared.KEY}`` reference to the provider key, set "
+                  "beforehand with ``set_secret`` on scope ``shared``. Never the key itself."),
+        ],
+    ) -> Any:
+        """List the model ids an OpenAI-compatible provider offers (submitter or admin).
+
+        The daemon calls ``GET {base_url}/models`` with the referenced shared
+        key, so you can pick a model for ``set_ai_route`` while the key stays on
+        the machine. Returns ``{base_url_host, models}`` (sorted ids only).
+        Read-only despite the POST underneath (no idempotency key).
+        Refusals: 422 ``ai_gateway.base_url_invalid`` / ``ai_gateway.secret_ref_invalid``,
+        503 ``secret_missing``, 502 ``ai_gateway.provider_unreachable`` /
+        ``ai_gateway.provider_error`` (the HTTP status, never the provider's text).
+        """
+        return await _list_ai_provider_models_impl(
+            _request_client(), base_url=base_url, api_key_ref=api_key_ref
+        )
 
 async def set_ai_route(
         alias: _Alias,
@@ -167,6 +199,7 @@ async def get_ai_usage(
 
 TOOLS = (
     list_ai_routes,
+    list_ai_provider_models,
     set_ai_route,
     remove_ai_route,
     get_ai_usage,

@@ -768,6 +768,30 @@ def test_shared_write_takes_submitter_or_admin_not_readonly(tmp_path):
     assert ok.json()["keys"] == ["K", "L"]
 
 
+def test_shared_write_refuses_a_scoped_submitter(tmp_path):
+    # A shared value reaches every workload: a token scoped to one app (or one
+    # project) must not set it. The unscoped tunnel principal still may.
+    scoped = ApiToken(
+        id="tok-scoped",
+        name="sc",
+        role=TokenRole.submitter,
+        token_hash=hash_token("scoped-raw"),
+        scope_services=["other-app"],
+    )
+    q = _queries()
+    tokens = {**_TOKENS, scoped.token_hash: scoped}
+    q.get_api_token_by_hash = AsyncMock(side_effect=lambda h: tokens.get(h))
+    c = _client(tmp_path, q)
+    resp = c.post("/secrets/shared", json={"values": {"K": "v"}}, headers=_auth("scoped-raw"))
+    assert resp.status_code == 403
+    assert resp.json()["code"] == "forbidden"
+    assert c.get("/secrets/shared", headers=_auth("scoped-raw")).json()["keys"] == []
+    assert (
+        c.post("/secrets/shared", json={"values": {"K": "v"}}, headers=_auth(SUB_RAW)).status_code
+        == 200
+    )
+
+
 def test_shared_delete_is_admin_only(tmp_path):
     c = _client(tmp_path)
     c.post("/secrets/shared", json={"values": {"K": "v"}}, headers=_auth(ADMIN_RAW))

@@ -43,6 +43,8 @@ from nerdit.core.link.client import (
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nerdit.config.settings import LinkSettings
     from nerdit.core.eventlog import EventRecorder
+    from nerdit.core.hooks import HookAdmission
+    from nerdit.core.link.frames import Header
     from nerdit.core.link.identity import NodeIdentity
 
 logger = logging.getLogger("nerdit.link.manager")
@@ -278,6 +280,8 @@ class LinkManager:
             [str, str | None, str | None, str | None], Awaitable[AppTarget | None]
         ]
         | None = None,
+        admit_hook: Callable[[str, str, Sequence[Header], bytes], Awaitable[HookAdmission | int]]
+        | None = None,
         clock: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         monotonic: Callable[[], float] | None = None,
@@ -296,6 +300,8 @@ class LinkManager:
         #: `None` — an unlinked, slug-less or domain-less node — means the mux
         #: serves no app stream at all.
         self._resolve_app = resolve_app
+        #: `HookGate.admit`, or None: every hook stream answers 404.
+        self._admit_hook = admit_hook
         self._clock = clock or (lambda: datetime.now(UTC))
         self._sleep = sleep or asyncio.sleep
         self._monotonic = monotonic or time.monotonic
@@ -854,6 +860,7 @@ class LinkManager:
                 validate_capability=self.validate_capability,
                 loopback_base_url=self._loopback_base_url,
                 resolve_app=self._resolve_app,
+                admit_hook=self._admit_hook,
             )
         )
         self._mux = mux

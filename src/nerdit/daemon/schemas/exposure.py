@@ -265,3 +265,74 @@ class DomainRemovedView(BaseModel):
     service_name: str = Field(description="Stable service name")
     domain: str = Field(description="The folded domain the call addressed")
     removed: bool = Field(description="False = nothing was bound; the call was a no-op")
+
+
+class HookRequest(StrictRequestModel):
+    """`POST /api/services/{name}/hooks`: declare an inbound webhook.
+
+    No secret reference on the API: the key is imposed as
+    `NERDIT_HOOK_<NAME>_SECRET`, set with `POST /api/secrets/{service}`.
+    """
+
+    name: str = Field(
+        description=(
+            "Lowercase letters, digits and '-', 1-32 characters, starting with a letter; "
+            "maps to NERDIT_HOOK_<NAME>_SECRET / _URL"
+        )
+    )
+    sender: str = Field(description="'stripe' | 'github' | 'slack' | 'hmac' | 'none'")
+    path: str = Field(description="App path the delivery is POSTed to, e.g. /webhooks/stripe")
+    header: str | None = Field(
+        default=None, description="sender 'hmac' only (required): the signature header name"
+    )
+    prefix: str | None = Field(
+        default=None,
+        description="sender 'hmac' only: text before the lowercase hex digest, e.g. 'sha256='",
+    )
+
+
+class HookView(BaseModel):
+    """One live inbound webhook; `url` and `secret_key` are computed per request."""
+
+    name: str = Field(description="Hook name, unique per service")
+    sender: str = Field(description="'stripe' | 'github' | 'slack' | 'hmac' | 'none'")
+    path: str = Field(description="App path the delivery is POSTed to")
+    header: str | None = Field(description="sender 'hmac' only: the signature header name")
+    prefix: str | None = Field(description="sender 'hmac' only: the digest prefix")
+    secret_ref: str | None = Field(
+        description="The ${secrets.X} reference the signature is checked with; null for 'none'"
+    )
+    secret_key: str | None = Field(
+        description=(
+            "The S2 key to set with POST /api/secrets/{service} (the provider's signing "
+            "secret); null for sender 'none' or a nerdit.toml hook naming its own ${secrets.X}"
+        )
+    )
+    url: str | None = Field(
+        description=(
+            "Webhook URL to paste at the provider; null until the machine is linked and "
+            "<app>--<slug> fits one DNS label. It only answers once the app is shared"
+        )
+    )
+    created_at: datetime = Field(description="When the hook was first added")
+
+
+class HookListView(BaseModel):
+    """A service's live hooks; empty when none. Only a missing service is a 404."""
+
+    service_name: str = Field(description="Stable service name")
+    hooks: list[HookView] = Field(default_factory=list, description="Live hooks, sorted by name")
+
+
+class HookSetView(HookView):
+    """A hook and whether this call created it (a replay answers created=false)."""
+
+    created: bool = Field(description="True when this call added the hook; false on a replay")
+
+
+class HookRemovedView(BaseModel):
+    """`DELETE /api/services/{name}/hooks/{hook}`: idempotent, always 200."""
+
+    service_name: str = Field(description="Stable service name")
+    name: str = Field(description="The hook name the call addressed")
+    removed: bool = Field(description="False = no live hook of that name; the call was a no-op")

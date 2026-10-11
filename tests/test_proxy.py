@@ -217,6 +217,26 @@ async def test_caddy_route_obj_path_mode():
     assert _extract_dial(obj) == "127.0.0.1:9401"
 
 
+async def test_every_app_route_deletes_the_hook_carriers():
+    """Only the mux asserts X-Nerdit-Hook-*: a LAN or custom-domain request can't forge them."""
+    from nerdit.core.proxy.routing import _strips_hook_carriers
+
+    mgr = _manager()
+    path_obj = mgr._caddy_route_obj(mgr.build_route("myapp", 9401))
+    domain_obj = mgr._caddy_route_obj(mgr.build_domain_route("myapp", 9401, "x.example", auth=None))
+    for obj in (path_obj, domain_obj):
+        assert _strips_hook_carriers(obj)
+    proxy = path_obj["handle"][0]["routes"][0]["handle"][1]
+    assert proxy["headers"]["request"]["delete"] == [
+        "x-nerdit-hook",
+        "x-nerdit-hook-delivery",
+        "x-nerdit-hook-received-at",
+    ]
+    # A route written by an older daemon reads as drift (no dial), so reconcile rewrites it.
+    del proxy["headers"]
+    assert not _strips_hook_carriers(path_obj)
+
+
 async def test_caddy_route_obj_subdomain_mode():
     mgr = _manager(mode="subdomain", base_domain="lan.local")
     spec = mgr.build_route("myapp", 9401)
@@ -588,6 +608,12 @@ async def test_caddy_admin_upsert_appends_then_replaces():
     await admin.aclose()
 
 
+#: The hook-carrier delete every app reverse_proxy carries (routing.HOOK_CARRIERS).
+_STRIP = {
+    "request": {"delete": ["x-nerdit-hook", "x-nerdit-hook-delivery", "x-nerdit-hook-received-at"]}
+}
+
+
 async def test_caddy_admin_live_routes_counts_duplicates_last_wins():
     """Duplicate @ids are counted; dial/shape reflect the newest (id-map target)."""
     fake = FakeCaddy()
@@ -595,12 +621,24 @@ async def test_caddy_admin_live_routes_counts_duplicates_last_wins():
         {
             "@id": "nerdit-route-a",
             "match": [{"path": ["/a", "/a/*"]}],
-            "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "127.0.0.1:1111"}]}],
+            "handle": [
+                {
+                    "handler": "reverse_proxy",
+                    "upstreams": [{"dial": "127.0.0.1:1111"}],
+                    "headers": _STRIP,
+                }
+            ],
         },
         {
             "@id": "nerdit-route-a",
             "match": [{"host": ["a.lan.local"]}],
-            "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "127.0.0.1:2222"}]}],
+            "handle": [
+                {
+                    "handler": "reverse_proxy",
+                    "upstreams": [{"dial": "127.0.0.1:2222"}],
+                    "headers": _STRIP,
+                }
+            ],
         },
     ]
     admin = _admin(fake)
@@ -655,6 +693,7 @@ async def test_caddy_admin_live_routes_parses_dials():
                                 {
                                     "handler": "reverse_proxy",
                                     "upstreams": [{"dial": "127.0.0.1:9400"}],
+                                    "headers": _STRIP,
                                 },
                             ]
                         }
@@ -678,14 +717,26 @@ async def test_caddy_admin_live_routes_reports_matcher_shape():
         {
             "@id": "nerdit-route-a",
             "match": [{"path": ["/a", "/a/*"]}],
-            "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "127.0.0.1:9400"}]}],
+            "handle": [
+                {
+                    "handler": "reverse_proxy",
+                    "upstreams": [{"dial": "127.0.0.1:9400"}],
+                    "headers": _STRIP,
+                }
+            ],
         }
     )
     fake.routes.append(
         {
             "@id": "nerdit-route-b",
             "match": [{"host": ["b.lan.local"]}],
-            "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "127.0.0.1:9401"}]}],
+            "handle": [
+                {
+                    "handler": "reverse_proxy",
+                    "upstreams": [{"dial": "127.0.0.1:9401"}],
+                    "headers": _STRIP,
+                }
+            ],
         }
     )
     # a dial-less nerdit route is still reported (prunable / upsertable)
@@ -2866,6 +2917,7 @@ async def test_route_object_golden_path_mode_no_auth():
                             {
                                 "handler": "reverse_proxy",
                                 "upstreams": [{"dial": "127.0.0.1:9401"}],
+                                "headers": _STRIP,
                             },
                         ]
                     }
@@ -2901,6 +2953,7 @@ async def test_route_object_golden_path_mode_with_auth(hash_calls):
                             {
                                 "handler": "reverse_proxy",
                                 "upstreams": [{"dial": "127.0.0.1:9401"}],
+                                "headers": _STRIP,
                             },
                         ]
                     }
@@ -2919,7 +2972,13 @@ async def test_route_object_golden_subdomain_mode_no_auth():
     assert obj == {
         "@id": "nerdit-route-myapp",
         "match": [{"host": ["myapp.lan.local"]}],
-        "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "127.0.0.1:9401"}]}],
+        "handle": [
+            {
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "127.0.0.1:9401"}],
+                "headers": _STRIP,
+            }
+        ],
     }
 
 
@@ -2933,7 +2992,11 @@ async def test_route_object_golden_subdomain_mode_with_auth(hash_calls):
         "match": [{"host": ["myapp.lan.local"]}],
         "handle": [
             _auth_handler(),
-            {"handler": "reverse_proxy", "upstreams": [{"dial": "127.0.0.1:9401"}]},
+            {
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": "127.0.0.1:9401"}],
+                "headers": _STRIP,
+            },
         ],
     }
 

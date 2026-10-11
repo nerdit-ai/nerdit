@@ -319,6 +319,47 @@ async def test_without_queries_the_resolver_is_never_installed(tmp_path) -> None
     assert manager._resolve_app is None
 
 
+async def test_bootstrap_wires_a_hook_gate_only_with_queries_and_a_secret_resolver(
+    tmp_path,  # noqa: ANN001
+    queries,  # noqa: ANN001
+) -> None:
+    """Both seams or no gate (every hook stream 404s); the gate installed is
+    driven against the real database, not attribute-peeked."""
+    job = await _seed_service(queries, "demo")
+    outcome, hook = await queries.add_hook(
+        "demo",
+        job_id=job.id,
+        name="ping",
+        sender="none",
+        path="/hook",
+        header=None,
+        prefix=None,
+        secret_ref=None,
+    )
+    assert outcome == "inserted" and hook is not None
+    settings = _boot_settings(_linked(nodes_base_domain=DOMAIN), tmp_path)
+
+    def no_secret(service: str, project_id: str | None, ref: str) -> str | None:
+        return None
+
+    without_secret = await build_link_manager(settings, AsyncMock(), queries=queries)  # type: ignore[arg-type]
+    without_queries = await build_link_manager(settings, AsyncMock(), resolve_secret=no_secret)  # type: ignore[arg-type]
+    assert without_secret is not None and without_secret._admit_hook is None
+    assert without_queries is not None and without_queries._admit_hook is None
+
+    manager = await build_link_manager(
+        settings,
+        AsyncMock(),
+        queries=queries,
+        resolve_secret=no_secret,  # type: ignore[arg-type]
+    )
+    assert manager is not None and manager._admit_hook is not None
+    admitted = await manager._admit_hook(hook.hook_id, "demo", [], b"{}")
+    assert not isinstance(admitted, int)
+    assert (admitted.name, admitted.path) == ("ping", "/hook")
+    assert await manager._admit_hook(hook.hook_id, "other", [], b"{}") == 404
+
+
 # ---------------------------------------------------------------------------
 # 3. manager seam — MuxContext and LinkStatus
 # ---------------------------------------------------------------------------
@@ -345,6 +386,9 @@ async def test_every_mux_context_carries_the_resolver(identity: NodeIdentity) ->
     ) -> AppTarget | None:  # pragma: no cover - identity only
         return None
 
+    async def admit(*_: Any) -> int:  # pragma: no cover - identity only
+        return 404
+
     async with FakeRelay(verifier=identity.verifier, clock=clock) as relay:
         manager = LinkManager(
             _settings(),
@@ -356,6 +400,7 @@ async def test_every_mux_context_carries_the_resolver(identity: NodeIdentity) ->
             connector=lambda: dial_relay(relay.url),
             mux_factory=_RecordingMux,
             resolve_app=resolve,
+            admit_hook=admit,
             clock=clock,
             sleep=clockwork.sleep,
             monotonic=clock.monotonic,
@@ -370,6 +415,7 @@ async def test_every_mux_context_carries_the_resolver(identity: NodeIdentity) ->
 
             assert len(_RecordingMux.instances) == 1
             assert _RecordingMux.instances[0].ctx.resolve_app is resolve
+            assert _RecordingMux.instances[0].ctx.admit_hook is admit
         finally:
             await manager.stop()
 

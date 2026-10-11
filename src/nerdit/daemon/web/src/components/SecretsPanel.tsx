@@ -106,7 +106,10 @@ export function SecretsPanel({
       {readOnly && (
         <Notice tone="warning" className="flex items-center gap-2 text-13">
           <ShieldAlert size={16} aria-hidden="true" className="shrink-0" />
-          Admin token required to modify these secrets. Showing key names only.
+          {canDelete
+            ? "Admin token required to modify these secrets."
+            : "An unscoped submitter or admin token sets these secrets; deleting them takes admin."}{" "}
+          Showing key names only.
         </Notice>
       )}
 

@@ -361,4 +361,4 @@ async def test_every_matrix_warning_row_carries_an_advisory_reason(tmp_path, que
 
 def test_license_is_stashed_before_the_link_manager_is_built():
     src = _server_source()
-    assert src.index("app.state.license = ") < src.index("build_link_manager(settings")
+    assert src.index("app.state.license = ") < src.index("await build_link_manager(")

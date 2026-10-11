@@ -55,6 +55,7 @@ def _register_commands() -> None:  # noqa: PLR0915
     from nerdit.cli.commands.domains import domains_app  # noqa: F811
     from nerdit.cli.commands.events import events  # noqa: F811
     from nerdit.cli.commands.exit import exit_daemon  # noqa: F811
+    from nerdit.cli.commands.hooks import hooks_app  # noqa: F811
     from nerdit.cli.commands.init import init  # noqa: F811
     from nerdit.cli.commands.license import license_app  # noqa: F811
     from nerdit.cli.commands.link import link, unlink  # noqa: F811
@@ -125,6 +126,7 @@ def _register_commands() -> None:  # noqa: PLR0915
     # are meaningless without the noun, and it keeps the exposure surface
     # (``share``/``unshare``/``domains``) legible at the top level.
     app.add_typer(domains_app, name="domains")
+    app.add_typer(hooks_app, name="hooks")
     # (P17d D-LIC5) A group, not three flat verbs: ``install``/``status``/
     # ``remove`` are meaningless without the noun, and the group leaves room for
     # a future ``nerdit license show`` without another top-level name.

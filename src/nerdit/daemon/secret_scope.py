@@ -30,6 +30,7 @@ from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import (
     Principal,
     _owns,
+    _scope_denial,
     current_principal,
     owner_denial,
     require_owner_or_admin,
@@ -205,6 +206,21 @@ async def reject_foreign_claim(request: Request, name: str) -> None:
         raise project_owned_error(name)
 
 
+def _require_shared_writer(request: Request, *, mint: bool) -> None:
+    """Gate a `shared` write: a set (`mint`) takes an unscoped submitter or admin, a delete admin.
+
+    A shared value reaches every workload, so only a principal whose authority
+    spans the machine may set it: admin, or an UNSCOPED submitter (the
+    node-link tunnel). A service- or project-scoped token stays inside its
+    scope and gets the scope envelope (Codex, 0.8.4 follow-up).
+    """
+    principal = require_role(request, *((TokenRole.submitter,) if mint else ()), TokenRole.admin)
+    if principal.role != TokenRole.admin and (
+        principal.scope_services is not None or principal.project_id is not None
+    ):
+        raise _scope_denial(principal, _SHARED_PUBLIC)
+
+
 async def authorize_secret_scope(
     request: Request,
     service: str,
@@ -238,8 +254,8 @@ async def authorize_secret_scope(
                 "shared-scope secrets are disabled.",
                 hint="Rename or delete that service, then restart the daemon.",
             )
-        if write:  # a set (`mint`) is submitter-or-admin; a delete stays admin
-            require_role(request, *((TokenRole.submitter,) if mint else ()), TokenRole.admin)
+        if write:
+            _require_shared_writer(request, mint=mint)
         return
     # `/secrets/{service}` passes no `project` (label-only); the variables
     # routes pass the project they already judged (D-P40-7).

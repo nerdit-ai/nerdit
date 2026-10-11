@@ -11,6 +11,13 @@ role, app-carrier, and cloud-control headers before forwarding to the app, and
 rewrite Host to its hosted name. Hop-by-hop headers are dropped; this protocol
 does not support WebSockets.
 
+A stream carrying `x-nerdit-hook` is an inbound webhook: POST only, admitted
+by `MuxContext.admit_hook` before the share resolver (only the gate knows
+whether the hook exists, which separates 404 from 503), then dialled at the
+hook's path with the daemon's own three `X-Nerdit-Hook-*` headers. Those
+carriers are dropped from every other app stream; the edge's Received-At is
+trusted because the cloud strips client copies before setting its own.
+
 Honor advertised limits and stream unbuffered `aiter_raw` chunks immediately,
 splitting only at `RESPONSE_CHUNK_BYTES`. No read timeout may truncate live SSE
 or long-poll responses. The frozen node-link spec defines body completion and
@@ -31,7 +38,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from nerdit.core.link.client import LinkClosedError, MuxContext
+from nerdit.core.hooks import DELIVERY_HEADER, HOOK_HEADER, RECEIVED_AT_HEADER, HookAdmission
+from nerdit.core.link.client import AppTarget, LinkClosedError, MuxContext
 from nerdit.core.link.frames import (
     ERROR_CODE_AUTH,
     ERROR_CODE_INTERNAL,
@@ -126,6 +134,10 @@ CLOUD_CONTROL_HEADER = "x-nerdit-cloud-control"
 #: cloud said so" must not reach a third party's container just because two
 #: unrelated invariants currently keep it out. Kept in lockstep with the
 #: reference daemon (`nerdit-cloud` `dev/fake_daemon.py`).
+#:
+#: The three webhook carriers join them so no app ever sees a relay-supplied or
+#: forged `X-Nerdit-Hook-*`; the mux re-adds its own only on an admitted hook
+#: stream. The fake daemon gains the same three names in the cloud edge PR.
 _APP_REQUEST_DROPPED = frozenset(
     {
         "host",
@@ -139,6 +151,9 @@ _APP_REQUEST_DROPPED = frozenset(
         "forwarded",
         CLOUD_CONTROL_HEADER,
         PROJECT_DELEGATION_HEADER,
+        HOOK_HEADER,
+        DELIVERY_HEADER,
+        RECEIVED_AT_HEADER,
     }
 )
 
@@ -154,6 +169,21 @@ _NOT_SHARED_BODY = (
     b'"message":"No shared service answers at this address.",'
     b'"detail":"No shared service answers at this address."}'
 )
+#: Constant answers on a hook stream: 401 a refused signature (the edge drops
+#: the delivery), 503 a missing secret or a stopped/unshared app (it queues).
+_HOOK_REJECTED_BODY = (
+    b'{"code":"hook.rejected","message":"The webhook was refused.",'
+    b'"detail":"The webhook was refused."}'
+)
+_HOOK_UNAVAILABLE_BODY = (
+    b'{"code":"hook.unavailable","message":"The webhook cannot be delivered right now.",'
+    b'"detail":"The webhook cannot be delivered right now."}'
+)
+_HOOK_REFUSALS = {
+    404: (404, _NOT_SHARED_BODY),
+    401: (401, _HOOK_REJECTED_BODY),
+    503: (503, _HOOK_UNAVAILABLE_BODY),
+}
 
 #: What a log line is allowed to say about an APP stream's path (P26 WP-H, PR
 #: review). Every warning in this module names `method` and `path` and
@@ -186,6 +216,37 @@ _BODILESS_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "DELETE"})
 _SUBMITTER = "submitter"
 
 _BEARER_PREFIX = "Bearer "
+
+
+def _app_request(
+    frame: OpenStream, target: AppTarget, admission: HookAdmission | None
+) -> tuple[str, list[Header]]:
+    """The loopback URL and filtered headers an admitted app stream is dialled with."""
+    headers = [
+        (name, value)
+        for name, value in frame.headers
+        if name.lower() not in HOP_BY_HOP and name.lower() not in _APP_REQUEST_DROPPED
+    ]
+    # httpx honours an explicit `Host` over the URL authority
+    # (`Request._prepare` uses `setdefault`), so the app sees the name
+    # the browser typed while the socket still goes to loopback.
+    headers.extend((("host", target.host), ("x-forwarded-host", target.host)))
+    # `frame.path` is origin-relative by grammar (`frames.py`), so the
+    # app is served at the ROOT of its hosted name — no base path, which is
+    # the whole point of the hosted layer for path-mode nodes. An admitted hook
+    # is dialled at its own path with the daemon's three carriers.
+    path = frame.path
+    if admission is not None:
+        path = admission.path
+        headers.extend(
+            (
+                (HOOK_HEADER, admission.name),
+                (DELIVERY_HEADER, admission.delivery),
+                (RECEIVED_AT_HEADER, admission.received_at),
+            )
+        )
+    url = f"http://127.0.0.1:{target.port}{path}"
+    return (f"{url}?{frame.query}" if frame.query else url), headers
 
 
 @dataclass(slots=True)
@@ -607,12 +668,26 @@ class StreamMux:
         """
         frame = stream.frame
         resolver = self._ctx.resolve_app
-        carriers = (APP_HEADER, APP_JOB_HEADER, APP_ACCESS_HEADER, "x-forwarded-host")
+        carriers = (
+            APP_HEADER,
+            APP_JOB_HEADER,
+            APP_ACCESS_HEADER,
+            "x-forwarded-host",
+            HOOK_HEADER,
+            DELIVERY_HEADER,
+            RECEIVED_AT_HEADER,
+        )
         if any(
             sum(name.lower() == carrier for name, _ in frame.headers) > 1 for carrier in carriers
         ):
-            await self._send_not_shared(frame)
+            await self._send_refusal(frame)
             return
+        body = stream.body()
+        admission: HookAdmission | None = None
+        if frame.header(HOOK_HEADER) is not None:
+            admission = await self._admit_hook(frame, app_name, body)
+            if admission is None:
+                return
         target = (
             await resolver(
                 app_name,
@@ -624,25 +699,11 @@ class StreamMux:
             else None
         )
         if target is None:
-            await self._send_not_shared(frame)
+            # An admitted hook on a stopped or unshared app: 503, the edge queues.
+            await self._send_refusal(frame, *_HOOK_REFUSALS[503 if admission else 404])
             return
 
-        headers = [
-            (name, value)
-            for name, value in frame.headers
-            if name.lower() not in HOP_BY_HOP and name.lower() not in _APP_REQUEST_DROPPED
-        ]
-        # httpx honours an explicit `Host` over the URL authority
-        # (`Request._prepare` uses `setdefault`), so the app sees the name
-        # the browser typed while the socket still goes to loopback.
-        headers.extend((("host", target.host), ("x-forwarded-host", target.host)))
-
-        # `frame.path` is origin-relative by grammar (`frames.py`), so the
-        # app is served at the ROOT of its hosted name — no base path, which is
-        # the whole point of the hosted layer for path-mode nodes.
-        url = f"http://127.0.0.1:{target.port}{frame.path}"
-        if frame.query:
-            url = f"{url}?{frame.query}"
+        url, headers = _app_request(frame, target, admission)
 
         async def validate_connected_target(event: str, _info: dict[str, object]) -> None:
             # httpcore is pinned: this boundary is AFTER socket acquisition but
@@ -659,7 +720,7 @@ class StreamMux:
                 frame.method,
                 url,
                 headers=headers,
-                content=stream.body(),
+                content=body,
                 extensions={"trace": validate_connected_target},
             ) as response:
                 stream.response = response
@@ -690,8 +751,30 @@ class StreamMux:
             watching.cancel()
             await asyncio.gather(serving, watching, return_exceptions=True)
 
-    async def _send_not_shared(self, frame: OpenStream) -> None:
-        """Answer an unroutable app stream with the one structured 404.
+    async def _admit_hook(
+        self, frame: OpenStream, app_name: str, body: bytes
+    ) -> HookAdmission | None:
+        """Run the hook gate; on refusal answer the constant status and return None.
+
+        Non-POST and a node without a gate answer the unshared 404 without
+        calling it.
+        """
+        admit = self._ctx.admit_hook
+        hook_id = frame.header(HOOK_HEADER)
+        if frame.method.upper() != "POST" or admit is None or hook_id is None:
+            await self._send_refusal(frame)
+            return None
+        verdict = await admit(hook_id, app_name, frame.headers, body)
+        if isinstance(verdict, HookAdmission):
+            return verdict
+        await self._send_refusal(frame, *_HOOK_REFUSALS.get(verdict, _HOOK_REFUSALS[404]))
+        return None
+
+    async def _send_refusal(
+        self, frame: OpenStream, status: int = 404, body: bytes = _NOT_SHARED_BODY
+    ) -> None:
+        """Answer an app stream with a constant refusal: the one structured 404,
+        or a hook stream's constant 401/503 (never the hook id).
 
         The requested name is deliberately absent from both the body and the
         log line: it is attacker-chosen input, and repeating it would turn the
@@ -700,28 +783,27 @@ class StreamMux:
         whose URL is most likely to be a bare magic link somebody mistyped.
         """
         logger.warning(
-            "Stream %s (%s %s): no shared service answers this app stream",
+            "Stream %s (%s %s): app stream refused with %s",
             frame.stream_id,
             frame.method,
             _log_path(frame),
+            status,
         )
         ctx = self._ctx
         await ctx.send(
             response_head_frame(
                 stream_id=frame.stream_id,
                 node_id=ctx.node_id,
-                status=404,
+                status=status,
                 headers=[
                     ("content-type", "application/json"),
                     ("cache-control", "no-store"),
-                    ("content-length", str(len(_NOT_SHARED_BODY))),
+                    ("content-length", str(len(body))),
                 ],
             )
         )
         await ctx.send(
-            response_body_frame(
-                stream_id=frame.stream_id, node_id=ctx.node_id, body=_NOT_SHARED_BODY
-            )
+            response_body_frame(stream_id=frame.stream_id, node_id=ctx.node_id, body=body)
         )
         await ctx.send(response_end_frame(stream_id=frame.stream_id, node_id=ctx.node_id))
 

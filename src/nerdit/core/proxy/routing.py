@@ -12,7 +12,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from nerdit.core.hooks import DELIVERY_HEADER, HOOK_HEADER, RECEIVED_AT_HEADER
+
 from .edgeauth import EdgeAuthMaterial, auth_fingerprint
+
+#: Hook carriers only the mux asserts (after `HookGate.admit`). Every app route
+#: deletes them, so a direct LAN or custom-domain request never forges them.
+HOOK_CARRIERS = [HOOK_HEADER, DELIVERY_HEADER, RECEIVED_AT_HEADER]
 
 # Caddy route objects we own carry this `@id` prefix so reconcile can tell
 # nerdit-managed routes apart from anything an operator added by hand.
@@ -343,6 +349,19 @@ def _extract_dial(route_obj: dict[str, Any]) -> str | None:
         if isinstance(dial, str):
             return dial
     return None
+
+
+def _strips_hook_carriers(route_obj: dict[str, Any]) -> bool:
+    """True when the route's `reverse_proxy` deletes every hook carrier.
+
+    A route written by an older daemon lacks the delete list; the caller reads
+    it as a drifted dial so the next reconcile rewrites it once.
+    """
+    handler = _find_handler(route_obj, "reverse_proxy") or {}
+    headers = handler.get("headers")
+    request = headers.get("request") if isinstance(headers, dict) else None
+    deleted = request.get("delete") if isinstance(request, dict) else None
+    return isinstance(deleted, list) and set(HOOK_CARRIERS) <= set(deleted)
 
 
 def _route_shape(route_obj: dict[str, Any]) -> str:

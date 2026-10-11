@@ -74,6 +74,18 @@ def test_action_tokens():
     assert derive_action("DELETE", "/tokens/tok-9") == ("token.revoke", "token", "tok-9")
 
 
+def test_hook_routes_derive_hook_created_and_hook_removed():
+    assert derive_action("POST", "/api/services/shop/hooks") == ("hook.created", "service", "shop")
+    assert derive_action("DELETE", "/api/services/shop/hooks/stripe") == (
+        "hook.removed",
+        "service",
+        "shop",
+    )
+    # A decoded '%2F' still maps to the rule, never to the raw-path fallback.
+    assert derive_action("DELETE", "/services/shop/hooks/a/b")[0] == "hook.removed"
+    assert derive_action("POST", "/services/shop/hooks/x")[0] != "hook.created"
+
+
 def test_action_fallback_is_templated():
     # An unmapped mutation still logs with bounded cardinality.
     action, target_type, target_id = derive_action("POST", "/services/abc123/unknown")

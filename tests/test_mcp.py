@@ -2347,9 +2347,13 @@ async def test_build_server_registers_all_tools():
         "project_logs",
         "diagnose_project",
         "list_ai_routes",
+        "list_ai_provider_models",
         "set_ai_route",
         "remove_ai_route",
         "get_ai_usage",
+        "list_hooks",
+        "add_hook",
+        "remove_hook",
     }
     # The tool set is a public contract for external agents: pin the count so a
     # tool cannot be added or dropped without an explicit CHANGELOG decision.
@@ -2362,8 +2366,11 @@ async def test_build_server_registers_all_tools():
     # (P40d) 55 → 57 with write_project_files/apply_project (the declaration).
     # P41d adds project_logs/diagnose_project, bringing the set to 59; the AI
     # gateway adds list/set/remove_ai_route + get_ai_usage (63) — deliberately no
-    # key tool: revoking an app's key stays on the CLI/REST.
-    assert len(names) == 63
+    # key tool: revoking an app's key stays on the CLI/REST; 0.8.5 adds
+    # list_ai_provider_models (64), the console's model picker; inbound webhooks
+    # add list_hooks/add_hook/remove_hook (67) — deliberately no secret tool:
+    # the signing secret goes through set_secret.
+    assert len(names) == 67
 
 
 _MCP_TOOLS_GOLDEN_PATH = Path(__file__).parent / "data" / "mcp_tools_golden.json"
@@ -2841,6 +2848,63 @@ async def test_add_domain_impl_surfaces_the_daemon_refusal_unchanged():
     assert "wildcard" in result["error"]["message"]
     assert "bare, lowercase DNS name" in result["error"]["hint"]
     assert "detail" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_add_hook_impl_mints_a_key_and_sends_the_contract_body():
+    """The webhook write is a thin projection: no secret field, unset knobs omitted."""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["idem"] = request.headers.get("idempotency-key")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"name": "stripe", "created": True})
+
+    result = await exposure_tools._add_hook_impl(
+        _client(handler), name="demo", hook_name="stripe", sender="stripe", path="/wh"
+    )
+
+    assert result["created"] is True
+    assert (seen["method"], seen["path"]) == ("POST", "/api/services/demo/hooks")
+    assert seen["body"] == {"name": "stripe", "sender": "stripe", "path": "/wh"}
+    uuid.UUID(seen["idem"])
+
+
+@pytest.mark.asyncio
+async def test_remove_hook_impl_deletes_with_a_minted_key():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["idem"] = request.headers.get("idempotency-key")
+        return httpx.Response(200, json={"service_name": "demo", "name": "stripe", "removed": True})
+
+    result = await exposure_tools._remove_hook_impl(
+        _client(handler), name="demo", hook_name="stripe"
+    )
+
+    assert result["removed"] is True
+    assert (seen["method"], seen["path"]) == ("DELETE", "/api/services/demo/hooks/stripe")
+    uuid.UUID(seen["idem"])
+
+
+@pytest.mark.asyncio
+async def test_add_hook_impl_surfaces_the_daemon_refusal_unchanged():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={"code": "hook.exists", "message": "m", "hint": "Remove it first."},
+        )
+
+    result = await exposure_tools._add_hook_impl(
+        _client(handler), name="demo", hook_name="stripe", sender="github", path="/wh"
+    )
+
+    assert result["error"]["code"] == "hook.exists"
+    assert result["error"]["status"] == 409
 
 
 @pytest.mark.asyncio

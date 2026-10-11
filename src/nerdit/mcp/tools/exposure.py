@@ -11,7 +11,8 @@ operator owns: the node's own Caddy serves ``https://<domain>/`` directly, in
 either proxy mode and at the root — no tunnel, no ``/<app>/`` prefix.
 
 Thin loopback projections of ``PUT``/``DELETE /api/services/{name}/share`` and
-``PUT``/``DELETE /api/services/{name}/domains/{domain}`` (Invariant #3): every
+``PUT``/``DELETE /api/services/{name}/domains/{domain}`` and the
+``/api/services/{name}/hooks`` trio (Invariant #3): every
 refusal — entitlement, consent, link state, workload kind, label length, domain
 grammar, ownership, the node's ACME policy — is decided by the daemon and
 surfaces as its structured envelope. Nothing is pre-checked here, and ``access``
@@ -109,6 +110,51 @@ async def _remove_domain_impl(
     if not idempotency_key:
         idempotency_key = str(uuid.uuid4())
     return await _call(client.remove_domain(name, domain, idempotency_key=idempotency_key))
+
+
+async def _list_hooks_impl(client: NerditClient, *, name: str) -> Any:
+    """List an app's inbound webhooks (read-only, no key)."""
+    return await _call(client.list_hooks(name))
+
+
+async def _add_hook_impl(  # noqa: PLR0913 - the route's body fields, keyword-only
+    client: NerditClient,
+    *,
+    name: str,
+    hook_name: str,
+    sender: str,
+    path: str,
+    header: str | None = None,
+    prefix: str | None = None,
+    idempotency_key: str | None = None,
+) -> Any:
+    """Add an inbound webhook, auto-minting a key (the write-tool idiom)."""
+    if not idempotency_key:
+        idempotency_key = str(uuid.uuid4())
+    return await _call(
+        client.add_hook(
+            name,
+            hook_name,
+            sender=sender,
+            path=path,
+            header=header,
+            prefix=prefix,
+            idempotency_key=idempotency_key,
+        )
+    )
+
+
+async def _remove_hook_impl(
+    client: NerditClient,
+    *,
+    name: str,
+    hook_name: str,
+    idempotency_key: str | None = None,
+) -> Any:
+    """Remove an inbound webhook, auto-minting a key. Idempotent server-side."""
+    if not idempotency_key:
+        idempotency_key = str(uuid.uuid4())
+    return await _call(client.remove_hook(name, hook_name, idempotency_key=idempotency_key))
 
 
 # fmt: off
@@ -280,6 +326,93 @@ async def remove_domain(
             domain=domain,
             idempotency_key=idempotency_key,
         )
+
+HookName = Annotated[
+    str,
+    Field(
+        description="Webhook name: lowercase letters, digits and '-', 1-32 characters, "
+        "starting with a letter (e.g. ``stripe``); maps to ``NERDIT_HOOK_<NAME>_SECRET`` "
+        "and ``NERDIT_HOOK_<NAME>_URL``."
+    ),
+]
+
+async def list_hooks(name: ExposedApp) -> Any:
+        """List a deployed app's inbound webhooks (owner or admin only).
+
+        Returns ``{service_name, hooks: [{name, sender, path, header, prefix,
+        secret_ref, secret_key, url, created_at}]}``. ``url`` is null until the
+        machine is linked, and answers only once the app is shared.
+        """
+        return await _list_hooks_impl(_request_client(), name=name)
+
+async def add_hook(  # noqa: PLR0913 - one parameter per route field
+        name: ExposedApp,
+        hook_name: HookName,
+        sender: Annotated[
+            str,
+            Field(
+                description="Who signs the deliveries: ``stripe`` (Stripe-Signature), "
+                "``github`` (X-Hub-Signature-256), ``slack`` (X-Slack-Signature), ``hmac`` "
+                "(HMAC-SHA256 lowercase hex in ``header``, after ``prefix``) or ``none`` "
+                "(unsigned: the URL is the only guard)."
+            ),
+        ],
+        path: Annotated[
+            str,
+            Field(description="App path each delivery is POSTed to, e.g. ``/webhooks/stripe``."),
+        ],
+        header: Annotated[
+            str | None,
+            Field(description="sender ``hmac`` only (required there): the signature header."),
+        ] = None,
+        prefix: Annotated[
+            str | None,
+            Field(description="sender ``hmac`` only: text before the hex digest (``sha256=``)."),
+        ] = None,
+        idempotency_key: IdempotencyKey = None,
+    ) -> Any:
+        """Give a deployed app an inbound webhook address a provider can POST to.
+
+        The machine verifies each delivery's signature before the app sees it,
+        then POSTs the provider's headers and exact body to ``path``. No secret
+        travels through this tool: the response carries ``url`` (paste it at the
+        provider) and ``secret_key``; then store the provider's signing secret
+        with ``set_secret(name, {secret_key: value})``. ``url`` is null until
+        the machine is linked, and answers only once the app is shared.
+
+        Refusals: 422 ``hook.invalid`` (``reason`` ``name`` or ``shape``), 422
+        ``hook.kind_unsupported`` (models and databases), 409 ``hook.exists``
+        (a different webhook already has that name). A replay of the same
+        webhook answers ``created: false``.
+        """
+        return await _add_hook_impl(
+            _request_client(),
+            name=name,
+            hook_name=hook_name,
+            sender=sender,
+            path=path,
+            header=header,
+            prefix=prefix,
+            idempotency_key=idempotency_key,
+        )
+
+async def remove_hook(
+        name: ExposedApp,
+        hook_name: HookName,
+        idempotency_key: IdempotencyKey = None,
+    ) -> Any:
+        """Remove an inbound webhook; its address stops answering. Idempotent.
+
+        The signing secret stays set (remove it with ``remove_secret``). A
+        webhook still declared in nerdit.toml comes back with a NEW address on
+        the next deploy.
+        """
+        return await _remove_hook_impl(
+            _request_client(),
+            name=name,
+            hook_name=hook_name,
+            idempotency_key=idempotency_key,
+        )
 # fmt: on
 
 
@@ -288,4 +421,7 @@ TOOLS = (
     unshare_service,
     add_domain,
     remove_domain,
+    list_hooks,
+    add_hook,
+    remove_hook,
 )

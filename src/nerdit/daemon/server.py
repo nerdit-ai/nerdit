@@ -349,7 +349,8 @@ async def lifespan(app: FastAPI):
     # edge-auth resolver is wired with a late setter rather than by reordering
     # boot. Nothing has started yet: the proxy is first used by
     # build_controllers below and only started further down the lifespan.
-    proxy_manager.set_secret_resolver(build_edge_auth_resolver(secret_manager))
+    resolve_secret = build_edge_auth_resolver(secret_manager)
+    proxy_manager.set_secret_resolver(resolve_secret)
     (
         model_controller,
         data_controller,
@@ -473,7 +474,9 @@ async def lifespan(app: FastAPI):
     # nothing at all is constructed or started, so a fresh install dials
     # nowhere. When it is on, the manager owns its own connect/renew/reconnect
     # task; the daemon opens no inbound port for it.
-    link_manager = await build_link_manager(settings, event_recorder, queries=queries)
+    link_manager = await build_link_manager(
+        settings, event_recorder, queries=queries, resolve_secret=resolve_secret
+    )
     # Publish on app.state BEFORE starting: the middleware's capability
     # resolution and the stale-bearer refusal both read this attribute, so it
     # must be set before any tunneled loopback request can possibly arrive

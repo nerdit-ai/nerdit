@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
@@ -32,6 +32,7 @@ from nerdit.core.link.frames import (
     Downlink,
     ErrorFrame,
     FrameError,
+    Header,
     HelloAck,
     NodeChallenge,
     StreamDownlink,
@@ -47,6 +48,7 @@ from nerdit.core.link.identity import NodeIdentity, proof_message
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import httpx
 
+    from nerdit.core.hooks import HookAdmission
     from nerdit.core.link.capability import MintedCapability
 
 logger = logging.getLogger("nerdit.link.client")
@@ -703,6 +705,12 @@ class MuxContext:
     #: `http_client_factory`; production builds an `httpx.AsyncClient` with
     #: no `base_url`, because an app stream's authority is per-stream.
     app_client_factory: Callable[[], httpx.AsyncClient] | None = None
+    #: `(hook_id, service_name, headers, body) -> HookAdmission | status`
+    #: (`core.hooks.HookGate.admit`). `None` (the default) is fail-closed like
+    #: `resolve_app`: every stream carrying `x-nerdit-hook` answers 404.
+    admit_hook: (
+        Callable[[str, str, Sequence[Header], bytes], Awaitable[HookAdmission | int]] | None
+    ) = None
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 

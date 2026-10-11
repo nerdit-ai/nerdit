@@ -527,6 +527,9 @@ async def get_capabilities(request: Request) -> dict[str, Any]:
             # Constant ``True``: `/ai-gateway/*` is a plain 404 on an older
             # daemon; whether the gateway listens is `GET /ai-gateway`'s `enabled`.
             "ai_gateway_v1": True,
+            # Constant ``True``: `/services/{name}/hooks` is a plain 404 on an
+            # older daemon; the console shows Update this machine.
+            "inbound_hooks": True,
         },
     }
     if is_admin:

@@ -248,6 +248,9 @@ def test_capabilities_admin_has_paths_and_admin_addr():
     assert body["features"]["deploy_into_project_v1"] is True
     # Constant true: `/ai-gateway/*` is a plain 404 before this build.
     assert body["features"]["ai_gateway_v1"] is True
+    # Constant true: `/services/{name}/hooks` is a plain 404 on an older
+    # daemon; the console shows Update this machine.
+    assert body["features"]["inbound_hooks"] is True
 
 
 def test_capabilities_projects_the_container_sandbox():

@@ -36,6 +36,7 @@ from nerdit.config.project import shared_secret_keys_for
 from nerdit.config.settings import (
     AiGatewaySettings,
     ContainerSettings,
+    LinkSettings,
     ModelsSettings,
     RetentionSettings,
     ServicesSettings,
@@ -63,6 +64,7 @@ from nerdit.core.health import (
     run_probe,
     within_start_period,
 )
+from nerdit.core.hooks import hook_url, url_env_key
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.core.launch import (
     _RUN_LINE_MAX_BYTES,
@@ -661,8 +663,12 @@ class ServiceController:
         retention_settings: RetentionSettings | None = None,
         events: EventRecorder | None = None,
         ai_gateway: AiGatewaySettings | None = None,
+        link: LinkSettings | None = None,
     ) -> None:
         self._queries = queries
+        # The live `settings.link` (unlink mutates it in place): the hosted
+        # slug/domain composing NERDIT_HOOK_<NAME>_URL. None => no hook URLs.
+        self._link = link
         # `[ai_gateway]` for `provider = "gateway"` bindings; None reads as off.
         self._ai_gateway = ai_gateway
         # Flipped by the lifespan when the gateway listener failed to bind.
@@ -2515,6 +2521,15 @@ class ServiceController:
             injected.update(inject_env(resolved_ai))
         if resolved_db:
             injected.update(inject_db_env(resolved_db))
+        # NERDIT_HOOK_<NAME>_URL per live webhook; omitted while unlinked or when
+        # the hosted label does not fit. A hook added later shows at the next launch.
+        if job.kind is JobKind.service and job.service_name and self._link is not None:
+            for hook in await self._queries.list_hooks(job.service_name):
+                url = hook_url(
+                    job.service_name, hook.hook_id, self._link.slug, self._link.nodes_base_domain
+                )
+                if url:
+                    injected[url_env_key(hook.name)] = url
         env.update(injected)
         # Tell the app which port it was wired to (Heroku/Cloud-Run convention).
         # An explicit config/secret PORT still wins.

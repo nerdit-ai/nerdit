@@ -100,34 +100,56 @@ async def _upstream(gw: Gateway, route: AiGatewayRoute) -> tuple[str, str] | JSO
         except BindingNotReady as exc:
             return error(503, "model_not_ready", str(exc))
         return resolved.base_url, resolved.api_key
-    ref = route.api_key_ref or ""
-    secrets = gw.secrets
     try:
-        # Machine-level alias: only the shared scope is consulted (no
-        # per-service override; an unscoped ref resolves nothing).
+        key = provider_key(gw.secrets, route.api_key_ref or "")
+    except ProviderKeyError as exc:
+        return error(503, exc.code, exc.message)
+    return (route.base_url or "").rstrip("/"), key
+
+
+class ProviderKeyError(Exception):
+    """A provider key that cannot be used; `code` is `secret_missing` or `secret_invalid`."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code, self.message = code, message
+
+
+def provider_key(secrets: SecretManager | None, ref: str) -> str:
+    """The stripped shared-scope provider key `ref` names.
+
+    Shared by the gateway and the control plane's provider calls so the two
+    cannot drift. Machine-level: only the shared scope is consulted (no
+    per-service override; an unscoped ref resolves nothing). Messages name the
+    ref, never the value.
+
+    Raises:
+        ProviderKeyError: `secret_missing` (unset or undecryptable) or
+            `secret_invalid` (empty, non-ASCII or control characters).
+    """
+    try:
         res = walk_secret_ref(
             ref,
             service_env=None,
             shared_env=(lambda: secrets.load(SHARED_SCOPE)) if secrets is not None else None,
         )
     except SecretDecryptError:
-        return error(503, "secret_missing", f"the provider key {ref} cannot be decrypted")
+        raise ProviderKeyError(
+            "secret_missing", f"the provider key {ref} cannot be decrypted"
+        ) from None
     if res.value is None:
-        return error(
-            503,
+        raise ProviderKeyError(
             "secret_missing",
             f"the provider key {ref} is not set; ask your agent to set it with "
             f"nerdit secrets set --shared",
         )
     key = res.value.strip()
     if not key or not key.isascii() or not key.isprintable():
-        # Never echo the value: only the ref's name reaches the app.
-        return error(
-            503,
+        raise ProviderKeyError(
             "secret_invalid",
             f"the provider key {ref} is empty or holds non-ASCII or control characters",
         )
-    return (route.base_url or "").rstrip("/"), key
+    return key
 
 
 def _tokens(usage: object) -> tuple[int, int]:

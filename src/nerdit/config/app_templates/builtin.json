@@ -6,7 +6,7 @@
     "icon": "message-square",
     "category": "ai",
     "repo_url": "https://github.com/nerdit-ai/nerdit-templates",
-    "ref": "v1.1.0",
+    "ref": "v1.2.0",
     "subdir": "fastapi-ai-chat",
     "deploy_defaults": {
       "port": 8000,
@@ -22,7 +22,7 @@
     "icon": "layout",
     "category": "web",
     "repo_url": "https://github.com/nerdit-ai/nerdit-templates",
-    "ref": "v1.1.0",
+    "ref": "v1.2.0",
     "subdir": "node-starter",
     "deploy_defaults": {
       "port": 3000,
@@ -37,7 +37,7 @@
     "icon": "server",
     "category": "api",
     "repo_url": "https://github.com/nerdit-ai/nerdit-templates",
-    "ref": "v1.1.0",
+    "ref": "v1.2.0",
     "subdir": "fastapi-api-starter",
     "deploy_defaults": {
       "port": 8000,
@@ -52,7 +52,7 @@
     "icon": "file-text",
     "category": "web",
     "repo_url": "https://github.com/nerdit-ai/nerdit-templates",
-    "ref": "v1.1.0",
+    "ref": "v1.2.0",
     "subdir": "static-site",
     "deploy_defaults": {
       "port": 8080,
@@ -60,5 +60,28 @@
     },
     "env_schema": [],
     "ai_hint": "Put the site under site/ (index.html is the entry point). Listens on 8080 as uid 101; do not switch to the stock nginx image \u2014 its root entrypoint fails under cap_drop=ALL."
+  },
+  {
+    "id": "stripe-webhook",
+    "name": "Stripe Webhook",
+    "description": "A FastAPI app that receives Stripe events through a Nerdit webhook.",
+    "icon": "webhook",
+    "category": "api",
+    "repo_url": "https://github.com/nerdit-ai/nerdit-templates",
+    "ref": "v1.2.0",
+    "subdir": "stripe-webhook",
+    "deploy_defaults": {
+      "port": 8000,
+      "gpus": 0
+    },
+    "env_schema": [
+      {
+        "name": "NERDIT_HOOK_STRIPE_SECRET",
+        "description": "The signing secret Stripe shows when you add the endpoint. Set it after the first deploy, once Stripe has the Webhook URL.",
+        "required": false,
+        "secret": true
+      }
+    ],
+    "ai_hint": "Declares [hooks.stripe] (path /webhooks/stripe). After deploy: share_service, then list_hooks for the Webhook URL; the user pastes it in Stripe (Developers > Webhooks > Add endpoint). The user sets the signing secret themselves (console Webhooks panel or `nerdit secrets set <app> --prompt NERDIT_HOOK_STRIPE_SECRET`); never ask for it in chat. Until it is set, deliveries are held, not lost."
   }
 ]

@@ -37,6 +37,7 @@ from .certs import CertStatus, acme_cert_path, acme_storage_key, inspect_cert
 from .edgeauth import EdgeAuthInvalid, EdgeAuthMaterial, EdgeAuthSpec, load_edge_auth
 from .routing import (
     _APEX_ID,
+    HOOK_CARRIERS,
     LiveRoute,
     RouteSpec,
     _domain_route_id,
@@ -721,6 +722,9 @@ class ProxyManager(CaddySupervisorMixin, CaddyTlsMixin):
         proxy_handler: dict[str, Any] = {
             "handler": "reverse_proxy",
             "upstreams": [{"dial": dial}],
+            # Hook carriers are asserted only by the mux after HookGate.admit; a
+            # direct (LAN / custom-domain) request must never carry them to the app.
+            "headers": {"request": {"delete": list(HOOK_CARRIERS)}},
         }
         # The shape is the one `caddy adapt` emits for a `basic_auth` block
         # (captured against Caddy v2.11.4), MINUS its `hash_cache: {}` key:

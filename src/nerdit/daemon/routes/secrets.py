@@ -2,7 +2,7 @@
 
 Reads list names only; values are injected at container launch, never returned.
 Writes require scope/role authorization, idempotency and redacted auditing.
-Shared scope maps to _shared storage: a submitter or admin sets values (0.8.4),
+Shared scope maps to _shared storage: an unscoped submitter or admin sets values (0.8.4),
 only admins delete them, any authenticated principal may read names. A rowless
 name is authorized through its claim (`daemon/secret_scope.py`): the first
 write reserves it for the caller until a deploy consumes it. Key rotation is

@@ -9,9 +9,11 @@ leaves the machine.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi import FastAPI
 
@@ -21,6 +23,7 @@ from nerdit.config.settings import (
     ModelsSettings,
     ProxySettings,
 )
+from nerdit.core.secrets import SHARED_SCOPE, SecretManager
 from nerdit.daemon.audit import AuditMiddleware
 from nerdit.daemon.auth import hash_token
 from nerdit.daemon.errors import RequestIdMiddleware, register_error_handlers
@@ -43,7 +46,7 @@ _DNS = {
 
 
 @pytest.fixture
-async def env(monkeypatch):
+async def env(monkeypatch, tmp_path):
     def fake_resolve(host: str, port: int) -> list[str]:
         if host in _DNS:
             return _DNS[host]
@@ -70,6 +73,7 @@ async def env(monkeypatch):
     register_error_handlers(app)
     app.include_router(router)
     app.state.queries = queries
+    app.state.secret_manager = SecretManager(tmp_path / "secrets")
     app.state.settings = SimpleNamespace(
         models=ModelsSettings(bridge_host="172.17.0.1"),
         ai_gateway=AiGatewaySettings(enabled=False),  # the "stored while off" shape
@@ -342,3 +346,138 @@ async def test_usage_filters_by_service_and_bounds_days(env):
     for days in (0, 91):
         resp = await env.client.get(f"/ai-gateway/usage?days={days}", headers=_auth(RO_RAW))
         assert resp.status_code == 422
+
+
+# --- provider model list ----------------------------------------------------------
+
+_MODELS = "/ai-gateway/providers/models"
+_MODELS_BODY = {"base_url": _API["base_url"], "api_key_ref": _API["api_key_ref"]}
+
+
+def _provider(monkeypatch, handler):
+    """Route the handler's outbound call through `httpx.MockTransport`, recording requests."""
+    seen: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return handler(request)
+
+    monkeypatch.setattr(
+        route_module,
+        "_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+    )
+    return seen
+
+
+async def test_provider_models_are_listed_with_the_key_kept_on_the_machine(env, monkeypatch):
+    env.app.state.secret_manager.set(SHARED_SCOPE, {"OPENROUTER_API_KEY": SENTINEL})
+    seen = _provider(
+        monkeypatch,
+        lambda r: httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": "m-b", "owned_by": SENTINEL},
+                    {"id": "m-a"},
+                    {"id": "m-b"},  # duplicate
+                    {"id": "bad\u00e9"},  # non-ASCII
+                    {"id": ""},
+                    {"id": 7},
+                    {"id": "x" * 201},
+                ],
+            },
+        ),
+    )
+    resp = await env.client.post(_MODELS, json=_MODELS_BODY, headers=_auth(A_RAW))
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"base_url_host": "api.example.com", "models": ["m-a", "m-b"]}
+    assert SENTINEL not in resp.text
+    (req,) = seen
+    assert str(req.url) == "https://api.example.com/v1/models"
+    assert req.headers["authorization"] == f"Bearer {SENTINEL}"
+    assert req.headers["x-api-key"] == SENTINEL
+    assert req.headers["anthropic-version"] == "2023-06-01"
+
+
+async def test_provider_models_need_submitter_and_valid_inputs(env, monkeypatch):
+    seen = _provider(monkeypatch, lambda r: httpx.Response(200, json={"data": []}))
+    resp = await env.client.post(_MODELS, json=_MODELS_BODY, headers=_auth(RO_RAW))
+    assert resp.status_code == 403
+    resp = await env.client.post(
+        _MODELS, json={**_MODELS_BODY, "api_key_ref": SENTINEL}, headers=_auth(A_RAW)
+    )
+    assert resp.status_code == 422 and resp.json()["code"] == "ai_gateway.secret_ref_invalid"
+    assert SENTINEL not in resp.text
+    # A pasted key longer than the field fails pydantic first: masked there too.
+    resp = await env.client.post(
+        _MODELS, json={**_MODELS_BODY, "api_key_ref": SENTINEL * 40}, headers=_auth(A_RAW)
+    )
+    assert resp.status_code == 422 and SENTINEL not in resp.text
+    resp = await env.client.post(
+        _MODELS,
+        json={**_MODELS_BODY, "base_url": "https://lan.example.com/v1"},
+        headers=_auth(A_RAW),
+    )
+    assert resp.status_code == 422 and resp.json()["code"] == "ai_gateway.base_url_invalid"
+    assert seen == []  # nothing left the machine
+
+
+async def test_provider_models_without_the_shared_secret_is_503(env, monkeypatch):
+    seen = _provider(monkeypatch, lambda r: httpx.Response(200, json={"data": []}))
+    resp = await env.client.post(_MODELS, json=_MODELS_BODY, headers=_auth(A_RAW))
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["code"] == "secret_missing"
+    assert "${secrets.shared.OPENROUTER_API_KEY}" in resp.json()["message"]
+    assert seen == []
+
+
+async def test_provider_errors_name_the_status_or_host_never_the_body(env, monkeypatch):
+    env.app.state.secret_manager.set(SHARED_SCOPE, {"OPENROUTER_API_KEY": SENTINEL})
+    upstream_text = f"invalid key {SENTINEL} for this account"
+    _provider(monkeypatch, lambda r: httpx.Response(401, text=upstream_text))
+    resp = await env.client.post(_MODELS, json=_MODELS_BODY, headers=_auth(A_RAW))
+    assert resp.status_code == 502, resp.text
+    assert resp.json()["code"] == "ai_gateway.provider_error"
+    assert "401" in resp.json()["message"] and SENTINEL not in resp.text
+
+    _provider(monkeypatch, lambda r: httpx.Response(200, text=upstream_text))  # not JSON
+    resp = await env.client.post(_MODELS, json=_MODELS_BODY, headers=_auth(A_RAW))
+    assert resp.status_code == 502 and resp.json()["code"] == "ai_gateway.provider_error"
+    assert SENTINEL not in resp.text
+
+    def unreachable(request):
+        raise httpx.ConnectError("boom", request=request)
+
+    _provider(monkeypatch, unreachable)
+    resp = await env.client.post(_MODELS, json=_MODELS_BODY, headers=_auth(A_RAW))
+    assert resp.status_code == 502 and resp.json()["code"] == "ai_gateway.provider_unreachable"
+    assert "api.example.com" in resp.json()["message"]
+
+
+async def test_provider_models_has_a_total_deadline(env, monkeypatch):
+    """A provider that trickles forever is cut off by the deadline, not only per read."""
+    env.app.state.secret_manager.set(SHARED_SCOPE, {"OPENROUTER_API_KEY": SENTINEL})
+
+    async def trickle():
+        while True:
+            yield b" "
+            await asyncio.sleep(0.01)
+
+    _provider(monkeypatch, lambda r: httpx.Response(200, content=trickle()))
+    monkeypatch.setattr(route_module, "_PROVIDER_DEADLINE", 0.1)
+    resp = await env.client.post(_MODELS, json=_MODELS_BODY, headers=_auth(A_RAW))
+    assert resp.status_code == 502 and resp.json()["code"] == "ai_gateway.provider_unreachable"
+
+
+async def test_provider_models_is_audited_by_host_and_ref_name_without_a_key(env, monkeypatch):
+    env.app.state.secret_manager.set(SHARED_SCOPE, {"OPENROUTER_API_KEY": SENTINEL})
+    _provider(monkeypatch, lambda r: httpx.Response(200, json={"data": [{"id": "m"}]}))
+    resp = await env.client.post(_MODELS, json=_MODELS_BODY, headers=_auth(A_RAW))
+    assert resp.status_code == 200
+    assert await env.audit("ai_gateway.provider_models_listed") == [
+        (None, {"base_url_host": "api.example.com", "api_key_ref_name": "OPENROUTER_API_KEY"})
+    ]
+    cursor = await env.db.conn.execute("SELECT params_redacted, action FROM audit_log")
+    assert SENTINEL not in json.dumps([tuple(r) for r in await cursor.fetchall()])

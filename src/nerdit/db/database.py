@@ -350,6 +350,28 @@ CREATE TABLE IF NOT EXISTS ai_gateway_usage (
     upstream_errors   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, service_name, alias)
 );
+
+-- Inbound webhooks: one row per hook address (``hook_id`` is the random path
+-- segment a provider posts to). The table is the truth; ``[hooks.<name>]`` in
+-- nerdit.toml is upserted into it at deploy and never revokes an undeclared
+-- row. No FK, for the ``service_shares`` reason above; the cascade (a revoke)
+-- lives in ``delete_service_checked``. Revoked rows stay forever, so a revoked
+-- id never resolves again and is never reminted. A wholly new table, so it
+-- rides ``_SCHEMA`` unconditionally -- no ``_migrate`` block.
+CREATE TABLE IF NOT EXISTS hooks (
+    hook_id      TEXT PRIMARY KEY,
+    service_name TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    sender       TEXT NOT NULL CHECK (sender IN ('stripe', 'github', 'slack', 'hmac', 'none')),
+    path         TEXT NOT NULL,
+    header       TEXT,
+    prefix       TEXT,
+    secret_ref   TEXT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    revoked_at   TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hooks_live_name
+    ON hooks(service_name, name) WHERE revoked_at IS NULL;
 """
 
 

@@ -960,6 +960,44 @@ class NerditClient:
             timeout=15.0,
         )
 
+    async def list_hooks(self, name: str) -> dict:
+        """List an app's inbound webhooks (owner or admin)."""
+        return await self._request_json(
+            "GET", f"{self._base_url}/api/services/{self._segment(name)}/hooks", timeout=10.0
+        )
+
+    async def add_hook(  # noqa: PLR0913 - the request body's fields, keyword-only
+        self,
+        name: str,
+        hook: str,
+        *,
+        sender: str,
+        path: str,
+        header: str | None = None,
+        prefix: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        """Add an inbound webhook; requires an idempotency key. No secret travels here."""
+        body = {"name": hook, "sender": sender, "path": path, "header": header, "prefix": prefix}
+        return await self._request_json(
+            "POST",
+            f"{self._base_url}/api/services/{self._segment(name)}/hooks",
+            json={k: v for k, v in body.items() if v is not None},
+            idempotency_key=idempotency_key,
+            timeout=15.0,
+        )
+
+    async def remove_hook(
+        self, name: str, hook: str, *, idempotency_key: str | None = None
+    ) -> dict:
+        """Remove an inbound webhook; idempotent (`removed: false` when absent)."""
+        return await self._request_json(
+            "DELETE",
+            f"{self._base_url}/api/services/{self._segment(name)}/hooks/{_encode_dot_segment(hook)}",
+            idempotency_key=idempotency_key,
+            timeout=15.0,
+        )
+
     async def install_license(self, blob: str, *, idempotency_key: str | None = None) -> dict:
         """Install a license on the daemon (admin-only; requires an idempotency key).
 
@@ -1489,6 +1527,15 @@ class NerditClient:
         """Every alias via `GET /api/ai-gateway/routes`."""
         return await self._request_json(
             "GET", f"{self._base_url}/api/ai-gateway/routes", timeout=5.0
+        )
+
+    async def list_ai_provider_models(self, base_url: str, api_key_ref: str) -> dict:
+        """A provider's model ids via `POST /api/ai-gateway/providers/models` (key stays local)."""
+        return await self._request_json(
+            "POST",
+            f"{self._base_url}/api/ai-gateway/providers/models",
+            json={"base_url": base_url, "api_key_ref": api_key_ref},
+            timeout=35.0,
         )
 
     async def set_ai_route(  # noqa: PLR0913 - one wire field per keyword

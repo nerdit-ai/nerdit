@@ -12,22 +12,28 @@ from nerdit.config.app_templates import (
 from nerdit.config.app_templates import loader as app_templates_loader
 from nerdit.db.models import AppTemplateEnvVar
 
-_EXPECTED_IDS = {"fastapi-ai-chat", "node-starter", "fastapi-api-starter", "static-site"}
+_EXPECTED_IDS = {
+    "fastapi-ai-chat",
+    "node-starter",
+    "fastapi-api-starter",
+    "static-site",
+    "stripe-webhook",
+}
 
 
 def test_load_app_templates_returns_three_entries():
     templates = load_app_templates()
-    assert len(templates) == 4
+    assert len(templates) == 5
     assert {t.id for t in templates} == _EXPECTED_IDS
 
 
 def test_o2_no_drift_invariant():
     # Every seed must point at the pinned templates repo over https, on the
-    # v1.1.0 tag, with a subdir equal to its id (contracts §13 / O2).
+    # v1.2.0 tag, with a subdir equal to its id (contracts §13 / O2).
     for template in load_app_templates():
         assert template.repo_url.startswith("https://")
         assert "github.com" in template.repo_url
-        assert template.ref == "v1.1.0"
+        assert template.ref == "v1.2.0"
         assert template.subdir == template.id
 
 
@@ -41,6 +47,7 @@ def test_ai_hint_only_where_an_agent_needs_one():
     assert "nginx" in by_id["static-site"].ai_hint
     assert by_id["node-starter"].ai_hint is None
     assert by_id["fastapi-api-starter"].ai_hint is None
+    assert by_id["stripe-webhook"].ai_hint is not None
 
 
 def test_app_templates_by_id_cached_mapping():
@@ -281,7 +288,7 @@ def test_t2_list_returns_three_seeds_readonly_ok(tmp_path):
     resp = _client(_queries(), tmp_path).get("/app-templates", headers=_auth(RO_RAW))
     assert resp.status_code == 200, resp.text
     ids = {t["id"] for t in resp.json()}
-    assert ids == {"fastapi-ai-chat", "node-starter", "fastapi-api-starter", "static-site"}
+    assert ids == _EXPECTED_IDS
 
 
 def test_t2_detail_returns_template(tmp_path):

@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 import pytest
 
+from nerdit.core.hooks import DELIVERY_HEADER, HOOK_HEADER, RECEIVED_AT_HEADER, HookAdmission
 from nerdit.core.link import mux as mux_module
 from nerdit.core.link.client import AppTarget, CloseInfo, LinkClosedError, MuxContext
 from nerdit.core.link.frames import (
@@ -130,6 +131,7 @@ def _ctx(  # noqa: PLR0913 - one keyword per injected seam, by design
     monotonic: _FakeMonotonic | None = None,
     resolve_app: Callable[[str], Any] | None = None,
     app_transport: httpx.AsyncBaseTransport | None = None,
+    admit_hook: Callable[..., Any] | None = None,
 ) -> tuple[MuxContext, Collector]:
     sink = collector or Collector()
     clock = monotonic or _FakeMonotonic()
@@ -147,6 +149,7 @@ def _ctx(  # noqa: PLR0913 - one keyword per injected seam, by design
                 transport=transport, base_url="http://127.0.0.1:9321"
             ),
             resolve_app=resolve_app,
+            admit_hook=admit_hook,
             # (P26) The app client gets NO base_url, exactly like production:
             # an app stream's authority is per-stream, so a relative target is
             # not even expressible on this client.
@@ -1672,3 +1675,197 @@ async def test_neither_default_client_honours_environment_proxies(
             assert client._transport_for_url(httpx.URL(url)) is client._transport
     finally:
         await mux.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Inbound webhooks: the x-nerdit-hook stream
+# ---------------------------------------------------------------------------
+
+HOOK_ID = "abcdefghijklmnopqrst"
+_HOSTED = AppTarget("demo", 4321, "demo--gpu-box.nodes.test")
+
+
+def _gate(verdict: Any) -> Callable[..., Any]:
+    """An admit_hook double returning ``verdict`` and recording each call."""
+
+    async def admit(hook_id: str, service: str, headers: Any, body: bytes) -> Any:
+        calls.append((hook_id, service, list(headers), body))
+        return verdict
+
+    calls: list[Any] = []
+    admit.calls = calls  # type: ignore[attr-defined]
+    return admit
+
+
+_ADMITTED = HookAdmission("stripe", "/billing/webhook", "dlv_1", "2026-10-10T12:00:00Z")
+
+
+def _hook_frame(extra: list[tuple[str, str]] | None = None, **kw: Any) -> OpenStream:
+    kw.setdefault("method", "POST")
+    kw.setdefault("path", "/.nerdit/hooks/" + HOOK_ID)
+    kw.setdefault("body_b64", encode_body(b'{"id":"evt_1"}'))
+    headers = [
+        ("content-type", "application/json"),
+        (HOOK_HEADER, HOOK_ID),
+        (RECEIVED_AT_HEADER, "2026-10-10T12:00:00Z"),
+        (DELIVERY_HEADER, "dlv_1"),
+        *(extra or []),
+    ]
+    return _app_frame(headers=headers, **kw)
+
+
+async def _run_hook(
+    frame: OpenStream, *, verdict: Any = _ADMITTED, target: AppTarget | None = _HOSTED
+) -> tuple[Collector, _BytesTransport, Any]:
+    app_transport = _BytesTransport(200, [("content-type", "text/plain")], [b"ok"])
+    gate = _gate(verdict)
+    ctx, sink = _ctx(
+        httpx.ASGITransport(app=_CountingApp()),
+        resolve_app=_resolver(target),
+        app_transport=app_transport,
+        admit_hook=gate,
+    )
+    mux = StreamMux(ctx)
+    await mux.handle(frame)
+    await sink.wait(lambda: "stream_response_end" in sink.types())
+    await sink.settle()
+    await mux.aclose()
+    return sink, app_transport, gate
+
+
+async def test_hook_stream_dials_the_hook_path_with_query_and_three_headers() -> None:
+    sink, transport, gate = await _run_hook(_hook_frame(query="a=1"))
+
+    assert gate.calls[0][:2] == (HOOK_ID, "demo")
+    request = transport.requests[0]
+    assert str(request.url) == "http://127.0.0.1:4321/billing/webhook?a=1"
+    assert request.method == "POST"
+    assert request.headers["host"] == "demo--gpu-box.nodes.test"
+    assert request.headers.get_list(HOOK_HEADER) == ["stripe"]
+    assert request.headers.get_list(DELIVERY_HEADER) == ["dlv_1"]
+    assert request.headers.get_list(RECEIVED_AT_HEADER) == ["2026-10-10T12:00:00Z"]
+    assert sink.of("stream_response_head")[0]["status"] == 200
+
+
+async def test_hook_stream_forwards_provider_signature_headers_and_exact_body_bytes() -> None:
+    body = b'{"id":"evt_1",  "amount": 100}\r\n'
+    frame = _hook_frame([("stripe-signature", "t=1,v1=abc")], body_b64=encode_body(body))
+    _, transport, gate = await _run_hook(frame)
+
+    assert gate.calls[0][3] == body
+    request = transport.requests[0]
+    assert request.content == body
+    assert request.headers["stripe-signature"] == "t=1,v1=abc"
+    for stripped in ("authorization", "x-nerdit-role", APP_HEADER):
+        assert stripped not in request.headers
+
+
+async def test_unknown_hook_answers_the_same_404_body_as_an_unshared_app() -> None:
+    sink, transport, _ = await _run_hook(_hook_frame(), verdict=404)
+
+    assert transport.requests == []
+    assert sink.of("stream_response_head")[0]["status"] == 404
+    assert sink.body() == mux_module._NOT_SHARED_BODY
+
+
+async def test_rejected_hook_answers_constant_401_and_never_dials() -> None:
+    sink, transport, _ = await _run_hook(_hook_frame(), verdict=401)
+
+    assert transport.requests == []
+    assert sink.of("stream_response_head")[0]["status"] == 401
+    assert json.loads(sink.body())["code"] == "hook.rejected"
+    assert HOOK_ID not in sink.body().decode()
+
+
+async def test_hook_with_unavailable_secret_answers_503_and_never_dials() -> None:
+    sink, transport, _ = await _run_hook(_hook_frame(), verdict=503)
+
+    assert transport.requests == []
+    assert sink.of("stream_response_head")[0]["status"] == 503
+    assert json.loads(sink.body())["code"] == "hook.unavailable"
+
+
+async def test_admitted_hook_on_a_stopped_app_answers_503() -> None:
+    sink, transport, _ = await _run_hook(_hook_frame(), target=None)
+
+    assert transport.requests == []
+    assert sink.of("stream_response_head")[0]["status"] == 503
+    assert json.loads(sink.body())["code"] == "hook.unavailable"
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+async def test_non_post_hook_stream_is_404_without_calling_the_gate(method: str) -> None:
+    kw: dict[str, Any] = {"method": method}
+    if method == "GET":
+        kw["body_b64"] = None
+    sink, transport, gate = await _run_hook(_hook_frame(**kw))
+
+    assert gate.calls == []
+    assert transport.requests == []
+    assert sink.body() == mux_module._NOT_SHARED_BODY
+
+
+@pytest.mark.parametrize("carrier", [HOOK_HEADER, DELIVERY_HEADER, RECEIVED_AT_HEADER])
+async def test_duplicated_hook_carriers_are_404(carrier: str) -> None:
+    sink, transport, gate = await _run_hook(_hook_frame([(carrier, "x")]))
+
+    assert gate.calls == []
+    assert transport.requests == []
+    assert sink.body() == mux_module._NOT_SHARED_BODY
+
+
+async def test_no_admit_hook_means_every_hook_stream_is_404() -> None:
+    app_transport = _BytesTransport(200, [], [b"never"])
+    ctx, sink = _ctx(
+        httpx.ASGITransport(app=_CountingApp()),
+        resolve_app=_resolver(_HOSTED),
+        app_transport=app_transport,
+    )
+    mux = StreamMux(ctx)
+    await mux.handle(_hook_frame())
+    await sink.wait(lambda: "stream_response_end" in sink.types())
+    await mux.aclose()
+
+    assert app_transport.requests == []
+    assert sink.body() == mux_module._NOT_SHARED_BODY
+
+
+async def test_hook_carriers_are_dropped_from_ordinary_app_streams() -> None:
+    app_transport = _BytesTransport(200, [], [b"ok"])
+    ctx, sink = _ctx(
+        httpx.ASGITransport(app=_CountingApp()),
+        resolve_app=_resolver(_HOSTED),
+        app_transport=app_transport,
+    )
+    mux = StreamMux(ctx)
+    await mux.handle(
+        _app_frame(
+            method="GET",
+            path="/",
+            headers=[(DELIVERY_HEADER, "forged"), (RECEIVED_AT_HEADER, "forged")],
+        )
+    )
+    await sink.wait(lambda: "stream_response_end" in sink.types())
+    await mux.aclose()
+
+    request = app_transport.requests[0]
+    for carrier in (HOOK_HEADER, DELIVERY_HEADER, RECEIVED_AT_HEADER):
+        assert carrier not in request.headers, carrier
+
+
+async def test_no_log_record_carries_a_hook_id_signature_or_body(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="nerdit.link.mux")
+    frame = _hook_frame(
+        [("stripe-signature", "t=1,v1=SIGNATUREVALUE")],
+        body_b64=encode_body(b"HOOKBODYSECRET"),
+    )
+    for verdict in (404, 401, 503):
+        await _run_hook(frame, verdict=verdict)
+    await _run_hook(frame, target=None)
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert logged
+    for forbidden in (HOOK_ID, "SIGNATUREVALUE", "HOOKBODYSECRET", "/.nerdit/hooks"):
+        assert forbidden not in logged, forbidden

@@ -40,6 +40,7 @@ from nerdit.daemon.routes.domains import router as domains_router
 from nerdit.daemon.routes.events import router as events_router
 from nerdit.daemon.routes.gpus import router as gpus_router
 from nerdit.daemon.routes.health import router as health_router
+from nerdit.daemon.routes.hooks import router as hooks_router
 from nerdit.daemon.routes.images import router as images_router
 from nerdit.daemon.routes.license import router as license_router
 from nerdit.daemon.routes.link import router as link_router
@@ -248,6 +249,8 @@ def build_app(
         # mount: it is the second way an operator publishes an app, and a
         # generated client should find both under one heading.
         (domains_router, "Exposure"),
+        # Inbound webhooks: the third per-service exposure surface, same tag.
+        (hooks_router, "Exposure"),
         # (P40b / D-P40-10) The project noun, registered LAST, `/api` only —
         # a brand-new surface with no legacy CLI to serve.
         (projects_router, "Projects"),

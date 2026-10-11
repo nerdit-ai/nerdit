@@ -4,6 +4,42 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.9.0 (2026-10-11)
+
+Applications can receive webhooks. If your machine is linked to Nerdit Cloud,
+the hosted side has to be updated before the machine: a 0.9.0 daemon behind an
+older cloud release does not accept hooks on its hosted address.
+
+### Inbound webhooks
+
+- **Webhook URLs for an application.** A provider (Stripe, GitHub, Slack, any
+  sender that signs with HMAC-SHA256, or an unsigned one) can POST to a deployed
+  application through its hosted address. The machine verifies the signature
+  against a secret you set (`NERDIT_HOOK_<NAME>_SECRET`) before the application
+  sees a byte, then forwards the request to the path you chose. The application
+  finds its own URL in `NERDIT_HOOK_<NAME>_URL`.
+- **Three ways to declare one.** `nerdit hooks list|add|rm`, a `[hooks.<name>]`
+  section in a single-app `nerdit.toml` (applied on every deploy), or the
+  `list_hooks` / `add_hook` / `remove_hook` MCP tools and REST operations
+  (`GET`/`POST /api/services/{name}/hooks`,
+  `DELETE /api/services/{name}/hooks/{hook}`). The secret itself goes through
+  the usual secrets commands; it is never passed on the command line.
+- **A `stripe-webhook` template** in the store: a FastAPI app that declares
+  `[hooks.stripe]`, dedupes on the Stripe event id and records it only after
+  handling. Set `NERDIT_HOOK_STRIPE_SECRET` after the first deploy, once Stripe
+  shows the signing secret; deliveries are held until then. All templates now
+  track `nerdit-templates` v1.2.0.
+
+### Also in this release
+
+- Setting a shared secret now also requires an unscoped token: a `submitter`
+  token limited to one application or project is refused, since a shared value
+  reaches every application on the machine.
+- Agents and the console can ask the machine for a provider's model list
+  (`POST /api/ai-gateway/providers/models`, MCP `list_ai_provider_models`) with
+  a key the machine already holds, so a model can be picked before an alias is
+  created. The key never leaves the machine; the answer is model ids only.
+
 ## 0.8.4 (2026-10-09)
 
 - **Shared secrets from the console.** Setting a machine-wide (`shared`) secret,

@@ -139,6 +139,10 @@ _ROUTE_RULES: list[tuple[str, re.Pattern[str], str, str | None, int | None]] = [
         "service",
         1,
     ),
+    # Inbound webhooks. The DELETE group is `.+` for the domain reason above:
+    # a decoded '%2F' must still map here, never to the raw-path fallback.
+    ("POST", re.compile(r"^/services/([^/]+)/hooks$"), "hook.created", "service", 1),
+    ("DELETE", re.compile(r"^/services/([^/]+)/hooks/(.+)$"), "hook.removed", "service", 1),
     ("POST", re.compile(r"^/daemon/restart$"), "daemon.restart", "daemon", None),
     ("POST", re.compile(r"^/system/gc$"), "system.gc", "system", None),
     # Literal /system/backup/volumes must sit ABOVE /system/backup so it is not
@@ -223,6 +227,16 @@ _ROUTE_RULES: list[tuple[str, re.Pattern[str], str, str | None, int | None]] = [
         1,
     ),
     ("DELETE", re.compile(r"^/ai-gateway/keys/([^/]+)$"), "ai_gateway.key_revoked", "service", 1),
+    # The provider model list: a read, but a POST (its body carries the
+    # secret ref) that spends a provider call with a key, so it leaves a row
+    # with the host and the ref name.
+    (
+        "POST",
+        re.compile(r"^/ai-gateway/providers/models$"),
+        "ai_gateway.provider_models_listed",
+        "ai_gateway",
+        None,
+    ),
 ]
 
 # Actions whose target the route may stamp via `request.state.audit_target`

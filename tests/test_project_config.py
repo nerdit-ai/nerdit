@@ -7,12 +7,17 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from nerdit.config.app_config import validate_hooks_section
 from nerdit.config.project import (
+    DeclarationError,
     DeployConfig,
     describe_project_config_error,
     find_project_config,
     load_project_config,
+    parse_hooks,
+    parse_project_declaration,
 )
+from nerdit.daemon.errors import NerditError
 
 # --- find_project_config ---
 
@@ -429,3 +434,104 @@ def test_deploy_validator_messages_are_value_free(kwargs):
     with pytest.raises(ValidationError) as excinfo:
         DeployConfig(**kwargs)
     assert "never-print-this" not in describe_project_config_error(excinfo.value)
+
+
+# --- [hooks.<name>] (inbound webhooks) ---
+
+
+def test_hooks_section_parses_the_five_keys():
+    hooks = parse_hooks(
+        {
+            "stripe": {"sender": "stripe", "path": "/webhooks/stripe"},
+            "shop-x": {
+                "sender": "hmac",
+                "path": "/w",
+                "header": "X-Signature-256",
+                "prefix": "sha256=",
+                "secret": "${vars.SHOP_SECRET}",
+            },
+            "open": {"sender": "none", "path": "/"},
+        }
+    )
+    assert hooks["stripe"].secret is None
+    shop = hooks["shop-x"]
+    assert (shop.header, shop.prefix, shop.secret) == (
+        "X-Signature-256",
+        "sha256=",
+        "${secrets.SHOP_SECRET}",  # the ${vars.} alias is stored in its secrets form
+    )
+
+
+def test_hooks_refuse_a_literal_secret_value_without_echoing_it():
+    with pytest.raises(ValidationError) as exc:
+        parse_hooks({"stripe": {"sender": "stripe", "path": "/", "secret": "whsec_LEAK123"}})
+    assert "whsec_LEAK123" not in str(exc.value)
+    with pytest.raises(NerditError) as wrapped:
+        validate_hooks_section(
+            {"stripe": {"sender": "stripe", "path": "/", "secret": "whsec_LEAK123"}}
+        )
+    assert wrapped.value.code == "deploy.invalid_hooks"
+    assert "whsec_LEAK123" not in str(wrapped.value.message)
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        {"sender": "hmac", "path": "/"},  # hmac without header
+        {"sender": "stripe", "path": "/", "header": "X-Sig"},  # header without hmac
+        {"sender": "github", "path": "/", "prefix": "sha256="},  # prefix without hmac
+        {"sender": "none", "path": "/", "secret": "${secrets.X}"},  # none with secret
+        {"sender": "paypal", "path": "/"},
+        {"sender": "stripe", "path": "no-slash"},
+        {"sender": "stripe", "path": "/a?b=1"},
+        {"sender": "stripe", "path": "/a#frag"},
+        {"sender": "stripe", "path": "/a b"},
+        {"sender": "stripe", "path": "/" + "a" * 512},
+        {"sender": "hmac", "path": "/", "header": "X-Sig", "prefix": "p" * 33},
+        {"sender": "stripe", "path": "/", "extra": 1},
+    ],
+)
+def test_hmac_requires_header_and_none_forbids_secret(table):
+    with pytest.raises(ValidationError):
+        parse_hooks({"h": table})
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Authorization",
+        "cookie",
+        "HOST",
+        "Forwarded",
+        "X-Forwarded-For",
+        "x-nerdit-hook",
+        "X Sig",
+        "",
+    ],
+)
+def test_hook_header_refuses_authorization_cookie_host_forwarded_and_stripped_prefixes(header):
+    with pytest.raises(ValidationError) as exc:
+        parse_hooks({"h": {"sender": "hmac", "path": "/", "header": header}})
+    assert "input_value" not in str(exc.value)  # hide_input_in_errors
+
+
+@pytest.mark.parametrize("name", ["a", "stripe", "shop-2", "a" * 32])
+def test_hook_names_follow_the_lowercase_hyphen_grammar(name):
+    assert name in parse_hooks({name: {"sender": "none", "path": "/"}})
+
+
+@pytest.mark.parametrize("name", ["", "Stripe", "2x", "a_b", "a-", "-a", "a" * 33, "é"])
+def test_hook_names_refuse_everything_else_without_echoing(name):
+    with pytest.raises(ValueError) as exc:
+        parse_hooks({name: {"sender": "none", "path": "/"}})
+    assert "NERDIT_HOOK_<NAME>" in str(exc.value)
+
+
+def test_a_project_declaration_refuses_a_root_hooks_table():
+    data = {
+        "project": {"name": "shop"},
+        "services": {"web": {"port": 8000}},
+        "hooks": {"stripe": {"sender": "stripe", "path": "/"}},
+    }
+    with pytest.raises(DeclarationError, match=r"\[hooks\] is for a single-app"):
+        parse_project_declaration(data)

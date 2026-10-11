@@ -73,6 +73,23 @@ def rewrite_vars_ref(value: str | None) -> str | None:
     return value
 
 
+# [hooks.<name>] grammar (inbound webhooks). The name maps to the
+# NERDIT_HOOK_<NAME>_SECRET / _URL keys: no '_', so the '-' -> '_' fold is injective.
+HOOK_SENDERS = ("stripe", "github", "slack", "hmac", "none")
+HOOK_NAME_RE = re.compile(r"[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?")
+HOOK_NAME_ERROR = (
+    'Invalid [hooks] name: lowercase letters, digits and "-", 1-32 characters, '
+    "starting with a letter (it maps to NERDIT_HOOK_<NAME>_* names)."
+)
+# The app path a delivery is rewritten to: printable ASCII, no query ('?') or fragment ('#').
+_HOOK_PATH_RE = re.compile(r"/[\x21-\x22\x24-\x3e\x40-\x7e]{0,511}")
+_HOOK_HEADER_RE = re.compile(r"[A-Za-z0-9-]{1,64}")
+_HOOK_PREFIX_RE = re.compile(r"[\x20-\x7e]{0,32}")
+# Headers the cloud edge strips before the tunnel: a hook keyed on one could never verify.
+_HOOK_STRIPPED_HEADERS = ("authorization", "cookie", "host", "forwarded")
+_HOOK_STRIPPED_PREFIXES = ("x-forwarded-", "x-nerdit-")
+
+
 # [db.*] binding name grammar (P15, D-A) — its OWN constant, cloned from
 # AI_BINDING_NAME_RE (never repointed) so the frozen [ai.*] grammar and the new
 # [db.*] grammar evolve independently. Binding names map to NERDIT_DB_<NAME>_URL.
@@ -227,6 +244,81 @@ class EdgeAuthConfig(BaseModel):
                 "passwords are not allowed in nerdit.toml."
             )
         return value
+
+
+class HookConfig(BaseModel):
+    """One `[hooks.<name>]` table: an inbound webhook verified on this machine.
+
+    `secret` must be a secret reference, never a literal. Validation messages are
+    value-free and inputs are hidden from errors (the `EdgeAuthConfig` posture).
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    sender: Literal["stripe", "github", "slack", "hmac", "none"]
+    path: str
+    header: str | None = None
+    prefix: str | None = None
+    secret: str | None = None
+
+    @field_validator("path")
+    @classmethod
+    def _check_path(cls, value: str) -> str:
+        if not _HOOK_PATH_RE.fullmatch(value):
+            raise ValueError(
+                "Invalid [hooks] path: must start with '/', at most 512 printable ASCII "
+                "characters, no spaces, no '?' or '#'."
+            )
+        return value
+
+    @field_validator("header")
+    @classmethod
+    def _check_header(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        lowered = value.lower()
+        if (
+            not _HOOK_HEADER_RE.fullmatch(value)
+            or lowered in _HOOK_STRIPPED_HEADERS
+            or lowered.startswith(_HOOK_STRIPPED_PREFIXES)
+        ):
+            raise ValueError(
+                "Invalid [hooks] header: 1-64 letters, digits or '-', and not Authorization, "
+                "Cookie, Host, Forwarded, X-Forwarded-* or X-Nerdit-* (the edge strips them)."
+            )
+        return value
+
+    @field_validator("prefix")
+    @classmethod
+    def _check_prefix(cls, value: str | None) -> str | None:
+        if value is not None and not _HOOK_PREFIX_RE.fullmatch(value):
+            raise ValueError("Invalid [hooks] prefix: at most 32 printable ASCII characters.")
+        return value
+
+    @field_validator("secret")
+    @classmethod
+    def _check_secret_is_secret_ref(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = rewrite_vars_ref(value) or ""
+        if not SECRET_REF_RE.fullmatch(value):
+            # Never echo the value: a literal signing secret is what this rejects.
+            raise ValueError(
+                "Invalid [hooks] secret: must be a secret reference like "
+                "'${secrets.STRIPE_WEBHOOK_SECRET}' (uppercase key, set via "
+                "'nerdit secrets set'); literal secrets are not allowed in nerdit.toml."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _check_sender_fields(self) -> HookConfig:
+        if (self.sender == "hmac") != (self.header is not None):
+            raise ValueError("Invalid [hooks] table: 'header' is required with sender 'hmac' only.")
+        if self.prefix is not None and self.sender != "hmac":
+            raise ValueError("Invalid [hooks] table: 'prefix' is only for sender 'hmac'.")
+        if self.secret is not None and self.sender == "none":
+            raise ValueError("Invalid [hooks] table: sender 'none' takes no 'secret'.")
+        return self
 
 
 class DeployConfig(BaseModel):
@@ -610,6 +702,27 @@ def parse_db_bindings(raw: object) -> dict[str, DbBindingConfig]:
     return bindings
 
 
+def parse_hooks(raw: object) -> dict[str, HookConfig]:
+    """Parse `[hooks.<name>]` tables; messages never echo a value.
+
+    Raises:
+        ValueError: A name or table is invalid.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "[hooks] must be a table of [hooks.<name>] tables, e.g. [hooks.stripe] "
+            "with 'sender' and 'path' keys."
+        )
+    hooks: dict[str, HookConfig] = {}
+    for name, table in raw.items():
+        if not isinstance(name, str) or not HOOK_NAME_RE.fullmatch(name):
+            raise ValueError(HOOK_NAME_ERROR)
+        if not isinstance(table, dict):
+            raise ValueError(f"[hooks.{name}] must be a table with 'sender' and 'path' keys.")
+        hooks[name] = HookConfig(**table)
+    return hooks
+
+
 def load_project_config(path: Path | None = None) -> ProjectConfig | None:
     """Load and parse a nerdit.toml file.
 
@@ -720,6 +833,12 @@ def parse_project_declaration(
     services: dict[str, dict] = {}
     for svc, table in tables.items():
         services[svc] = _service_table(name, svc, table)
+    if "hooks" in data:
+        # A root table would reach every service through `_deploy_section_source`.
+        raise DeclarationError(
+            "[hooks] is for a single-app nerdit.toml; add a project service's webhooks "
+            "with `nerdit hooks add`."
+        )
     _check_bindings(data)
     return name, services, _required_vars(data.get("vars"))
 

@@ -370,6 +370,14 @@ class ServiceQueries(QueriesBase):
                 "AND revoked_at IS NULL",
                 (datetime.now(UTC).isoformat(), job_id),
             )
+            # Revoke (never delete) its webhooks: a same-name successor must not
+            # inherit an address, and a revoked id must never be reminted.
+            await self._db.conn.execute(
+                "UPDATE hooks SET revoked_at = ? "
+                "WHERE service_name = (SELECT service_name FROM jobs WHERE id = ?) "
+                "AND revoked_at IS NULL",
+                (datetime.now(UTC).isoformat(), job_id),
+            )
             await self._db.conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
             secrets_reclaimed = False
             if on_secrets_reclaimed is not None and target["service_name"] is not None:

@@ -7,6 +7,11 @@ only read and write its SQLite rows, so they answer while the gateway is off
 * Reads (any authenticated principal): the state view, the aliases, the key
   metadata and the usage aggregates. No view carries a secret value, a
   virtual key or its hash: an alias shows its `api_key_ref` (a name).
+* The provider model list (`POST /ai-gateway/providers/models`) takes
+  submitter or admin like a write: it spends one provider call with a
+  shared-scope key that never leaves the machine (the console's model picker).
+  A POST so the ref travels in the body, not in access logs; it changes
+  nothing, so no `Idempotency-Key`, but it is audited (host + ref name).
 * Writes take submitter or admin (0.8.3, D-P31-5): an alias only references a
   shared secret a submitter's own deploy already receives, and a hosted box's
   tunnel principal is submitter-capped. Daemon config stays admin. `PUT` needs
@@ -21,19 +26,23 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import socket
 from typing import Literal
 from urllib.parse import urlsplit
 
+import httpx
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
 from nerdit.config.project import AI_GATEWAY_ALIAS_HINT, AI_GATEWAY_ALIAS_RE, SECRET_REF_RE
+from nerdit.core.ai_gateway.proxy import ProviderKeyError, provider_key
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.daemon.audit import audit_params
 from nerdit.daemon.auth import require_owner_or_admin, require_role
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.schemas._base import StrictRequestModel
+from nerdit.daemon.secret_scope import secret_manager
 from nerdit.db.enums import JobKind
 from nerdit.db.models import TokenRole
 from nerdit.db.rows import AiGatewayKey, AiGatewayRoute, AiGatewayUsage
@@ -104,6 +113,48 @@ class AiKeyRevokeResponse(BaseModel):
 class AiUsageList(BaseModel):
     days: int
     usage: list[AiGatewayUsage]
+
+
+class AiProviderModelsRequest(StrictRequestModel):
+    """Which provider to ask, and with which key reference (never a key).
+
+    A body, not a query string: a query string lands in access logs and proxy
+    logs before the handler can refuse a pasted literal key.
+    """
+
+    base_url: str = Field(
+        max_length=2048,
+        description="The OpenAI-compatible base URL, usually ending in /v1. https, or http "
+        "to loopback / the models bridge.",
+    )
+    api_key_ref: str = Field(
+        max_length=256,
+        description="A ${secrets.shared.KEY} reference to the provider key, never the key.",
+    )
+
+
+class AiProviderModelList(BaseModel):
+    """A provider's model ids (`data[*].id` of the OpenAI `/v1/models` shape), sorted."""
+
+    base_url_host: str
+    models: list[str]
+
+
+# One provider call: its answer is buffered, so bound it like the gateway does.
+_PROVIDER_TIMEOUT = 15.0
+# Total deadline for one provider call: httpx's per-phase timeout above does
+# not bound a slow trickle of chunks, this does.
+_PROVIDER_DEADLINE = 30.0
+_PROVIDER_MAX_BODY = 8 * 1024 * 1024
+_PROVIDER_MAX_MODELS = 2000
+
+
+def _http_client() -> httpx.AsyncClient:
+    """A short-lived client per provider call (a seam for tests).
+
+    No redirects: one could carry the key to another host.
+    """
+    return httpx.AsyncClient(timeout=_PROVIDER_TIMEOUT, follow_redirects=False)
 
 
 def _view(request: Request, routes: int) -> AiGatewayView:
@@ -395,6 +446,86 @@ async def revoke_ai_gateway_keys(request: Request, service: str) -> AiKeyRevokeR
     request.state.audit_params = audit_params({"service": service})
     revoked = await queries.revoke_ai_gateway_keys(service)
     return AiKeyRevokeResponse(service=service, revoked=revoked)
+
+
+def _provider_error(message: str) -> NerditError:
+    return NerditError(
+        502,
+        "ai_gateway.provider_error",
+        message,
+        hint="Check base_url (usually ending in /v1) and the key stored under api_key_ref.",
+    )
+
+
+@router.post(
+    "/ai-gateway/providers/models",
+    response_model=AiProviderModelList,
+    operation_id="list_ai_provider_models",
+)
+async def list_ai_provider_models(
+    request: Request, body: AiProviderModelsRequest
+) -> AiProviderModelList:
+    """The model ids a provider offers (submitter or admin), before an alias exists.
+
+    The daemon calls `GET {base_url}/models` with the referenced shared-scope
+    key, so a console or agent can offer a model picker while the key stays on
+    the machine. The answer carries the ids only, never the provider's body.
+    A POST carrying a body (not a query string, which access logs would keep)
+    that changes nothing: no `Idempotency-Key`, audited as
+    `ai_gateway.provider_models_listed` with the host and the ref name.
+    Refusals: 422 as `set_ai_route`; 503 `secret_missing` / `secret_invalid`;
+    502 `ai_gateway.provider_unreachable` / `ai_gateway.provider_error`
+    (naming the host or the HTTP status, never the upstream text: it could echo
+    the key).
+    """
+    require_role(request, TokenRole.submitter, TokenRole.admin)
+    ref_key = _check_ref(body.api_key_ref)
+    host = await _check_base_url(request, body.base_url)
+    request.state.audit_params = audit_params({"base_url_host": host, "api_key_ref_name": ref_key})
+    try:
+        key = provider_key(secret_manager(request), body.api_key_ref)
+    except ProviderKeyError as exc:
+        raise NerditError(
+            503,
+            exc.code,
+            exc.message,
+            hint="Store the key with `nerdit secrets set --shared KEY=...`, then retry.",
+        ) from None
+    # x-api-key + anthropic-version let Anthropic's compatibility layer answer
+    # too; OpenAI-shaped providers ignore them. Same host either way.
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+    }
+    url = f"{body.base_url.rstrip('/')}/models"
+    raw = bytearray()
+    try:
+        async with (
+            asyncio.timeout(_PROVIDER_DEADLINE),
+            _http_client() as client,
+            client.stream("GET", url, headers=headers) as resp,
+        ):
+            if not 200 <= resp.status_code < 300:
+                raise _provider_error(f"The provider answered {resp.status_code}.")
+            async for chunk in resp.aiter_bytes():
+                raw += chunk
+                if len(raw) > _PROVIDER_MAX_BODY:
+                    raise _provider_error("The provider's model list is too large.")
+    except (httpx.HTTPError, TimeoutError):
+        raise NerditError(
+            502,
+            "ai_gateway.provider_unreachable",
+            f"The provider at '{host}' did not answer.",
+            hint="Check base_url and that this machine reaches the provider.",
+        ) from None
+    try:
+        items = json.loads(bytes(raw))["data"]
+        ids = {item["id"] for item in items if isinstance(item.get("id"), str)}
+    except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+        raise _provider_error("The provider did not answer an OpenAI-shaped model list.") from None
+    models = sorted(m for m in ids if 0 < len(m) <= 200 and m.isascii() and m.isprintable())
+    return AiProviderModelList(base_url_host=host, models=models[:_PROVIDER_MAX_MODELS])
 
 
 @router.get("/ai-gateway/usage", response_model=AiUsageList, operation_id="get_ai_usage")

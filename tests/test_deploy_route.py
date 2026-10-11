@@ -1857,6 +1857,18 @@ def test_deploy_shared_ref_audits_shared_referenced_to_requester(tmp_path):
     assert json.loads(row["params_redacted"]) == {"service": "demo", "keys": ["OPENAI_KEY"]}
 
 
+def test_deploy_shared_hook_secret_audits_shared_referenced(tmp_path):
+    """A [hooks.*] secret bound to a shared key leaves the same admin signal."""
+    q = _queries()
+    toml = (
+        '[hooks.stripe]\nsender = "stripe"\npath = "/wh"\nsecret = "${secrets.shared.STRIPE_WH}"\n'
+    )
+    resp = _post(_client(q, tmp_path), _node_ai_zip(toml))
+    assert resp.status_code == 201, resp.text
+    [row] = _shared_referenced_calls(q)
+    assert json.loads(row["params_redacted"]) == {"service": "demo", "keys": ["STRIPE_WH"]}
+
+
 def test_deploy_unscoped_ref_records_no_shared_referenced(tmp_path):
     q = _queries()
     resp = _post(_client(q, tmp_path), _node_ai_zip(_AI_API_TOML))

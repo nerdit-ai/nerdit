@@ -101,6 +101,9 @@ _IDEMPOTENCY_EXEMPT_PATHS: list[tuple[str, re.Pattern[str]]] = [
     ("PUT", re.compile(r"^/link/github-token$")),
     # Immutable assignment: the same value is a no-op, any different value conflicts.
     ("PUT", re.compile(r"^/link/public-address$")),
+    # A read shaped as a POST (the body keeps the secret ref out of access
+    # logs): nothing is written, and a cached replay would serve a stale list.
+    ("POST", re.compile(r"^/ai-gateway/providers/models$")),
 ]
 
 

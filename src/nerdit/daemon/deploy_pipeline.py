@@ -34,6 +34,7 @@ from nerdit.config.app_config import (
     validate_ai_section,
     validate_db_section,
     validate_deploy_fields,
+    validate_hooks_section,
 )
 from nerdit.config.build import BuildSettings
 from nerdit.config.defaults import ZIP_EXCLUDE_PATTERNS, app_image_repo, app_image_tag
@@ -68,6 +69,7 @@ from nerdit.core.gitsource import (
     validate_repo_url,
     validate_subdir,
 )
+from nerdit.core.hooks import default_secret_ref
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.core.project_identity import PRODUCTION
 from nerdit.core.secrets import SHARED_SCOPE, SecretDecryptError
@@ -357,6 +359,29 @@ def reject_foreign_label(
         raise seat_taken_error(label)
     if joined is None or existing.project_id != joined.id or existing.service != service:
         raise name_taken_error(label)
+
+
+def _declared_hooks(request: Request, project: dict) -> dict[str, dict[str, Any]]:
+    """Validate `[hooks.*]` into `hooks` row fields, stamping the names on the audit row.
+
+    The hooks table is the truth: these rows are upserted at deploy and a hook
+    the file does not declare is never revoked.
+    """
+    if "hooks" not in project:
+        return {}
+    specs = validate_hooks_section(project["hooks"], source=PROJECT_CONFIG_NAME)
+    if specs:
+        request.state.audit_params["hooks"] = sorted(specs)
+    return {
+        hook: {
+            "sender": cfg.sender,
+            "path": cfg.path,
+            "header": cfg.header,
+            "prefix": cfg.prefix,
+            "secret_ref": None if cfg.sender == "none" else cfg.secret or default_secret_ref(hook),
+        }
+        for hook, cfg in specs.items()
+    }
 
 
 def _deploy_section_source(project: dict, table: dict | None) -> dict:
@@ -1741,6 +1766,8 @@ async def _finalize_deploy(
         if db_spec:
             # audit_params masks password leaves — a resolved DSN never a param.
             request.state.audit_params["db"] = audit_params(db_spec)
+        # Validated before the dry-run return, upserted after the row write.
+        hook_rows = _declared_hooks(request, project)
 
         build_fields, container_port = assemble_build_fields(
             name=name,
@@ -1874,6 +1901,9 @@ async def _finalize_deploy(
                 declared=declared,
             )
 
+        # upsert [hooks.*] after the row write; dry run returned above
+        await queries.apply_declared_hooks(job.service_name or name, job.id, hook_rows)
+
         # One `service.deploy_started` per generation, at the only
         # seam every ingress (ZIP / git / template store) shares — after the row
         # is written, so `build_version` is the generation just stamped by
@@ -1893,7 +1923,9 @@ async def _finalize_deploy(
         # audited to the REQUESTING principal — the admin's before-launch
         # signal, on top of the launch-time secret.shared_resolved row.
         shared_keys = sorted(
-            set(shared_secret_keys(ai_spec)) | set(shared_secret_keys_for(db_spec, ("password",)))
+            set(shared_secret_keys(ai_spec))
+            | set(shared_secret_keys_for(db_spec, ("password",)))
+            | set(shared_secret_keys_for(hook_rows, ("secret_ref",)))
         )
         if shared_keys:
             await record_shared_referenced(request, name, shared_keys)
