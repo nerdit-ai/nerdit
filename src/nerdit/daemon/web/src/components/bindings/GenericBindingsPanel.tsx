@@ -44,8 +44,6 @@ export function GenericBindingsPanel<TDraft extends { name: string; provider: st
 
   return (
     <div className="space-y-4">
-      <p className="text-13 text-subtle-foreground">{descriptor.copy.intro}</p>
-
       {/* Quiet placeholder in the card's own shape, never the word "Loading". */}
       {state.configLoading && <div aria-hidden="true" className="h-20 rounded-card bg-surface-hover" />}
       {state.configError && <Notice tone="destructive">{apiErrorCopy(state.configError)}</Notice>}
@@ -53,7 +51,7 @@ export function GenericBindingsPanel<TDraft extends { name: string; provider: st
 
       {state.view && (
         <>
-          {empty && <p className="text-13 text-muted-foreground">{descriptor.copy.empty}</p>}
+          {empty && <p className="text-13 text-muted-foreground">{descriptor.empty}</p>}
 
           {state.draftNames.map((draftName) => (
             <BindingCard key={draftName} draftName={draftName} descriptor={descriptor} state={state} />

@@ -118,7 +118,7 @@ test("an audit 403 (defense in depth) shows the admin hint, the overview intact"
 
   await page.goto("/projects/my-app");
   await expect(page.getByTestId("app-deploy-line")).toBeVisible();
-  await expect(page.getByText(/activity needs an admin token/i)).toBeVisible();
+  await expect(page.getByText(/activity is visible with the machine's admin token/i)).toBeVisible();
 });
 
 test("manage tab: a managed db binding renders and edits to external write secret then ref", async ({

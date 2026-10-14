@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
 import { useAudit } from "../api/queries";
 import { useAuditStream } from "../api/auditStream";
 import { apiUrl } from "../api/client";
@@ -15,6 +16,7 @@ import {
   TableRow,
   type BadgeTone
 } from "../components/ui";
+import { buttonClass } from "../lib/button";
 import { authErrorCode, clearStoredToken, getStoredToken, handleAuthFailure, isDeadBearer } from "../lib/auth";
 import type { AuditLogEntry } from "../api/types";
 
@@ -346,7 +348,7 @@ export default function Audit() {
     <div className="mx-auto max-w-content space-y-7">
       <PageHeader
         title="Activity"
-        subtitle="Append-only record of every change: who did it, what it touched, how it ended."
+        subtitle="Append-only record of every change."
       />
 
       {access.isLoading && (
@@ -363,7 +365,12 @@ export default function Audit() {
         <Panel title="Activity">
           <div className="flex flex-col items-start gap-2 px-4 py-10">
             <p className="text-14 text-foreground">Admin token required</p>
-            <p className="text-14 text-muted-foreground">Sign in with an admin token.</p>
+            <p className="text-14 text-muted-foreground">
+              This page needs the machine's admin token. Other sessions can use the rest of the dashboard.
+            </p>
+            <Link to="/" className={`mt-2 ${buttonClass()}`}>
+              Back to apps
+            </Link>
           </div>
         </Panel>
       )}

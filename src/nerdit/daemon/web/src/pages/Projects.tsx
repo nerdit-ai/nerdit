@@ -7,6 +7,7 @@ import { TemplateDeployDialog } from "../components/TemplateDeployDialog";
 import { Badge, Button, Menu, Mono, Notice, PageHeader, Panel, TableRow } from "../components/ui";
 import {
   useAllBindings,
+  useAuthRole,
   useCapabilities,
   useDatabases,
   useModels,
@@ -229,6 +230,7 @@ function AppsTable({
   onNew: () => void;
 }) {
   const empty = !isLoading && !error && rows.length === 0;
+  const tunnel = useAuthRole().data?.mode === "tunnel";
   return (
     <>
       {error && <Notice tone="destructive">{error.message}</Notice>}
@@ -259,8 +261,8 @@ function AppsTable({
             <div className="min-w-0">
               <p className="text-14 text-foreground">No apps yet.</p>
               <p className="mt-1 text-13 text-muted-foreground">
-                Point Nerdit at a folder and it builds, runs, and gets a URL. From a shell:{" "}
-                <Mono>nerdit deploy .</Mono>
+                Point Nerdit at a folder and it builds, runs, and gets a URL.{" "}
+                {tunnel ? "Or ask your agent to deploy one." : <>From a shell: <Mono>nerdit deploy .</Mono></>}
               </p>
             </div>
             <Button variant="primary" data-testid="apps-empty-new" onClick={onNew}>

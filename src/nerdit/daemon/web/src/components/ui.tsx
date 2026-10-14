@@ -28,6 +28,7 @@ import type {
 } from "react";
 import { forwardRef, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { buttonClass, type ButtonVariant } from "../lib/button";
 
 /** Tiny class joiner — the codebase's own pattern, without a dependency. */
 function cx(...parts: Array<string | false | null | undefined>): string {
@@ -36,20 +37,13 @@ function cx(...parts: Array<string | false | null | undefined>): string {
 
 /* ------------------------------------------------------------------ Button */
 
-export type ButtonVariant = "primary" | "secondary" | "ghost" | "destructive";
+export type { ButtonVariant };
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: ButtonVariant;
   size?: "sm" | "md";
   loading?: boolean;
 }
-
-const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
-  primary: "bg-primary text-primary-foreground hover:bg-primary-hover",
-  secondary: "border border-border bg-surface text-foreground hover:bg-surface-hover",
-  ghost: "text-foreground hover:bg-surface-hover",
-  destructive: "bg-destructive text-primary-foreground"
-};
 
 export function Button({
   variant = "secondary",
@@ -66,13 +60,7 @@ export function Button({
       {...rest}
       type={type}
       disabled={disabled || loading}
-      className={cx(
-        "inline-flex items-center justify-center gap-2 rounded-button font-medium",
-        "disabled:cursor-not-allowed disabled:opacity-50",
-        size === "sm" ? "h-8 px-3 text-12" : "h-9 px-4 text-14",
-        BUTTON_VARIANTS[variant],
-        className
-      )}
+      className={cx(buttonClass(variant, size), className)}
     >
       {loading && <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />}
       {children}
@@ -130,13 +118,16 @@ export function Panel({
   title?: ReactNode;
   actions?: ReactNode;
   className?: string;
-  children: ReactNode;
+  /** Omitted for a header-only panel (title + action, no body). */
+  children?: ReactNode;
 } & HTMLAttributes<HTMLElement>) {
   return (
     <section {...rest} className={cx("rounded-panel border border-border bg-surface", className)}>
       {(title || actions) && (
-        <header className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
-          {title ? <h2 className="label">{title}</h2> : <span />}
+        <header
+          className={cx("flex items-center justify-between gap-3 px-4 py-3", children != null && "border-b border-border")}
+        >
+          {title ? <h2 className="text-16 font-semibold text-foreground">{title}</h2> : <span />}
           {actions && <div className="flex items-center gap-2">{actions}</div>}
         </header>
       )}

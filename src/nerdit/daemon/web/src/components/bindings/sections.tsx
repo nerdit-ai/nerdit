@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { Link } from "react-router-dom";
 import type { AppConfigView, Database, Model } from "../../api/types";
 import { useDatabases, useModels } from "../../api/queries";
 import {
@@ -26,7 +27,8 @@ export interface BindingPath<TDraft> {
  */
 export interface BindingSectionDescriptor<TDraft extends { name: string; provider: string }, TItem> {
   section: "ai" | "db";
-  copy: { intro: string; empty: string };
+  /** The empty state: one line ending with where to get one. */
+  empty: ReactNode;
   useItems: () => { items: TItem[] };
   getSection: (view: AppConfigView) => Record<string, Record<string, unknown>>;
   draftFromView: (name: string, binding: Record<string, unknown>) => TDraft;
@@ -62,10 +64,15 @@ export interface BindingSectionDescriptor<TDraft extends { name: string; provide
 
 export const aiSection: BindingSectionDescriptor<AiBindingDraft, Model> = {
   section: "ai",
-  copy: {
-    intro: "Wire this app to a model. Injected as env at launch.",
-    empty: "Nothing wired yet. Add one to give this app a model."
-  },
+  empty: (
+    <>
+      No model wired. Serve one on{" "}
+      <Link to="/models" className="text-primary hover:underline">
+        Models
+      </Link>
+      .
+    </>
+  ),
   useItems: () => ({ items: useModels().data?.items ?? [] }),
   getSection: (view) => view.ai,
   draftFromView,
@@ -102,10 +109,15 @@ export const aiSection: BindingSectionDescriptor<AiBindingDraft, Model> = {
 
 export const dbSection: BindingSectionDescriptor<DbBindingDraft, Database> = {
   section: "db",
-  copy: {
-    intro: "Wire this app to a database. Injected as env at launch.",
-    empty: "Nothing wired yet. Add one to give this app a database."
-  },
+  empty: (
+    <>
+      No database wired. Create one on{" "}
+      <Link to="/databases" className="text-primary hover:underline">
+        Databases
+      </Link>
+      .
+    </>
+  ),
   useItems: () => ({ items: useDatabases().data?.items ?? [] }),
   getSection: (view) => view.db ?? {},
   draftFromView: dbDraftFromView,

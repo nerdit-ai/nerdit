@@ -2,8 +2,8 @@ import { Fragment, useEffect } from "react";
 import { Command } from "cmdk";
 import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { fetchAllServices } from "../api/queries";
-import { navGroups } from "../shell/navItems";
+import { fetchAllServices, useAuthRole } from "../api/queries";
+import { navGroups, navItemVisible } from "../shell/navItems";
 
 interface CommandPaletteProps {
   open: boolean;
@@ -12,6 +12,7 @@ interface CommandPaletteProps {
 
 export function CommandPalette({ open, onClose }: CommandPaletteProps) {
   const navigate = useNavigate();
+  const role = useAuthRole().data?.role;
 
   // Dynamic app jump-list. Cache-shared with `useAllBindings` (same queryKey +
   // the same cursor-walking queryFn) so the palette rides the apps list's
@@ -116,7 +117,7 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
 
             {navGroups.map((group) => (
               <Command.Group key={group.id} heading={group.heading} className={groupCls}>
-                {group.items.map(({ to, label }) => (
+                {group.items.filter((item) => navItemVisible(item, role)).map(({ to, label }) => (
                   <Command.Item key={to} value={label} onSelect={() => go(to)} className={itemCls}>
                     <span>{label}</span>
                     <span className={suffixCls}>{to}</span>

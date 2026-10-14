@@ -992,6 +992,7 @@ def test_origin_is_additive_and_leaves_every_pre_p34_field_intact() -> None:
 
     assert set(body) == {
         "service_name",
+        "job_id",
         "access",
         "url",
         "state",
@@ -1002,6 +1003,7 @@ def test_origin_is_additive_and_leaves_every_pre_p34_field_intact() -> None:
     }
     assert body["access"] == "public"
     assert body["state"] == "ready"
+    assert body["job_id"] == "svc-1"
 
 
 # ---------------------------------------------------------------------------

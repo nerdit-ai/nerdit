@@ -23,12 +23,16 @@ function proxyConfigPuts(page: Page): Request[] {
   return puts;
 }
 
-test("doctor card renders the worst-of status and every check", async ({ page }) => {
+test("doctor card renders the worst-of status, a summary and every check on demand", async ({ page }) => {
   await mockApi(page);
   await gotoSettings(page);
 
   // Worst-of status badge is "warn" (config_restart_pending is warn).
   await expect(page.getByTestId("doctor-status")).toHaveText("warn");
+  // Collapsed to one summary row; the rows sit behind the disclosure.
+  await expect(page.getByTestId("doctor-summary")).toHaveText("7 ok · 1 warning · 1 skipped");
+  await expect(page.getByTestId("doctor-check")).toHaveCount(0);
+  await page.getByRole("button", { name: "Show checks" }).click();
   await expect(page.getByTestId("doctor-check")).toHaveCount(9);
   await expect(page.getByText("config_restart_pending")).toBeVisible();
   await expect(page.getByText("pending restart: proxy.hostname_override")).toBeVisible();
@@ -42,6 +46,9 @@ test("proxy status card lists the live facts", async ({ page }) => {
 
   const proxy = page.getByTestId("proxy-card");
   await expect(proxy.getByText("SHA256:ab12cd34ef56")).toBeVisible();
+  // A readable live table needs no footnote: it shows only when unreadable.
+  await expect(page.getByText("No endpoints registered yet.")).toBeVisible();
+  await expect(page.getByTestId("routes-live-table")).toHaveCount(0);
   await expect(proxy.getByText("test-host.local")).toBeVisible();
   await expect(proxy.getByText("TLS synced")).toBeVisible();
 });

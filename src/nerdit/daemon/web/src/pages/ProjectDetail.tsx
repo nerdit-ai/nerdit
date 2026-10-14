@@ -47,10 +47,12 @@ import {
   publicUrlState,
   sourceLine
 } from "../lib/format";
+import { buttonClass } from "../lib/button";
 import { serviceStatusLabel, serviceStatusTone } from "../lib/status";
 import { deriveProject, kindHomePath, type Project, type ProjectResource } from "../lib/projects";
 import type { AuditLogEntry, Service } from "../api/types";
 import { toast } from "../state/toastStore";
+import { AppError, AppLoading } from "./AppStates";
 
 /**
  * The app page (design guidelines §4).
@@ -119,9 +121,11 @@ export interface ProjectDetailProps {
   projectPath?: string;
   /** True under `/services/:service`: a way back up, and delete returns there. */
   nested?: boolean;
+  /** Header name while loading or failing; the short service name when nested. */
+  title?: string;
 }
 
-export default function ProjectDetail({ label, basePath, projectPath, nested }: ProjectDetailProps) {
+export default function ProjectDetail({ label, basePath, projectPath, nested, title = label }: ProjectDetailProps) {
   const { tab } = useParams();
   const name = label;
   const navigate = useNavigate();
@@ -221,12 +225,19 @@ export default function ProjectDetail({ label, basePath, projectPath, nested }: 
     [svc, bindings, models.data, databases.data]
   );
 
-  if (service.isLoading) return <p className="text-14 text-muted-foreground">Loading app…</p>;
-  if (notFound || (svc && svc.kind !== "service")) {
-    return <p className="text-14 text-muted-foreground">Loading app…</p>;
+  if (service.isLoading) return <AppLoading name={title} />;
+  if (notFound || (svc && svc.kind !== "service")) return <AppLoading name={title} />;
+  if (service.error) {
+    return (
+      <AppError
+        name={title}
+        message={(service.error as Error).message}
+        retry={() => void service.refetch()}
+        retrying={service.isFetching}
+      />
+    );
   }
-  if (service.error) return <p className="text-14 text-destructive">{(service.error as Error).message}</p>;
-  if (!svc || !project) return <p className="text-14 text-destructive">App not found.</p>;
+  if (!svc || !project) return <AppError name={title} message="App not found." />;
 
   const activeTab: TabKey =
     legacy ?? (tab && TABS.some((t) => t.key === tab) ? (tab as TabKey) : "overview");
@@ -514,7 +525,7 @@ function AuditGateHint({
     return <p className="text-13 text-subtle-foreground">Activity needs a newer daemon.</p>;
   }
   if (!isAdmin) {
-    return <p className="text-13 text-subtle-foreground">Activity needs an admin token.</p>;
+    return <p className="text-13 text-subtle-foreground">Activity is visible with the machine's admin token.</p>;
   }
   return null;
 }
@@ -572,6 +583,9 @@ function OverviewTab({
 }) {
   const phase = svc.last_deploy?.phase;
   const inFlight = Boolean(phase && IN_FLIGHT.has(phase));
+  // A Cloud session is never admin: no activity panel to point at instead of a dead end.
+  const tunnel = useAuthRole().data?.mode === "tunnel";
+  const showActivity = auditEnabled || !tunnel;
   const status = statusLine(svc);
   const deploy = deployLine(svc);
 
@@ -622,7 +636,7 @@ function OverviewTab({
 
       {canConfigure && <DiagnosePanel ident={svc.name} status={svc.status} phase={phase} />}
 
-      <Panel
+      {showActivity && <Panel
         title="Recent activity"
         actions={
           <Link to="/activity" className="text-13 text-muted-foreground hover:text-foreground">
@@ -637,7 +651,7 @@ function OverviewTab({
             <AuditGateHint isAdmin={isAdmin} auditFilterAvailable={auditFilterAvailable} />
           )}
         </div>
-      </Panel>
+      </Panel>}
     </div>
   );
 }
@@ -666,7 +680,7 @@ function ActivityFeed({ name }: { name: string }) {
   const rows = (query.data?.pages ?? []).flatMap((page) => page.items).slice(0, 5);
 
   if (query.isError) {
-    return <p className="text-13 text-subtle-foreground">Activity needs an admin token.</p>;
+    return <p className="text-13 text-subtle-foreground">Activity is visible with the machine's admin token.</p>;
   }
   if (query.isLoading) return <p className="text-13 text-muted-foreground">Reading activity…</p>;
   if (rows.length === 0) {
@@ -714,7 +728,7 @@ function ManageTab({
         }
       >
         <p className="px-4 py-3 text-13 text-muted-foreground">
-          GPUs, start command, health check and resource limits. Name and port are fixed at deploy.
+          Name and port are fixed at deploy.
         </p>
       </Panel>
 
@@ -727,40 +741,25 @@ function ManageTab({
       {/* (P40e) A single-service project keeps this page as its home; the
           project-level sections (variables, addresses, delete) are one link away. */}
       {projectPath && (
-        <Panel title="Project">
-          <p className="px-4 py-3 text-13 text-muted-foreground">
-            Variables shared by every service of <Mono>{svc.project ?? svc.name}</Mono>, its
-            addresses and the project itself.{" "}
-            <Link to={projectPath} className="text-primary hover:underline" data-testid="app-project-link">
-              Open the project
+        <Panel
+          title="Project"
+          actions={
+            <Link to={projectPath} className={buttonClass("secondary", "sm")} data-testid="app-project-link">
+              Open project {svc.project ?? svc.name}
             </Link>
-          </p>
-        </Panel>
+          }
+        />
       )}
 
       <Panel title="AI resources">
-        <div className="space-y-3 px-4 py-3">
+        <div className="px-4 py-3">
           <GenericBindingsPanel name={name} descriptor={aiSection} />
-          <p className="text-13 text-subtle-foreground">
-            Serve models from the{" "}
-            <Link to="/models" className="text-primary hover:underline">
-              Models page
-            </Link>
-            .
-          </p>
         </div>
       </Panel>
 
       <Panel title="Database resources">
-        <div className="space-y-3 px-4 py-3">
+        <div className="px-4 py-3">
           <GenericBindingsPanel name={name} descriptor={dbSection} />
-          <p className="text-13 text-subtle-foreground">
-            Provision databases from the{" "}
-            <Link to="/databases" className="text-primary hover:underline">
-              Databases page
-            </Link>
-            .
-          </p>
         </div>
       </Panel>
 

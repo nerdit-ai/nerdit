@@ -100,7 +100,7 @@ export function SecretsPanel({
   return (
     <div className="space-y-4">
       <p className="text-13 text-muted-foreground">
-        Injected as env at launch. Write-only: key names are listed, values are never shown again.
+        Values are never shown again.
       </p>
 
       {readOnly && (
@@ -126,8 +126,7 @@ export function SecretsPanel({
       )}
       {!names.isLoading && !names.error && keys.length === 0 && (
         <p className="text-13 text-muted-foreground">
-          No secrets set. Add a key below, or from a shell:{" "}
-          <Mono>nerdit secrets set {service} KEY=value</Mono>
+          No secrets. Or run <Mono>nerdit secrets set {service} KEY=value</Mono>.
         </p>
       )}
 

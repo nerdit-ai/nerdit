@@ -36,7 +36,7 @@ test("non-admin token gets the friendly admin-required state, not an error", asy
   await page.goto("/activity");
   await expect(page.getByText(/admin token required/i)).toBeVisible();
   await expect(
-    page.getByText(/sign in with an admin token/i)
+    page.getByText(/needs the machine.s admin token/i)
   ).toBeVisible();
   // The 403 is surfaced as data, never as an error banner or a retry loop.
   await expect(page.getByText(/could not reach/i)).toHaveCount(0);

@@ -429,7 +429,7 @@ def test_lot5_hosted_only_fields_are_in_the_schema(schema: dict) -> None:
     """Lot 5 is additive: new fields on existing models, no new operation."""
     models = schema["components"]["schemas"]
     assert "hosted_only" in models["ShareRequest"]["properties"]
-    assert {"hosted_only", "local_routes"} <= set(models["ShareView"]["required"])
+    assert {"hosted_only", "local_routes", "job_id"} <= set(models["ShareView"]["required"])
     assert models["ShareView"]["properties"]["local_routes"]["enum"] == [
         "absent",
         "present",

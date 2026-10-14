@@ -101,10 +101,10 @@ token.
 
 ### Claude on the web or desktop (remote, through Nerdit Cloud)
 
-Link the machine with `nerdit link`. Then open **Connect** in
+Link the machine with `nerdit link`. Then open **Agents** in
 [app.nerdit.ai](https://app.nerdit.ai) and add the connection URL it shows as a
 custom connector in Claude. You approve which machines or projects the
-assistant can reach. No token leaves your machine. See the
+agent can reach. No token leaves your machine. See the
 [guide](https://docs.nerdit.ai/app/connect-assistant).
 
 ### Over HTTP

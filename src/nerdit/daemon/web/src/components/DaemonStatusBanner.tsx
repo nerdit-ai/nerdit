@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, WifiOff } from "lucide-react";
-import { useDaemonStatus } from "../api/queries";
+import { useAuthRole, useDaemonStatus } from "../api/queries";
+import { CLOUD_MACHINES_URL } from "../lib/auth";
 import { Banner } from "./ui";
 
 function formatAgo(date: Date | null): string {
@@ -26,6 +27,7 @@ function formatAgo(date: Date | null): string {
  */
 export function DaemonStatusBanner() {
   const { status, lastSeen } = useDaemonStatus();
+  const tunnel = useAuthRole().data?.mode === "tunnel";
   const [, force] = useState(0);
 
   // Re-render every 5s while we are not "online" so the "last seen" string
@@ -41,8 +43,8 @@ export function DaemonStatusBanner() {
   const isOffline = status === "offline";
   const Icon = isOffline ? WifiOff : AlertTriangle;
   const label = isOffline
-    ? `Daemon offline (last seen ${formatAgo(lastSeen)})`
-    : "Reconnecting to nerditd…";
+    ? `This machine is offline (last seen ${formatAgo(lastSeen)})`
+    : "Reconnecting to this machine…";
 
   return (
     <div
@@ -51,9 +53,14 @@ export function DaemonStatusBanner() {
       data-testid="daemon-status-banner"
     >
       <Banner tone={isOffline ? "destructive" : "warning"}>
-        <span className="flex items-center gap-2 font-medium">
+        <span className="flex flex-wrap items-center gap-2 font-medium">
           <Icon aria-hidden="true" className="h-4 w-4 shrink-0" />
           {label}
+          {tunnel && (
+            <a href={CLOUD_MACHINES_URL} className="font-normal underline">
+              Open it again from Nerdit Cloud.
+            </a>
+          )}
         </span>
       </Banner>
     </div>

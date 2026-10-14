@@ -15,7 +15,7 @@ import {
   resetAnalytics
 } from "../lib/analytics";
 import { clearStoredToken } from "../lib/auth";
-import { navGroups, type NavItem } from "./navItems";
+import { navGroups, navItemVisible, type NavItem } from "./navItems";
 
 // A nav entry is active on an exact match or when the URL is a detail route
 // under it. Two carve-outs, both about the Apps row:
@@ -45,7 +45,7 @@ function NavItemLink({
       data-testid={`nav-link-${label.toLowerCase()}`}
       className={`block rounded-button px-3 py-2 text-14 transition-colors ${
         active
-          ? "bg-surface-hover font-medium text-foreground"
+          ? "bg-primary-subtle font-medium text-primary"
           : "text-muted-foreground hover:bg-surface-hover hover:text-foreground"
       }`}
     >
@@ -57,17 +57,18 @@ function NavItemLink({
 // One flat list. The uppercase group labels are retired with the groups they
 // labelled: six destinations do not need filing, and `navGroups` keeps its
 // shape only because the palette still groups by heading.
-function DashboardNavigation({
+export function DashboardNavigation({
   pathname,
   onNavigate
 }: {
   pathname: string;
   onNavigate?: () => void;
 }) {
+  const role = useAuthRole().data?.role;
   return (
     <nav aria-label="Dashboard" className="space-y-1">
       {navGroups.map((group) =>
-        group.items.map((item) => (
+        group.items.filter((item) => navItemVisible(item, role)).map((item) => (
           <NavItemLink key={item.to} {...item} pathname={pathname} onNavigate={onNavigate} />
         ))
       )}

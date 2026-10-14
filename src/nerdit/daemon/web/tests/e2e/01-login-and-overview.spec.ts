@@ -59,8 +59,8 @@ test("login lands on the apps list with mocked daemon", async ({ page }) => {
   await expect(page.getByRole("button", { name: /new app/i })).toBeVisible();
 
   // Daemon-status banner must stay hidden when /api/health returns 200.
-  await expect(page.getByText(/daemon offline/i)).toHaveCount(0);
-  await expect(page.getByText(/reconnecting to nerditd/i)).toHaveCount(0);
+  await expect(page.getByText(/this machine is offline/i)).toHaveCount(0);
+  await expect(page.getByText(/reconnecting to this machine/i)).toHaveCount(0);
 });
 
 test("Cloud session opens without a token and never offers a fake sign out", async ({ page }) => {
@@ -95,10 +95,11 @@ test("a Cloud session ending mid-page keeps recovery in the loaded shell", async
   });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Apps", level: 1 })).toBeVisible();
-  await page.route("**/api/tokens", (route) => route.fulfill({
+  // Tokens is hidden from a submitter, so the session ends on a page it can open.
+  await page.route(/\/api\/models(\?.*)?$/, (route) => route.fulfill({
     status: 401, contentType: "application/json", body: JSON.stringify({ error: { code: "proxy_session_expired", message: "The session expired", status: 401 } })
   }));
-  await page.getByTestId("nav-link-tokens").click();
+  await page.getByTestId("nav-link-models").click();
   await expect(page.getByRole("heading", { name: "Session ended" })).toBeVisible();
   expect(documents).toHaveLength(1);
   await expect(page.getByLabel(/paste your nerdit token/i)).toHaveCount(0);

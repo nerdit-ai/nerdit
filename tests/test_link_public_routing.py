@@ -103,7 +103,7 @@ async def test_duplicate_routing_carrier_fails_before_dial(queries, carrier):
         await mux.aclose()
 
 
-@pytest.mark.parametrize("host", [HOST, "demo--gpu-box.nodes.test"])
+@pytest.mark.parametrize("host", [HOST, "demo--gpu-box.nodes.test", "app.example.com"])
 async def test_origin_receives_validated_authority_without_internal_carriers(queries, host):
     job, resolver = await _bound(queries)
     transport = _BytesTransport(200, [], [b"ok"])

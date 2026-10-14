@@ -1,5 +1,6 @@
 import { useId, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
 import { apiUrl } from "../api/client";
 import { useAuthRole, useCreateToken, useRevokeToken, useTokens } from "../api/queries";
 import {
@@ -16,6 +17,7 @@ import {
   Select,
   TableRow
 } from "../components/ui";
+import { buttonClass } from "../lib/button";
 import { authErrorCode, clearStoredToken, getStoredToken, handleAuthFailure, isDeadBearer } from "../lib/auth";
 import { formatRelative } from "../lib/format";
 import { toast } from "../state/toastStore";
@@ -475,7 +477,7 @@ export default function Tokens() {
     <div className="mx-auto max-w-content space-y-7">
       <PageHeader
         title="Tokens"
-        subtitle="Scoped API tokens: role, quotas, last use. The secret is shown once, at creation, and stored only as a hash."
+        subtitle="API tokens for this machine. Each secret is shown once."
       />
 
       {access.isLoading && (
@@ -492,7 +494,12 @@ export default function Tokens() {
         <Panel title="Tokens">
           <div className="flex flex-col items-start gap-2 px-4 py-10">
             <p className="text-14 text-foreground">Admin token required</p>
-            <p className="text-14 text-muted-foreground">Sign in with an admin token.</p>
+            <p className="text-14 text-muted-foreground">
+              This page needs the machine's admin token. Other sessions can use the rest of the dashboard.
+            </p>
+            <Link to="/" className={`mt-2 ${buttonClass()}`}>
+              Back to apps
+            </Link>
           </div>
         </Panel>
       )}

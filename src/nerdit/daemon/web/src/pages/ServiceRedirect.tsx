@@ -4,6 +4,7 @@ import { ApiError } from "../api/client";
 import { useService } from "../api/queries";
 import { kindHomePath } from "../lib/projects";
 import { toast } from "../state/toastStore";
+import { AppError, AppLoading } from "./AppStates";
 
 /**
  * Kind-aware redirect for the retired `/services/:ident` route (D8). That URL
@@ -39,7 +40,14 @@ export default function ServiceRedirect() {
   }, [notFound, service.data, navigate]);
 
   if (service.isError && !notFound) {
-    return <p className="text-destructive">{(service.error as Error).message}</p>;
+    return (
+      <AppError
+        name={ident}
+        message={(service.error as Error).message}
+        retry={() => void service.refetch()}
+        retrying={service.isFetching}
+      />
+    );
   }
-  return <p className="text-muted-foreground">Loading app…</p>;
+  return <AppLoading name={ident} />;
 }

@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
 import { KeyRound } from "lucide-react";
 import ProjectDetail from "./ProjectDetail";
+import { AppError, AppLoading } from "./AppStates";
 import { AppRow, HeadCell } from "./Projects";
 import {
   Badge,
@@ -46,7 +47,6 @@ import { ApiError } from "../api/client";
 
 const projectPath = (name: string) => `/projects/${encodeURIComponent(name)}`;
 
-const Loading = () => <p className="text-14 text-muted-foreground">Loading app…</p>;
 
 export default function ProjectRoute() {
   const { name = "", tab } = useParams();
@@ -66,7 +66,7 @@ export default function ProjectRoute() {
   // `isFetched`, not `isPending`: a dataless errored query (the 404 of a label
   // URL) goes back to `pending` on every refetch, and a Loading swap there would
   // unmount the service page below and drop whatever the user was typing.
-  if (capabilities.isPending || (gated && !project.isFetched)) return <Loading />;
+  if (capabilities.isPending || (gated && !project.isFetched)) return <AppLoading name={name} />;
   if (!gated) return <LabelRoute name={name} tab={tab} />;
   if (!project.data) {
     // Only a definitive compatibility answer can reinterpret the URL as a label.
@@ -74,10 +74,12 @@ export default function ProjectRoute() {
       return <LabelRoute name={name} tab={tab} />;
     }
     return (
-      <div className="space-y-3">
-        <p role="alert" className="text-14 text-destructive">{error?.message}</p>
-        <Button onClick={() => void project.refetch()} loading={project.isFetching}>Retry</Button>
-      </div>
+      <AppError
+        name={name}
+        message={error?.message ?? "Could not load this app."}
+        retry={() => void project.refetch()}
+        retrying={project.isFetching}
+      />
     );
   }
 
@@ -129,7 +131,7 @@ function LabelRoute({ name, tab }: { name: string; tab?: string }) {
   // The project-shaped URL renders from `GET /projects/<project>`, which a token
   // scoped to this LABEL alone may not read: redirect only once it answered.
   const home = useProject(svc?.project ?? "", Boolean(nested));
-  if (nested && !home.isFetched) return <Loading />; // first answer only, as above
+  if (nested && !home.isFetched) return <AppLoading name={name} />; // first answer only, as above
   if (nested && home.data) {
     // `state` rides along: the palette's redeploy hand-off lands on a label URL.
     return (
@@ -147,8 +149,15 @@ export function ServiceRoute() {
   // Data first, like ProjectRoute: a failed background poll keeps `data` AND
   // sets `error`, and must not unmount a live service page (typed secret, logs).
   if (!project.data) {
-    if (!project.error) return <Loading />;
-    return <p className="text-14 text-destructive">{(project.error as Error).message}</p>;
+    if (!project.error) return <AppLoading name={service} />;
+    return (
+      <AppError
+        name={service}
+        message={(project.error as Error).message}
+        retry={() => void project.refetch()}
+        retrying={project.isFetching}
+      />
+    );
   }
   const row = project.data.services.find((svc) => svc.service === service);
   if (!row) return <Navigate to={projectPath(name)} replace />;
@@ -156,6 +165,7 @@ export function ServiceRoute() {
     <ProjectDetail
       key={row.name}
       label={row.name}
+      title={service}
       basePath={`${projectPath(name)}/services/${encodeURIComponent(service)}`}
       projectPath={projectPath(name)}
       nested
@@ -486,7 +496,7 @@ function ScopeGroup({
 
   return (
     <div>
-      <h3 className="label mb-1">{service ? `Service ${service}` : "Project"}</h3>
+      <h3 className="mb-1 text-14 font-semibold text-foreground">{service ? `Service ${service}` : "Project"}</h3>
       <ul className="divide-y divide-border border-y border-border">
         {names.map((entry) => {
           const value = entry.plain

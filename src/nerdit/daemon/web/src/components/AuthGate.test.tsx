@@ -74,7 +74,10 @@ describe("authenticated dashboard entry", () => {
   it("does not mount the dashboard when the auth probe is unavailable", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")));
     mount();
-    await screen.findByRole("alert");
+    await screen.findByText("Can't reach this machine");
+    // A local dashboard (not served through the relay) never sends people to Cloud.
+    expect(screen.getByText("This machine did not answer.")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Open Nerdit Cloud" })).toBeNull();
     expect(screen.queryByText("Dashboard")).toBeNull();
     expect(screen.queryByText("Local login")).toBeNull();
   });

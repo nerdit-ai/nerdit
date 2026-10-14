@@ -15,6 +15,9 @@ export function setSessionMode(mode: AuthMode | undefined): void {
   sessionMode = mode;
 }
 
+/** Where a Cloud session reopens this machine (hardcoded like the feedback mailto). */
+export const CLOUD_MACHINES_URL = "https://app.nerdit.ai/machines";
+
 export const SESSION_ENDED_EVENT = "nerdit:session-ended";
 
 export function handleAuthFailure(): void {

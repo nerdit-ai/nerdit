@@ -4,6 +4,19 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.9.1 (2026-10-13)
+
+Groundwork for custom domains on a machine linked to Nerdit Cloud: a hosted
+application will be able to answer on your own domain name once the hosted side
+turns the feature on. Nothing changes on the machine until then; when it does,
+a machine older than 0.9.1 is asked to update first.
+
+- **Custom domains (machine half).** The machine accepts a hosted request for an
+  application under a domain the cloud has verified for your account, and the
+  application sees that domain as its own host. Nerdit's own names, bare names,
+  IP addresses and `localhost` are refused. `GET /api/services/{name}/share`
+  now reports the application's current `job_id`.
+
 ## 0.9.0 (2026-10-11)
 
 Applications can receive webhooks. If your machine is linked to Nerdit Cloud,

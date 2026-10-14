@@ -158,7 +158,7 @@ class ShareQueries(QueriesBase):
         await self._db.conn.commit()
 
     @_serialized
-    async def resolve_shared_app(
+    async def resolve_shared_app(  # noqa: PLR0913 - the routing facts of one stream
         self,
         node_id: str,
         service_name: str,
@@ -166,6 +166,7 @@ class ShareQueries(QueriesBase):
         job_id: str | None,
         access: str | None,
         legacy_host: str | None,
+        nodes_domain: str | None,
     ) -> tuple[str, int, str] | None:
         """Validate a single committed incarnation, audience, endpoint and authority."""
         cursor = await self._db.conn.execute(
@@ -184,7 +185,8 @@ class ShareQueries(QueriesBase):
             return None
         if access == "public" and row["access"] != "public":
             return None
-        if authority.partition(":")[0].endswith(f".{PUBLIC_ADDRESS_DOMAIN}"):
+        host = authority.partition(":")[0]
+        if host.endswith(f".{PUBLIC_ADDRESS_DOMAIN}"):
             if (
                 job_id is None
                 or access is None
@@ -208,7 +210,23 @@ class ShareQueries(QueriesBase):
             elif authority == legacy_host:
                 await self._pin_hosted_alias(node_id, authority, row["id"])
                 await self._db.conn.commit()
-            else:
+            # A customer domain: admitted only on cloud proof of this incarnation
+            # (job_id matched row["id"] above) and never pinned. Nerdit's own zones
+            # stay pin-only (a node that has not learnt its zone admits none); a
+            # bare, numeric or loopback name never reaches an app.
+            elif (
+                job_id is None
+                or access is None
+                or nodes_domain is None
+                or "." not in host
+                or host.rpartition(".")[2].isdigit()
+                or host.rpartition(".")[2] == "localhost"
+                or any(
+                    host == zone or host.endswith(f".{zone}")
+                    for zone in (PUBLIC_ADDRESS_DOMAIN, nodes_domain)
+                    if zone
+                )
+            ):
                 return None
         return row["id"], row["port"], access or row["access"]
 

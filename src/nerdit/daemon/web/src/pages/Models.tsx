@@ -2,6 +2,7 @@ import { useMemo, useRef, useState, type FormEvent, type RefObject } from "react
 import { Link } from "react-router-dom";
 import {
   useAllBindings,
+  useAuthRole,
   useCapabilities,
   useDatabases,
   useModels,
@@ -239,6 +240,7 @@ function ServeModelPanel({ inputRef }: { inputRef: RefObject<HTMLInputElement> }
 
 export default function Models() {
   const models = useModels();
+  const tunnel = useAuthRole().data?.mode === "tunnel";
   const databases = useDatabases();
   const allBindings = useAllBindings();
   const stop = useServiceAction("stop");
@@ -271,7 +273,7 @@ export default function Models() {
     <div className="mx-auto max-w-content space-y-7">
       <PageHeader
         title="Models"
-        subtitle="Served locally over an OpenAI-compatible API. Models stay loopback-only, never public: apps reach them through the injected OPENAI_BASE_URL."
+        subtitle="Local models your apps call over an OpenAI-compatible API. Never public."
         actions={
           <Button variant="primary" data-testid="open-serve-form" onClick={openServeForm}>
             Serve a model
@@ -291,10 +293,16 @@ export default function Models() {
         {empty ? (
           <div className="flex flex-col items-start gap-2 px-4 py-10" data-testid="models-empty">
             <p className="text-14 text-foreground">No models served yet.</p>
-            <p className="text-14 text-muted-foreground">
-              Serve one here, or from a shell on this machine:
-            </p>
-            <Mono className="text-muted-foreground">nerdit serve llama3.1:8b</Mono>
+            {tunnel ? (
+              <p className="text-14 text-muted-foreground">Serve one here. Or ask your agent to serve one.</p>
+            ) : (
+              <>
+                <p className="text-14 text-muted-foreground">
+                  Serve one here, or from a shell on this machine:
+                </p>
+                <Mono className="text-muted-foreground">nerdit serve llama3.1:8b</Mono>
+              </>
+            )}
           </div>
         ) : (
           <div className="overflow-x-auto">

@@ -2,6 +2,7 @@ import { useMemo, useRef, useState, type FormEvent, type RefObject } from "react
 import { Link } from "react-router-dom";
 import {
   useAllBindings,
+  useAuthRole,
   useCapabilities,
   useCreateDatabase,
   useDatabases,
@@ -183,6 +184,7 @@ function CreateDatabasePanel({ inputRef }: { inputRef: RefObject<HTMLInputElemen
 
 export default function Databases() {
   const databases = useDatabases();
+  const tunnel = useAuthRole().data?.mode === "tunnel";
   const allBindings = useAllBindings();
   const stop = useServiceAction("stop");
   const restart = useServiceAction("restart");
@@ -212,7 +214,7 @@ export default function Databases() {
     <div className="mx-auto max-w-content space-y-7">
       <PageHeader
         title="Databases"
-        subtitle="Managed Postgres and Redis on this machine, with minted credentials an app reads through its own binding."
+        subtitle="Postgres and Redis for your apps."
         actions={
           <Button variant="primary" data-testid="open-create-database" onClick={openCreateForm}>
             New database
@@ -232,10 +234,16 @@ export default function Databases() {
         {empty ? (
           <div className="flex flex-col items-start gap-2 px-4 py-10" data-testid="databases-empty">
             <p className="text-14 text-foreground">No databases yet.</p>
-            <p className="text-14 text-muted-foreground">
-              Create one here, or from a shell on this machine:
-            </p>
-            <Mono className="text-muted-foreground">nerdit db create appdb</Mono>
+            {tunnel ? (
+              <p className="text-14 text-muted-foreground">Create one here. Or ask your agent to create one.</p>
+            ) : (
+              <>
+                <p className="text-14 text-muted-foreground">
+                  Create one here, or from a shell on this machine:
+                </p>
+                <Mono className="text-muted-foreground">nerdit db create appdb</Mono>
+              </>
+            )}
           </div>
         ) : (
           <div className="overflow-x-auto">

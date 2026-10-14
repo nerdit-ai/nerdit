@@ -11,6 +11,8 @@
 export interface NavItem {
   to: string;
   label: string;
+  /** The page's API is admin-only (GET /tokens, /audit); hidden for other roles. */
+  adminOnly?: boolean;
 }
 
 export interface NavGroup {
@@ -22,6 +24,11 @@ export interface NavGroup {
   items: readonly NavItem[];
 }
 
+/** Show admin-only items while the role is unknown, so admins see no flicker. */
+export function navItemVisible(item: NavItem, role: string | undefined): boolean {
+  return !item.adminOnly || role === undefined || role === "admin";
+}
+
 export const navGroups: readonly NavGroup[] = [
   {
     id: "nav",
@@ -31,8 +38,8 @@ export const navGroups: readonly NavGroup[] = [
       { to: "/", label: "Apps" },
       { to: "/models", label: "Models" },
       { to: "/databases", label: "Databases" },
-      { to: "/tokens", label: "Tokens" },
-      { to: "/activity", label: "Activity" },
+      { to: "/tokens", label: "Tokens", adminOnly: true },
+      { to: "/activity", label: "Activity", adminOnly: true },
       { to: "/settings", label: "Settings" }
     ]
   }

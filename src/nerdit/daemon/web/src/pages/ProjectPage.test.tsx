@@ -106,7 +106,7 @@ describe("ProjectRoute", () => {
       expect(calls.some((call) => call.path.startsWith("/services/"))).toBe(false);
 
       routes["/projects/asso"] = ASSO;
-      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
       expect(await screen.findByTestId("project-page")).toBeTruthy();
     }
   );

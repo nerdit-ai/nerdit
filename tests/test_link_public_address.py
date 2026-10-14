@@ -464,7 +464,6 @@ async def test_active_url_survives_offline_private_and_reshare(queries, bound_se
         ("quiet-lake-abcdefgh23.nerdit.app", "current", "admin"),
         ("quiet-lake-abcdefgh23.nerdit.app:443", "current", "public"),
         ("demo--foreign.nodes.test", "current", "public"),
-        ("demo--node.foreign.test", "current", "public"),
         (None, "current", "public"),
     ],
 )
@@ -566,6 +565,64 @@ async def test_historical_alias_requires_existing_pin_and_cloud_job_carriers(
         await resolver.resolve("demo", "demo--unknown.nodes.test", bound_service.job_id, "private")
         is None
     )
+
+
+async def test_custom_domain_needs_cloud_proof_of_the_live_incarnation_and_is_never_pinned(
+    db, queries, bound_service
+):
+    await queries.acquire_service_port("demo", bound_service.job_id, 8000, (14300, 14400))
+    await queries.set_service_share("demo", "private", job_id=bound_service.job_id)
+    resolver = AppStreamResolver(
+        queries, node_id=NODE_ID, slug="node", nodes_base_domain="nodes.test"
+    )
+    current = bound_service.job_id
+    for host in (
+        "app.example.com",
+        "app.example.com:8443",
+        "demo--node.foreign.test",
+        f"{'a' * 63}.example.com",
+        "xn--bcher-kva.example",
+    ):
+        target = await resolver.resolve("demo", host, current, "private")
+        assert target is not None and target.host == host and target.job_id == current
+    for host, job_id, access in (
+        ("app.example.com", None, None),
+        ("app.example.com", None, "private"),
+        ("app.example.com", current, None),
+        ("app.example.com", "stale-job", "private"),
+        ("app.example.com", current, "public"),  # stored share is private
+        (f"{'a' * 64}.example.com", current, "private"),
+        ("-app.example.com", current, "private"),
+        ("app.example.com.", current, "private"),
+        ("App.example.com", current, "private"),
+        ("localhost", current, "private"),
+        ("app.localhost", current, "private"),
+        ("127.0.0.1", current, "private"),
+        ("example", current, "private"),
+        ("nerdit.app", current, "private"),
+        ("nodes.test", current, "private"),
+        ("demo--other.nodes.test", current, "private"),
+        ("evil.nodes.test", current, "private"),
+    ):
+        assert await resolver.resolve("demo", host, job_id, access) is None, host
+    # The query refuses a missing audience itself, not only via the resolver pre-check.
+    assert (
+        await queries.resolve_shared_app(
+            NODE_ID, "demo", "app.example.com", current, None, None, "nodes.test"
+        )
+        is None
+    )
+    # ...and a node that has not learnt its nodes zone yet admits no custom domain.
+    assert (
+        await queries.resolve_shared_app(
+            NODE_ID, "demo", "app.example.com", current, "private", None, None
+        )
+        is None
+    )
+    aliases = await db.conn.execute("SELECT COUNT(*) FROM service_hosted_aliases")
+    assert (await aliases.fetchone())[0] == 0
+    await queries.delete_service_share("demo")
+    assert await resolver.resolve("demo", "app.example.com", current, "private") is None
 
 
 async def test_project_probe_returns_all_service_roles_and_live_publication(queries, bound_service):

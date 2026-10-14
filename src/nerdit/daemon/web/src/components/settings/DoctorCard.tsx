@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { Badge, Button, Mono, Panel, type BadgeTone } from "../ui";
 import { useDoctor } from "../../api/queries";
@@ -21,8 +22,22 @@ function tone(status: DoctorStatus): BadgeTone {
   return TONES[status] ?? "muted";
 }
 
+/** Summary words and emphasis, in display order; a problem count reads louder than "ok". */
+const SUMMARY: [DoctorStatus, (n: number) => string, string][] = [
+  ["ok", () => "ok", "text-muted-foreground"],
+  ["warn", (n) => (n === 1 ? "warning" : "warnings"), "font-medium text-warning-foreground"],
+  ["fail", () => "failed", "font-medium text-destructive"],
+  ["skipped", () => "skipped", "text-subtle-foreground"]
+];
+
 export function DoctorCard() {
   const doctor = useDoctor();
+  const [open, setOpen] = useState(false);
+  const checks = doctor.data?.checks ?? [];
+  const summary = SUMMARY.map(([status, word, className]) => {
+    const n = checks.filter((check) => check.status === status).length;
+    return n > 0 ? { status, text: `${n} ${word(n)}`, className } : null;
+  }).filter((part) => part !== null);
 
   return (
     <Panel
@@ -56,8 +71,24 @@ export function DoctorCard() {
       )}
 
       {doctor.data && (
-        <ul className="divide-y divide-border">
-          {doctor.data.checks.map((check) => {
+        <div className="flex items-center justify-between gap-3 px-4 py-3 text-14">
+          <span data-testid="doctor-summary">
+            {summary.map((part, i) => (
+              <span key={part.status}>
+                {i > 0 && <span className="text-subtle-foreground"> · </span>}
+                <span className={part.className}>{part.text}</span>
+              </span>
+            ))}
+          </span>
+          <Button size="sm" variant="ghost" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+            {open ? "Hide checks" : "Show checks"}
+          </Button>
+        </div>
+      )}
+
+      {doctor.data && open && (
+        <ul className="divide-y divide-border border-t border-border">
+          {checks.map((check) => {
             const muted = check.status === "skipped";
             return (
               <li

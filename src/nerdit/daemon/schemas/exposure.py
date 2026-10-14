@@ -136,6 +136,9 @@ class ShareView(BaseModel):
     """
 
     service_name: str = Field(description="Stable service name")
+    job_id: str = Field(
+        description="The current incarnation's job id: the cloud's proof for a custom domain"
+    )
     access: Literal["private", "public"] = Field(description="Stored exposure mode")
     url: str | None = Field(
         description="The hosted URL, or null while unlinked or awaiting a routable address"

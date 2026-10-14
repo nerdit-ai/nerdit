@@ -185,14 +185,10 @@ export function ServiceShareCard({ endpoint }: { endpoint: ServiceEndpoint | nul
             Your own domain, served by this node. Visitors trust the certificate once by running{" "}
             <Mono className="text-foreground">nerdit trust</Mono>.
           </>
+        ) : isPublic ? (
+          "Anyone with the link can open it."
         ) : (
-          <>
-            Hosted through your Nerdit account, so it works from anywhere with no certificate to
-            trust.{" "}
-            {isPublic
-              ? "Anyone with the link can open it."
-              : "It opens only for the owner of this machine's Nerdit account and the people they allow in the Nerdit App."}
-          </>
+          "Private: only you and the people you let in can open it."
         )}
       </p>
     </Panel>

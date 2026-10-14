@@ -15,8 +15,8 @@ import type { RouteItem } from "../../api/types";
 //     a subdomain route, anything else is the literal path. Tested with `===`,
 //     NEVER truthiness: an empty string is a real route, not a missing one.
 //   * `live` is advisory. `null` means the live Caddy table could not be read,
-//     which renders "–" (unknown) and never "missing"; the page-level
-//     `live_table` tri-state is shown as a caption so the dash is explained.
+//     which renders "–" (unknown) and never "missing"; when the page-level
+//     `live_table` is "unreadable", a caption explains the dash.
 //
 // The first column header is "Name", not "Service": the table lists models and
 // databases too, and neither is an app (design guidelines §3).
@@ -56,12 +56,6 @@ function LiveCell({ live, reason }: { live: RouteItem["live"]; reason: RouteItem
   return <span className="text-muted-foreground">ok</span>;
 }
 
-const LIVE_TABLE_CAPTION: Record<string, string> = {
-  readable: "Live proxy table readable: the live column reflects the running proxy.",
-  unreadable: "Live proxy table unreadable: the live column shows – (unknown), not absent.",
-  disabled: "Proxy off, so there is no live table to read: the live column shows – (unknown)."
-};
-
 const HEADERS = ["Name", "Kind", "Status", "Route", "Address", "Port", "Live"];
 
 export function RoutesCard() {
@@ -72,7 +66,6 @@ export function RoutesCard() {
 
   const items = [...earlier, ...(page.data?.items ?? [])];
   const nextCursor = page.data?.next_cursor ?? null;
-  const liveTable = page.data?.live_table;
 
   function loadMore() {
     if (nextCursor === null) return;
@@ -159,12 +152,12 @@ export function RoutesCard() {
         </div>
       )}
 
-      {liveTable && (
+      {page.data?.live_table === "unreadable" && (
         <p
           data-testid="routes-live-table"
           className="border-t border-border px-4 py-3 text-12 text-subtle-foreground"
         >
-          {LIVE_TABLE_CAPTION[liveTable] ?? `Live table: ${liveTable}`}
+          Live proxy table unreadable: the live column shows – (unknown), not absent.
         </p>
       )}
 

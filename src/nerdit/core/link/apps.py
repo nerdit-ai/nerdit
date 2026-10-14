@@ -16,7 +16,7 @@ logger = logging.getLogger("nerdit.link.apps")
 class ShareLookup(Protocol):
     """Atomic hosted routing query used by both stream admission and revocation."""
 
-    def resolve_shared_app(
+    def resolve_shared_app(  # noqa: PLR0913 - the routing facts of one stream
         self,
         node_id: str,
         service_name: str,
@@ -24,6 +24,7 @@ class ShareLookup(Protocol):
         job_id: str | None,
         access: str | None,
         legacy_host: str | None,
+        nodes_domain: str | None,
     ) -> Awaitable[tuple[str, int, str] | None]:
         """Return the current job, live port and admitted audience, or refuse."""
 
@@ -86,7 +87,7 @@ class AppStreamResolver:
             else None
         )
         result = await self._queries.resolve_shared_app(
-            self._node_id, service_name, authority, job_id, access, legacy_host
+            self._node_id, service_name, authority, job_id, access, legacy_host, self._domain
         )
         if result is None:
             return None

@@ -55,7 +55,7 @@ export function Settings() {
 
   return (
     <div className="mx-auto max-w-content space-y-7">
-      <PageHeader title="Settings" subtitle="This daemon, the machine it runs on, and this browser." />
+      <PageHeader title="Settings" subtitle="Nerdit on this machine, and this browser." />
 
       <AppearanceCard />
 
@@ -74,8 +74,8 @@ export function Settings() {
       <Panel title="Shared secrets" data-testid="shared-secrets-card">
         <div className="px-4 py-4">
           <p className="mb-4 text-14 text-muted-foreground">
-            Referenced with <Mono>{"${secrets.shared.KEY}"}</Mono>, never injected on their own.
-            An app&rsquo;s own secret of the same name wins.
+            Apps reference them as <Mono>{"${secrets.shared.KEY}"}</Mono>; an app&rsquo;s own secret
+            wins. Values are never shown again.
           </p>
           {/* Server-side rule since 0.8.4: a submitter sets shared values, only
               an admin deletes them; mirror it up front. Defaults to admin until

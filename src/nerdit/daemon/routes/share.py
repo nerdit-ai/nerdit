@@ -199,6 +199,7 @@ def _view(
     entry = hosted_entry(hosted, service_name)
     return ShareView(
         service_name=service_name,
+        job_id=job.id,
         access=share.access,
         url=entry.url if entry is not None else None,
         state=hosted_state(hosted, share),
