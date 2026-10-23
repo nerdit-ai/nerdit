@@ -1166,6 +1166,33 @@ async def test_deploy_impl_zips_and_posts(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply", "key"),
+    [
+        ({"name": "demo", "hints": ["async"]}, "hints"),
+        ({"dry_run": True, "warnings": []}, "warnings"),
+    ],
+)
+async def test_deploy_impl_names_what_the_archive_left_out(tmp_path, reply, key):
+    app = tmp_path / "app"
+    (app / "node_modules" / "x").mkdir(parents=True)
+    (app / "node_modules" / "x" / "index.js").write_text("")
+    (app / "package.json").write_text('{"name":"demo"}')
+    (app / ".env").write_text("TOKEN=sk-never-shown")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=reply)
+
+    result = await server._deploy_impl(_client(handler), path=str(app), name="demo")
+    lines = result[key]
+    text = " ".join(lines)
+    assert "node_modules/" in text and ".env" in text
+    assert "sk-never-shown" not in text
+    if key == "hints":
+        assert lines[-1] == "async"
+
+
+@pytest.mark.asyncio
 async def test_deploy_impl_rollback_posts_no_zip():
     seen: dict = {}
 

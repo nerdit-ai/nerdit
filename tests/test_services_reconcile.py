@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from nerdit.config.settings import ContainerSettings, ModelsSettings, ServicesSettings
+from nerdit.core.eventlog import EventRecorder
 from nerdit.core.launch import _RUN_LINE_MAX_BYTES, _RUN_TAIL_MAX_BYTES
 from nerdit.core.models.backend import ModelPullError, OllamaBackend, sanitize_model_name
 from nerdit.core.models.controller import ModelController
@@ -1926,6 +1927,70 @@ class _ConcurrentWriteBuildRuntime(FakeRuntime):
         await self._q.update_job_config(self._job_id, json.dumps(cfg))
         raise ContainerRuntimeError("build failed")
         yield  # pragma: no cover
+
+
+async def test_a_built_generation_whose_image_vanished_waits_for_it(queries, tmp_path):
+    """A woken box restores Docker images after the daemon's first ticks, so the
+    tag reads missing while the row still names the context its build deleted.
+    Rebuilding from that gone dir failed the app terminally (2026-10-18); the
+    row must instead wait for the image, then launch it."""
+    runtime = _FailingBuildRuntime()
+    runtime.missing_images.add("nerdit-app/app:2")
+    controller = _controller(queries, runtime)
+    await queries.create_job(
+        _deploy_svc(
+            "app",
+            version=2,
+            action="redeploy",
+            phase="healthy",
+            ctx=tmp_path / "removed-by-the-build",
+            status=JobStatus.running,
+            container_id="c-old",
+        )
+    )
+
+    for _ in range(5):  # more ticks than the restart budget
+        await controller.reconcile()
+        await _drain_builds(controller)
+
+    row = await queries.get_service_by_name("app")
+    assert "build_image" not in runtime.calls
+    assert runtime.run_configs == []  # held, not crash-looping on a missing image
+    assert row.desired_state == "running"
+    assert _phase(row) == "healthy"
+
+    runtime.missing_images.clear()  # the box finished restoring
+    await controller.reconcile()
+    row = await queries.get_service_by_name("app")
+    assert row.status is JobStatus.restarting  # the ordinary restart path relaunches it
+    await controller.shutdown()
+
+
+class _HangingBuildRuntime(FakeRuntime):
+    """build_image never finishes, so only shutdown can end the build."""
+
+    async def build_image(self, context_dir, image, dockerfile=None):
+        self.calls.append("build_image")
+        await asyncio.Event().wait()
+        yield  # pragma: no cover
+
+
+async def test_a_build_cancelled_by_shutdown_keeps_its_context(queries, tmp_path):
+    """The next boot rebuilds from the kept context; deleting it would read as a
+    finished build whose image is restoring, and the row would wait forever."""
+    runtime = _HangingBuildRuntime()
+    runtime.missing_images.add("nerdit-app/app:1")
+    controller = _controller(queries, runtime)
+    ctx = tmp_path / "ctx"
+    ctx.mkdir()
+    await queries.create_job(_deploy_svc("app", ctx=ctx))
+
+    await controller.reconcile()
+    while "build_image" not in runtime.calls:
+        await asyncio.sleep(0)
+    await controller.shutdown()
+
+    assert ctx.is_dir()
 
 
 async def _drain_builds(controller) -> None:
@@ -3905,3 +3970,137 @@ async def test_collect_logs_writes_one_batch(queries, monkeypatch):
     await controller._collect_logs(job.id, "c1")
     assert batches == [runtime.log_lines]
     assert [e.message for e in await queries.get_logs(job.id)] == runtime.log_lines
+
+
+async def test_a_restart_that_brings_a_failed_generation_back_marks_it_healthy(queries):
+    """After a wake failed a built generation, `restart_service` relaunched its
+    image but `last_deploy` stayed `failed`: wait_for_service answered `failed`
+    and diagnose kept advising a rollback (2026-10-23)."""
+    runtime = FakeRuntime()
+    controller = _controller(queries, runtime)
+    job = _deploy_svc(
+        "app",
+        version=2,
+        action="redeploy",
+        phase="failed",
+        status=JobStatus.restarting,
+        previous_image="nerdit-app/app:1",
+    )
+    cfg = json.loads(job.config)
+    cfg["last_deploy"].update(reason="build_failed", error_class="USER_ERROR")
+    job.config = json.dumps(cfg)
+    job.error_class = ErrorClass.platform_error
+    job.error_message = "Build failed: no BuildKit builder"
+    await queries.create_job(job)
+    controller._events = EventRecorder(queries)
+
+    for _ in range(3):
+        await controller.reconcile()
+
+    row = await queries.get_service_by_name("app")
+    ld = json.loads(row.config)["last_deploy"]
+    assert row.status is JobStatus.running
+    assert ld["phase"] == "healthy"
+    assert ld["reason"] is None
+    assert ld["error_class"] is None
+    # Diagnose and wait read the row columns before `last_deploy`.
+    assert row.error_class is None
+    assert row.error_message is None
+    cur = await queries._db.conn.execute("SELECT type FROM events ORDER BY id")
+    assert [r["type"] for r in await cur.fetchall()] == ["service.healthy"]
+    await controller.shutdown()
+
+
+async def test_a_container_older_than_the_failure_keeps_it_failed(queries):
+    """A container that started before the generation failed is not that
+    generation coming back (a cutover or stripped settle left it serving)."""
+    runtime = FakeRuntime()
+    runtime.live["c-old"] = datetime.now(UTC)
+    controller = _controller(queries, runtime)
+    job = _deploy_svc(
+        "app",
+        version=2,
+        action="redeploy",
+        phase="failed",
+        status=JobStatus.running,
+        container_id="c-old",
+    )
+    job.started_at = datetime.fromisoformat(_LD_TS) - timedelta(hours=1)
+    await queries.create_job(job)
+
+    for _ in range(3):
+        await controller.reconcile()
+
+    assert _phase(await queries.get_service_by_name("app")) == "failed"
+    await controller.shutdown()
+
+
+async def test_a_failed_release_is_never_marked_healthy(queries):
+    """Its migration outcome is unknown, whatever the relaunched container does."""
+    runtime = FakeRuntime()
+    controller = _controller(queries, runtime)
+    job = _deploy_svc(
+        "app", version=2, action="redeploy", phase="failed", status=JobStatus.restarting
+    )
+    cfg = json.loads(job.config)
+    cfg["last_deploy"].update(reason="release_failed")
+    job.config = json.dumps(cfg)
+    await queries.create_job(job)
+
+    for _ in range(3):
+        await controller.reconcile()
+
+    row = await queries.get_service_by_name("app")
+    assert row.status is JobStatus.running
+    assert _phase(row) == "failed"
+    await controller.shutdown()
+
+
+async def test_a_reverted_redeploy_keeps_its_failed_phase(queries):
+    """The revert branch keeps the previous version serving: the failed
+    generation never ran, so it must stay `failed`."""
+    runtime = FakeRuntime()
+    controller = _controller(queries, runtime)
+    job = _deploy_svc(
+        "app",
+        version=2,
+        action="redeploy",
+        phase="failed",
+        status=JobStatus.restarting,
+        previous_image="nerdit-app/app:1",
+    )
+    cfg = json.loads(job.config)
+    cfg.update(image="nerdit-app/app:1", build_version=1)
+    job.config = json.dumps(cfg)
+    await queries.create_job(job)
+
+    for _ in range(3):
+        await controller.reconcile()
+
+    row = await queries.get_service_by_name("app")
+    assert row.status is JobStatus.running
+    assert _phase(row) == "failed"
+    await controller.shutdown()
+
+
+async def test_a_version_matched_stamp_never_lands_on_a_newer_generation(queries, monkeypatch):
+    """A redeploy landing between the stamp's read and its write owns the row."""
+    from nerdit.core.deploy_state import stamp_last_deploy
+
+    job = _deploy_svc("app", version=2, phase="failed")
+    await queries.create_job(job)
+    stale = await queries.get_job(job.id)
+    await queries.patch_job_config(job.id, {"build_version": 3})  # the redeploy
+    real_get_job = queries.get_job
+
+    async def _stale_read(job_id):
+        return stale if job_id == job.id else await real_get_job(job_id)
+
+    monkeypatch.setattr(queries, "get_job", _stale_read)
+    stamped = await stamp_last_deploy(
+        queries, job.id, only_from=("failed",), require_version_match=True, phase="healthy"
+    )
+    monkeypatch.undo()
+
+    assert stamped is False
+    assert _phase(await queries.get_job(job.id)) == "failed"

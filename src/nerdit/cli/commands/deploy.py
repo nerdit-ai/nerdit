@@ -23,6 +23,7 @@ from nerdit.cli.display import (
     render_client_error,
     wait_exit_code,
 )
+from nerdit.config.project import _DISPLAY_UNSAFE_RE
 
 
 def parse_env_pairs(items: list[str]) -> dict[str, str]:
@@ -157,6 +158,15 @@ def _note_skipped_secrets(skipped: list[str]) -> None:
             "[yellow]Not uploaded: .env files[/yellow] [dim](use `nerdit secrets set` "
             "or `nerdit vars set`).[/dim]"
         )
+
+
+def _note_skipped_excluded(skipped: list[str]) -> None:
+    """Name the default-excluded paths left out of the archive, capped at ten."""
+    if skipped:
+        # Names come from the deployed tree: strip terminal and bidi controls.
+        shown = ", ".join(_plain(_DISPLAY_UNSAFE_RE.sub("?", p)) for p in skipped[:10])
+        more = f" (+{len(skipped) - 10} more)" if len(skipped) > 10 else ""
+        console.print(f"[dim]Not uploaded (excluded by default): {shown}{more}[/dim]")
 
 
 def _git_name_default(repo_url: str, subdir: str | None) -> str:
@@ -420,8 +430,10 @@ async def _deploy_async(
 
     console.print(f"[dim]Creating archive of {directory}...[/dim]")
     skipped_secrets: list[str] = []
-    zip_bytes = create_dir_zip(directory, skipped_secrets)
+    skipped_excluded: list[str] = []
+    zip_bytes = create_dir_zip(directory, skipped_secrets, skipped_excluded)
     _note_skipped_secrets(skipped_secrets)
+    _note_skipped_excluded(skipped_excluded)
 
     try:
         # Ask the daemon for its cap only past the local default: an archive

@@ -56,7 +56,7 @@ WorkspaceFiles = Annotated[
     Field(
         description="Workspace-relative path -> that file's full UTF-8 text; a write "
         "replaces the file whole. Paths are relative with no ``..``; ``.git``, "
-        "``node_modules``, ``__pycache__``, ``.venv``, ``data/`` and ``*.pyc`` are "
+        "``node_modules``, ``__pycache__``, ``.venv`` and ``*.pyc`` are "
         "refused, and ``.env`` / ``.env.*`` by name. Text only (NUL or non-UTF-8 is "
         "refused). Caps: 256 KiB per file, 10 MiB and 500 files per workspace."
     ),
@@ -225,24 +225,29 @@ async def deploy_app(
         reported back in the response ``hints``: ``name``, ``port``, ``gpus``,
         ``start``, ``health``, ``health_type`` (``http``|``tcp``),
         ``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,
-        ``auto_deploy``, ``edge_auth``, ``build_settings``. Use ``[deploy.build_settings]``
+        ``auto_deploy``, ``edge_auth``, ``forward_authorization``, ``build_settings``.
+        Use ``[deploy.build_settings]``
         for build overrides, or a Dockerfile for custom builds.
 
         ``release`` runs once inside the new image before traffic moves; if it
         fails the deploy settles ``failed`` and the image reverts, never the data —
         whatever the migration already committed stays, so write idempotent
         migrations. ``cutover`` null = zero-downtime swap
-        when eligible, false = same-port swap. ``env`` values are literal and
-        never resolve ``${secrets.*}``: a secret reaches the app through
-        ``set_secret`` / ``nerdit secrets set`` (injected at launch, overriding
-        an ``env`` key of the same name).
+        when eligible, false = same-port swap. An ``env`` value that is exactly
+        ``${secrets[.shared].KEY}`` or ``${vars[.shared].KEY}`` resolves at launch
+        (unset: 422 ``deploy.env_ref_unresolved``; embedded in text: 422
+        ``deploy.invalid``); other values are literal. ``set_secret`` /
+        ``nerdit secrets set`` still injects at launch and overrides an ``env``
+        key of the same name.
         On a successful non-dry-run deploy the
-        response carries ``summary`` (app/status/version/public_url), ``hints``
+        response carries ``summary`` (app/status/version/public_url; ``summary.public_url`` is the
+        preferred address: trusted domain, then hosted, then local), ``hints``
         (ordered one-liners, never empty) and ``next_step`` (the structured
         follow-up call); a ``dry_run`` plan carries none of the three — read a
         plan's advisories from its ``warnings``. On a node in ``path``
-        proxy mode the app is served at ``/<name>/``, so a frontend must be
-        built with that base path.
+        proxy mode the local URL serves the app at ``/<name>/``, so a frontend
+        reached there must be built with that base path; hosted and domain URLs
+        serve at the root and never need one.
 
         ``build_settings`` overrides
         preset/install/build/start/node_version/package_manager/subdir/public_env.

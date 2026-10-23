@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -71,6 +72,34 @@ def rewrite_vars_ref(value: str | None) -> str | None:
     if value is not None and value.startswith("${vars."):
         return "${secrets." + value[len("${vars.") :]
     return value
+
+
+#: Reserved `${…}` namespaces: a value containing one is a platform reference,
+#: never text an app may receive (ordinary `${VAR:-x}` templates stay untouched).
+ENV_REF_PREFIXES = ("${secrets.", "${vars.", "${github.")
+
+
+def env_ref_problem(env: Mapping[str, str | None] | None) -> str | None:
+    """Return why an app env map holds a malformed reserved reference, else `None`.
+
+    A value using a reserved namespace must be exactly one
+    `${secrets[.shared].KEY}` (or `${vars…}`) reference. The message names the
+    env key only, never its value.
+    """
+    for key, value in (env or {}).items():
+        if value is None or not any(p in value for p in ENV_REF_PREFIXES):
+            continue
+        if "${github." in value:
+            return (
+                f"env {key}: ${{github.installation}} is only valid as a git token_ref, "
+                "not as an app env value."
+            )
+        if not SECRET_REF_RE.fullmatch(rewrite_vars_ref(value) or ""):
+            return (
+                f"env {key}: a ${{secrets.*}} reference must be the whole value: "
+                "${secrets.KEY} or ${secrets.shared.KEY}."
+            )
+    return None
 
 
 # [hooks.<name>] grammar (inbound webhooks). The name maps to the
@@ -374,6 +403,20 @@ class DeployConfig(BaseModel):
     # Like other non-form deployment fields, auth carries forward when omitted.
     # Only an explicit edge_auth=null removes protection; no container restart needed.
     edge_auth: EdgeAuthConfig | None = None
+    # Hand the browser's Authorization to the app on its hosted and cloud custom
+    # domain URLs (the cloud ships it in a carrier header the tunnel mux renames).
+    # Carries forward like cutover; clear it with deploy forward_authorization=null.
+    forward_authorization: bool | None = None
+
+    @model_validator(mode="after")
+    def _check_forward_authorization(self) -> DeployConfig:
+        """Refuse forward_authorization alongside edge_auth, which owns Authorization."""
+        if self.forward_authorization and self.edge_auth is not None:
+            raise ValueError(
+                "Invalid [deploy] forward_authorization: cannot be combined with "
+                "edge_auth, which owns the Authorization header on the local proxy path."
+            )
+        return self
 
     @field_validator("name")
     @classmethod

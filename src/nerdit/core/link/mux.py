@@ -109,6 +109,10 @@ _REQUEST_DROPPED = frozenset({"host", "content-length"})
 APP_HEADER = "x-nerdit-app"
 APP_JOB_HEADER = "x-nerdit-app-job"
 APP_ACCESS_HEADER = "x-nerdit-app-access"
+#: The browser's own Authorization, renamed by the cloud because `authorization`
+#: carries the relay capability on node-link/v1. Consumed here and handed to the
+#: app as `authorization` only when it opted in (`[deploy].forward_authorization`).
+APP_AUTHORIZATION_HEADER = "x-nerdit-app-authorization"
 
 #: The cloud's control-plane carrier (P32 D-P32-2) — the header that marks a
 #: stream as framed by the cloud's own server-side code rather than by a user,
@@ -147,6 +151,7 @@ _APP_REQUEST_DROPPED = frozenset(
         APP_HEADER,
         APP_JOB_HEADER,
         APP_ACCESS_HEADER,
+        APP_AUTHORIZATION_HEADER,
         "x-forwarded-host",
         "forwarded",
         CLOUD_CONTROL_HEADER,
@@ -217,16 +222,29 @@ _SUBMITTER = "submitter"
 
 _BEARER_PREFIX = "Bearer "
 
+#: `nerdit.daemon.auth.TOKEN_PREFIX`, mirrored because `core` must not import `daemon`.
+_DAEMON_TOKEN_PREFIX = "nrd_"
+
 
 def _app_request(
-    frame: OpenStream, target: AppTarget, admission: HookAdmission | None
+    frame: OpenStream,
+    target: AppTarget,
+    admission: HookAdmission | None,
+    authorization: str | None = None,
 ) -> tuple[str, list[Header]]:
-    """The loopback URL and filtered headers an admitted app stream is dialled with."""
+    """Build the loopback URL and filtered headers an admitted app stream is dialled with.
+
+    Args:
+        authorization: The browser credential to hand the app as `authorization`,
+            already vetted by `StreamMux._app_authorization`.
+    """
     headers = [
         (name, value)
         for name, value in frame.headers
         if name.lower() not in HOP_BY_HOP and name.lower() not in _APP_REQUEST_DROPPED
     ]
+    if authorization is not None:
+        headers.append(("authorization", authorization))
     # httpx honours an explicit `Host` over the URL authority
     # (`Request._prepare` uses `setdefault`), so the app sees the name
     # the browser typed while the socket still goes to loopback.
@@ -548,6 +566,25 @@ class StreamMux:
             return False
         return bool(self._ctx.validate_capability(token, _SUBMITTER))
 
+    def _app_authorization(self, frame: OpenStream, target: AppTarget) -> str | None:
+        """Return the browser Authorization an opted-in app may receive, else None.
+
+        A daemon token or this link's capability is never handed to an app, even
+        when the cloud relays one in the carrier.
+        """
+        value = frame.header(APP_AUTHORIZATION_HEADER)
+        if not target.forward_authorization or value is None:
+            return None
+        # Whatever the scheme: the bare value and the credential after it.
+        candidates = (value.strip(), value.strip().partition(" ")[2].strip())
+        if any(
+            c.startswith(_DAEMON_TOKEN_PREFIX) or self._ctx.validate_capability(c, _SUBMITTER)
+            for c in candidates
+            if c
+        ):
+            return None
+        return value
+
     # -- serving -------------------------------------------------------------
 
     async def _serve(self, stream: _Stream) -> None:
@@ -672,6 +709,7 @@ class StreamMux:
             APP_HEADER,
             APP_JOB_HEADER,
             APP_ACCESS_HEADER,
+            APP_AUTHORIZATION_HEADER,
             "x-forwarded-host",
             HOOK_HEADER,
             DELIVERY_HEADER,
@@ -703,7 +741,9 @@ class StreamMux:
             await self._send_refusal(frame, *_HOOK_REFUSALS[503 if admission else 404])
             return
 
-        url, headers = _app_request(frame, target, admission)
+        url, headers = _app_request(
+            frame, target, admission, self._app_authorization(frame, target)
+        )
 
         async def validate_connected_target(event: str, _info: dict[str, object]) -> None:
             # httpcore is pinned: this boundary is AFTER socket acquisition but

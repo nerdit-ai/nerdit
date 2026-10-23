@@ -18,6 +18,7 @@ import os
 import shutil
 import stat
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,13 +38,20 @@ from nerdit.config.app_config import (
     validate_hooks_section,
 )
 from nerdit.config.build import BuildSettings
-from nerdit.config.defaults import ZIP_EXCLUDE_PATTERNS, app_image_repo, app_image_tag
+from nerdit.config.defaults import (
+    ZIP_EXCLUDE_PATTERNS,
+    app_image_repo,
+    app_image_tag,
+    matches_exclude_pattern,
+)
 from nerdit.config.project import (
     _DISPLAY_UNSAFE_RE,
     PROJECT_CONFIG_NAME,
     SECRET_REF_RE,
     DeployConfig,
+    env_ref_problem,
     is_project_declaration,
+    rewrite_vars_ref,
     shared_secret_keys,
     shared_secret_keys_for,
 )
@@ -72,7 +80,7 @@ from nerdit.core.gitsource import (
 from nerdit.core.hooks import default_secret_ref
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.core.project_identity import PRODUCTION
-from nerdit.core.secrets import SHARED_SCOPE, SecretDecryptError
+from nerdit.core.secrets import SHARED_SCOPE, SecretDecryptError, project_storage_name
 from nerdit.core.variables import load_scoped
 from nerdit.daemon.audit import audit_params, record_shared_referenced
 from nerdit.daemon.auth import (
@@ -83,6 +91,7 @@ from nerdit.daemon.auth import (
 )
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.secret_scope import (
+    claim_owned_by_caller,
     name_claimed_error,
     name_taken_error,
     project_owned_by_caller,
@@ -156,6 +165,19 @@ _PATH_MODE_HINT = (
     "(e.g. Vite `base`, CRA `homepage`) or its assets will 404. Subdomain "
     "mode ([proxy].mode = 'subdomain', docs/guide/proxy.md §7) serves the app "
     "at the root of its own hostname and needs no base path."
+)
+# Only where Nerdit itself drops paths (a buildpack build's generated
+# .dockerignore); the paths are sanitized, capped names, never contents.
+_EXCLUDED_PATHS_HINT = (
+    "Nerdit's generated .dockerignore left these out of the build context: "
+    "{paths}. Commit your own .dockerignore to choose what ships."
+)
+# A passthrough Dockerfile that copies a repo data/ to /data loses it at
+# runtime: the implicit data volume is mounted over it.
+_DATA_SHADOW_HINT = (
+    "The build context has a top-level data/ directory and this app mounts its "
+    "data volume at /data, which hides anything the image puts there (WORKDIR / "
+    "or COPY data /data). Keep repo data under the app's WORKDIR or rename it."
 )
 
 # The deploy verbs return the instant the row is written (the build and the
@@ -311,7 +333,8 @@ _DEPLOY_SHAPE_HINT = (
     "absolute container paths), release (a single-line pre-swap command, "
     "<=4096 chars), cutover (false disarms the zero-downtime swap), "
     "auto_deploy (true opts into push-triggered redeploy) and edge_auth "
-    "({user, password = '${secrets.KEY}'}); "
+    "({user, password = '${secrets.KEY}'}), forward_authorization (true hands the "
+    "browser's Authorization to the app on hosted URLs; not with edge_auth); "
     "build_settings (install/build/start/node_version/package_manager/subdir/"
     "public_env); "
     "explicit deploy fields override these values."
@@ -612,6 +635,53 @@ def _dockerignore_patterns() -> list[str]:
     return out
 
 
+def _excluded_context_entries(context_dir: Path) -> list[str]:
+    """List the context paths the generated .dockerignore drops, sanitized and capped.
+
+    Walks top-down and records an excluded directory as ``dir/`` without
+    descending into it, so a large ``node_modules`` costs one entry.
+
+    Returns:
+        Relative display paths, at most `_UNKNOWN_KEY_LOG_LIMIT`, plus a trailing
+        ``(+N more)`` entry past the cap.
+    """
+    found: list[str] = []
+    for root, dirnames, filenames in os.walk(context_dir):
+        rel = Path(root).relative_to(context_dir)
+        dirnames.sort()
+        kept = []
+        for d in dirnames:
+            if matches_exclude_pattern((d,)):
+                found.append(f"{(rel / d).as_posix()}/")
+            else:
+                kept.append(d)
+        dirnames[:] = kept
+        found += [(rel / f).as_posix() for f in sorted(filenames) if matches_exclude_pattern((f,))]
+    shown = [
+        _DISPLAY_UNSAFE_RE.sub("?", p)[:_UNKNOWN_KEY_LOG_MAX_CHARS]
+        for p in found[:_UNKNOWN_KEY_LOG_LIMIT]
+    ]
+    return [*shown, f"(+{len(found) - len(shown)} more)"] if len(found) > len(shown) else shown
+
+
+def _build_context_hints(plan: BuildPlan, context_dir: Path, effective: Effective) -> list[str]:
+    """Advise what the build context loses: generated excludes, or data/ under /data.
+
+    A buildpack build without its own .dockerignore names what Nerdit's generated
+    one drops. A passthrough Dockerfile excludes nothing, so it is warned only
+    when a top-level data/ may be copied to /data, where the data volume hides it.
+    """
+    if plan.dockerfile_text is not None:
+        if _existing_regular_file(context_dir / ".dockerignore"):
+            return []
+        excluded = _excluded_context_entries(context_dir)
+        return [_EXCLUDED_PATHS_HINT.format(paths=", ".join(excluded))] if excluded else []
+    data_path = _resolve_data_volume(effective.deploy_cfg.volumes)[1]
+    if data_path == IMPLICIT_DATA_PATH and (context_dir / "data").is_dir():
+        return [_DATA_SHADOW_HINT]
+    return []
+
+
 def _unsafe_generated_file(filename: str) -> NerditError:
     """The refusal both generated-file writes share. Names the entry, never a path."""
     return NerditError(
@@ -835,6 +905,11 @@ def resolve_effective_fields(
     eff_edge_auth = zip_deploy.get("edge_auth")
     if eff_edge_auth is None and existing is not None:
         eff_edge_auth = prev_cfg.get("edge_auth")
+    # Same `is None` carry-forward: a silent source keeps the opt-in, and only
+    # `deploy forward_authorization=null` clears it.
+    eff_forward_authorization = zip_deploy.get("forward_authorization")
+    if eff_forward_authorization is None and existing is not None:
+        eff_forward_authorization = prev_cfg.get("forward_authorization")
     if gpus is not None:
         eff_gpus = gpus
     elif "gpus" in zip_deploy:
@@ -857,6 +932,7 @@ def resolve_effective_fields(
         cutover=eff_cutover,
         auto_deploy=eff_auto_deploy,
         edge_auth=eff_edge_auth,
+        forward_authorization=eff_forward_authorization,
     )
     # Use the VALIDATED gpus value downstream: DeployConfig coerces lax
     # inputs (e.g. a quoted "2" in the ZIP's nerdit.toml) to int, while the
@@ -949,6 +1025,8 @@ def assemble_build_fields(
     # config API owns deletion (`deploy edge_auth=null`).
     if deploy_cfg.edge_auth is not None:
         build_fields["edge_auth"] = deploy_cfg.edge_auth.model_dump()
+    if deploy_cfg.forward_authorization is not None:
+        build_fields["forward_authorization"] = deploy_cfg.forward_authorization
 
     return build_fields, container_port
 
@@ -1049,6 +1127,12 @@ def compute_overwrote_api_config(
         or _explicit_changed(None, "cutover", effective.deploy_cfg.cutover, prev_cfg.get("cutover"))
         or _explicit_changed(
             None, "auto_deploy", effective.deploy_cfg.auto_deploy, prev_cfg.get("auto_deploy")
+        )
+        or _explicit_changed(
+            None,
+            "forward_authorization",
+            effective.deploy_cfg.forward_authorization,
+            prev_cfg.get("forward_authorization"),
         )
         # `edge_auth` is API-writable on the same PUT surface, so the
         # same visibility rule applies — and it matters more here than for the
@@ -1431,19 +1515,69 @@ async def write_fresh(
         raise exc.to_error() from exc
 
 
-def _deploy_summary(body: dict) -> dict:
-    """Copy the four summary fields from the assembled response without recomputing.
+def _primary_public_url(endpoint: dict) -> str | None:
+    """Pick the address a user should open from the endpoint's ``public_urls``.
 
-    Fresh deployments have no endpoint yet: public_url is null and status reflects
-    pre-launch state.
+    A ready direct domain a browser trusts (an issued certificate, or plain
+    http) wins, then a ready hosted URL, then any other ready domain (one that
+    needs a trust step: internal CA, pending or expired), then the local
+    ``public_url``, then any entry with a URL (a hosted-only lock while the
+    link is down). The daemon never stores cloud custom domains (e.g. a
+    Cloudflare-for-SaaS host), so it cannot name them; the cloud enriches its
+    own deploy reply with those.
     """
-    endpoint = body.get("endpoint") or {}
+    entries = [
+        e for e in endpoint.get("public_urls") or [] if e.get("state") == "ready" and e.get("url")
+    ]
+    for pick in (
+        lambda e: (
+            e.get("kind") == "domain"
+            and (e.get("cert_state") == "issued" or not str(e["url"]).startswith("https://"))
+        ),
+        lambda e: e.get("kind") == "hosted",
+        lambda e: e.get("kind") == "domain",
+    ):
+        for entry in entries:
+            if pick(entry):
+                return entry["url"]
+    if endpoint.get("public_url"):
+        return endpoint["public_url"]
+    return next((e["url"] for e in endpoint.get("public_urls") or [] if e.get("url")), None)
+
+
+def _deploy_summary(body: dict) -> dict:
+    """Project the four at-a-glance summary fields from the assembled response.
+
+    ``public_url`` is the preferred address (see ``_primary_public_url``);
+    ``endpoint.public_url`` keeps its default-kind meaning. Fresh deployments
+    have no endpoint yet: public_url is null and status reflects pre-launch state.
+    """
     return {
         "app": body.get("name"),
         "status": body.get("status"),
         "version": body.get("build_version"),
-        "public_url": endpoint.get("public_url"),
+        "public_url": _primary_public_url(body.get("endpoint") or {}),
     }
+
+
+def _served_at_root(request: Request, body: dict) -> bool:
+    """Whether the app has a hosted or domain URL, both served at the hostname root.
+
+    Presence, not state: a share whose link is down still serves at the root
+    once it is back. The one exception is a `not_entitled` hosted entry while
+    the cloud has recently said no (`fresh_false`): that URL will not serve,
+    so the local base path is the one that matters. Any other entitlement
+    reading is ambiguous and keeps the entry.
+    """
+    entries = (body.get("endpoint") or {}).get("public_urls") or []
+    manager = getattr(request.app.state, "link_manager", None)
+    mirror = getattr(manager, "pro_mirror_state", None)
+    refused = callable(mirror) and mirror() == "fresh_false"
+    return any(
+        e.get("kind") == "domain"
+        or (e.get("kind") == "hosted" and not (refused and e.get("state") == "not_entitled"))
+        for e in entries
+    )
 
 
 def _deploy_hints(
@@ -1452,23 +1586,32 @@ def _deploy_hints(
     unknown_deploy_keys: list[str],
     *,
     failure_detail: str | None = None,
+    context_hints: list[str] | None = None,
+    served_at_root: bool = False,
 ) -> list[str]:
     """Build ordered success advisories, never an error channel.
 
-    Failure detail, when present, leads; ignored input precedes routing advice, and
+    Failure detail, when present, leads; ignored input and build-context hints
+    precede routing advice, and
     an async-progress sentence closes every list. Use only sanitized, bounded key
     names and validated service names, never values. Base-path advice requires live
-    proxy availability and path mode, not an endpoint that fresh deploys lack.
+    proxy availability and path mode, not an endpoint that fresh deploys lack,
+    and is skipped when ``served_at_root`` (a hosted or domain URL exists).
     """
     hints: list[str] = []
     if failure_detail:
         hints.append(_FAILED_STATE_HINT.format(name=name, detail=failure_detail))
     if unknown_deploy_keys:
         hints.append(_unknown_keys_message(unknown_deploy_keys))
+    hints.extend(context_hints or ())
     settings = getattr(request.app.state, "settings", None)
     proxy = getattr(settings, "proxy", None) if settings else None
     proxy_mgr = getattr(request.app.state, "proxy_manager", None)
-    if getattr(proxy, "mode", None) == "path" and bool(getattr(proxy_mgr, "available", False)):
+    if (
+        not served_at_root
+        and getattr(proxy, "mode", None) == "path"
+        and bool(getattr(proxy_mgr, "available", False))
+    ):
         hints.append(_PATH_MODE_HINT.format(name=name))
     hints.append(_ASYNC_DEPLOY_WHY)
     return hints
@@ -1648,6 +1791,20 @@ async def _finalize_deploy(
         if existing is not None:
             require_owner_or_admin(request, existing)
         prev_cfg = parse_job_config(existing) if existing else {}
+        # Before the dry-run return too: a plan must not promise a deploy whose
+        # env reference can never resolve at launch, carried-forward ones included.
+        env_shared_keys = await require_env_refs(
+            request,
+            name,
+            env,
+            carried=prev_cfg.get("env"),
+            existing=existing,
+            project_id=existing.project_id
+            if existing is not None
+            else declared[0].id
+            if declared is not None and declared[0] is not None
+            else None,
+        )
         # Captured BEFORE the redeploy write overwrites the phase
         # object: "the generation you are replacing was failing" is exactly the
         # context a caller redeploying a crash-loop needs, and one line later it
@@ -1822,6 +1979,10 @@ async def _finalize_deploy(
             prev_cfg=prev_cfg,
         )
 
+        # Before the dry-run return so the plan warns exactly what the deploy will.
+        # Off the event loop: the walk is unbounded on a large context.
+        context_hints = await asyncio.to_thread(_build_context_hints, plan, context_dir, effective)
+
         if dry_run:
             # Every validator has run but nothing is persisted; the route
             # wraps this in a 200 (the decorator's 201 is for the real path).
@@ -1841,6 +2002,7 @@ async def _finalize_deploy(
                 unknown_deploy_keys=unknown_deploy_keys,
             )
             body["build"] = preview
+            body["warnings"].extend(context_hints)
             body["warnings"].extend(preview["warnings"])
             cleanup_root = context_root or context_dir
             await asyncio.to_thread(shutil.rmtree, cleanup_root, ignore_errors=True)
@@ -1926,6 +2088,7 @@ async def _finalize_deploy(
             set(shared_secret_keys(ai_spec))
             | set(shared_secret_keys_for(db_spec, ("password",)))
             | set(shared_secret_keys_for(hook_rows, ("secret_ref",)))
+            | set(env_shared_keys)
         )
         if shared_keys:
             await record_shared_referenced(request, name, shared_keys)
@@ -1942,7 +2105,14 @@ async def _finalize_deploy(
             # template / workspace), so all five carry them.
             # `summary` is PROJECTED from `body` — never recomputed.
             "summary": _deploy_summary(body),
-            "hints": _deploy_hints(request, name, unknown_deploy_keys, failure_detail=prev_failure),
+            "hints": _deploy_hints(
+                request,
+                name,
+                unknown_deploy_keys,
+                failure_detail=prev_failure,
+                context_hints=context_hints,
+                served_at_root=_served_at_root(request, body),
+            ),
             # The structured half of the same statement. Machine-shaped so
             # an agent branches on it instead of parsing `hints` prose.
             "next_step": _next_step(name),
@@ -2006,15 +2176,37 @@ _SUBMITTER_CLONE_HINT = (
 )
 
 
-def github_token_absent_error(*, role: TokenRole | None = None) -> NerditError:
+#: Shown when GitHub answers an installation-token clone with an auth challenge:
+#: the token resolved, so the App lost access between the cloud's push and the
+#: clone. Names states only, never the repository or installation.
+_GITHUB_INSTALLATION_REFUSED_HINT = (
+    "GitHub refused the installation token for this repository — the Nerdit GitHub "
+    "App may no longer have access (repository removed from the installation's "
+    "selected repositories, or the app was uninstalled or suspended); re-pick the "
+    "repository for this node in the console"
+)
+
+
+def github_token_absent_error(
+    *, role: TokenRole | None = None, reason: str | None = None
+) -> NerditError:
     """Build the explicit-action GitHub-token absence error.
 
     GitWatch treats this exact 422/code pair as quiet backoff. The caller's role
-    changes only the hint; status, code and detail remain stable. Public-share
-    eligibility does not determine repository authorization.
+    and the absence cause change only the hint; status, code and detail remain
+    stable. Public-share eligibility does not determine repository authorization.
+
+    Args:
+        role: The caller's role; a submitter is sent to the node owner.
+        reason: A secret-free cause from `github_token_absence_reason`; `None`
+            keeps the generic hint.
     """
     if role is TokenRole.submitter:
         hint = _SUBMITTER_PRIVATE_REPO_HINT
+        if reason is not None:
+            hint = f"{reason}; {hint}"
+    elif reason is not None:
+        hint = f"{reason}; or pass a `${{secrets.*}}` token_ref"
     else:
         hint = (
             "link this node and install the Nerdit GitHub App, or pass a `${secrets.*}` token_ref"
@@ -2027,13 +2219,58 @@ def github_token_absent_error(*, role: TokenRole | None = None) -> NerditError:
     )
 
 
-def private_repo_hint(exc: GitSourceError, *, role: TokenRole, had_token: bool) -> str | None:
-    """The clone-failure hint a caller can act on, by role.
+def github_token_absence_reason(app: Any, repo_url: str) -> str:
+    """Explain why `resolve_github_installation_token` returned None.
+
+    Called only on the failure path. Reads the link state and the secret-free
+    mirror summaries, so the sentence carries no token, repository name,
+    installation id or count. The daemon cannot tell "not picked for this node"
+    from "not in the App's selected repositories": both arrive as an absent repo.
+    """
+    manager = getattr(app.state, "link_manager", None)
+    if manager is None or manager.status().state != "connected":
+        return (
+            "this node is not linked to Nerdit Cloud or its link is offline, so no GitHub "
+            "installation token has been pushed — run `nerdit link` and check "
+            "`nerdit doctor`, then retry"
+        )
+    settings = getattr(app.state, "settings", None)
+    github_host = settings.git.github_host if settings is not None else "github.com"
+    if (
+        not installation_token_allowed_for_host(github_host)
+        or github_repo_slug(repo_url, github_host) is None
+    ):
+        return "an installation token is only offered for a github.com owner/name repository URL"
+    if manager.github_installations():
+        return (
+            "the cloud pushed GitHub tokens to this node, but none covers this repository — "
+            "add it to the Nerdit GitHub App installation's selected repositories and pick "
+            "it for this node in the console (Deploy from GitHub does both)"
+        )
+    if manager.github_mirror_held()[0] > 0:
+        return (
+            "the GitHub installation token held by this node expired and the cloud has not "
+            "re-pushed it — retry shortly; if it persists, check `nerdit doctor`"
+        )
+    return (
+        "no GitHub installation token has been pushed to this node — install the Nerdit "
+        "GitHub App on the repository owner, pick the repository for this node in the "
+        "console, and check the account is active"
+    )
+
+
+def private_repo_hint(
+    exc: GitSourceError, *, role: TokenRole, had_token: bool, installation: bool = False
+) -> str | None:
+    """The clone-failure hint a caller can act on, by role and credential kind.
 
     An unauthenticated clone that hit an auth challenge is a private (or
     missing) repository. The stock hint tells the caller to store a token;
     a submitter cannot, so it gets the owner-facing, host-neutral sentence.
+    A refused `${github.installation}` token means the App lost access.
     """
+    if installation and _is_auth_failure(exc):
+        return _GITHUB_INSTALLATION_REFUSED_HINT
     if role is TokenRole.submitter and not had_token and _is_auth_failure(exc):
         return _SUBMITTER_CLONE_HINT
     return exc.hint
@@ -2091,7 +2328,10 @@ async def resolve_git_token(
     if token_ref == GITHUB_INSTALLATION_REF:
         token = resolve_github_installation_token(request.app, repo_url)
         if token is None:
-            raise github_token_absent_error(role=current_principal(request).role)
+            raise github_token_absent_error(
+                role=current_principal(request).role,
+                reason=github_token_absence_reason(request.app, repo_url),
+            )
         return token
     if secrets is None:  # pragma: no cover - always wired in the daemon
         raise NerditError(500, "internal", "Secret manager is not configured.")
@@ -2121,6 +2361,101 @@ async def resolve_git_token(
         assert res.key is not None  # a resolved value implies a parsed key
         await record_shared_referenced(request, name, [res.key])
     return res.value
+
+
+def reject_malformed_env_refs(env: Mapping[str, str | None] | None) -> None:
+    """Refuse an app env value that misuses a reserved `${secrets.|vars.|github.}` namespace.
+
+    Raises:
+        NerditError: 422 `deploy.invalid`, naming the env key only.
+    """
+    problem = env_ref_problem(env)
+    if problem is not None:
+        raise NerditError(
+            422,
+            "deploy.invalid",
+            problem,
+            hint=(
+                "Store the value with `nerdit secrets set` and set the env value to exactly "
+                "${secrets.KEY} or ${secrets.shared.KEY}, or remove the reference."
+            ),
+        )
+
+
+async def require_env_refs(
+    request: Request,
+    name: str,
+    env: Mapping[str, str | None] | None,
+    *,
+    carried: Mapping[str, str] | None = None,
+    existing: Job | None,
+    project_id: str | None,
+) -> list[str]:
+    """Refuse app env references that are malformed or name no stored secret.
+
+    The format check covers the request's `env` only, so an old row's odd
+    literal is not newly refused; the existence check covers the env the
+    deploy will store: `carried` (the previous env) overlaid with `env`, where
+    a null value drops the key, exactly as `write_redeploy` merges it.
+
+    Key names only, under the `_resolve_token_ref` scope rules: the service
+    scope only through an existing row (already owner-checked) or a claim the
+    caller owns, the project scope only when it is the caller's, then the
+    shared scope. An unproven scope is never read, so a miss is no
+    key-existence oracle.
+
+    Returns:
+        The shared keys the env references, for `secret.shared_referenced`.
+
+    Raises:
+        NerditError: 422 `deploy.invalid` (malformed), 422
+            `deploy.env_ref_unresolved` (not set), 500 `secret.decrypt_failed`.
+    """
+    reject_malformed_env_refs(env)
+    refs = {
+        key: match
+        for key, value in {**(carried or {}), **(env or {})}.items()
+        if value is not None
+        and (match := SECRET_REF_RE.fullmatch(rewrite_vars_ref(str(value)) or ""))
+    }
+    if not refs:
+        return []
+    mgr = getattr(request.app.state, "secret_manager", None)
+    queries = request.app.state.queries
+    project = (
+        await queries.get_project(project_id)
+        if project_id is not None
+        else await queries.get_project_by_name(name)
+    )
+    owned = existing is not None or await claim_owned_by_caller(request, name)
+    scoped: set[str] = set()
+    shared: set[str] = set()
+    try:
+        if mgr is not None:
+            if project is not None and project_owned_by_caller(request, project):
+                scoped.update(mgr.list_keys(project_storage_name(project.id)))
+            if owned:
+                scoped.update(mgr.list_keys(name))
+            # A scoped variable named like the env key replaces it at launch
+            # (`_resolve_launch_env`), so its reference is never resolved.
+            refs = {k: m for k, m in refs.items() if k not in scoped}
+            if any(m[1] and m[2] not in scoped for m in refs.values()):
+                shared.update(mgr.list_keys(SHARED_SCOPE))
+    except SecretDecryptError as exc:
+        raise NerditError(500, "secret.decrypt_failed", str(exc)) from exc
+    for env_key, match in refs.items():
+        scope, key = match[1], match[2]
+        if key in scoped or (scope == "shared" and key in shared):
+            continue
+        where = f"--shared {key}" if scope else f"{name} {key}"
+        command = f"nerdit secrets set {where}=..."
+        raise NerditError(
+            422,
+            "deploy.env_ref_unresolved",
+            f"env {env_key} references {match[0]}, which is not set.",
+            hint=f"Set it first with `{command}`, then redeploy.",
+        )
+    return sorted({m[2] for m in refs.values() if m[1] and m[2] not in scoped})
 
 
 async def _resolve_source_token(
@@ -2390,7 +2725,12 @@ async def redeploy_from_source(
                 f"The source repository for '{name}' needs a credential, "
                 "but none is recorded on the service.",
             ) from exc
-        raise NerditError(exc.status_code, exc.code, exc.message, hint=exc.hint) from exc
+        hint = (
+            _GITHUB_INSTALLATION_REFUSED_HINT
+            if token_ref == GITHUB_INSTALLATION_REF and _is_auth_failure(exc)
+            else exc.hint
+        )
+        raise NerditError(exc.status_code, exc.code, exc.message, hint=hint) from exc
 
     # Carry the reference NAME forward so the next redeploy is still unattended
     # (D-P24-14) — never a raw token, which exists only as a local above.

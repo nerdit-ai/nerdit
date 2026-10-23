@@ -32,7 +32,12 @@ from typing import Literal
 
 import httpx
 
-from nerdit.config.project import shared_secret_keys_for
+from nerdit.config.project import (
+    ENV_REF_PREFIXES,
+    SECRET_REF_RE,
+    rewrite_vars_ref,
+    shared_secret_keys_for,
+)
 from nerdit.config.settings import (
     AiGatewaySettings,
     ContainerSettings,
@@ -47,6 +52,7 @@ from nerdit.core.app_build import (
     _sensitive_override_values,
 )
 from nerdit.core.backup import DumpOutputError, _rmtree_staging, _verify_dump_output
+from nerdit.core.bindings.secretref import walk_secret_ref
 from nerdit.core.cutover import CutoverManager
 from nerdit.core.data.backend import DataBackend
 from nerdit.core.data.binding import inject_db_env, resolve_db_bindings
@@ -266,7 +272,7 @@ class LaunchEnvNotReady(Exception):  # noqa: N818 — domain condition, not an e
     Non-terminal, a retry-next-tick signal: the caller logs the wait once and
     defers the launch. `kind` selects the caller's dedupe/log channel:
     `"binding"` → `ServiceController._log_binding_wait`;
-    `"secrets"` / `"shared_secrets"` → `_log_secret_wait`.
+    `"secrets"` / `"shared_secrets"` / `"env_ref"` → `_log_secret_wait`.
     """
 
     def __init__(self, kind: str, message: str) -> None:
@@ -293,6 +299,9 @@ class ResolvedLaunchEnv:
     #: The resolved `[ai.*]` bindings; `gateway` ones are keyless when the caller
     #: asked for no key (`_launch` mints once every launch precondition passed).
     resolved_ai: dict[str, ResolvedBinding] = field(default_factory=dict)
+    #: Config env keys whose value was a resolved `${secrets…}` reference: their
+    #: values are secrets whatever the key is named, so tails scrub them.
+    ref_env_keys: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -2417,11 +2426,14 @@ class ServiceController:
         D-P40-9) ONCE, lazily loads the shared scope only when a
         `${secrets.shared.KEY}` ref is actually unresolved, resolves `[ai.*]`
         then `[db.*]` bindings, and merges the container env (config env ⊕
-        secrets ⊕ injected ai ⊕ injected db ⊕ `PORT`). A decrypt failure or a
-        not-ready binding raises rather than returning — the caller applies the
-        retry-next-tick semantics. Also reports `injected_keys` — the keys the
-        binding resolvers actually produced — for `run_once`'s protected-key
-        overlay.
+        secrets ⊕ injected ai ⊕ injected db ⊕ `PORT`). Whole-value config env
+        refs (`${secrets[.shared].KEY}`, `${vars…}`) resolve with the binding
+        precedence; a missing one, or any reserved reference left in the final
+        env, raises `LaunchEnvNotReady("env_ref")` naming keys and refs only.
+        A decrypt failure or a not-ready binding raises rather than returning —
+        the caller applies the retry-next-tick semantics. Also reports
+        `injected_keys` — the keys the binding resolvers actually produced — for
+        `run_once`'s protected-key overlay.
         """
         # Scoped variables (project < service, D-P40-9), loaded ONCE — shared
         # between binding resolution and the container env. The project scope
@@ -2442,29 +2454,37 @@ class ServiceController:
         db_dict = db_specs if isinstance(db_specs, dict) else {}
         resolved_ai: dict[str, ResolvedBinding] = {}
         resolved_db: dict = {}
-        shared_keys: list[str] = []
+        cfg_env: dict[str, str] = dict(cfg.get("env") or {})
+        # Whole-value `${secrets[.shared].KEY}` / `${vars…}` config env refs; a
+        # key a scoped variable overrides is replaced below and never resolved.
+        env_refs = {
+            key: ref
+            for key, value in cfg_env.items()
+            if key not in secret_env
+            and SECRET_REF_RE.fullmatch(ref := rewrite_vars_ref(str(value)) or "")
+        }
+        # LAZY shared load: _shared is read only when a spec or env value carries
+        # a ${secrets.shared.KEY} ref, so one corrupt shared file blocks only
+        # the services that reference it — never the whole node. A ref whose
+        # KEY is already a service- or project-scope override resolves from secret_env first
+        # (the documented escape hatch), so it does NOT force a shared
+        # decrypt: a fully-overridden service must launch even when _shared is
+        # corrupt/unreadable. Shared refs come from the [ai.*] api_key, the
+        # [db.*] password and the config env.
+        shared_keys = sorted(
+            set(shared_secret_keys_for(ai_dict, ("api_key",)))
+            | set(shared_secret_keys_for(db_dict, ("password",)))
+            | {m[2] for ref in env_refs.values() if (m := SECRET_REF_RE.fullmatch(ref)) and m[1]}
+        )
+        shared_env: dict[str, str] = {}
+        if any(k not in secret_env for k in shared_keys) and self._secrets is not None:
+            try:
+                shared_env = self._secrets.load(SHARED_SCOPE)
+            except SecretDecryptError as exc:
+                raise LaunchEnvNotReady(
+                    "shared_secrets", f"Shared secrets unavailable: {exc}"
+                ) from exc
         if ai_dict or db_dict:
-            # LAZY shared load: _shared is read only when a spec carries a
-            # ${secrets.shared.KEY} ref, so one corrupt shared file blocks only
-            # the services that reference it — never the whole node. A ref whose
-            # KEY is already a service- or project-scope override resolves from secret_env first
-            # (the documented escape hatch), so it does NOT force a shared
-            # decrypt: a fully-overridden service must launch even when _shared is
-            # corrupt/unreadable. Shared refs come from BOTH kinds — the
-            # [ai.*] api_key and the [db.*] password.
-            shared_keys = sorted(
-                set(shared_secret_keys_for(ai_dict, ("api_key",)))
-                | set(shared_secret_keys_for(db_dict, ("password",)))
-            )
-            unresolved_shared = [k for k in shared_keys if k not in secret_env]
-            shared_env: dict[str, str] = {}
-            if unresolved_shared and self._secrets is not None:
-                try:
-                    shared_env = self._secrets.load(SHARED_SCOPE)
-                except SecretDecryptError as exc:
-                    raise LaunchEnvNotReady(
-                        "shared_secrets", f"Shared secrets unavailable: {exc}"
-                    ) from exc
             # AI resolves BEFORE DB so a mixed spec's first BindingNotReady
             # message is deterministic (the log dedupe keys on the message).
             try:
@@ -2511,7 +2531,19 @@ class ServiceController:
         # inject AFTER the secrets merge so platform-computed values override
         # same-named user secrets (Decision #4: users must not hand-override
         # OPENAI_BASE_URL / DATABASE_URL).
-        env = dict(cfg.get("env") or {})
+        env = cfg_env
+        for key, ref in env_refs.items():
+            res = walk_secret_ref(
+                ref, service_env=lambda: secret_env, shared_env=lambda: shared_env
+            )
+            if res.value is None:
+                hint = (
+                    f"nerdit secrets set --shared {res.key}=..."
+                    if res.scope == "shared"
+                    else f"nerdit secrets set <app> {res.key}=..."
+                )
+                raise LaunchEnvNotReady("env_ref", f"env {key}: {ref} is not set — run: {hint}")
+            env[key] = res.value
         env.update(secret_env)
         # Materialize the injected pairs once so their KEYS can be handed
         # to the caller as `injected_keys` — the D-P14-5 protected set derives
@@ -2550,12 +2582,24 @@ class ServiceController:
             and self._proxy_mode == "path"
         ):
             env.setdefault("FORWARDED_ALLOW_IPS", "*")
+        # Backstop: no reserved reference reaches a container as text (embedded
+        # refs, ${github.*}, a variable stored as a ref). Keys only: an
+        # embedded-ref value may also carry a literal credential.
+        leaked = sorted(k for k, v in env.items() if any(p in v for p in ENV_REF_PREFIXES))
+        if leaked:
+            raise LaunchEnvNotReady(
+                "env_ref",
+                f"env {', '.join(leaked)}: unresolved ${{secrets.|vars.|github.}} reference — "
+                "an env value must be exactly ${secrets.KEY} or ${secrets.shared.KEY}; "
+                "fix the app env or variable and redeploy",
+            )
         return ResolvedLaunchEnv(
             env=env,
             secret_env=secret_env,
             shared_keys=shared_keys,
             injected_keys=set(injected),
             resolved_ai=resolved_ai,
+            ref_env_keys=set(env_refs),
         )
 
     def mark_ai_gateway_down(self) -> None:
@@ -3124,11 +3168,57 @@ class ServiceController:
             ),
             phase="healthy",
         )
+        if not stamped and self._relaunched_after_failure(job):
+            # A restart brought the failed generation's own image back: the
+            # generation is healthy again, or wait/diagnose report it failed
+            # forever. `failed` is already terminal, so no second deploy event.
+            stamped = await stamp_last_deploy(
+                self._queries,
+                job.id,
+                only_from=("failed",),
+                require_version_match=True,
+                phase="healthy",
+                reason=None,
+                error_class=None,
+                error_message=None,
+                remediation_code=None,
+            )
+            version = parse_job_config(job).get("build_version")
+            if stamped and isinstance(version, int):
+                await self._queries.clear_job_error(job.id, build_version=version)
         # Edge-triggered on the actual write: this method runs on
         # EVERY reconcile tick of a live service, so emitting unconditionally
         # would put one row per coalescing window on the feed forever.
         if stamped:
             await record_job_event(self._events, "service.healthy", job)
+
+    @staticmethod
+    def _relaunched_after_failure(job: Job) -> bool:
+        """Whether a service's live container was launched on its failed generation's image.
+
+        Excludes the revert branches of `_settle_failed_generation`: they move
+        `image` (and `build_version`) off the failed tag, or keep an older
+        container that started before the failure was stamped.
+        """
+        if job.kind is not JobKind.service or job.started_at is None:
+            return False
+        cfg = parse_job_config(job)
+        ld = cfg.get("last_deploy")
+        if not isinstance(ld, dict) or ld.get("phase") != "failed":
+            return False
+        # A failed release leaves its migration unobserved: never call it healthy.
+        if ld.get("reason") == "release_failed":
+            return False
+        if ld.get("image") is None or ld.get("image") != cfg.get("image"):
+            return False
+        try:
+            failed_at = datetime.fromisoformat(str(ld.get("updated_at")))
+        except ValueError:
+            return False
+        started = job.started_at
+        if started.tzinfo is None or failed_at.tzinfo is None:
+            started, failed_at = started.replace(tzinfo=None), failed_at.replace(tzinfo=None)
+        return started > failed_at
 
     async def _reconcile_live(
         self, job: Job, probes: list[tuple[Job, Coroutine[object, object, None]]]

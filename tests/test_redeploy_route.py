@@ -906,6 +906,8 @@ def _link_manager(
     """Keep link and mirror states explicit while repository grants stay separate."""
     mgr = MagicMock()
     mgr.github_token_for_repo = MagicMock(side_effect=lambda slug: tokens.get(slug))
+    mgr.github_installations = MagicMock(return_value=tuple(tokens))
+    mgr.github_mirror_held = MagicMock(return_value=(len(tokens), None))
     # The auth middleware also consults a wired manager for relay capabilities:
     # an explicit "no" keeps the test bearers resolving as ordinary tokens.
     mgr.validate_capability = MagicMock(return_value=False)
@@ -971,7 +973,8 @@ def test_recorded_github_ref_without_a_token_is_422_before_the_clone(tmp_path, f
     assert body["code"] == "deploy.github_token_absent"
     # The redeploy was posted by the submitter that owns the row (audit A22):
     # it is told who can supply the token, not to do what its role cannot.
-    assert body["hint"].startswith("this token cannot install the Nerdit GitHub App")
+    assert body["hint"].startswith("this node is not linked to Nerdit Cloud")
+    assert "this token cannot install the Nerdit GitHub App" in body["hint"]
     assert "${secrets.shared.GITHUB_TOKEN}" in body["hint"]
     assert not fake_clone.calls
     q.update_service_config_guarded.assert_not_awaited()
@@ -987,7 +990,29 @@ def test_recorded_github_ref_for_a_repo_outside_every_installation_is_422(tmp_pa
     )
     assert resp.status_code == 422
     assert resp.json()["code"] == "deploy.github_token_absent"
+    assert "selected repositories" in resp.json()["hint"]
     assert not fake_clone.calls
+
+
+def test_a_refused_recorded_installation_token_says_the_app_lost_access(tmp_path, monkeypatch):
+    clone = _FakeClone(
+        error=GitSourceError(
+            400,
+            "deploy.git_clone_failed",
+            "git clone failed: remote: Repository not found.",
+            hint="authentication failed — check the token_ref value ...",
+        )
+    )
+    monkeypatch.setattr(deploy_pipeline, "clone_source", clone)
+    source = {**_GIT_SOURCE, "token_ref": "${github.installation}"}
+    app = _make_app(_queries(_git_row(source=source)), tmp_path, secret_manager=_secret_manager({}))
+    app.state.link_manager = _link_manager({"acme/demo": "ghs-x"})
+    resp = TestClient(app, raise_server_exceptions=False).post(
+        "/deploy/demo/redeploy", headers=_auth(SUB_RAW)
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == "deploy.git_clone_failed"
+    assert resp.json()["hint"].startswith("GitHub refused the installation token")
 
 
 async def test_saved_public_env_survives_a_redeploy_from_source(tmp_path, fake_clone):

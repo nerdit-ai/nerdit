@@ -122,8 +122,10 @@ async def _deploy_impl(
 
     from nerdit.cli.upload import create_dir_zip
 
-    zip_bytes = create_dir_zip(directory)
-    return await _call(
+    skipped_secrets: list[str] = []
+    skipped_excluded: list[str] = []
+    zip_bytes = create_dir_zip(directory, skipped_secrets, skipped_excluded)
+    result = await _call(
         client.deploy(
             zip_bytes=zip_bytes,
             _build_settings_checked=True,
@@ -139,6 +141,35 @@ async def _deploy_impl(
             dry_run=dry_run,
         )
     )
+    _note_skipped(result, skipped_secrets, skipped_excluded)
+    return result
+
+
+def _note_skipped(result: Any, secrets: list[str], excluded: list[str]) -> None:
+    """Name what the local archive left out, as the CLI does, in the reply's advisories.
+
+    A dry-run plan gets it in ``warnings``; a deploy gets it in ``hints``
+    before the closing async sentence. Paths only, sanitized and capped at
+    ten; never a file's contents. An error reply is left untouched.
+    """
+    from nerdit.config.project import _DISPLAY_UNSAFE_RE
+
+    if not isinstance(result, dict) or "error" in result:
+        return
+    lines = []
+    for label, paths in (
+        ("Not uploaded (excluded by default)", excluded),
+        ("Not uploaded (.env files; use set_secret)", secrets),
+    ):
+        if paths:
+            shown = ", ".join(_DISPLAY_UNSAFE_RE.sub("?", p)[:200] for p in paths[:10])
+            more = f" (+{len(paths) - 10} more)" if len(paths) > 10 else ""
+            lines.append(f"{label}: {shown}{more}")
+    key = "warnings" if result.get("dry_run") else "hints"
+    advisories = result.get(key)
+    if lines and isinstance(advisories, list):
+        at = len(advisories) - 1 if key == "hints" and advisories else len(advisories)
+        advisories[at:at] = lines
 
 
 async def _deploy_git_impl(
@@ -331,7 +362,8 @@ async def deploy(
         reported back in the response ``hints``: ``name``, ``port``, ``gpus``,
         ``start``, ``health``, ``health_type`` (``http``|``tcp``),
         ``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,
-        ``auto_deploy``, ``edge_auth``, ``build_settings``. Generated Node builds run
+        ``auto_deploy``, ``edge_auth``, ``forward_authorization``, ``build_settings``.
+        Generated Node builds run
         ``scripts.build`` automatically;
         override it through ``[deploy.build_settings]`` or use a Dockerfile.
 
@@ -341,13 +373,15 @@ async def deploy(
         migrations. ``cutover`` null = zero-downtime swap
         when eligible, false = same-port swap.
         On a successful non-dry-run deploy the
-        response carries ``summary`` (app/status/version/public_url), ``hints``
+        response carries ``summary`` (app/status/version/public_url; ``summary.public_url`` is the
+        preferred address: trusted domain, then hosted, then local), ``hints``
         (ordered one-liners, never empty) and ``next_step`` (the structured
         follow-up call); a ``dry_run`` plan and a ``rollback`` response carry
         none of the three — read a plan's advisories from its ``warnings``. On a
-        node in ``path`` proxy mode the app is served at ``/<name>/``, so a
-        frontend must be built with that base
-        path; in ``subdomain`` mode it is served at the root of its own
+        node in ``path`` proxy mode the local URL serves the app at ``/<name>/``,
+        so a frontend reached there must be built with that base path (never for
+        a hosted or domain URL, which serve at the root; the hint is omitted when
+        one exists); in ``subdomain`` mode it is served at the root of its own
         hostname and needs none — read ``capabilities.proxy.mode``.
 
         ``build_settings`` overrides
@@ -440,7 +474,8 @@ async def deploy_git(
         reported back in the response ``hints``: ``name``, ``port``, ``gpus``,
         ``start``, ``health``, ``health_type`` (``http``|``tcp``),
         ``memory_limit``, ``cpu_limit``, ``volumes``, ``release``, ``cutover``,
-        ``auto_deploy``, ``edge_auth``, ``build_settings``. Generated Node builds run
+        ``auto_deploy``, ``edge_auth``, ``forward_authorization``, ``build_settings``.
+        Generated Node builds run
         ``scripts.build`` automatically;
         override it through ``[deploy.build_settings]`` or use a Dockerfile.
 
@@ -450,12 +485,14 @@ async def deploy_git(
         migrations. ``cutover`` null = zero-downtime swap
         when eligible, false = same-port swap.
         On a successful non-dry-run deploy the
-        response carries ``summary`` (app/status/version/public_url), ``hints``
+        response carries ``summary`` (app/status/version/public_url; ``summary.public_url`` is the
+        preferred address: trusted domain, then hosted, then local), ``hints``
         (ordered one-liners, never empty) and ``next_step`` (the structured
         follow-up call); a ``dry_run`` plan carries none of the three — read a
         plan's advisories from its ``warnings``. On a node in ``path``
-        proxy mode the app is served at ``/<name>/``, so a frontend must be
-        built with that base path.
+        proxy mode the local URL serves the app at ``/<name>/``, so a frontend
+        reached there must be built with that base path; hosted and domain URLs
+        serve at the root and never need one.
 
         ``build_settings`` overrides
         preset/install/build/start/node_version/package_manager/subdir/public_env.

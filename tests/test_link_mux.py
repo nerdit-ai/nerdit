@@ -36,6 +36,7 @@ from nerdit.core.link.frames import (
     parse_downlink,
 )
 from nerdit.core.link.mux import (
+    APP_AUTHORIZATION_HEADER,
     APP_HEADER,
     CLOUD_CONTROL_HEADER,
     HOP_BY_HOP,
@@ -1869,3 +1870,61 @@ async def test_no_log_record_carries_a_hook_id_signature_or_body(
     assert logged
     for forbidden in (HOOK_ID, "SIGNATUREVALUE", "HOOKBODYSECRET", "/.nerdit/hooks"):
         assert forbidden not in logged, forbidden
+
+
+# ---------------------------------------------------------------------------
+# [deploy].forward_authorization — the browser's Authorization via its carrier
+# ---------------------------------------------------------------------------
+
+_OPTED_IN = dataclasses.replace(_HOSTED, forward_authorization=True)
+
+
+async def _app_request_headers(target: AppTarget, carriers: list[str]) -> httpx.Headers | None:
+    """Serve one app stream carrying `carriers` and return what the app saw."""
+    app_transport = _BytesTransport(200, [], [b"ok"])
+    ctx, sink = _ctx(
+        httpx.ASGITransport(app=_CountingApp()),
+        resolve_app=_resolver(target),
+        app_transport=app_transport,
+    )
+    mux = StreamMux(ctx)
+    await mux.handle(
+        _app_frame(
+            method="GET", path="/", headers=[(APP_AUTHORIZATION_HEADER, v) for v in carriers]
+        )
+    )
+    await sink.wait(lambda: "stream_response_end" in sink.types())
+    await mux.aclose()
+    return app_transport.requests[0].headers if app_transport.requests else None
+
+
+async def test_an_opted_in_app_receives_the_carrier_as_authorization() -> None:
+    headers = await _app_request_headers(_OPTED_IN, ["Bearer eyJhbGciOi.jwt"])
+
+    assert headers is not None
+    # Exactly the browser value: the relay capability never rides along.
+    assert headers.get_list("authorization") == ["Bearer eyJhbGciOi.jwt"]
+    assert APP_AUTHORIZATION_HEADER not in headers
+
+
+async def test_without_the_opt_in_the_carrier_is_dropped() -> None:
+    headers = await _app_request_headers(_HOSTED, ["Bearer eyJhbGciOi.jwt"])
+
+    assert headers is not None
+    assert "authorization" not in headers
+    assert APP_AUTHORIZATION_HEADER not in headers
+
+
+async def test_a_duplicated_carrier_is_refused_and_never_dials() -> None:
+    assert await _app_request_headers(_OPTED_IN, ["Bearer a", "Bearer b"]) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [f"Bearer nrd_{'a' * 43}", f"bearer {TOKEN}", f"nrd_{'a' * 43}", TOKEN, f"Basic {TOKEN}"],
+)
+async def test_a_daemon_token_or_the_link_capability_is_never_forwarded(value: str) -> None:
+    headers = await _app_request_headers(_OPTED_IN, [value])
+
+    assert headers is not None
+    assert "authorization" not in headers

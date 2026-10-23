@@ -378,8 +378,13 @@ async def clone_for_request(
     ref: str | None,
     subdir: str | None,
     token: str | None,
+    installation: bool = False,
 ) -> tuple[GitSourceInfo, Path]:
     """Shallow-clone into a fresh upload dir under the `[git]` limits.
+
+    Args:
+        installation: The token came from `${github.installation}`, so an auth
+            refusal means the GitHub App lost access to the repository.
 
     Returns:
         The clone info and the clone ROOT (the cleanup target; `info.context_dir`
@@ -398,7 +403,10 @@ async def clone_for_request(
             exc.code,
             exc.message,
             hint=private_repo_hint(
-                exc, role=current_principal(request).role, had_token=token is not None
+                exc,
+                role=current_principal(request).role,
+                had_token=token is not None,
+                installation=installation,
             ),
         ) from exc
     return info, dest_dir
@@ -499,7 +507,12 @@ async def deploy_git(
     )
 
     info, dest_dir = await clone_for_request(
-        request, body.repo_url, ref=body.ref, subdir=body.subdir, token=token
+        request,
+        body.repo_url,
+        ref=body.ref,
+        subdir=body.subdir,
+        token=token,
+        installation=token_ref == GITHUB_INSTALLATION_REF,
     )
 
     # `token_ref` persists the `${…}` reference NAME, never the token, so an

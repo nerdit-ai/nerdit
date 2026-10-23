@@ -17,14 +17,14 @@ from typing import Literal
 from fastapi import APIRouter, Query, Request, Response
 
 from nerdit.core.volumes import VolumeSpecError, service_data_root
-from nerdit.daemon.audit import audit_params
+from nerdit.daemon.audit import audit_params, record_shared_referenced
 from nerdit.daemon.auth import (
     QuotaExceeded,
     require_owner_or_admin,
     require_role,
     require_service_scope,
 )
-from nerdit.daemon.deploy_pipeline import reject_apex_shadow
+from nerdit.daemon.deploy_pipeline import reject_apex_shadow, require_env_refs
 from nerdit.daemon.errors import NerditError
 from nerdit.daemon.limits import _MAX_LOG_TAIL, valid_ts_filter
 from nerdit.daemon.routes.service_diagnose import router as diagnose_router
@@ -149,6 +149,11 @@ async def create_service(request: Request, body: ServiceCreateRequest) -> Servic
     # Fast path for a name another token reserved by setting its secrets
     # (P39); `reserve_service_for_token` re-checks inside its transaction.
     await reject_foreign_claim(request, body.name)
+    # After the claim check: the service scope is read only for a claim the
+    # caller owns, so a miss is no key-existence oracle.
+    env_shared_keys = await require_env_refs(
+        request, body.name, body.env, existing=None, project_id=None
+    )
 
     # SANDBOX-1: script_path bind-mounts a host directory; a non-admin token has
     # no daemon-managed upload path for it in P2 (services are register-only over
@@ -202,6 +207,8 @@ async def create_service(request: Request, body: ServiceCreateRequest) -> Servic
         raise project_owned_error(body.name) from exc
     except QuotaExceeded as exc:
         raise exc.to_error() from exc
+    if env_shared_keys:
+        await record_shared_referenced(request, body.name, env_shared_keys)
 
     # No hosted context here, deliberately: a service that was
     # just created cannot carry a share row. `PUT .../share` requires the

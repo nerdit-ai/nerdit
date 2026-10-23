@@ -22,11 +22,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from nerdit.core.deploy_state import record_deploy_settled, stamp_last_deploy
+from nerdit.core.eventlog import record_job_event
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.core.launch import (
     _SCRUB_MIN_VALUE_LEN,
@@ -175,6 +177,8 @@ def _sensitive_env_values(resolved: "ResolvedLaunchEnv") -> set[str]:
     # Empty values are dropped here rather than downstream: a "" target would
     # splice `***` between every character of every line.
     values = {value for value in resolved.secret_env.values() if value}
+    # A resolved `${secrets…}` env ref is a declared secret under any key name.
+    values.update(v for k in resolved.ref_env_keys if (v := resolved.env.get(k)))
     for key, value in resolved.env.items():
         if value and len(value) >= _SCRUB_MIN_VALUE_LEN and _is_credential_key(key):
             values.add(value)
@@ -270,6 +274,17 @@ class AppImageBuilder:
         # must keep intercepting this predicate.
         if await self._c._needs_build(job):
             if not self._task_in_flight(job.id):
+                cfg = parse_job_config(job, warn=True)
+                if not os.path.isdir(str(cfg["build_context_dir"])):
+                    # `build` removes the context on either outcome, so this
+                    # generation already built and its image went missing
+                    # afterwards (a woken box restores images after boot).
+                    # Rebuilding from nothing fails the app, and launching burns
+                    # the restart budget into crash_loop: hold until it returns.
+                    await self._c._log_secret_wait(
+                        job, f"Waiting for image {cfg['image']} to be present locally"
+                    )
+                    return True
                 # Boot touch-up: a row stuck at phase "building" with
                 # no live build task (e.g. a daemon restart mid-build) regresses
                 # to "queued" — the freshly spawned build re-stamps "building"
@@ -424,6 +439,7 @@ class AppImageBuilder:
         # The build context is only needed for the build itself; drop it on EITHER
         # outcome (success or a failed build) so successive deploys never leak
         # extracted upload dirs.
+        cancelled = False
         try:
             try:
                 # Hold the global build semaphore only for the actual image
@@ -499,8 +515,14 @@ class AppImageBuilder:
             if not await self._run_release(job, image):
                 return
             await self._c._prune_old_images(job)
+        except asyncio.CancelledError:
+            # Shutdown cancelled the build: keep the context so the next boot
+            # rebuilds. A missing context means the build ran (`ensure_built`).
+            cancelled = True
+            raise
         finally:
-            await self.cleanup_context(job, cleanup_dir)
+            if not cancelled:
+                await self.cleanup_context(job, cleanup_dir)
 
     async def _run_release(self, job: Job, image: str) -> bool:
         """Run the built generation's release and contain unexpected task failures.
@@ -1201,6 +1223,7 @@ class AppImageBuilder:
         # never fire on a newer generation's behalf. The crash-loop sibling in
         # `services.py` settles a DIFFERENT, deliberately
         # unguarded scenario and is untouched here.
+        prior_ld = parse_job_config(job).get("last_deploy")
         if not await self._write_terminal_settle(
             job.id,
             target_version=target_version,
@@ -1222,6 +1245,7 @@ class AppImageBuilder:
         # Fixed action on the terminal branch (never `audit_action`): a fresh
         # deploy that never came up is a `service.failed`, whatever killed it.
         await _audit_outcome("service.failed")
+        await self._record_healthy_generation_failed(job, prior_ld, reason, error_class)
         logger.warning("%s for service %s: %s", label, job.service_name or job.id, message)
         # NOT reclaimable — the one branch that keeps the build markers. The
         # row still carries `build_context_dir`, so removing the tag would
@@ -1230,6 +1254,24 @@ class AppImageBuilder:
         # REBUILD, re-executing a migration that already ran once. Keeping the
         # tag keeps layer 3 in charge: it re-settles the restart instead.
         return False
+
+    async def _record_healthy_generation_failed(
+        self, job: Job, prior_ld: object, reason: str, error_class: ErrorClass
+    ) -> None:
+        """Put a terminal settle of an already-healthy generation on the event feed.
+
+        The phase writer emits only a generation's first terminal settle, so a
+        healthy generation failed later (a rebuild on wake) would leave the feed
+        silent. Fixed tokens only, never the failure message.
+        """
+        if isinstance(prior_ld, dict) and prior_ld.get("phase") == "healthy":
+            await record_job_event(
+                self._c._events,
+                "service.failed",
+                job,
+                reason=reason,
+                data={"error_class": error_class.value},
+            )
 
     async def _emit_bypass_settle(self, job: Job, blob: dict) -> None:
         """Emit the terminal deploy event for branches that bypass the phase writer.

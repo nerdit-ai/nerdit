@@ -925,3 +925,39 @@ async def test_domain_removed_reasons_are_distinguishable(db, queries):
     await recorder.record("domain.removed", service_name="demo", reason="service_deleted")
 
     assert [r["reason"] for r in await _all_events(db)] == ["removed", "service_deleted"]
+
+
+async def test_a_healthy_generation_failed_later_records_service_failed(db, queries, tmp_path):
+    """A generation settled ``healthy`` and then failed terminally (a rebuild on
+    wake, 2026-10-23) emits no second deploy event, so ``service.failed`` is the
+    only feed record that the app went down."""
+    from tests.test_services_reconcile import (
+        _controller,
+        _deploy_svc,
+        _drain_builds,
+        _FailingBuildRuntime,
+    )
+
+    runtime = _FailingBuildRuntime()
+    runtime.missing_images.add("nerdit-app/app:2")
+    controller = _controller(queries, runtime)
+    controller._events = EventRecorder(queries)
+    ctx = tmp_path / "ctx"
+    ctx.mkdir()
+    await queries.create_job(
+        _deploy_svc("app", version=2, action="redeploy", phase="healthy", ctx=ctx)
+    )
+
+    eventlog.set_recorder(EventRecorder(queries))
+    try:
+        await controller.reconcile()
+        await _drain_builds(controller)
+    finally:
+        eventlog.set_recorder(None)
+        await controller.shutdown()
+
+    rows = await _all_events(db)
+    assert [r["type"] for r in rows] == ["service.failed"]
+    assert rows[0]["reason"] == "build_failed"
+    assert rows[0]["build_version"] == 2
+    assert json.loads(rows[0]["data"]) == {"error_class": ErrorClass.user_error.value}

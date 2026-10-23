@@ -153,7 +153,7 @@ DEFAULT_LINK_RENEW_MARGIN_S = 120
 DEFAULT_UPLOAD_DIR = Path("~/.nerdit/uploads")
 DEFAULT_MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB
 UPLOAD_WARNING_BYTES = 100 * 1024 * 1024  # 100 MB
-ZIP_EXCLUDE_PATTERNS = {".git", "data/", "*.pyc", "__pycache__", ".venv", "node_modules"}
+ZIP_EXCLUDE_PATTERNS = {".git", "*.pyc", "__pycache__", ".venv", "node_modules"}
 
 
 def matches_exclude_pattern(parts: Sequence[str], *, casefold: bool = False) -> bool:

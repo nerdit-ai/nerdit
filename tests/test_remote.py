@@ -189,7 +189,7 @@ class TestZipCreation:
         assert should_exclude(".git/config") is True
         assert should_exclude("__pycache__/module.cpython-311.pyc") is True
         assert should_exclude("model.pyc") is True
-        assert should_exclude("data/dataset.csv") is True
+        assert should_exclude("data/dataset.csv") is False
         assert should_exclude("train.py") is False
         assert should_exclude("utils/helpers.py") is False
 

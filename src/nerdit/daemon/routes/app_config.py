@@ -85,6 +85,8 @@ _DEPLOY_MUTABLE_KEYS = frozenset(
         # disarm one (`deploy edge_auth=null`); deleting it from nerdit.toml
         # does not. Also absent from _RESTART_DEPLOY_KEYS — see below.
         "edge_auth",
+        # Read per hosted stream by the tunnel mux; no restart needed.
+        "forward_authorization",
     }
 )
 _DEPLOY_IMMUTABLE_KEYS = frozenset({"name", "port"})
@@ -130,6 +132,7 @@ _DEPLOY_TRACKED_KEYS = (
     "cutover",
     "auto_deploy",
     "edge_auth",
+    "forward_authorization",
 )
 
 
@@ -286,6 +289,7 @@ def _build_view(job: Job) -> AppConfigView:
         "auto_deploy": cfg.get("auto_deploy"),
         # the edge-auth declaration, masked like the [ai.*]/[db.*] specs.
         "edge_auth": _redacted_edge_auth(cfg.get("edge_auth")),
+        "forward_authorization": cfg.get("forward_authorization"),
     }
     # api_key is a ${secrets.X} / ${secrets.shared.X} ref by SECRET_REF_RE
     # construction — inherently safe — but still passed through redact_section
@@ -379,6 +383,7 @@ def _merge_deploy(job: Job, cfg: dict, body: dict) -> tuple[dict, list[str]]:
         # `validate_app_config`. A masked `password` would make every no-op
         # write look changed and would then fail the secret-ref validator.
         "edge_auth": cfg.get("edge_auth"),
+        "forward_authorization": cfg.get("forward_authorization"),
     }
     effective = dict(current)
     for key, value in body.items():
@@ -537,6 +542,7 @@ async def put_app_config_section(
         # Raw blob — the ai/db branches below leave this dict as the
         # unchanged baseline, and it feeds the validator + the persist branch.
         "edge_auth": cfg.get("edge_auth"),
+        "forward_authorization": cfg.get("forward_authorization"),
     }
     if section == "deploy":
         eff_deploy, changed = _merge_deploy(job, cfg, body)
@@ -564,6 +570,7 @@ async def put_app_config_section(
             # enforces (user shape, password = ${secrets.KEY} — a literal is a
             # 422 that never echoes it).
             "edge_auth": eff_deploy["edge_auth"],
+            "forward_authorization": eff_deploy["forward_authorization"],
         }
     }
     if merged_ai:
@@ -661,6 +668,10 @@ async def put_app_config_section(
         new_cfg["edge_auth"] = deploy_cfg.edge_auth.model_dump()
     else:
         new_cfg.pop("edge_auth", None)
+    if eff_deploy["forward_authorization"] is not None:
+        new_cfg["forward_authorization"] = deploy_cfg.forward_authorization
+    else:
+        new_cfg.pop("forward_authorization", None)
     # Retargeting the `data` volume must move the wedge-persisted
     # NERDIT_DATA_DIR with it (the deploy path's _ensure_data_volume rule) —
     # otherwise apps following the documented convention keep writing to an

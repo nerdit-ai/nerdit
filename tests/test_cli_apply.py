@@ -188,6 +188,16 @@ async def test_apply_zips_the_folder_under_the_declared_project(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_apply_names_the_default_excluded_paths(tmp_path, monkeypatch):
+    _patch(monkeypatch, APPLIED)
+    (_project_dir(tmp_path) / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "dep.js").write_text("x")
+    with console.capture() as cap:
+        await _apply_async(str(tmp_path))
+    assert "Not uploaded (excluded by default): node_modules/" in cap.get()
+
+
+@pytest.mark.asyncio
 async def test_apply_waiting_for_variables_prints_the_command_and_exits_4(tmp_path, monkeypatch):
     fake = _patch(
         monkeypatch,

@@ -4,6 +4,35 @@ All notable changes to Nerdit are recorded here.
 
 ## Unreleased
 
+## 0.9.2 (2026-10-23)
+
+Applications on a hosted machine come back on their own after the machine
+wakes, their status is reported truthfully around a failure, and application
+settings can now point at your secrets.
+
+- **No more failed applications after a wake.** A hosted machine that woke up
+  could try to rebuild an application whose image was not restored yet, fail,
+  and leave it stopped until someone restarted it. The machine now waits for
+  the image and starts the application as soon as it is back. An application
+  already stopped this way needs one `nerdit services restart <app>`.
+- **Clearer status after such a failure.** Once restarted, an application that
+  runs again is reported healthy instead of failed, the diagnosis no longer
+  claims an older version is still serving when nothing is, and an application
+  that goes down this way now appears in the event feed and its webhooks.
+- **Secret references in application settings.** A setting whose value is
+  exactly `${secrets.KEY}`, `${secrets.shared.KEY}`, `${vars.KEY}` or
+  `${vars.shared.KEY}` now receives the value instead of the text, and a deploy
+  that refers to a value that is not set is refused with a clear error. An
+  application whose stored settings embed such a reference inside a longer
+  value, or refer to a key that is not set, will not restart until it is fixed
+  and redeployed.
+- **`data/` folders are uploaded.** `nerdit deploy` no longer leaves out
+  `data/`; add it to a `.dockerignore` to keep the old behaviour. The CLI now
+  lists what it left out.
+- **The deploy result points at the address to open**, a hosted or custom
+  address when there is one.
+- **Applications can receive the browser's `Authorization` header** on hosted
+  addresses, with `[deploy].forward_authorization = true`.
 ## 0.9.1 (2026-10-13)
 
 Groundwork for custom domains on a machine linked to Nerdit Cloud: a hosted

@@ -19,6 +19,7 @@ import typer
 from nerdit.cli.commands.deploy import (
     _git_name_default,
     _maybe_wait,
+    _note_skipped_excluded,
     _note_skipped_secrets,
     _render_dry_run,
 )
@@ -130,8 +131,10 @@ def _folder_source(path: str | None, max_bytes: int) -> tuple[str, bytes]:
         raise _fail(_plain(str(exc))) from exc
     console.print(f"[dim]Creating archive of {directory}...[/dim]")
     skipped_secrets: list[str] = []
-    zip_bytes = create_dir_zip(directory, skipped_secrets)
+    skipped_excluded: list[str] = []
+    zip_bytes = create_dir_zip(directory, skipped_secrets, skipped_excluded)
     _note_skipped_secrets(skipped_secrets)
+    _note_skipped_excluded(skipped_excluded)
     try:
         check_upload_size(zip_bytes, max_bytes)
     except ValueError as exc:

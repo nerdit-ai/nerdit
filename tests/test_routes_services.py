@@ -3320,3 +3320,46 @@ def test_create_claim_raced_into_the_transaction_returns_409():
     resp = _client(q).post("/services", json=_body(), headers=_auth(SUB_RAW))
     assert resp.status_code == 409
     assert resp.json()["code"] == "service.name_claimed"
+
+
+def test_create_refuses_embedded_env_ref():
+    q = _queries()
+    resp = _client(q).post(
+        "/services", json=_body(env={"AUTH": "Bearer ${secrets.TOKEN}"}), headers=_auth(SUB_RAW)
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "deploy.invalid"
+    assert "env AUTH" in resp.json()["message"]
+
+
+def _env_ref_client(q: AsyncMock, shared: dict[str, str]) -> TestClient:
+    app = _make_app(q, with_audit=True)
+    app.state.secret_manager.list_keys = MagicMock(
+        side_effect=lambda scope: sorted(shared) if scope == "_shared" else []
+    )
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_create_refuses_unset_shared_env_ref():
+    q = _queries()
+    resp = _env_ref_client(q, {}).post(
+        "/services", json=_body(env={"K": "${secrets.shared.STRIPE_KEY}"}), headers=_auth(SUB_RAW)
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "deploy.env_ref_unresolved"
+    q.reserve_service_for_token.assert_not_called()
+
+
+def test_create_audits_shared_env_ref_before_launch():
+    q = _queries()
+    resp = _env_ref_client(q, {"STRIPE_KEY": "sk"}).post(
+        "/services", json=_body(env={"K": "${secrets.shared.STRIPE_KEY}"}), headers=_auth(SUB_RAW)
+    )
+    assert resp.status_code == 201, resp.text
+    rows = [
+        c.kwargs
+        for c in q.insert_audit_log.await_args_list
+        if c.kwargs.get("action") == "secret.shared_referenced"
+    ]
+    assert len(rows) == 1
+    assert json.loads(rows[0]["params_redacted"]) == {"service": "demo", "keys": ["STRIPE_KEY"]}

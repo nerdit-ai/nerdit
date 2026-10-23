@@ -101,6 +101,29 @@ def test_create_dir_zip_includes_app_files_and_applies_excludes(tmp_path):
     assert "stray.pyc" not in names
 
 
+def test_create_dir_zip_ships_data_and_reports_excluded(tmp_path):
+    for rel in ("data/seed.json", "a/data/x.json", "node_modules/p/i.js", "a/__pycache__/m.pyc"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("x")
+    (tmp_path / "node_modules/q.js").write_text("x")
+    skipped: list[str] = []
+
+    zip_bytes = create_dir_zip(tmp_path, skipped_excluded=skipped)
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = set(zf.namelist())
+    assert {"data/seed.json", "a/data/x.json"} <= names
+    assert sorted(skipped) == ["a/__pycache__/", "node_modules/"]
+
+
+def test_note_skipped_excluded_caps_at_ten(capsys):
+    from nerdit.cli.commands.deploy import _note_skipped_excluded
+
+    _note_skipped_excluded([f"d{i}/" for i in range(12)])
+    out = capsys.readouterr().out
+    assert "d9/" in out and "d10/" not in out and "(+2 more)" in out
+
+
 # ---- parse_env_pairs ----
 
 
@@ -886,3 +909,11 @@ def test_dry_run_plan_prints_no_public_env_line_when_empty():
     with console.capture() as cap:
         _render_dry_run({"action": "create", "name": "my-app", "build": {"public_env": {}}})
     assert "public_env" not in cap.get()
+
+
+def test_note_skipped_excluded_strips_terminal_controls(capsys):
+    from nerdit.cli.commands.deploy import _note_skipped_excluded
+
+    _note_skipped_excluded(["evil\x1b[2J\n‮.pyc"])
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "‮" not in out and "evil" in out

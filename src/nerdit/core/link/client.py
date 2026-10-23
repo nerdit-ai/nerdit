@@ -670,6 +670,8 @@ class AppTarget:
     host: str
     job_id: str | None = None
     access: str | None = None
+    #: The app's `[deploy].forward_authorization` opt-in, re-read per stream.
+    forward_authorization: bool = False
 
 
 @dataclass(frozen=True, slots=True)

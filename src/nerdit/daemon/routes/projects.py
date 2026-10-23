@@ -27,7 +27,7 @@ from nerdit.config.project import (
     parse_project_declaration,
 )
 from nerdit.config.redaction import redact_url_userinfo
-from nerdit.core.gitsource import GitSourceInfo, git_source_meta
+from nerdit.core.gitsource import GITHUB_INSTALLATION_REF, GitSourceInfo, git_source_meta
 from nerdit.core.jobconfig import parse_job_config
 from nerdit.core.project_identity import (
     DEFAULT_SERVICE,
@@ -1106,7 +1106,12 @@ async def _read_declaration(
         project_id=row.id if row is not None else None,
     )
     source.info, source.tree = await clone_for_request(
-        request, source.repo_url, ref=source.ref, subdir=None, token=source.token
+        request,
+        source.repo_url,
+        ref=source.ref,
+        subdir=None,
+        token=source.token,
+        installation=source.token_ref == GITHUB_INSTALLATION_REF,
     )
     return _tree_declaration(source.info.context_dir, "repository")
 

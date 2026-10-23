@@ -162,6 +162,7 @@ def test_get_view_projection():
         "auto_deploy": None,
         # P25: the edge-auth declaration — none on this fixture.
         "edge_auth": None,
+        "forward_authorization": None,
     }
     assert view["ai"]["default"]["model"] == "llama3.1:8b"
     assert view["env_keys"] == ["BAZ", "FOO"]  # names only, sorted, no values
@@ -491,6 +492,8 @@ def test_put_deploy_release_is_in_the_tracked_diff_not_the_restart_set():
         "cutover",
         "auto_deploy",
         "edge_auth",
+        # Read by the tunnel mux per stream; the container never sees a change.
+        "forward_authorization",
     }
 
 
@@ -1424,6 +1427,28 @@ def test_put_deploy_edge_auth_null_disarms_it():
     assert r.json()["applied"] is True
     new_cfg = json.loads(q.update_app_config.await_args.args[1])
     assert "edge_auth" not in new_cfg
+
+
+def test_put_deploy_forward_authorization_sets_and_null_clears_without_restart():
+    q = _queries(_app_job())
+    r = _put(_client(q), body={"forward_authorization": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["requires_restart"] is False
+    assert json.loads(q.update_app_config.await_args.args[1])["forward_authorization"] is True
+
+    q = _queries(_app_job(config_extra={"forward_authorization": True}))
+    r = _put(_client(q), body={"forward_authorization": None})
+    assert r.status_code == 200, r.text
+    assert "forward_authorization" not in json.loads(q.update_app_config.await_args.args[1])
+
+
+def test_put_deploy_forward_authorization_is_refused_alongside_edge_auth():
+    q = _queries(_app_job(config_extra={"edge_auth": _EDGE_AUTH}))
+    r = _put(_client(q), body={"forward_authorization": True})
+    assert r.status_code == 422
+    assert r.json()["code"] == "deploy.invalid"
+    assert "APP_PW" not in r.content.decode()
+    q.update_app_config.assert_not_awaited()
 
 
 def test_put_deploy_edge_auth_rejects_a_literal_password_without_echoing_it():

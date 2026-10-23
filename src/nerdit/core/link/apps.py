@@ -25,8 +25,8 @@ class ShareLookup(Protocol):
         access: str | None,
         legacy_host: str | None,
         nodes_domain: str | None,
-    ) -> Awaitable[tuple[str, int, str] | None]:
-        """Return the current job, live port and admitted audience, or refuse."""
+    ) -> Awaitable[tuple[str, int, str, bool] | None]:
+        """Return the current job, live port, admitted audience and opt-in, or refuse."""
 
 
 class AppStreamResolver:
@@ -91,8 +91,10 @@ class AppStreamResolver:
         )
         if result is None:
             return None
-        admitted_job, port, audience = result
-        return AppTarget(service_name, port, authority, admitted_job, audience)
+        admitted_job, port, audience, forward_authorization = result
+        return AppTarget(
+            service_name, port, authority, admitted_job, audience, forward_authorization
+        )
 
 
 __all__ = ["AppStreamResolver", "ShareLookup"]

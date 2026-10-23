@@ -364,6 +364,20 @@ class WorkloadQueries(QueriesBase):
         await self._db.conn.commit()
 
     @_serialized
+    async def clear_job_error(self, job_id: str, *, build_version: int) -> None:
+        """Clear both error columns, which diagnose and wait read before `last_deploy`.
+
+        Only while the row is still on `build_version`, so a newer generation's
+        error survives.
+        """
+        await self._db.conn.execute(
+            "UPDATE jobs SET error_class = NULL, error_message = NULL WHERE id = ? "
+            "AND json_valid(config) AND json_extract(config, '$.build_version') = ?",
+            (job_id, build_version),
+        )
+        await self._db.conn.commit()
+
+    @_serialized
     async def set_job_error_message(self, job_id: str, error_message: str | None) -> None:
         """Set or clear the error message without regressing concurrent lifecycle changes."""
         await self._db.conn.execute(

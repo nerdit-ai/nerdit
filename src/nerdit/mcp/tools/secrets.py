@@ -22,7 +22,7 @@ _SecretsScopeWrite = Annotated[
         "need not exist yet: a set on an undeployed name reserves it for this token until "
         "deployed — or ``shared`` for the global scope (set: unscoped submitter or admin; "
         "delete: admin), read by a service only where a ``${secrets.shared.KEY}`` reference "
-        "is honoured (``ai``/``db``/``edge_auth`` refs, a git ``token_ref``), never via ``env``."
+        "is honoured (``ai``/``db``/``edge_auth`` refs, ``token_ref``, a whole-value ``env``)."
     ),
 ]
 _SecretsScopeRead = Annotated[

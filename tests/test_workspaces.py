@@ -106,7 +106,6 @@ def test_validate_file_path_rejects_the_traversal_matrix(path):
         "__pycache__/m.pyc",
         "x.pyc",
         ".venv/bin/act",
-        "data/db.sqlite",
     ],
 )
 def test_excluded_segments_rejected(path):
@@ -115,7 +114,9 @@ def test_excluded_segments_rejected(path):
     assert exc.value.code == "workspace.excluded_path"
 
 
-@pytest.mark.parametrize("path", ["datafiles/x.txt", "gitthing/.keep", "pycache/x.py"])
+@pytest.mark.parametrize(
+    "path", ["datafiles/x.txt", "gitthing/.keep", "pycache/x.py", "data/db.sqlite"]
+)
 def test_exclusion_near_misses_accepted(path):
     validate_file_path(path)  # widening ZIP_EXCLUDE_PATTERNS must fail here
 
@@ -746,7 +747,7 @@ def test_secret_basename_guard_is_case_insensitive(path):
 
 
 @pytest.mark.parametrize(
-    "path", ["NODE_MODULES/x.js", "a/X.PYC", "__PYCACHE__/m.pyc", "Data/set.csv", ".GIT/config"]
+    "path", ["NODE_MODULES/x.js", "a/X.PYC", "__PYCACHE__/m.pyc", ".VENV/x", ".GIT/config"]
 )
 def test_exclude_guard_is_case_insensitive(path):
     with pytest.raises(WorkspaceError) as exc:
@@ -855,7 +856,7 @@ def test_summary_and_listing_shape_unchanged(tmp_path):
         (".git/config", True),
         ("__pycache__/module.cpython-311.pyc", True),
         ("model.pyc", True),
-        ("data/dataset.csv", True),
+        ("data/dataset.csv", False),
         ("node_modules/x.js", True),
         (".venv/bin/python", True),
         ("train.py", False),
@@ -876,7 +877,7 @@ def test_cli_should_exclude_is_byte_identical(path, excluded):
     ("path", "excluded"),
     [
         (".git/config", True),
-        ("Data/set.csv", True),
+        (".Venv/bin/python", True),
         ("NODE_MODULES/x.js", True),
         ("a/X.PYC", True),
         ("train.py", False),

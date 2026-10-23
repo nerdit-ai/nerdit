@@ -391,7 +391,9 @@ def test_unit_stale_priv_denied_does_not_fire():
         "priv_denied": True,
         "last_crash_at": _CRASH_STALE,
     }
-    code, _ = derive_remediation(_job(), cfg, forensics, BindingWait(), None)
+    code, _ = derive_remediation(
+        _job(status=JobStatus.running), cfg, forensics, BindingWait(), None
+    )
     assert code is RemediationCode.rollback
 
 
@@ -2223,3 +2225,38 @@ def test_unit_settle_code_matches_the_forensics_rules(forensics, reason, expecte
         verdict = _crash_loop_rules("x", forensics, fresh=fresh, crash_loop=reason == "crash_loop")
         assert verdict is not None
         assert verdict[0].value == expected
+
+
+def test_unit_terminal_build_failure_does_not_claim_the_previous_image_serves():
+    """A row still on the failed tag was settled terminally, so nothing serves
+    it; Rule 4 told the operator otherwise (pillbox, 2026-10-20)."""
+    cfg = {
+        "image": "nerdit-app/my-app:4",
+        "last_deploy": _last_deploy(reason="build_failed", image="nerdit-app/my-app:4"),
+        "previous_image": "nerdit-app/my-app:3",
+    }
+    code, detail = derive_remediation(_job(), cfg, {}, BindingWait(), None)
+    assert code is not RemediationCode.rollback
+    assert "still serving" not in detail
+
+
+def test_unit_reverted_build_failure_still_rolls_back():
+    cfg = {
+        "image": "nerdit-app/my-app:3",
+        "last_deploy": _last_deploy(reason="build_failed", image="nerdit-app/my-app:4"),
+        "previous_image": "nerdit-app/my-app:3",
+    }
+    code, _ = derive_remediation(_job(status=JobStatus.running), cfg, {}, BindingWait(), None)
+    assert code is RemediationCode.rollback
+
+
+def test_unit_reverted_row_whose_old_container_stopped_does_not_roll_back():
+    """Reverted, but the previous container has exited since: nothing serves."""
+    cfg = {
+        "image": "nerdit-app/my-app:3",
+        "last_deploy": _last_deploy(reason="build_failed", image="nerdit-app/my-app:4"),
+        "previous_image": "nerdit-app/my-app:3",
+    }
+    code, detail = derive_remediation(_job(status=JobStatus.failed), cfg, {}, BindingWait(), None)
+    assert code is not RemediationCode.rollback
+    assert "still serving" not in detail

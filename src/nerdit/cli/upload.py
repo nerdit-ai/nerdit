@@ -57,11 +57,26 @@ def should_exclude(rel_path: str) -> bool:
     return matches_exclude_pattern(Path(rel_path).parts)
 
 
-def create_dir_zip(directory: str | Path, skipped_secrets: list[str] | None = None) -> bytes:
+def _excluded_top(rel: str) -> str:
+    """Return the shortest excluded prefix of *rel*, ``dir/`` for a directory."""
+    parts = Path(rel).parts
+    for i, part in enumerate(parts):
+        if matches_exclude_pattern((part,)):
+            return "/".join(parts[: i + 1]) + ("/" if i < len(parts) - 1 else "")
+    return rel  # only the symlink target matched
+
+
+def create_dir_zip(
+    directory: str | Path,
+    skipped_secrets: list[str] | None = None,
+    skipped_excluded: list[str] | None = None,
+) -> bytes:
     """Create a ZIP archive of a whole directory.
 
     Zips the directory contents recursively for `nerdit deploy`. Arcnames are
-    relative to the directory root and `ZIP_EXCLUDE_PATTERNS` apply. Symlinks
+    relative to the directory root and `ZIP_EXCLUDE_PATTERNS` apply; the top
+    excluded component of each dropped path (e.g. ``node_modules/``) is
+    appended once to *skipped_excluded* when given. Symlinks
     resolving outside the directory are dropped (they would upload their
     target), and so are `.env` / `.env.*` files, which would be baked into the
     image; their relative paths are appended to *skipped_secrets* when given.
@@ -81,6 +96,10 @@ def create_dir_zip(directory: str | Path, skipped_secrets: list[str] | None = No
             # path must pass the same filters as the link's own name.
             target_rel = str(target.relative_to(base_dir))
             if should_exclude(rel) or should_exclude(target_rel):
+                if skipped_excluded is not None:
+                    top = _excluded_top(rel)
+                    if top not in skipped_excluded:
+                        skipped_excluded.append(top)
                 continue
             if is_secret_basename(rel) or is_secret_basename(target_rel):
                 if skipped_secrets is not None:

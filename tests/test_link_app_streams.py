@@ -125,6 +125,31 @@ async def test_a_shared_running_service_resolves_to_its_live_port_and_hosted_hos
     assert target == AppTarget("demo", 14999, "demo--gpu-box.nodes.test", job.id, "private")
 
 
+async def test_the_resolver_carries_the_persisted_forward_authorization_opt_in(
+    queries,  # noqa: ANN001
+) -> None:
+    """Read per stream from the job row, so turning it off applies at once."""
+    job = await _seed_service(queries, "demo")
+    await _seed_endpoint(queries, job)
+    await queries.set_service_share("demo", "private", job_id=job.id)
+    resolver = _resolver(queries)
+    assert (
+        await resolver.resolve("demo", "demo--gpu-box.nodes.test")
+    ).forward_authorization is False
+
+    for stored, expected in (("true", True), ('"true"', False), ("1", False), ("false", False)):
+        await queries.update_job_config(job.id, f'{{"forward_authorization": {stored}}}')
+        target = await resolver.resolve("demo", "demo--gpu-box.nodes.test")
+        assert target is not None
+        assert target.forward_authorization is expected, stored
+
+    # A malformed blob degrades to "not opted in" rather than refusing the stream.
+    await queries.update_job_config(job.id, "{not json")
+    target = await resolver.resolve("demo", "demo--gpu-box.nodes.test")
+    assert target is not None
+    assert target.forward_authorization is False
+
+
 async def test_an_ordinary_endpoint_resolves_to_its_reserved_port(queries) -> None:  # noqa: ANN001
     job = await _seed_service(queries, "demo")
     reserved = await _seed_endpoint(queries, job)

@@ -242,6 +242,7 @@ def test_capabilities_admin_has_paths_and_admin_addr():
     assert body["features"]["variables"] is True
     # (P40d) Constant true: the apply route does not exist before P40d.
     assert body["features"]["project_apply"] is True
+    assert body["features"]["app_authorization_v1"] is True
     # (Lot 5) Constant true: an older daemon 422s `hosted_only` on PUT share.
     assert body["features"]["hosted_only_shares"] is True
     # Constant true: `project` / `service` on a deploy body 422 before this build.

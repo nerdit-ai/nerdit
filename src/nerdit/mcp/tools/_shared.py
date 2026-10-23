@@ -149,10 +149,11 @@ Cursor = Annotated[
 DeployEnv = Annotated[
     dict[str, str | None] | None,
     Field(
-        description="Runtime env for the container: values are literal strings, never "
-        "resolved (a ``${secrets.*}`` reference is passed through as text); a null "
-        "value deletes that key on redeploy. Secrets go through ``set_secret``, "
-        "which overrides an ``env`` key of the same name at launch."
+        description="Runtime env for the container. A value that is exactly "
+        "``${secrets[.shared].KEY}`` or ``${vars[.shared].KEY}`` resolves at launch; an "
+        "unset one fails the deploy (``deploy.env_ref_unresolved``), one embedded in "
+        "text is refused (``deploy.invalid``). Other values are literal; null deletes "
+        "the key on redeploy. ``set_secret`` overrides an ``env`` key of the same name."
     ),
 ]
 DeployPort = Annotated[

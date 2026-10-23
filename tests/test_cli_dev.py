@@ -158,7 +158,6 @@ def test_excluded_paths_do_not_trigger_a_deploy(tmp_path, monkeypatch):
             lambda: _write(tmp_path, "node_modules/dep/index.js", "1"),
             lambda: _write(tmp_path, "__pycache__/app.cpython-311.pyc", "1"),
             lambda: _write(tmp_path, ".git/objects/ab/cdef", "1"),
-            lambda: _write(tmp_path, "data/blob.bin", "1"),
             None,
             None,
         ],

@@ -167,11 +167,18 @@ class ShareQueries(QueriesBase):
         access: str | None,
         legacy_host: str | None,
         nodes_domain: str | None,
-    ) -> tuple[str, int, str] | None:
-        """Validate a single committed incarnation, audience, endpoint and authority."""
+    ) -> tuple[str, int, str, bool] | None:
+        """Validate a single committed incarnation, audience, endpoint and authority.
+
+        Returns:
+            The job id, live port, admitted audience and the job's persisted
+            `forward_authorization` opt-in, or None to refuse.
+        """
         cursor = await self._db.conn.execute(
             "SELECT j.id, s.access, COALESCE(e.active_host_port, e.host_port) AS port, "
-            "a.slug, a.active FROM jobs j "
+            "a.slug, a.active, CASE WHEN json_valid(j.config) "
+            "THEN json_type(j.config, '$.forward_authorization') END IS 'true' AS fwd_auth "
+            "FROM jobs j "
             "JOIN service_shares s ON s.service_name = j.service_name "
             "JOIN service_endpoints e ON e.service_name = j.service_name AND e.job_id = j.id "
             "LEFT JOIN service_public_addresses a ON a.job_id = j.id "
@@ -228,7 +235,7 @@ class ShareQueries(QueriesBase):
                 )
             ):
                 return None
-        return row["id"], row["port"], access or row["access"]
+        return row["id"], row["port"], access or row["access"], bool(row["fwd_auth"])
 
     @_serialized
     async def clear_service_public_addresses(self) -> None:

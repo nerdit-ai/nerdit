@@ -148,7 +148,10 @@ class BuildSettings(BaseModel):
                 raise ValueError(
                     "public_env values must be single lines of at most 4096 characters."
                 )
-            if "${secrets." in item or "${vars." in item or "${github." in item:
+            # Deferred: config.project imports this module.
+            from nerdit.config.project import ENV_REF_PREFIXES
+
+            if any(p in item for p in ENV_REF_PREFIXES):
                 raise ValueError(
                     "public_env values are embedded in public build output; secret references "
                     "are not allowed."

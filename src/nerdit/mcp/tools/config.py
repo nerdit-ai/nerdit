@@ -255,10 +255,12 @@ async def get_app_config(name: _AppName) -> Any:
         traffic moves (a failure aborts the deploy and reverts the image,
         never the data — write idempotent migrations); ``deploy.cutover`` null =
         zero-downtime swap when eligible, false = same-port swap. ``env_keys``
-        are literal runtime env names; secret refs are accepted only by
-        ``ai.*.api_key``, ``db.*.password``, ``edge_auth.password`` and a git
-        ``token_ref`` — a ``${secrets.shared.KEY}`` there resolves at launch for
-        any owner, so a human can place the secret and the agent only names it.
+        are runtime env names; secret refs are accepted only by
+        ``ai.*.api_key``, ``db.*.password``, ``edge_auth.password``, a git
+        ``token_ref`` and a whole-value app ``env`` entry
+        (``${secrets[.shared].KEY}`` / ``${vars[.shared].KEY}``) — a
+        ``${secrets.shared.KEY}`` there resolves at launch for any owner, so a
+        human can place the secret and the agent only names it.
         """
         return await _get_app_config_impl(_request_client(), name)
 

@@ -484,6 +484,18 @@ def test_deploy_passthrough_dockerfile_no_generated_dockerignore(tmp_path):
     assert not (Path(cfg["build_context_dir"]) / ".dockerignore").exists()
 
 
+def test_passthrough_dockerfile_hints_no_exclusion_but_data_shadow(tmp_path):
+    """A passthrough build excludes nothing; a top-level data/ warns about /data."""
+    q = _queries()
+    files = {"Dockerfile": 'FROM scratch\nCMD ["true"]\n', "node_modules/x.js": "x"}
+    hints = _post(_client(q, tmp_path), _zip(files)).json()["hints"]
+    assert not any("dockerignore" in h or "/data" in h for h in hints)
+
+    files["data/seed.json"] = "{}"
+    hints = _post(_client(_queries(), tmp_path), _zip(files)).json()["hints"]
+    assert any("COPY data /data" in h for h in hints)
+
+
 def test_fresh_deploy_response_has_no_rollback(tmp_path):
     """A first deploy exposes build_version=1 and no rollback target (P6, D3)."""
     q = _queries()
@@ -3127,6 +3139,25 @@ def test_silent_redeploy_carries_edge_auth_forward(tmp_path):
     assert cfg["build_version"] == 2
 
 
+def test_silent_redeploy_carries_forward_authorization_forward(tmp_path):
+    q = _queries(_redeploy_existing({"forward_authorization": True}))
+    resp = _post(_client(q, tmp_path), _node_zip())
+    assert resp.status_code == 201, resp.text
+    assert _written_cfg(q)["forward_authorization"] is True
+
+
+def test_forward_authorization_with_edge_auth_is_refused_without_values(tmp_path):
+    toml = _EDGE_AUTH_TOML.replace(
+        "[deploy.edge_auth]", "forward_authorization = true\n[deploy.edge_auth]"
+    )
+    q = _queries()
+    resp = _post(_client(q, tmp_path), _node_ai_zip(toml))
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "deploy.invalid"
+    assert "forward_authorization" in resp.json()["message"]
+    assert "APP_PW" not in resp.text
+
+
 def test_zip_edge_auth_beats_the_prior_row_value(tmp_path):
     """Precedence, leg 1: the repo's own ``[deploy].edge_auth`` wins."""
     existing = _redeploy_existing({"edge_auth": {"user": "old", "password": "${secrets.OLD_PW}"}})
@@ -3336,6 +3367,105 @@ def test_path_mode_emits_no_base_path_hint_when_the_proxy_is_unavailable(tmp_pat
     resp = _post(_proxy_client(q, tmp_path, mode="path", available=False), _node_zip())
     assert resp.status_code == 201, resp.text
     assert resp.json()["hints"] == [_ASYNC_HINT]
+
+
+def _exposed_client(q: AsyncMock, tmp_path, monkeypatch, ctx) -> TestClient:
+    """A live path-mode client whose deploy sees ``demo``'s endpoint and ``ctx`` exposure."""
+    from nerdit.daemon import deploy_pipeline
+    from nerdit.db.models import ServiceEndpoint
+
+    q.get_service_endpoint = AsyncMock(
+        return_value=ServiceEndpoint(
+            service_name="demo", job_id="svc-1", container_port=8000, host_port=9400, route="/demo"
+        )
+    )
+    monkeypatch.setattr(deploy_pipeline, "load_hosted_context", AsyncMock(return_value=ctx))
+    client = _proxy_client(q, tmp_path, mode="path", available=True)
+    proxy = client.app.state.settings.proxy
+    proxy.scheme, proxy.https_port, proxy.public_port, proxy.base_domain = "https", 443, None, None
+    client.app.state.hostname = "box"
+    return client
+
+
+def test_shared_app_in_path_mode_gets_no_base_path_hint(tmp_path, monkeypatch):
+    """(a) A hosted entry serves the app at the root: the /<name>/ base-path advice is wrong."""
+    from tests.test_public_urls import _ctx, _share
+
+    q = _queries()
+    client = _exposed_client(q, tmp_path, monkeypatch, _ctx(shares={"demo": _share()}))
+    resp = _post(client, _node_zip())
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["hints"] == [_ASYNC_HINT]
+
+
+@pytest.mark.parametrize(("mirror", "hinted"), [("fresh_false", True), ("never", False)])
+def test_refused_public_share_keeps_the_base_path_hint(tmp_path, monkeypatch, mirror, hinted):
+    """A public share the cloud just refused never serves: /<name>/ is the URL that works."""
+    from types import SimpleNamespace
+
+    from tests.test_public_urls import _ctx, _share
+
+    q = _queries()
+    client = _exposed_client(q, tmp_path, monkeypatch, _ctx(shares={"demo": _share("public")}))
+    client.app.state.link_manager = SimpleNamespace(
+        validate_capability=lambda token, role: False, pro_mirror_state=lambda: mirror
+    )
+    body = _post(client, _node_zip()).json()
+    assert body["endpoint"]["public_urls"][-1]["state"] == "not_entitled", body["endpoint"]
+    assert any("'path' proxy mode" in h for h in body["hints"]) is hinted, body["hints"]
+
+
+def test_summary_public_url_prefers_the_ready_hosted_url(tmp_path, monkeypatch):
+    """(b) summary names the hosted URL; endpoint.public_url stays the local default."""
+    from tests.test_public_urls import HOSTED_URL, _ctx, _share
+
+    q = _queries()
+    client = _exposed_client(q, tmp_path, monkeypatch, _ctx(shares={"demo": _share()}))
+    body = _post(client, _node_zip()).json()
+    assert body["endpoint"]["public_url"] == "https://box/demo/"
+    assert body["summary"]["public_url"] == HOSTED_URL
+
+
+def test_summary_public_url_prefers_a_ready_domain(tmp_path, monkeypatch):
+    """(c) A live direct domain with an issued certificate outranks hosted and local."""
+    from nerdit.core.proxy.certs import CertStatus
+    from tests.test_public_urls import _ctx, _domain, _share
+
+    ctx = _ctx(
+        shares={"demo": _share()},
+        domains={"demo": (_domain("app.example.com", acme=True),)},
+        cert_states={"app.example.com": CertStatus("issued")},
+    )
+    body = _post(_exposed_client(_queries(), tmp_path, monkeypatch, ctx), _node_zip()).json()
+    kinds = {e["kind"]: e for e in body["endpoint"]["public_urls"]}
+    assert kinds["domain"]["state"] == "ready", kinds
+    assert body["summary"]["public_url"] == kinds["domain"]["url"]
+    assert body["hints"] == [_ASYNC_HINT]
+
+
+@pytest.mark.parametrize("cert", ["pending", "internal", "expired", "disabled"])
+def test_summary_public_url_skips_an_untrusted_domain_for_hosted(tmp_path, monkeypatch, cert):
+    """A ready domain whose certificate a browser does not trust yet loses to hosted."""
+    from nerdit.core.proxy.certs import CertStatus
+    from tests.test_public_urls import HOSTED_URL, _ctx, _domain, _share
+
+    ctx = _ctx(
+        shares={"demo": _share()},
+        domains={"demo": (_domain("app.example.com", acme=True),)},
+        cert_states={"app.example.com": CertStatus(cert)},  # type: ignore[arg-type]
+    )
+    body = _post(_exposed_client(_queries(), tmp_path, monkeypatch, ctx), _node_zip()).json()
+    kinds = {e["kind"]: e for e in body["endpoint"]["public_urls"]}
+    assert kinds["domain"]["state"] == "ready", kinds
+    assert body["summary"]["public_url"] == HOSTED_URL
+
+
+def test_summary_public_url_untrusted_domain_still_beats_local(tmp_path, monkeypatch):
+    from tests.test_public_urls import _ctx, _domain
+
+    ctx = _ctx(domains={"demo": (_domain("app.example.com"),)})
+    body = _post(_exposed_client(_queries(), tmp_path, monkeypatch, ctx), _node_zip()).json()
+    assert body["summary"]["public_url"] == "https://app.example.com/"
 
 
 def test_unknown_deploy_key_is_surfaced_as_a_hint(tmp_path):
@@ -3730,3 +3860,25 @@ def test_redeploy_never_reads_the_claim(tmp_path):
     resp = _post(_client(q, tmp_path), _node_zip())
     assert resp.status_code == 201, resp.text
     q.get_secret_claim.assert_not_awaited()
+
+
+def test_build_context_walk_runs_off_the_event_loop(tmp_path, monkeypatch):
+    """The context walk is unbounded on a large repo: it must not block the loop."""
+    import asyncio
+
+    from nerdit.daemon import deploy_pipeline
+
+    seen: list[bool] = []
+
+    def probe(*_args):  # noqa: ANN202
+        try:
+            asyncio.get_running_loop()
+            seen.append(True)
+        except RuntimeError:
+            seen.append(False)
+        return []
+
+    monkeypatch.setattr(deploy_pipeline, "_build_context_hints", probe)
+    resp = _post(_client(_queries(), tmp_path), _node_zip())
+    assert resp.status_code == 201, resp.text
+    assert seen == [False]

@@ -47,6 +47,7 @@ def test_public_source_keeps_tests_and_excludes_website_docs(tmp_path):
         "NOTICE",
         "SECURITY.md",
         "CODE_OF_CONDUCT.md",
+        "glama.json",
         "CHANGELOG.md",
         ".gitignore",
     ):

@@ -82,7 +82,14 @@ async def stamp_last_deploy(
         and getattr(row.kind, "value", row.kind) == "service"
     ):
         new_ld["remediation_code"] = settle_remediation_code(cfg, new_ld)
-    if not await queries.patch_job_config(job_id, {"last_deploy": new_ld}):
+    # The version match is re-checked at write time: a redeploy landing between
+    # the read and the write owns the row and must not get this stamp.
+    expect = ld.get("version") if require_version_match else None
+    if not await queries.patch_job_config(
+        job_id,
+        {"last_deploy": new_ld},
+        expect_build_version=expect if isinstance(expect, int) else None,
+    ):
         return False
 
     # Durable settle event — STRICTLY after the real write, past

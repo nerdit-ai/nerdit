@@ -59,6 +59,7 @@ def validate_deploy_fields(
     # blob (a ZIP's nerdit.toml table, a PUT body value, or a persisted config
     # key) and EdgeAuthConfig is the thing that decides whether it is one.
     edge_auth: Any = None,
+    forward_authorization: bool | None = None,
 ) -> DeployConfig:
     """Validate effective deployment fields with DeployConfig.
 
@@ -81,6 +82,7 @@ def validate_deploy_fields(
             cutover=cutover,
             auto_deploy=auto_deploy,
             edge_auth=edge_auth,
+            forward_authorization=forward_authorization,
         )
     except ValidationError as exc:
         raise NerditError(
@@ -96,7 +98,8 @@ def validate_deploy_fields(
                 "release a single-line command (<=4096 chars); "
                 "cutover/auto_deploy booleans (null = daemon default); "
                 "edge_auth = {user = '<name>', password = '${secrets.KEY}'} "
-                "(a secret reference, never a literal password)."
+                "(a secret reference, never a literal password); "
+                "forward_authorization a boolean, not combined with edge_auth."
             ),
         ) from exc
 
@@ -320,6 +323,7 @@ async def validate_app_config(
         cutover=deploy.get("cutover"),
         auto_deploy=deploy.get("auto_deploy"),
         edge_auth=deploy.get("edge_auth"),
+        forward_authorization=deploy.get("forward_authorization"),
     )
     ai_section = effective_doc.get("ai")
     bindings: dict[str, AiBindingConfig] | None = None

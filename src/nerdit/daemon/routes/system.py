@@ -530,6 +530,9 @@ async def get_capabilities(request: Request) -> dict[str, Any]:
             # Constant ``True``: `/services/{name}/hooks` is a plain 404 on an
             # older daemon; the console shows Update this machine.
             "inbound_hooks": True,
+            # Constant ``True``: this daemon consumes `x-nerdit-app-authorization`
+            # (never forwarded as-is), so the cloud may send it.
+            "app_authorization_v1": True,
         },
     }
     if is_admin:

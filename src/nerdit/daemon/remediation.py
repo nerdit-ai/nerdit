@@ -477,11 +477,21 @@ def derive_remediation(  # noqa: PLR0913 - one parameter per LOCKED input class
     # generation never surfaces a prior one's error), leaving the class only in
     # `config['last_deploy']`.
     ld_class = last_deploy.get("error_class") if last_deploy else None
+    # Only the revert branch of `_settle_failed_generation` leaves the previous
+    # version serving, and it points `image` back off the failed tag. A row
+    # still on that tag was settled terminally, and a reverted row whose old
+    # container has since stopped serves nothing either.
+    ld_image = last_deploy.get("image") if last_deploy else None
+    previous_serving = (
+        bool(cfg.get("previous_image"))
+        and (ld_image is None or ld_image != cfg.get("image"))
+        and job.status in (JobStatus.running, JobStatus.degraded, JobStatus.restarting)
+    )
     if job.error_class is ErrorClass.platform_error or ld_class == ErrorClass.platform_error.value:
         roll = (
             f" The previous image is still serving; POST /deploy/{name}/rollback "
             "restores it meanwhile."
-            if cfg.get("previous_image")
+            if previous_serving
             else ""
         )
         # COUPLING: `ErrorClass.platform_error` is generic ("a HOST fault"),
@@ -511,7 +521,7 @@ def derive_remediation(  # noqa: PLR0913 - one parameter per LOCKED input class
         )
 
     # Rule 4 — a redeploy build failure with a rollback target still serving.
-    if reason == "build_failed" and action == "redeploy" and cfg.get("previous_image"):
+    if reason == "build_failed" and action == "redeploy" and previous_serving:
         version = last_deploy.get("version") if last_deploy else None
         vtag = f" v{version}" if isinstance(version, int) else ""
         return (

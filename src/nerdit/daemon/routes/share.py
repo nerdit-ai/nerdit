@@ -207,6 +207,7 @@ def _view(
         origin=_origin(job),
         hosted_only=share.hosted_only,
         local_routes=local_routes,
+        forward_authorization=parse_job_config(job).get("forward_authorization") is True,
     )
 
 

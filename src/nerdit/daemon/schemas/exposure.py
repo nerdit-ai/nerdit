@@ -163,6 +163,13 @@ class ShareView(BaseModel):
             "then)"
         ),
     )
+    forward_authorization: bool = Field(
+        default=False,
+        description=(
+            "[deploy].forward_authorization: the app receives the browser's "
+            "Authorization header on its hosted and cloud custom-domain URLs"
+        ),
+    )
     # ticket_url: a WP-HC TODO. Minting a cloud navigation ticket needs an
     # authenticated daemon → cloud call that does not exist yet, so the field is
     # simply absent in this WP rather than reserved as a null nobody can fill.

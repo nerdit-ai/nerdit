@@ -1000,10 +1000,26 @@ def test_origin_is_additive_and_leaves_every_pre_p34_field_intact() -> None:
         "origin",
         "hosted_only",
         "local_routes",
+        "forward_authorization",
     }
+    assert body["forward_authorization"] is False
     assert body["access"] == "public"
     assert body["state"] == "ready"
     assert body["job_id"] == "svc-1"
+
+
+def test_share_view_reports_the_forward_authorization_opt_in() -> None:
+    """The cloud reads this flag to decide whether to send the carrier at all."""
+    q = _queries(
+        _svc(config={"forward_authorization": True}),
+        shares={"demo": ServiceShare(service_name="demo", access="public")},
+    )
+    body = (
+        _client(q, manager=FakeLinkManager(entitled=True))
+        .get("/api/services/demo/share", headers=_auth())
+        .json()
+    )
+    assert body["forward_authorization"] is True
 
 
 # ---------------------------------------------------------------------------

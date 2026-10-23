@@ -110,6 +110,8 @@ OVERLAY_FILES=(
     "NOTICE"
     "SECURITY.md"
     "CODE_OF_CONDUCT.md"
+    # Lists the maintainers allowed to claim the Glama MCP server listing.
+    "glama.json"
     # The public changelog: a fresh history whose first entry is the first
     # public release. The private CHANGELOG.md narrates unreleased phases and
     # cites internal plans, so it is not in ALLOW_FILES.

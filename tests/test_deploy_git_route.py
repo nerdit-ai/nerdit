@@ -75,6 +75,7 @@ def _secret_manager(store: dict[str, dict[str, str]] | None = None) -> MagicMock
     mgr = MagicMock()
     data = store or {}
     mgr.load = MagicMock(side_effect=lambda scope: data.get(scope, {}))
+    mgr.list_keys = MagicMock(side_effect=lambda scope: sorted(data.get(scope, {})))
     return mgr
 
 
@@ -629,6 +630,53 @@ def test_git_deploy_preserves_repo_dockerignore(tmp_path, monkeypatch):
     assert ignore.read_text() == "# repo file\nsecret.txt\n"
 
 
+def _clone_with(extra: list[str]) -> AsyncMock:
+    """A Node clone that also materializes each relative file path in *extra*."""
+    base = _fake_clone()
+
+    async def _run(repo_url, **kw) -> GitSourceInfo:
+        info = await base.side_effect(repo_url, **kw)
+        for rel in extra:
+            (info.context_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+            (info.context_dir / rel).write_text("x")
+        return info
+
+    return AsyncMock(side_effect=_run)
+
+
+def _excluded_hint(texts: list[str]) -> str:
+    return next(t for t in texts if "generated .dockerignore left" in t)
+
+
+def test_git_buildpack_names_excluded_paths_but_ships_data(tmp_path, monkeypatch):
+    """data/ is no longer excluded; what still is gets named in hints."""
+    q = _queries()
+    clone = _clone_with(["node_modules/p/i.js", "data/seed.json", "x.pyc"])
+    resp = _post(_client(q, tmp_path), monkeypatch, clone)
+    assert resp.status_code == 201, resp.text
+    hint = _excluded_hint(resp.json()["hints"])
+    assert "node_modules/" in hint and "x.pyc" in hint and "data" not in hint
+    cfg = json.loads(q.reserve_service_for_token.call_args.args[0].config)
+    assert "data" not in (Path(cfg["build_context_dir"]) / ".dockerignore").read_text()
+
+
+def test_git_excluded_hint_capped_and_mirrored_in_dry_run(tmp_path, monkeypatch):
+    """15 excluded dirs show 10 plus "(+5 more)", same text in the dry-run plan."""
+    extra = [f"p{i:02d}/node_modules/x.js" for i in range(15)]
+    resp = _post(_client(_queries(), tmp_path), monkeypatch, _clone_with(extra))
+    hint = _excluded_hint(resp.json()["hints"])
+    assert "p09/node_modules/" in hint and "p10/" not in hint and "(+5 more)" in hint
+    client = _client(_queries(), tmp_path)
+    monkeypatch.setattr(pipeline, "clone_source", _clone_with(extra))
+    plan = client.post(
+        "/deploy/git",
+        json={"repo_url": REPO, "name": "demo"},
+        params={"dry_run": "true"},
+        headers=_auth(SUB_RAW),
+    ).json()
+    assert _excluded_hint(plan["warnings"]) == hint
+
+
 # --- env null-delete + dry_run (P13 WP9) -------------------------------------
 
 
@@ -769,10 +817,16 @@ def _link_manager(
     *,
     link_state: str = "connected",
     pro_mirror: str = "never",
+    expired: int = 0,
 ) -> MagicMock:
-    """Model repository tokens and independent public-share eligibility."""
+    """Model repository tokens and independent public-share eligibility.
+
+    ``tokens`` are the live installations; ``expired`` adds held-but-lapsed ones.
+    """
     mgr = MagicMock()
     mgr.github_token_for_repo = MagicMock(side_effect=lambda slug: tokens.get(slug))
+    mgr.github_installations = MagicMock(return_value=tuple(tokens))
+    mgr.github_mirror_held = MagicMock(return_value=(len(tokens) + expired, None))
     # The auth middleware also consults a wired manager for relay capabilities:
     # an explicit "no" keeps the test bearers resolving as ordinary tokens.
     mgr.validate_capability = MagicMock(return_value=False)
@@ -839,11 +893,18 @@ def test_github_ref_without_a_link_manager_is_422_with_the_hint(tmp_path, monkey
     assert resp.status_code == 422
     body = resp.json()
     assert body["code"] == "deploy.github_token_absent"
+    assert body["detail"] == _ABSENT_DETAIL
     assert body["hint"] == (
-        "link this node and install the Nerdit GitHub App, or pass a `${secrets.*}` token_ref"
+        "this node is not linked to Nerdit Cloud or its link is offline, so no GitHub "
+        "installation token has been pushed — run `nerdit link` and check "
+        "`nerdit doctor`, then retry; or pass a `${secrets.*}` token_ref"
     )
     clone.assert_not_awaited()
 
+
+_ABSENT_DETAIL = (
+    "token_ref '${github.installation}' resolves to no installation token for this repository."
+)
 
 _SUBMITTER_HINT = (
     "this token cannot install the Nerdit GitHub App or write a shared secret — "
@@ -864,7 +925,8 @@ def test_a_submitter_is_told_to_ask_the_owner_for_the_github_token(tmp_path, mon
     assert resp.status_code == 422
     body = resp.json()
     assert body["code"] == "deploy.github_token_absent"
-    assert body["hint"] == _SUBMITTER_HINT
+    assert body["hint"].endswith("; " + _SUBMITTER_HINT)
+    assert body["hint"].startswith("this node is not linked to Nerdit Cloud")
     clone.assert_not_awaited()
 
 
@@ -955,6 +1017,88 @@ def test_github_absence_ignores_public_share_eligibility(tmp_path, monkeypatch, 
     assert "plan" not in body["hint"]
     assert "upgrade" not in body["hint"]
     clone.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (None, {}, "https://github.com/owner/repo", ["not linked", "`nerdit link`"]),
+        ({}, {"link_state": "backoff"}, "https://github.com/owner/repo", ["link is offline"]),
+        (
+            {"owner/repo": "ghs-x"},
+            {},
+            "https://github.com/owner",
+            ["github.com owner/name repository URL"],
+        ),
+        (
+            {"someone/else": "ghs-sentinel-live"},
+            {},
+            "https://github.com/owner/repo",
+            [
+                "none covers this repository",
+                "add it to the Nerdit GitHub App installation's selected repositories",
+                "pick it for this node in the console (Deploy from GitHub does both)",
+            ],
+        ),
+        ({}, {"expired": 1}, "https://github.com/owner/repo", ["expired", "not re-pushed"]),
+        (
+            {},
+            {},
+            "https://github.com/owner/repo",
+            ["no GitHub installation token has been pushed", "account is active"],
+        ),
+    ],
+    ids=["no-manager", "offline", "not-owner-name", "not-covered", "expired", "never-pushed"],
+)
+@pytest.mark.parametrize("role", [LEGACY, SUB_RAW])
+def test_github_absence_hint_names_the_cause(tmp_path, monkeypatch, case, role):
+    """Point 5: the hint says why; status, code and detail stay GitWatch's pair."""
+    tokens, kw, repo_url, expected = case
+    clone = _fake_clone()
+    client = _gh_client(_queries(), tmp_path, None)
+    if tokens is not None:
+        client.app.state.link_manager = _link_manager(tokens, **kw)
+    resp = _post(
+        client, monkeypatch, clone, raw=role, repo_url=repo_url, token_ref="${github.installation}"
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["code"] == "deploy.github_token_absent"
+    assert body["detail"] == _ABSENT_DETAIL
+    for part in expected:
+        assert part in body["hint"], (part, body["hint"])
+    if role == SUB_RAW:
+        assert "ask the node owner" in body["hint"]
+    # States only: no token value, repository slug or installation identity.
+    for leak in ("ghs-", "owner/repo", "someone/else"):
+        assert leak not in body["hint"]
+    clone.assert_not_awaited()
+
+
+@pytest.mark.parametrize("token_ref", ["${github.installation}", "${secrets.shared.GITHUB_TOKEN}"])
+def test_a_refused_installation_token_says_the_app_lost_access(tmp_path, monkeypatch, token_ref):
+    """An installation token GitHub refuses gets the App-access hint; a stored
+    secret keeps the stock token hint."""
+    stock = "authentication failed — check the token_ref value has repo read access"
+    clone = AsyncMock(
+        side_effect=GitSourceError(
+            400,
+            "deploy.git_clone_failed",
+            "git clone failed: remote: Repository not found.",
+            hint=stock,
+        )
+    )
+    mgr = _secret_manager({"demo": {}, "_shared": {"GITHUB_TOKEN": "tok-value"}})
+    client = _gh_client(_queries(), tmp_path, {"owner/repo": "ghs-x"}, mgr)
+    resp = _post(client, monkeypatch, clone, raw=LEGACY, token_ref=token_ref)
+    assert resp.status_code == 400, resp.text
+    body = resp.json()
+    assert body["code"] == "deploy.git_clone_failed"
+    if token_ref == "${github.installation}":
+        assert body["hint"].startswith("GitHub refused the installation token")
+        assert "ghs-x" not in body["hint"]
+    else:
+        assert body["hint"] == stock
 
 
 def test_github_ref_variants_are_not_the_literal(tmp_path, monkeypatch):
@@ -1546,3 +1690,124 @@ def test_join_by_prj_id_is_judged_by_the_projects_owner(tmp_path, monkeypatch):
     assert resp.json()["code"] == "project.owned"
     q.get_project.assert_awaited_once_with(PRJ_ID)
     clone.assert_not_awaited()
+
+
+# --- app env secret references (Hexagone point 1) ----------------------------
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize(
+    ("value", "needle"),
+    [("Bearer ${secrets.shared.K}", "whole value"), ("${github.installation}", "token_ref")],
+)
+def test_env_malformed_ref_is_deploy_invalid(tmp_path, monkeypatch, dry_run, value, needle):
+    q = _queries()
+    monkeypatch.setattr(pipeline, "clone_source", _fake_clone())
+    resp = _client(q, tmp_path).post(
+        "/deploy/git",
+        params={"dry_run": str(dry_run).lower()},
+        json={"repo_url": REPO, "name": "demo", "env": {"AUTH": value}},
+        headers=_auth(SUB_RAW),
+    )
+    assert resp.status_code == 422, resp.text
+    err = resp.json()
+    assert err["code"] == "deploy.invalid"
+    assert "env AUTH" in err["message"] and needle in err["message"]
+    q.reserve_service_for_token.assert_not_called()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_env_unset_shared_ref_is_unresolved(tmp_path, monkeypatch, dry_run):
+    q = _queries()
+    mgr = _secret_manager({"_shared": {}})
+    monkeypatch.setattr(pipeline, "clone_source", _fake_clone())
+    resp = _client(q, tmp_path, secret_manager=mgr).post(
+        "/deploy/git",
+        params={"dry_run": str(dry_run).lower()},
+        json={
+            "repo_url": REPO,
+            "name": "demo",
+            "env": {"OPENAI_API_KEY": "${secrets.shared.OPENAI_API_KEY}"},
+        },
+        headers=_auth(SUB_RAW),
+    )
+    assert resp.status_code == 422, resp.text
+    err = resp.json()
+    assert err["code"] == "deploy.env_ref_unresolved"
+    assert "OPENAI_API_KEY" in err["message"]
+    assert "nerdit secrets set --shared OPENAI_API_KEY" in err["hint"]
+    q.reserve_service_for_token.assert_not_called()
+
+
+def test_env_fresh_deploy_never_probes_unowned_service_scope(tmp_path, monkeypatch):
+    """A leftover service-scope file of a reused name is no key-existence oracle."""
+    q = _queries()
+    mgr = _secret_manager({"demo": {"K": "leftover"}})
+    resp = _post(
+        _client(q, tmp_path, secret_manager=mgr),
+        monkeypatch,
+        _fake_clone(),
+        env={"A": "${secrets.K}"},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "deploy.env_ref_unresolved"
+    assert "nerdit secrets set demo K=" in resp.json()["hint"]
+    assert "demo" not in [c.args[0] for c in mgr.list_keys.call_args_list]
+
+
+def test_env_shared_ref_deploys_with_reference_stored(tmp_path, monkeypatch):
+    q = _queries()
+    mgr = _secret_manager({"_shared": {"OPENAI_API_KEY": "sk-value"}})
+    resp = _post(
+        _client(q, tmp_path, with_audit=True, secret_manager=mgr),
+        monkeypatch,
+        _fake_clone(),
+        env={"OPENAI_API_KEY": "${vars.shared.OPENAI_API_KEY}"},
+    )
+    assert resp.status_code == 201, resp.text
+    cfg = json.loads(q.reserve_service_for_token.call_args.args[0].config)
+    assert cfg["env"]["OPENAI_API_KEY"] == "${vars.shared.OPENAI_API_KEY}"
+    assert "sk-value" not in resp.text
+    calls = _shared_referenced(q)
+    assert json.loads(calls[0]["params_redacted"])["keys"] == ["OPENAI_API_KEY"]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_env_carried_forward_unset_ref_is_unresolved(tmp_path, monkeypatch, dry_run):
+    """A redeploy that keeps the old env still checks its references exist."""
+    q = _queries(_existing({"env": {"OLD": "${secrets.GONE}", "ODD": "a ${secrets.X} b"}}))
+    monkeypatch.setattr(pipeline, "clone_source", _fake_clone())
+    resp = _client(q, tmp_path, secret_manager=_secret_manager({"demo": {}})).post(
+        "/deploy/git",
+        params={"dry_run": str(dry_run).lower()},
+        json={"repo_url": REPO, "name": "demo", "env": {"NEW": "x"}},
+        headers=_auth(SUB_RAW),
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "deploy.env_ref_unresolved"
+    assert "env OLD" in resp.json()["message"]
+    assert "nerdit secrets set demo GONE=" in resp.json()["hint"]
+
+
+def test_env_carried_forward_ref_dropped_by_null_deploys(tmp_path, monkeypatch):
+    q = _queries(_existing({"env": {"OLD": "${secrets.GONE}"}}))
+    resp = _post(
+        _client(q, tmp_path, secret_manager=_secret_manager({"demo": {}})),
+        monkeypatch,
+        _fake_clone(),
+        env={"OLD": None},
+    )
+    assert resp.status_code in (200, 201), resp.text
+
+
+def test_env_ref_shadowed_by_scoped_variable_is_not_required(tmp_path, monkeypatch):
+    """A scoped variable named like the env key wins at launch: its ref never resolves."""
+    q = _queries(_existing({"env": {}}))
+    mgr = _secret_manager({"demo": {"API_TOKEN": "scoped"}, "_shared": {}})
+    resp = _post(
+        _client(q, tmp_path, secret_manager=mgr),
+        monkeypatch,
+        _fake_clone(),
+        env={"API_TOKEN": "${secrets.shared.MISSING}"},
+    )
+    assert resp.status_code in (200, 201), resp.text
